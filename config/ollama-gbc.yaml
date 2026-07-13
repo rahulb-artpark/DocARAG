@@ -1,0 +1,89 @@
+# config/ollama-gbc.yaml
+# Single-GPU (cuda:0) + Ollama setup of the full GBC (BookRAG) pipeline.
+# - LLM + VLM + text-embedding  -> served by local Ollama (http://localhost:11434)
+# - Rerankers + multimodal model -> loaded locally in-process via transformers on cuda:0
+# - MinerU PDF parsing           -> "pipeline" backend, runs in-process (no SGLang server)
+#
+# pdf_path / save_path are overridden per-document by the dataset config, so leave as-is.
+
+pdf_path: TODO
+save_path: TODO
+
+llm:
+  model_name: gpt-oss-bookrag        # installed Ollama model; serves text generation
+  api_key: ollama
+  api_base: http://localhost:11434
+  backend: ollama
+  max_tokens: 5000
+  temperature: 0.1
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+  max_workers: 4
+
+vlm:
+  model_name: qwen3-vl-bookrag        # vision-capable; used for figure/image descriptions
+  api_key: ollama
+  api_base: http://localhost:11434
+  temperature: 0.1
+  max_tokens: 6000
+  backend: ollama
+
+index:
+  chunk_size: 512
+  overlap: 50
+
+mineru:
+  backend: vlm-transformers      # local VLM parser (transformers); method forced to "vlm"
+  method: vlm                    # forced to "vlm" for non-pipeline backends
+  server_url: http://localhost:30000   # unused with the transformers backend
+  lang: en
+
+tree:
+  node_keywords: True
+  node_summary: True
+
+graph:
+  extractor_type: "llm"
+  local_model_name: "en_core_web_sm"
+  image_description_force: True
+  max_gleaning: 0
+  refine_type: "advanced"
+  embedding_config:
+    model_name: qwen3-embedding:0.6b   # Ollama embedding model
+    backend: ollama
+    max_length: 4096
+    device: "cuda:0"
+    api_base: "http://localhost:11434"
+  reranker_config:
+    model_name: Qwen/Qwen3-Reranker-4B # loaded locally via transformers
+    max_length: 4096
+    device: "cuda:0"
+    backend: local
+    api_base: ""
+
+vdb:
+  mm_embedding: True
+  vdb_dir_name: "Tree_vdb"
+  collection_name: "TreeVDB"
+  embedding_config:
+    model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+    device: "cuda:0"
+
+rag_force_reprocess: True
+
+rag:
+  strategy: gbc
+  variant: standard
+  topk: 10
+  sim_threshold: 0.3
+  select_depth: 2
+  max_retry: 2
+  reranker_config:
+    model_name: Qwen/Qwen3-Reranker-4B
+    max_length: 4096
+    device: "cuda:0"
+    backend: local
+    api_base: ""
+  mm_reranker_config:
+    model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+    device: "cuda:0"

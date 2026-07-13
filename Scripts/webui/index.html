@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BookRAG Explorer</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/vendor/vis-network.min.js"></script>
+    <script src="/vendor/marked.min.js"></script>
+    <script>
+      window.MathJax = {
+        tex: { inlineMath: [["$", "$"], ["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] },
+        svg: { fontCache: "global" },
+        options: { skipHtmlTags: ["script", "noscript", "style", "textarea", "pre"] },
+        startup: { typeset: false },
+      };
+    </script>
+    <script src="/vendor/tex-svg.js" id="MathJax-script" async></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <h1>BookRAG&nbsp;Explorer</h1>
+      </div>
+      <label class="runPicker">
+        <span>PDF</span>
+        <select id="runSelect"></select>
+      </label>
+      <nav class="tabs" aria-label="Views">
+        <button class="tab active" data-view="graph">Graph</button>
+        <button class="tab" data-view="tree">Tree</button>
+        <button class="tab" data-view="chat">Chat</button>
+      </nav>
+    </header>
+
+    <main>
+      <!-- ============================ GRAPH ============================ -->
+      <section id="graphView" class="view active">
+        <aside class="rail">
+          <input id="graphSearch" class="search" type="search" placeholder="Search entities…" />
+          <select id="entityTypeFilter" class="select">
+            <option value="">All entity types</option>
+          </select>
+          <div class="railStats" id="graphStats"></div>
+          <div class="railList" id="entityList"></div>
+        </aside>
+
+        <section class="stage">
+          <div class="stageBar">
+            <button id="graphFit" class="btn">Fit</button>
+            <button id="graphPhysics" class="btn">Freeze</button>
+            <label class="check"><input id="graphLabels" type="checkbox" /> Labels</label>
+            <span class="stageHint" id="graphHint"></span>
+          </div>
+          <div id="graphNet" class="net"></div>
+          <div id="graphLegend" class="legend"></div>
+        </section>
+
+        <div class="viewResizer" title="Drag to resize panel"></div>
+        <aside class="detail" id="graphDetail">
+          <div class="detailEmpty">
+            <h2>Knowledge graph</h2>
+            <p>Click an entity (in the graph or the list) to see how it was
+               extracted — its description, the source nodes it came from, and its
+               relationships.</p>
+          </div>
+        </aside>
+      </section>
+
+      <!-- ============================ TREE ============================= -->
+      <section id="treeView" class="view">
+        <aside class="rail">
+          <input id="treeSearch" class="search" type="search" placeholder="Search sections / text…" />
+          <select id="treeTypeFilter" class="select">
+            <option value="">All node types</option>
+          </select>
+          <div class="railStats" id="treeStats"></div>
+          <div class="railList" id="treeList"></div>
+        </aside>
+
+        <section class="stage">
+          <div class="stageBar">
+            <button id="treeFit" class="btn">Fit</button>
+            <label class="check"><input id="treeLabels" type="checkbox" checked /> Labels</label>
+            <span class="stageHint">Scroll to pan · Shift+scroll = sideways · Ctrl+scroll = zoom · click a node for details</span>
+          </div>
+          <div id="treeNet" class="net"></div>
+          <div id="treeLegend" class="legend"></div>
+        </section>
+
+        <div class="viewResizer" title="Drag to resize panel"></div>
+        <aside class="detail" id="treeDetail">
+          <div class="detailEmpty">
+            <h2>Document tree</h2>
+            <p>Click a node to inspect the text/section it represents, the
+               LLM-generated summary, its page, and its children.</p>
+          </div>
+        </aside>
+      </section>
+
+      <!-- ============================ CHAT ============================= -->
+      <section id="chatView" class="view">
+        <section class="chatShell">
+          <div class="messages" id="messages"></div>
+          <form id="chatForm" class="composer">
+            <textarea id="question" rows="1" placeholder="Ask a question about this document… (Enter to send, Shift+Enter for newline)"></textarea>
+            <button type="submit" id="askBtn" class="btn primary">Ask</button>
+          </form>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -193,16 +193,20 @@ def merge_middle_content(
     for info in pdf_info:
         para_blocks = info.get("para_blocks", [])
         middle_json_para_list.extend(para_blocks)
-    if len(middle_json_para_list) != len(content_list):
-        log.error(
-            f"Error: The number of items in middle_json ({len(middle_json_para_list)}) does not match the number of content items ({len(content_list)})."
-        )
-        raise ValueError(
-            f"The number of items in middle_json ({len(middle_json_para_list)}) does not match the number of content items ({len(content_list)})."
+    n_mid, n_con = len(middle_json_para_list), len(content_list)
+    if n_mid != n_con:
+        # Tolerant merge: MinerU sometimes emits a few more structure blocks than
+        # content items (or vice-versa). Instead of aborting, pair up to the
+        # shorter list. NOTE: if the extra blocks are not at the very end, node
+        # metadata can drift after the first divergence.
+        log.warning(
+            f"Count mismatch: middle_json has {n_mid} para_blocks but content_list "
+            f"has {n_con} items (diff {abs(n_mid - n_con)}). Pairing up to the "
+            f"shorter list; trailing extras are dropped."
         )
 
     res_pdf_info_list = []
-    for i in range(len(content_list)):
+    for i in range(min(n_mid, n_con)):
         res_pdf_info = copy.deepcopy(content_list[i])
         res_pdf_info["middle_json"] = copy.deepcopy(middle_json_para_list[i])
         if "img_path" in res_pdf_info:

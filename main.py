@@ -371,7 +371,9 @@ def main():
                         dataset_name=dataset_name,
                     )
                 except Exception as e:
+                    import traceback
                     log.error(f"  - ERROR: Failed to run inference. Reason: {e}")
+                    log.error(traceback.format_exc())
                     rag_error_list.append((doc_uuid, str(e)))
 
         # get the base directory of the script

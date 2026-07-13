@@ -1,0 +1,5 @@
+# Scripts/cfg/mytest.yaml
+# Dataset config for a single user-provided PDF.
+dataset_path: /home/rahul/BookRAG/datasets/mytest.json   # QA file (one doc)
+working_dir: /home/rahul/BookRAG/runs/mytest              # per-doc index saved under working_dir/<doc_uuid>
+dataset_name: mytest

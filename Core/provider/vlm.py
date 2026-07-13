@@ -379,7 +379,9 @@ class OllamaVLMController(BaseVLMController):
         images = images or []
         try:
             messages = self._prepare_messages(prompt_or_memory, images)
-            response = self.client.chat(model=self.model_name, messages=messages)
+            response = self.client.chat(
+                model=self.model_name, messages=messages, keep_alive=-1
+            )
 
             if response:
                 tracker = TokenTracker.get_instance()

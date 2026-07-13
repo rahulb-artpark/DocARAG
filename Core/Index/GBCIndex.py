@@ -35,7 +35,14 @@ class GBC:
         if config.graph.refine_type == "basic":
             self.entity_vdb_path = os.path.join(self.save_dir, "kg_vdb_basic")
         else:
-            self.entity_vdb_path = os.path.join(self.save_dir, "kg_vdb")
+            # Must match the path KGRefiner writes to (Core/pipelines/kg_refiner.py),
+            # otherwise RAG reads an empty kg_vdb and entity lookups return nothing.
+            embed_model_name = config.graph.embedding_config.model_name.replace("/", "_")
+            rerank_model_name = config.graph.reranker_config.model_name.replace("/", "_")
+            self.entity_vdb_path = os.path.join(
+                self.save_dir,
+                f"kg_vdb_{config.graph.g}_{embed_model_name}_{rerank_model_name}",
+            )
         
         self.embedder = TextEmbeddingProvider(
             model_name=config.graph.embedding_config.model_name,

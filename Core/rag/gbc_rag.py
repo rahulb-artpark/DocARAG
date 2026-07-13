@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Any, List, Tuple, Dict, Optional
+from typing import Any, Callable, List, Tuple, Dict, Optional
 
 from regex import F
 
@@ -94,6 +94,18 @@ class GBCRAG(BaseRAG):
             x_percentile=self.cfg.x_percentile,
             topk=self.cfg.topk,
         )
+        self.retrieval_callback: Optional[
+            Callable[[GBCRAGContext, SubStep], None]
+        ] = None
+
+    def _notify_retrieval_ready(self, context: GBCRAGContext, step: SubStep) -> None:
+        """Optional UI hook fired after retrieval and before answer generation."""
+        if not self.retrieval_callback:
+            return
+        try:
+            self.retrieval_callback(context, step)
+        except Exception as e:
+            log.warning(f"Retrieval callback failed: {e}")
 
     def _get_entity_embed_text(self, entity: QuestionEntity) -> str:
         return f"Name: {entity.entity_name}\nType: {entity.entity_type}"
@@ -481,6 +493,7 @@ class GBCRAG(BaseRAG):
             query = query_analysis.original_query
             current_step = SubStep(sub_query=query, sub_number=1)
             self._retrieve(query, current_step)
+            self._notify_retrieval_ready(context, current_step)
 
             final_answer, partial_answers = self.answer.answer_simple_question(
                 query=query,
@@ -506,6 +519,7 @@ class GBCRAG(BaseRAG):
                 sub_question = task.question
                 current_step = SubStep(sub_query=sub_question, sub_number=i + 1)
                 self._retrieve(sub_question, current_step)
+                self._notify_retrieval_ready(context, current_step)
 
                 sub_answer, partial_answers = self.answer.answer_simple_question(
                     query=sub_question,
@@ -542,6 +556,7 @@ class GBCRAG(BaseRAG):
             tree_data = self.gbc_index.TreeIndex.get_nodes_data(filter_nodes_ids)
             self._process_retrieved_nodes(tree_data, current_step)
             log.info(f"Global filter resulted in {len(filtered_nodes)} nodes.")
+            self._notify_retrieval_ready(context, current_step)
 
             operation = query_analysis.operation.upper()
 

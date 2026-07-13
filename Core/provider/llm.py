@@ -250,7 +250,9 @@ class OllamaController(BaseLLMController):
             messages=messages,
             options={
                 "temperature": self.temperature,
+                "num_predict": self.max_tokens,
             },
+            keep_alive=-1,
             think=False,
         )
 
@@ -288,7 +290,9 @@ class OllamaController(BaseLLMController):
             format=schema.model_json_schema(),  # 关键：传递schema
             options={
                 "temperature": self.temperature,
+                "num_predict": self.max_tokens,
             },
+            keep_alive=-1,
         )
 
         if response:
