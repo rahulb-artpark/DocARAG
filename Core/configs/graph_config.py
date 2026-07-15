@@ -1,7 +1,43 @@
 from dataclasses import dataclass, field
+import math
+import os
+from typing import Optional
 
 from Core.configs.embedding_config import EmbeddingConfig
 from Core.configs.rerank_config import RerankerConfig
+
+
+def graph_artifact_variant(config: "GraphConfig") -> str | None:
+    """Return the graph filename variant used by both writers and readers."""
+
+    if config.refine_type == "basic":
+        return "basic"
+
+    if config.reranker_config.model_name.lower().startswith("bge"):
+        model = config.reranker_config.model_name.replace("/", "_").replace(" ", "_")
+        return f"{config.g}_{model}"
+
+    is_default_g = abs(config.g - 0.6) < 1e-9
+    embedding_model = config.embedding_config.model_name
+    if is_default_g and embedding_model.lower().startswith("qwen"):
+        return None
+
+    model = embedding_model.replace("/", "_").replace(" ", "_")
+    return f"{config.g}_{model}"
+
+
+def entity_attestation_directory(save_dir: str, config: "GraphConfig") -> str:
+    """Return the run-local Qdrant attestation path for a graph profile."""
+
+    if config.refine_type == "basic":
+        directory = "entity_attestation_basic"
+    else:
+        embedding_model = config.embedding_config.model_name.replace("/", "_")
+        reranker_model = config.reranker_config.model_name.replace("/", "_")
+        directory = (
+            f"entity_attestation_{config.g}_{embedding_model}_{reranker_model}"
+        )
+    return os.path.join(save_dir, directory)
 
 
 @dataclass
@@ -9,12 +45,57 @@ class GraphConfig:
     # KG extraction
     extractor_type: str = "llm"  # Options: "llm", "local"
     local_model_name: str = "en_core_web_sm"
+    local_device: str = "cpu"  # Options: "cpu", "cuda", "auto"
     image_description_force: bool = False
     max_gleaning: int = 0
+    extraction_max_workers: int = 4
+    extraction_max_in_flight: Optional[int] = None
+    extraction_batch_size: int = 32
+    refinement_max_workers: int = 8
+    refinement_max_in_flight: Optional[int] = None
 
     # KG refinement
     refine_type: str = "advanced"  # Options: "basic", "advanced"
-    g: float = 0.6 # For advanced refinement, the Gradient-based similar threshold
+    g: float = 0.6  # For advanced refinement, the gradient similarity threshold
+    entity_collection_name: str = "bookrag-entities"
 
     embedding_config: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     reranker_config: RerankerConfig = field(default_factory=RerankerConfig)
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.entity_collection_name, str)
+            or not self.entity_collection_name.strip()
+            or self.entity_collection_name != self.entity_collection_name.strip()
+        ):
+            raise ValueError("entity_collection_name must be a non-empty trimmed string")
+        if self.extractor_type not in {"llm", "local"}:
+            raise ValueError("extractor_type must be 'llm' or 'local'")
+        if self.local_device not in {"cpu", "cuda", "auto"}:
+            raise ValueError("local_device must be 'cpu', 'cuda', or 'auto'")
+        if self.refine_type not in {"basic", "advanced"}:
+            raise ValueError("refine_type must be 'basic' or 'advanced'")
+        if isinstance(self.g, bool):
+            raise ValueError("g must be a finite number in the interval (0, 1]")
+        try:
+            valid_g = math.isfinite(self.g) and 0 < self.g <= 1
+        except TypeError as error:
+            raise ValueError(
+                "g must be a finite number in the interval (0, 1]"
+            ) from error
+        if not valid_g:
+            raise ValueError("g must be a finite number in the interval (0, 1]")
+        if self.extraction_max_workers < 1:
+            raise ValueError("extraction_max_workers must be at least 1")
+        if self.extraction_max_in_flight is None:
+            self.extraction_max_in_flight = self.extraction_max_workers
+        if self.extraction_max_in_flight < 1:
+            raise ValueError("extraction_max_in_flight must be at least 1")
+        if self.extraction_batch_size < 1:
+            raise ValueError("extraction_batch_size must be at least 1")
+        if self.refinement_max_workers < 1:
+            raise ValueError("refinement_max_workers must be at least 1")
+        if self.refinement_max_in_flight is None:
+            self.refinement_max_in_flight = self.refinement_max_workers
+        if self.refinement_max_in_flight < 1:
+            raise ValueError("refinement_max_in_flight must be at least 1")

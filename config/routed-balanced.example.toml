@@ -1,0 +1,104 @@
+# Opt-in routed parser profile. This is a validated template, not a certified
+# production model matrix. Replace every placeholder pin, validate it, then
+# select it with `docarag index --routed-profile PATH`.
+schema_version = "docarag.routed-runtime-profile.v1"
+profile_id = "balanced-local-example"
+
+[runtime]
+max_primary_latency_ms = 120000
+max_total_latency_ms = 300000
+
+[parse_options]
+languages = ["en"]
+ocr_mode = "auto"
+parse_tables = true
+parse_formulas = true
+parse_images = true
+# MinerU 3.x exposes an explicit accuracy/latency tier. This value is part of
+# ParseRequest identity and must match the qualified MinerU worker profile.
+mineru_effort = "medium"
+timeout_seconds = 300.0
+
+[page_probe]
+sha256_chunk_bytes = 1048576
+infer_scanned_pages = true
+scanned_max_native_characters = 20
+scanned_min_raster_coverage_ratio = 0.70
+
+[ingestion]
+max_page_features = 10000
+max_audit_bytes = 536870912
+max_canonical_artifact_bytes = 536870912
+sha256_chunk_bytes = 1048576
+probe_identity = "source_bound_pdf_page_probe.v1"
+
+[orchestration]
+max_batch_pages = 16
+minimum_observations_per_page = 1
+minimum_explicit_confidence = 0.50
+require_expected_block_types = true
+review_degraded_canonical = true
+review_reconciliation_issues = true
+
+[reconciliation]
+minimum_iou = 0.55
+high_iou = 0.85
+minimum_text_similarity = 0.65
+cross_type_iou = 0.78
+cross_type_text_similarity = 0.78
+accepted_confidence = 0.60
+grid_size = 16
+max_candidates_per_observation = 512
+max_raw_candidate_probes_per_observation = 4096
+parser_priority = ["docling", "mineru", "paddleocr-vl"]
+
+[reconciliation.parser_quality_weights]
+docling = 1.0
+mineru = 1.0
+paddleocr-vl = 1.0
+
+# Replace every adapter version and manifest digest with values returned by the
+# exact worker image/model you have qualified. The zero digests below are only
+# syntactically valid placeholders, so runtime readiness intentionally fails
+# until they are replaced.
+[[workers]]
+runtime_id = "docling-worker-local"
+adapter_name = "docling-export"
+base_url = "http://127.0.0.1:8101"
+expected_adapter_version = "replace-with-qualified-version"
+expected_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+connect_timeout_seconds = 5.0
+operation_timeout_seconds = 300.0
+max_request_bytes = 16777216
+max_response_bytes = 67108864
+estimated_latency_ms = 15000
+estimated_cost_microusd = 0
+# bearer_token_env = "DOCARAG_DOCLING_TOKEN"
+
+[[workers]]
+runtime_id = "mineru-worker-local"
+adapter_name = "mineru-normalized"
+base_url = "http://127.0.0.1:8102"
+expected_adapter_version = "replace-with-qualified-version"
+expected_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+connect_timeout_seconds = 5.0
+operation_timeout_seconds = 300.0
+max_request_bytes = 16777216
+max_response_bytes = 67108864
+estimated_latency_ms = 30000
+estimated_cost_microusd = 0
+# bearer_token_env = "DOCARAG_MINERU_TOKEN"
+
+[[workers]]
+runtime_id = "paddleocr-vl-worker-local"
+adapter_name = "paddleocr-vl-page"
+base_url = "http://127.0.0.1:8103"
+expected_adapter_version = "replace-with-qualified-version"
+expected_manifest_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+connect_timeout_seconds = 5.0
+operation_timeout_seconds = 300.0
+max_request_bytes = 16777216
+max_response_bytes = 67108864
+estimated_latency_ms = 60000
+estimated_cost_microusd = 0
+# bearer_token_env = "DOCARAG_PADDLE_TOKEN"

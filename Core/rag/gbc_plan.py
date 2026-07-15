@@ -1,6 +1,30 @@
-from pydantic import BaseModel, model_validator, field_validator
+import re
+
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Literal
+from Core.configs.gbc_limits import (
+    ABSOLUTE_MAX_FILTERS,
+    ABSOLUTE_MAX_FILTER_VALUE_CHARS,
+    ABSOLUTE_MAX_QUERY_CHARS,
+    ABSOLUTE_MAX_SUBQUESTION_CHARS,
+    ABSOLUTE_MAX_SUBQUESTIONS,
+)
 from Core.provider.llm import LLM
+
+
+class PlanningBudgetExceeded(ValueError):
+    """An untrusted query plan exceeded a configured synchronous budget."""
+
+
+def _validate_bounded_text(value: object, *, field: str, max_chars: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    if len(value) > max_chars:
+        raise PlanningBudgetExceeded(
+            f"{field} contains {len(value)} characters, exceeding the "
+            f"configured limit of {max_chars}"
+        )
+    return value
 
 
 # Step 1 Output Model
@@ -10,55 +34,138 @@ class QueryTypeResult(BaseModel):
 
 # Step 2 'complex' Output Model
 class SubQuestion(BaseModel):
-    question: str
+    question: str = Field(
+        min_length=1,
+        max_length=ABSOLUTE_MAX_SUBQUESTION_CHARS,
+    )
     type: Literal["retrieval", "synthesis"]
+
+    @model_validator(mode="after")
+    def validate_question_text(self):
+        if not self.question.strip():
+            raise ValueError("sub-question must not contain only whitespace")
+        return self
 
 
 class ComplexResult(BaseModel):
-    sub_questions: List[SubQuestion]
+    sub_questions: List[SubQuestion] = Field(
+        min_length=1,
+        max_length=ABSOLUTE_MAX_SUBQUESTIONS,
+    )
 
 
 # Step 2 'global' Output Models (统一为Filter列表)
-class Filter(BaseModel):
-    filter_type: Literal["section", "image", "table", "page"]
-    filter_value: Optional[str] = None
+_PAGE_FILTER_VALUE = re.compile(r"([1-9][0-9]*)(?:\s*-\s*([1-9][0-9]*))?")
 
-    @field_validator("filter_value")
-    def check_filter_value(cls, v, info):
-        filter_type = info.data.get("filter_type")
-        if v is not None and filter_type not in ["section", "page"]:
+
+def parse_page_filter_value(value: object) -> tuple[int, int]:
+    """Parse one-based page/range syntax without silently widening scope."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("page filter_value must be a page number or page range")
+    match = _PAGE_FILTER_VALUE.fullmatch(value.strip())
+    if match is None:
+        raise ValueError(
+            "page filter_value must use one-based syntax such as '3' or '3-7'"
+        )
+    start_page = int(match.group(1))
+    end_page = int(match.group(2) or match.group(1))
+    if end_page < start_page:
+        raise ValueError("page filter range end must be greater than or equal to start")
+    return start_page, end_page
+
+
+class Filter(BaseModel):
+    filter_type: Literal[
+        "document",
+        "section",
+        "title",
+        "image",
+        "table",
+        "equation",
+        "page",
+    ]
+    filter_value: Optional[str] = Field(
+        default=None,
+        max_length=ABSOLUTE_MAX_FILTER_VALUE_CHARS,
+    )
+
+    @model_validator(mode="after")
+    def check_filter_value(self):
+        if self.filter_type in {"document", "title", "image", "table", "equation"}:
+            if self.filter_value is not None:
+                raise ValueError(
+                    "filter_value can only be set for a named 'section' or 'page', "
+                    f"not for '{self.filter_type}'."
+                )
+            return self
+        if self.filter_type == "section":
+            if not isinstance(self.filter_value, str) or not self.filter_value.strip():
+                raise ValueError("section filter_value must be a non-empty section name")
+            return self
+        if self.filter_type == "page":
+            parse_page_filter_value(self.filter_value)
+            return self
+        # ``filter_type`` is a Literal, so this is a defensive future-proofing
+        # branch rather than a reachable compatibility fallback.
+        if self.filter_value is not None:
             raise ValueError(
-                f"filter_value can only be set for 'section' or 'page', not for '{filter_type}'."
+                f"unsupported filter type: {self.filter_type}"
             )
-        return v
+        return self
 
 
 class GlobalResult(BaseModel):
-    filters: List[Filter]
+    filters: List[Filter] = Field(
+        min_length=1,
+        max_length=ABSOLUTE_MAX_FILTERS,
+    )
     operation: Literal["COUNT", "LIST", "SUMMARIZE", "ANALYZE"]
 
 
 # Final combined result model (for returning to the user)
 class PlanResult(BaseModel):
     query_type: Literal["simple", "complex", "global"]
-    original_query: str
-    sub_questions: Optional[List[SubQuestion]] = None
-    filters: Optional[List[Filter]] = None  # 原scope字段已改为filters
+    original_query: str = Field(
+        min_length=1,
+        max_length=ABSOLUTE_MAX_QUERY_CHARS,
+    )
+    sub_questions: Optional[List[SubQuestion]] = Field(
+        default=None,
+        max_length=ABSOLUTE_MAX_SUBQUESTIONS,
+    )
+    filters: Optional[List[Filter]] = Field(  # 原scope字段已改为filters
+        default=None,
+        max_length=ABSOLUTE_MAX_FILTERS,
+    )
     operation: Optional[Literal["COUNT", "LIST", "SUMMARIZE", "ANALYZE"]] = None
 
     @model_validator(mode="after")
     def check_fields_for_type(self):
-        # ... (校验逻辑更新以包含 operation)
+        if not self.original_query.strip():
+            raise ValueError("original_query must not contain only whitespace")
         if self.query_type == "complex" and not self.sub_questions:
             raise ValueError(
                 "For 'complex' query_type, 'sub_questions' must be provided."
+            )
+        if self.query_type == "complex" and (
+            self.filters is not None or self.operation is not None
+        ):
+            raise ValueError(
+                "For 'complex' query_type, filters and operation must be null."
             )
         if self.query_type == "global" and (not self.filters or not self.operation):
             raise ValueError(
                 "For 'global' query_type, 'filters' and 'operation' must be provided."
             )
+        if self.query_type == "global" and self.sub_questions is not None:
+            raise ValueError(
+                "For 'global' query_type, sub_questions must be null."
+            )
         if self.query_type == "simple" and (
-            self.sub_questions or self.filters or self.operation
+            self.sub_questions is not None
+            or self.filters is not None
+            or self.operation is not None
         ):
             raise ValueError(
                 "For 'simple' query_type, all other specific fields must be null."
@@ -74,8 +181,101 @@ class TaskPlanner:
     Step 2: Process the query based on its type.
     """
 
-    def __init__(self, llm: LLM):
+    def __init__(
+        self,
+        llm: LLM,
+        *,
+        max_query_chars: int = 4_096,
+        max_subquestions: int = 8,
+        max_subquestion_chars: int = 1_024,
+        max_filters: int = 8,
+        max_filter_value_chars: int = 256,
+    ):
         self.llm = llm
+        limits = {
+            "max_query_chars": (max_query_chars, ABSOLUTE_MAX_QUERY_CHARS),
+            "max_subquestions": (max_subquestions, ABSOLUTE_MAX_SUBQUESTIONS),
+            "max_subquestion_chars": (
+                max_subquestion_chars,
+                ABSOLUTE_MAX_SUBQUESTION_CHARS,
+            ),
+            "max_filters": (max_filters, ABSOLUTE_MAX_FILTERS),
+            "max_filter_value_chars": (
+                max_filter_value_chars,
+                ABSOLUTE_MAX_FILTER_VALUE_CHARS,
+            ),
+        }
+        for name, (value, ceiling) in limits.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            if value > ceiling:
+                raise ValueError(f"{name} cannot exceed {ceiling}")
+            setattr(self, name, value)
+
+    def limits_trace(self) -> dict[str, int]:
+        """Return the effective limits persisted with the query trace."""
+
+        return {
+            "max_query_chars": self.max_query_chars,
+            "max_subquestions": self.max_subquestions,
+            "max_subquestion_chars": self.max_subquestion_chars,
+            "max_filters": self.max_filters,
+            "max_filter_value_chars": self.max_filter_value_chars,
+        }
+
+    def validate_query(self, query: object) -> str:
+        return _validate_bounded_text(
+            query,
+            field="query",
+            max_chars=self.max_query_chars,
+        )
+
+    def validate_plan(self, plan: PlanResult) -> PlanResult:
+        """Validate model-controlled fan-out before retrieval begins.
+
+        Values are rejected rather than truncated.  Truncation would turn an
+        apparently successful complex/global answer into one based on an
+        undisclosed subset of the model's requested evidence.
+        """
+
+        if not isinstance(plan, PlanResult):
+            raise TypeError("plan must be a PlanResult")
+        # Re-run the structural schema from serialized data so callers cannot
+        # bypass it with ``model_construct`` or a stale unsafe cache object.
+        plan = PlanResult.model_validate(plan.model_dump())
+        self.validate_query(plan.original_query)
+
+        if plan.query_type == "complex":
+            sub_questions = plan.sub_questions or []
+            if len(sub_questions) > self.max_subquestions:
+                raise PlanningBudgetExceeded(
+                    "complex plan contains "
+                    f"{len(sub_questions)} sub-questions, exceeding the "
+                    f"configured limit of {self.max_subquestions}"
+                )
+            for index, sub_question in enumerate(sub_questions, start=1):
+                _validate_bounded_text(
+                    sub_question.question,
+                    field=f"sub-question {index}",
+                    max_chars=self.max_subquestion_chars,
+                )
+
+        if plan.query_type == "global":
+            filters = plan.filters or []
+            if len(filters) > self.max_filters:
+                raise PlanningBudgetExceeded(
+                    f"global plan contains {len(filters)} filters, exceeding "
+                    f"the configured limit of {self.max_filters}"
+                )
+            for index, filter_spec in enumerate(filters, start=1):
+                value = filter_spec.filter_value
+                if value is not None and len(value) > self.max_filter_value_chars:
+                    raise PlanningBudgetExceeded(
+                        f"filter {index} contains {len(value)} characters, "
+                        "exceeding the configured limit of "
+                        f"{self.max_filter_value_chars}"
+                    )
+        return plan
 
     def _get_classification_prompt(self, query: str) -> str:
         # Prompt for Step 1: Classification Only
@@ -110,6 +310,7 @@ You are a query decomposition expert. You have been given a "complex" question. 
 1.  Each `retrieval` sub-question MUST be a direct information retrieval task that can be answered independently by looking up a specific fact, number, or value in the document.
 2.  **`retrieval` sub-questions MUST NOT depend on the answer of another sub-question.** They should be parallelizable. All logic for combining their results must be placed in a final `synthesis` question.
 3.  A `synthesis` question requires comparing, calculating, or combining the answers of the previous `retrieval` questions. It does **NOT** require a new lookup in the document.
+4.  Return at most {self.max_subquestions} sub-questions, and keep each `question` at or below {self.max_subquestion_chars} characters. If the request cannot be represented within this budget, do not invent a partial decomposition.
 
 You MUST provide your response in a JSON object with a single key 'sub_questions', which contains a list of objects. Each object must have a 'question' (string) and a 'type' (string: "retrieval" or "synthesis").
 
@@ -169,15 +370,20 @@ You are a highly specialized AI assistant. Your ONLY function is to analyze a "G
 ### INSTRUCTIONS & DEFINITIONS ###
 
 1.  **Filters**: You MUST determine the list of `filters` to apply. Even if the filter is for the whole document (e.g., all tables), the `filters` list must be present.
-    - `filter_type`: One of ["section", "image", "table", "page"].
+    - `filter_type`: One of ["document", "section", "title", "image", "table", "equation", "page"].
+        - `document`: Use for the whole document, such as a full-document summary. This does not mean a layout item count.
         - `section`: Use for structural parts like chapters, sections, appendices, or references.
+        - `title`: Use for all structural headings when counting or listing chapters/sections.
         - `image`: Use for visual elements like figures, images, pictures, or plots.
         - `table`: Use for tabular data.
+        - `equation`: Use for formulas or equations.
         - `page`: Use for specific page numbers or ranges.
-    - `filter_value`: (Optional) Can be provided for "section" (e.g., a section title) or "page" (e.g., '3-10' or '5'). **For "image" or "table", this value MUST be null.**
+    - `filter_value`: Required for "section" (e.g., a section title) and "page" (e.g., '3-10' or '5'). For every other filter type it MUST be null.
 
 2.  **Operation**: Determine the final aggregation operation.
     - `operation`: One of ["COUNT", "LIST", "SUMMARIZE", "ANALYZE"].
+
+3.  **Budget**: Return at most {self.max_filters} filters. Each `filter_value` must be at most {self.max_filter_value_chars} characters. Do not silently omit a required filter to fit this budget.
 
 ### EXAMPLES OF YOUR TASK ###
 
@@ -187,8 +393,14 @@ Assistant: {{"filters": [{{"filter_type": "page", "filter_value": "3-10"}}, {{"f
 User: "Summarize the discussion about 'data augmentation' in the 'Methodology' section."
 Assistant: {{"filters": [{{"filter_type": "section", "filter_value": "Methodology"}}], "operation": "SUMMARIZE"}}
 
-User: "How many chapters are in this report?"
-Assistant: {{"filters": [{{"filter_type": "section"}}], "operation": "COUNT"}}
+User: "List items in the 'Limitations' section."
+Assistant: {{"filters": [{{"filter_type": "section", "filter_value": "Limitations"}}], "operation": "LIST"}}
+
+User: "How many chapter or section headings are in the document?"
+Assistant: {{"filters": [{{"filter_type": "title"}}], "operation": "COUNT"}}
+
+User: "Summarize the whole document."
+Assistant: {{"filters": [{{"filter_type": "document"}}], "operation": "SUMMARIZE"}}
 
 ### YOUR CURRENT TASK ###
 
@@ -203,7 +415,7 @@ Assistant:
         result = self.llm.get_json_completion(prompt, schema=QueryTypeResult)
         return result.query_type
 
-    def _process_complex_query(self, query: str) -> List[str]:
+    def _process_complex_query(self, query: str) -> List[SubQuestion]:
         prompt = self._get_complex_prompt(query)
         result = self.llm.get_json_completion(prompt, schema=ComplexResult)
         return result.sub_questions
@@ -214,22 +426,27 @@ Assistant:
         return result
 
     def analyze(self, query: str) -> PlanResult:
+        self.validate_query(query)
         query_type = self._classify_query_type(query)
 
         if query_type == "simple":
-            return PlanResult(query_type=query_type, original_query=query)
+            plan = PlanResult(query_type=query_type, original_query=query)
 
         elif query_type == "complex":
             sub_questions = self._process_complex_query(query)
-            return PlanResult(
+            plan = PlanResult(
                 query_type=query_type, original_query=query, sub_questions=sub_questions
             )
 
         elif query_type == "global":
             global_result = self._process_global_query(query)
-            return PlanResult(
+            plan = PlanResult(
                 query_type=query_type,
                 original_query=query,
                 filters=global_result.filters,
                 operation=global_result.operation,
             )
+        else:  # pragma: no cover - the Literal schema makes this unreachable.
+            raise ValueError(f"unsupported query type: {query_type}")
+
+        return self.validate_plan(plan)

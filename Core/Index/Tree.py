@@ -1,7 +1,8 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import pickle
 import logging
 from enum import Enum
+from collections.abc import Mapping, Sequence
 from typing import Optional, Dict, Literal, Any, List, Set, Union
 import os
 
@@ -24,6 +25,42 @@ class MetaInfo(BaseModel):
     # document info
     file_name: str | None = Field(description="the name of the file", default=None)
     file_path: str | None = Field(description="the path of the file", default=None)
+    source_uri: str | None = Field(
+        description="the original source URI/path supplied by the user", default=None
+    )
+    source_sha256: str | None = Field(
+        description="SHA-256 of the immutable source bytes", default=None
+    )
+    snapshot_path: str | None = Field(
+        description="the immutable local snapshot parsed by this run", default=None
+    )
+    document_version_id: str | None = Field(
+        description="stable identity of the exact source-byte revision", default=None
+    )
+    canonical_artifact_path: str | None = Field(
+        description="path to the source-bound canonical evidence artifact",
+        default=None,
+    )
+    canonical_artifact_sha256: str | None = Field(
+        description="SHA-256 of the exact canonical evidence artifact bytes",
+        default=None,
+    )
+    canonical_artifact_size_bytes: int | None = Field(
+        description="size of the exact canonical evidence artifact",
+        default=None,
+    )
+    routed_audit_artifact_path: str | None = Field(
+        description="path to the replayable routed parsing audit artifact",
+        default=None,
+    )
+    routed_audit_artifact_sha256: str | None = Field(
+        description="SHA-256 of the exact routed parsing audit bytes",
+        default=None,
+    )
+    routed_audit_artifact_size_bytes: int | None = Field(
+        description="size of the exact routed parsing audit artifact",
+        default=None,
+    )
 
     # page info
     page_idx: int | None = Field(description="the page index", default=None)
@@ -37,6 +74,91 @@ class MetaInfo(BaseModel):
     )
     pdf_para_block: dict | None = Field(
         description="the paragraph block information from the PDF extractor",
+        default=None,
+    )
+    canonical_block_id: str | None = Field(
+        description="stable canonical evidence block identity", default=None
+    )
+    canonical_revision_id: str | None = Field(
+        description="immutable revision of the canonical evidence block", default=None
+    )
+    observation_id: str | None = Field(
+        description="source parser observation used by this node", default=None
+    )
+    derived_evidence_id: str | None = Field(
+        description="stable identity of content derived after parser refinement",
+        default=None,
+    )
+    source_canonical_block_ids: list[str] | None = Field(
+        description="ordered canonical blocks supporting derived content",
+        default=None,
+    )
+    source_canonical_revision_ids: list[str] | None = Field(
+        description="ordered immutable canonical revisions supporting derived content",
+        default=None,
+    )
+    page_id: str | None = Field(
+        description="stable page identity within the document revision", default=None
+    )
+    source_geometry: dict | None = Field(
+        description="page coordinate space, bounding box, and polygon", default=None
+    )
+    semantic_subtype: str | None = Field(
+        description="parser-provided semantic specialization", default=None
+    )
+    parser_provenance: dict | None = Field(
+        description="parser/model/config identity for the observation", default=None
+    )
+    quality_status: str | None = Field(
+        description="canonical reconciliation quality status", default=None
+    )
+    reconciliation_method: str | None = Field(
+        description="method used to create the canonical evidence", default=None
+    )
+    source_observation_ids: list[str] | None = Field(
+        description="all parser observations supporting the canonical block",
+        default=None,
+    )
+    source_evidence_refs: list[dict] | None = Field(
+        description=(
+            "ordered source block, observation, page, and geometry references for "
+            "derived content"
+        ),
+        default=None,
+    )
+    canonical_representation_ids: list[str] | None = Field(
+        description="immutable canonical representation identities available to this node",
+        default=None,
+    )
+    canonical_asset_ids: list[str] | None = Field(
+        description="immutable canonical asset identities available to this node",
+        default=None,
+    )
+    selected_representation_ids: list[str] | None = Field(
+        description=(
+            "canonical representations actually selected for the BookRAG node view"
+        ),
+        default=None,
+    )
+    selected_asset_ids: list[str] | None = Field(
+        description="canonical assets actually selected for the BookRAG node view",
+        default=None,
+    )
+    canonical_relations: list[dict] | None = Field(
+        description=(
+            "directed canonical structural relations with exact parser-assertion lineage"
+        ),
+        default=None,
+    )
+    semantic_substructures: list[dict] | None = Field(
+        description=(
+            "bounded canonical table, formula, diagram, flowchart, or layout "
+            "subgraphs with exact parser-observation lineage"
+        ),
+        default=None,
+    )
+    transformations: list[str] | None = Field(
+        description="ordered transformations applied after canonical parsing",
         default=None,
     )
 
@@ -69,6 +191,66 @@ class MetaInfo(BaseModel):
     title_level: int | None = Field(
         description="the level of the title, 0 is the root", default=-1
     )
+
+    @field_validator("semantic_substructures", mode="before")
+    @classmethod
+    def _validate_semantic_substructures(cls, value):
+        """Keep only bounded, canonical, source-bound JSON graph DTOs.
+
+        This validation is intentionally lazy so historical BookRAG-only trees do
+        not import the canonical contract.  New evidence cannot smuggle an
+        arbitrary or unbounded nested object through generic node metadata.
+        """
+
+        if value is None:
+            return None
+        if not isinstance(value, Sequence) or isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            raise ValueError("semantic_substructures must be an array")
+
+        from docarag.domain import (
+            MAX_SEMANTIC_BLOCK_CANONICAL_BYTES,
+            MAX_SEMANTIC_ELEMENTS_PER_BLOCK,
+            MAX_SEMANTIC_RELATIONS_PER_BLOCK,
+            MAX_SEMANTIC_SUBSTRUCTURES_PER_BLOCK,
+            SemanticSubstructure,
+        )
+        from docarag.domain.base import canonical_json_bytes
+
+        if len(value) > MAX_SEMANTIC_SUBSTRUCTURES_PER_BLOCK:
+            raise ValueError("semantic_substructures limit exceeded")
+
+        normalized: list[dict] = []
+        element_count = 0
+        relation_count = 0
+        for position, raw_structure in enumerate(value):
+            if not isinstance(raw_structure, Mapping):
+                raise ValueError(
+                    f"semantic_substructures[{position}] must be an object"
+                )
+            try:
+                structure = SemanticSubstructure.from_dict(raw_structure)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"semantic_substructures[{position}] is not a valid "
+                    "canonical semantic graph"
+                ) from exc
+            if not structure.is_source_bound:
+                raise ValueError(
+                    f"semantic_substructures[{position}] lacks source lineage"
+                )
+            element_count += len(structure.elements)
+            relation_count += len(structure.relations)
+            if element_count > MAX_SEMANTIC_ELEMENTS_PER_BLOCK:
+                raise ValueError("semantic_substructures element limit exceeded")
+            if relation_count > MAX_SEMANTIC_RELATIONS_PER_BLOCK:
+                raise ValueError("semantic_substructures relation limit exceeded")
+            normalized.append(structure.to_dict())
+
+        if len(canonical_json_bytes(normalized)) > MAX_SEMANTIC_BLOCK_CANONICAL_BYTES:
+            raise ValueError("semantic_substructures byte limit exceeded")
+        return normalized
 
 
 class TreeNode:
@@ -324,7 +506,58 @@ class DocumentTree:
                 "page": page_idx,
                 # "summary": node.summary,
             }
-            if node.type == NodeType.IMAGE or node.type == NodeType.TABLE:
+            # Keep the historical retrieval payload unchanged for old trees,
+            # while exposing complete evidence bindings for canonical nodes.
+            trace_fields = {
+                "page_id": node.meta_info.page_id,
+                "document_version_id": node.meta_info.document_version_id,
+                "canonical_block_id": node.meta_info.canonical_block_id,
+                "canonical_revision_id": node.meta_info.canonical_revision_id,
+                "observation_id": node.meta_info.observation_id,
+                "derived_evidence_id": node.meta_info.derived_evidence_id,
+                "source_canonical_block_ids": (
+                    node.meta_info.source_canonical_block_ids
+                ),
+                "source_canonical_revision_ids": (
+                    node.meta_info.source_canonical_revision_ids
+                ),
+                "source_observation_ids": node.meta_info.source_observation_ids,
+                "source_evidence_refs": node.meta_info.source_evidence_refs,
+                "canonical_representation_ids": (
+                    node.meta_info.canonical_representation_ids
+                ),
+                "canonical_asset_ids": node.meta_info.canonical_asset_ids,
+                "selected_representation_ids": (
+                    node.meta_info.selected_representation_ids
+                ),
+                "selected_asset_ids": node.meta_info.selected_asset_ids,
+                "canonical_relations": node.meta_info.canonical_relations,
+                # ``getattr`` keeps retrieval compatible with MetaInfo objects
+                # unpickled from releases predating this optional field.
+                "semantic_substructures": getattr(
+                    node.meta_info, "semantic_substructures", None
+                ),
+                "transformations": node.meta_info.transformations,
+                "geometry": node.meta_info.source_geometry,
+                "semantic_subtype": node.meta_info.semantic_subtype,
+                "parser_provenance": node.meta_info.parser_provenance,
+                "quality_status": node.meta_info.quality_status,
+                "reconciliation_method": node.meta_info.reconciliation_method,
+                "source_uri": node.meta_info.source_uri or self.meta_info.source_uri,
+                "source_sha256": (
+                    node.meta_info.source_sha256 or self.meta_info.source_sha256
+                ),
+                "snapshot_path": (
+                    node.meta_info.snapshot_path or self.meta_info.snapshot_path
+                ),
+            }
+            node_data.update(
+                {key: value for key, value in trace_fields.items() if value is not None}
+            )
+            # Image-backed evidence is not limited to IMAGE nodes. MinerU also
+            # emits crops for tables and interline equations; retrieval must
+            # retain those paths after the tree serialization boundary.
+            if node.type in (NodeType.IMAGE, NodeType.TABLE, NodeType.EQUATION):
                 node_data["img_path"] = node.meta_info.img_path
             if node.type is NodeType.TABLE:
                 node_data["table_body"] = node.meta_info.table_body

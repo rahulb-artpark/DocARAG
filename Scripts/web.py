@@ -9,6 +9,7 @@ or:
 """
 import argparse
 import errno
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -17,10 +18,13 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+import yaml
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -28,37 +32,264 @@ WEB_ROOT = REPO / "Scripts" / "webui"
 DEFAULT_CONFIG = os.environ.get("BOOKRAG_CONFIG", "config/ollama-gbc.yaml")
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-os.environ.setdefault("CHROMA_TELEMETRY_ENABLED", "False")
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
-logging.basicConfig(level=logging.WARNING, format="%(message)s")
-logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+from docarag.compat import inspect_run_readiness, run_provenance
+from docarag.provenance import query_readiness_stat_key
+from docarag.provenance import sha256_file
+from docarag.run_logging import RunLogInfo, RunLogScope
+from Core.provider.TokenTracker import TokenTracker
+
+MAX_REQUEST_BYTES = 64 * 1024
+_GRAPH_VALIDATION_CACHE = {}
+_ROLE_CACHE = {}
+
+
+def token_usage_payload(scope, query_id):
+    """Freeze one query's usage and final stage delta for trace persistence."""
+
+    scope.record_stage("query")
+    return {"scope": query_id, **scope.snapshot()}
+
+
+class RequestBodyError(ValueError):
+    def __init__(self, message, status=HTTPStatus.BAD_REQUEST):
+        super().__init__(message)
+        self.status = status
+
+
+class RunNotReadyError(RuntimeError):
+    """A tree can be viewed, but the full BookRAG index is not queryable."""
+
+
+def is_loopback_host(host):
+    if str(host).lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def runs_root():
+    configured = Path(os.environ.get("DOCARAG_RUNS_DIR", str(REPO / "runs"))).expanduser()
+    if not configured.is_absolute():
+        configured = REPO / configured
+    return configured.resolve()
+
+
+def read_run_config(run_dir):
+    path = Path(run_dir) / "run_config.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def configured_graph_variant(run_dir):
+    graph = read_run_config(run_dir).get("graph") or {}
+    if not isinstance(graph, dict):
+        return None
+    return "basic" if graph.get("refine_type") == "basic" else None
+
+
+def published_role(run_dir, role):
+    """Return ``(has_manifest, safe_role_path)`` using a small stat-keyed cache."""
+
+    run_dir = Path(run_dir).resolve()
+    manifest = run_dir / "artifact-manifest.json"
+    try:
+        stat_result = manifest.stat()
+    except OSError:
+        return False, None
+    cache_key = (str(manifest), stat_result.st_mtime_ns, stat_result.st_size)
+    roles = _ROLE_CACHE.get(cache_key)
+    if roles is None:
+        try:
+            payload = read_json(manifest)
+        except (OSError, ValueError, TypeError):
+            return True, None
+        loaded_roles = payload.get("roles") if isinstance(payload, dict) else None
+        roles = loaded_roles if isinstance(loaded_roles, dict) else {}
+        if len(_ROLE_CACHE) >= 64:
+            _ROLE_CACHE.clear()
+        _ROLE_CACHE[cache_key] = roles
+
+    value = roles.get(role)
+    if not isinstance(value, str) or not value:
+        return True, None
+    path = run_dir / value
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(run_dir)
+    except (OSError, RuntimeError, ValueError):
+        return True, None
+    if path.is_symlink() or resolved != path.absolute():
+        return True, None
+    return True, resolved
+
+
+def _valid_graph_artifact(path):
+    try:
+        stat_result = path.stat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    cache_key = (str(resolved), stat_result.st_mtime_ns, stat_result.st_size)
+    cached = _GRAPH_VALIDATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        data = read_json(path)
+    except (OSError, ValueError, TypeError):
+        valid = False
+    else:
+        graph = data.get("graph", data) if isinstance(data, dict) else None
+        valid = isinstance(graph, dict) and isinstance(graph.get("nodes"), list)
+    if len(_GRAPH_VALIDATION_CACHE) >= 128:
+        _GRAPH_VALIDATION_CACHE.clear()
+    _GRAPH_VALIDATION_CACHE[cache_key] = valid
+    return valid
+
+
+def find_graph_artifact(run_dir):
+    """Return the active graph variant, falling back to the freshest valid one."""
+    run_dir = Path(run_dir)
+    has_manifest, published = published_role(run_dir, "graph")
+    if has_manifest:
+        return published if published and _valid_graph_artifact(published) else None
+
+    candidates = [
+        path
+        for path in run_dir.glob("graph_data*.json")
+        if path.is_file() and _valid_graph_artifact(path)
+    ]
+    if not candidates:
+        return None
+
+    variant = configured_graph_variant(run_dir)
+    preferred = run_dir / (f"graph_data_{variant}.json" if variant else "graph_data.json")
+    if preferred in candidates:
+        return preferred
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def configured_attestation_dir(run_dir):
+    run_dir = Path(run_dir)
+    vdb = read_run_config(run_dir).get("vdb") or {}
+    if not isinstance(vdb, dict):
+        return None
+    value = vdb.get("manifest_dir_name")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = run_dir / path
+    path = path.resolve()
+    try:
+        path.relative_to(run_dir.resolve())
+    except ValueError:
+        return None
+    return path
+
+
+def _is_retrieval_artifact_dir(path):
+    return (
+        (path / "docarag-qdrant-index.ready.json").is_file()
+        or (path / "bm25_index.pkl").is_file()
+    )
+
+
+def find_retrieval_artifact_dir(run_dir):
+    """Find the run-local Qdrant attestation or BM25 artifact directory."""
+    run_dir = Path(run_dir)
+    has_manifest, published = published_role(run_dir, "retrieval_attestation")
+    if has_manifest and published:
+        return published.parent if published.is_file() else None
+    has_manifest, published = published_role(run_dir, "lexical_store")
+    if has_manifest:
+        return published.parent if published and published.is_file() else None
+
+    configured = configured_attestation_dir(run_dir)
+    if configured is not None:
+        return configured
+
+    try:
+        candidates = [
+            path
+            for path in run_dir.iterdir()
+            if path.is_dir() and _is_retrieval_artifact_dir(path)
+        ]
+    except OSError:
+        candidates = []
+    if not candidates:
+        return None
+
+    non_entity = [
+        path for path in candidates if not path.name.lower().startswith("entity_attestation")
+    ]
+    pool = non_entity or candidates
+    return max(pool, key=lambda path: (path.stat().st_mtime_ns, path.name)).resolve()
 
 
 def find_runs():
-    runs = []
-    for tree_path in (REPO / "runs").glob("**/tree.json"):
-        run_dir = tree_path.parent
-        runs.append(run_dir)
+    runs = set()
+    root = runs_root()
+    if not root.is_dir():
+        return []
+    for tree_path in root.glob("**/tree.json"):
+        run_dir = tree_path.parent.resolve()
+        try:
+            relative = run_dir.relative_to(root)
+        except ValueError:
+            continue
+        if relative != Path(".") and run_dir.is_dir():
+            runs.add(run_dir)
     return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def pick_run(path_arg):
+    root = runs_root()
     if path_arg:
         path = Path(path_arg).expanduser()
         if path.is_file():
             path = path.parent
-        return path.resolve()
+        path = path.resolve()
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Run must stay below configured runs directory {root}: {path}"
+            ) from exc
+        if relative == Path(".") or not path.is_dir():
+            raise SystemExit(f"Invalid run directory: {path}")
+        return path
     runs = find_runs()
     if not runs:
-        raise SystemExit("No indexed runs found under runs/ with tree.json")
+        raise SystemExit(f"No indexed runs found under {runs_root()} with tree.json")
     return runs[0].resolve()
 
 
 def read_json(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def write_private_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+    path.chmod(0o600)
 
 
 def node_content(node):
@@ -79,7 +310,8 @@ def normalize_type(value):
 
 def bind_server(host, port, handler, attempts=20):
     last_error = None
-    for candidate in range(port, port + attempts):
+    last_candidate = min(65535, port + attempts - 1)
+    for candidate in range(port, last_candidate + 1):
         try:
             return ThreadingHTTPServer((host, candidate), handler), candidate
         except OSError as exc:
@@ -87,7 +319,7 @@ def bind_server(host, port, handler, attempts=20):
                 raise
             last_error = exc
     raise SystemExit(
-        f"Could not start web UI: ports {port}-{port + attempts - 1} are in use"
+        f"Could not start web UI: ports {port}-{last_candidate} are in use"
     ) from last_error
 
 
@@ -96,18 +328,24 @@ class AppState:
         self.run_dir = run_dir
         self.chat_lock = threading.Lock()
         self.rag_agent = None
-        self.chat_counter = 0
+        self._rag_identity_key = None
+        self._tree_cache_key = None
+        self._tree_cache = None
+        self._graph_cache_key = None
+        self._graph_cache = None
+        self._readiness_cache_key = None
+        self._readiness_cache = None
 
-    def set_run_dir(self, run_dir):
-        with self.chat_lock:
-            if self.rag_agent:
-                try:
-                    self.rag_agent.close()
-                except Exception:
-                    pass
-            self.run_dir = run_dir
-            self.rag_agent = None
-            self.chat_counter = 0
+    def chat_readiness(self):
+        """Cache readiness until a query-loaded artifact/store identity changes."""
+
+        key = query_readiness_stat_key(self.run_dir)
+        if self._readiness_cache_key != key or self._readiness_cache is None:
+            self._readiness_cache = inspect_run_readiness(
+                self.run_dir, purpose="ask"
+            )
+            self._readiness_cache_key = key
+        return self._readiness_cache
 
     @property
     def doc_name(self):
@@ -118,7 +356,13 @@ class AppState:
             return self.run_dir.name
 
     def tree_payload(self):
-        data = read_json(self.run_dir / "tree.json")
+        tree_path = self.run_dir / "tree.json"
+        tree_stat = tree_path.stat()
+        cache_key = (tree_stat.st_mtime_ns, tree_stat.st_size)
+        if self._tree_cache_key == cache_key and self._tree_cache is not None:
+            return self._tree_cache
+
+        data = read_json(tree_path)
         nodes = data.get("nodes") or []
         children = {}
         by_id = {}
@@ -154,17 +398,31 @@ class AppState:
             )
 
         root_id = next((n["id"] for n in flat if n["parentId"] is None), None)
-        return {
-            "docName": self.doc_name,
+        document_meta = data.get("meta_info") or {}
+        payload = {
+            "docName": document_meta.get("file_name") or self.run_dir.name,
             "runDir": str(self.run_dir),
             "rootId": root_id,
             "nodes": flat,
         }
+        self._tree_cache_key = cache_key
+        self._tree_cache = payload
+        return payload
 
     def graph_payload(self):
-        path = self.run_dir / "graph_data.json"
-        if not path.exists():
-            return {"docName": self.doc_name, "nodes": [], "links": []}
+        path = find_graph_artifact(self.run_dir)
+        if path is None:
+            return {
+                "docName": self.doc_name,
+                "runDir": str(self.run_dir),
+                "graphArtifact": None,
+                "nodes": [],
+                "links": [],
+            }
+        graph_stat = path.stat()
+        cache_key = (str(path), graph_stat.st_mtime_ns, graph_stat.st_size)
+        if self._graph_cache_key == cache_key and self._graph_cache is not None:
+            return self._graph_cache
         data = read_json(path)
         graph = data.get("graph") or data
         raw_nodes = graph.get("nodes") or []
@@ -223,24 +481,54 @@ class AppState:
                 }
             )
 
-        return {
+        payload = {
             "docName": self.doc_name,
             "runDir": str(self.run_dir),
             "variant": data.get("variant"),
+            "graphArtifact": str(path),
+            "graphArtifactName": path.name,
             "nodes": nodes,
             "links": links,
         }
+        self._graph_cache_key = cache_key
+        self._graph_cache = payload
+        return payload
 
     def ensure_rag(self):
-        if self.rag_agent is not None:
+        readiness = self.chat_readiness()
+        if not readiness.ready:
+            raise RunNotReadyError(
+                "Run is viewable but not ready for chat: " + ", ".join(readiness.missing)
+            )
+        current_identity = self._readiness_cache_key
+        if self.rag_agent is not None and (
+            self._rag_identity_key is None
+            or self._rag_identity_key == current_identity
+        ):
+            self._rag_identity_key = current_identity
             return self.rag_agent
+        if self.rag_agent is not None:
+            close = getattr(self.rag_agent, "close", None)
+            if callable(close):
+                close()
+            self.rag_agent = None
 
         from Core.configs.system_config import load_system_config
         from Core.rag import create_rag_agent
         from Core.utils.resource_loader import prepare_rag_dependencies
 
-        cfg = load_system_config(DEFAULT_CONFIG)
+        run_config = self.run_dir / "run_config.yaml"
+        cfg = load_system_config(str(run_config if run_config.is_file() else DEFAULT_CONFIG))
         cfg.save_path = str(self.run_dir)
+        graph_artifact = find_graph_artifact(self.run_dir)
+        if graph_artifact is not None:
+            if graph_artifact.name == "graph_data_basic.json":
+                cfg.graph.refine_type = "basic"
+            elif graph_artifact.name == "graph_data.json" and cfg.graph.refine_type == "basic":
+                cfg.graph.refine_type = "advanced"
+        attestation_dir = find_retrieval_artifact_dir(self.run_dir)
+        if attestation_dir is not None:
+            cfg.vdb.manifest_dir_name = str(attestation_dir)
         dependencies = prepare_rag_dependencies(cfg=cfg)
         self.rag_agent = create_rag_agent(
             strategy_config=cfg.rag.strategy_config,
@@ -248,25 +536,140 @@ class AppState:
             vlm_config=cfg.vlm,
             **dependencies,
         )
+        self._rag_identity_key = current_identity
         return self.rag_agent
 
     def ask(self, question):
         with self.chat_lock:
-            rag_agent = self.ensure_rag()
-            self.chat_counter += 1
-            q_dir = self.run_dir / "web_chat" / f"q_{self.chat_counter:03d}"
-            q_dir.mkdir(parents=True, exist_ok=True)
-            started = time.time()
-            answer, node_ids = rag_agent.generation(question, q_dir)
-            retrieval = {}
+            started = time.monotonic()
+            query_id = f"q_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            query_root = self.run_dir / "web_chat"
+            query_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            query_root.chmod(0o700)
+            q_dir = query_root / query_id
+            q_dir.mkdir(mode=0o700)
+            execution_path = q_dir / "execution.json"
             retrieval_path = q_dir / "retrieval_res.json"
-            if retrieval_path.exists():
-                retrieval = read_json(retrieval_path)
+            provenance = run_provenance(self.run_dir)
+            config_path = self.run_dir / "run_config.yaml"
+            if not config_path.is_file():
+                config_path = Path(DEFAULT_CONFIG).expanduser().resolve()
+            try:
+                config_sha256 = sha256_file(config_path)
+            except OSError:
+                config_sha256 = None
+            stage = "validate_readiness"
+            agent_reused = self.rag_agent is not None
+            usage_scope = TokenTracker.get_instance().scope(name=query_id)
+            run_log_info: RunLogInfo | None = None
+            try:
+                with RunLogScope(
+                    q_dir,
+                    logger_names=("Core", "docarag", __name__),
+                    run_id=query_id,
+                ) as run_log_info:
+                    readiness = self.chat_readiness()
+                    if not readiness.ready:
+                        raise RunNotReadyError(
+                            "Run is viewable but not ready for chat: "
+                            + ", ".join(readiness.missing)
+                        )
+                    with usage_scope:
+                        stage = "load_index_and_models"
+                        rag_agent = self.ensure_rag()
+                        stage = "generate_answer"
+                        answer, node_ids = rag_agent.generation(question, q_dir)
+                    retrieval = (
+                        read_json(retrieval_path) if retrieval_path.exists() else {}
+                    )
+            except Exception as exc:
+                token_usage = token_usage_payload(usage_scope, query_id)
+                write_private_json(
+                    execution_path,
+                    {
+                        "schema_version": 1,
+                        "status": "failed",
+                        "query_id": query_id,
+                        "question": question,
+                        "run_dir": str(self.run_dir),
+                        "stage": stage,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "system_config": str(config_path),
+                        "system_config_sha256": config_sha256,
+                        "provenance": provenance,
+                        "token_usage": token_usage,
+                        "run_log": (
+                            str(run_log_info.log_file) if run_log_info else None
+                        ),
+                        "agent_lifecycle": {
+                            "mode": "persistent_web_process",
+                            "reused": agent_reused,
+                        },
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "retrieval_trace": (
+                            str(retrieval_path) if retrieval_path.exists() else None
+                        ),
+                    },
+                )
+                raise
+
+            elapsed = round(time.monotonic() - started, 3)
+            token_usage = token_usage_payload(usage_scope, query_id)
+            result_path = q_dir / "result.json"
+            if node_ids is None:
+                normalized_node_ids = []
+            elif isinstance(node_ids, (str, bytes)):
+                normalized_node_ids = [node_ids]
+            else:
+                try:
+                    normalized_node_ids = list(node_ids)
+                except TypeError:
+                    normalized_node_ids = [node_ids]
+            result = {
+                "schema_version": 1,
+                "status": "succeeded",
+                "query_id": query_id,
+                "question": question,
+                "answer": answer,
+                "node_ids": normalized_node_ids,
+                "run_dir": str(self.run_dir),
+                "elapsed_seconds": elapsed,
+                "system_config": str(config_path),
+                "system_config_sha256": config_sha256,
+                "provenance": provenance,
+                "token_usage": token_usage,
+                "run_log": str(run_log_info.log_file) if run_log_info else None,
+                "agent_lifecycle": {
+                    "mode": "persistent_web_process",
+                    "reused": agent_reused,
+                },
+                "retrieval_trace": (
+                    str(retrieval_path) if retrieval_path.exists() else None
+                ),
+            }
+            write_private_json(result_path, result)
+            write_private_json(
+                execution_path,
+                {
+                    key: value
+                    for key, value in result.items()
+                    if key not in {"answer", "node_ids"}
+                }
+                | {"result": str(result_path)},
+            )
             return {
                 "answer": answer,
-                "nodeIds": node_ids,
-                "elapsedSec": round(time.time() - started, 2),
+                "nodeIds": result["node_ids"],
+                "elapsedSec": elapsed,
                 "retrieval": retrieval,
+                "tokenUsage": token_usage,
+                "runLog": str(run_log_info.log_file) if run_log_info else None,
+                "queryId": query_id,
+                "executionTrace": str(execution_path),
+                "resultTrace": str(result_path),
             }
 
 
@@ -299,14 +702,18 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/runs":
+            run = self.state.run_dir
+            graph_artifact = find_graph_artifact(run)
             runs = [
                 {
                     "path": str(run),
                     "name": self._safe_doc_name(run),
-                    "hasGraph": (run / "graph_data.json").exists(),
+                    "hasGraph": graph_artifact is not None,
+                    "graphArtifact": (
+                        str(graph_artifact) if graph_artifact is not None else None
+                    ),
                     "mtime": run.stat().st_mtime,
                 }
-                for run in find_runs()
             ]
             self.send_json({"current": str(self.state.run_dir), "runs": runs})
             return
@@ -370,6 +777,10 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        origin = self.headers.get("Origin")
+        if origin and not is_loopback_host(urlparse(origin).hostname or ""):
+            self.send_error_json(HTTPStatus.FORBIDDEN, "Cross-origin request denied")
+            return
         if parsed.path == "/api/run":
             self.set_run()
             return
@@ -378,13 +789,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = self.read_json_body()
             question = str(payload.get("question") or "").strip()
             if not question:
                 self.send_error_json(HTTPStatus.BAD_REQUEST, "Question is required")
                 return
             self.send_json(self.state.ask(question))
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+        except RunNotReadyError as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, "Run is not ready for chat", str(exc))
         except Exception as exc:
             traceback.print_exc()
             self.send_error_json(
@@ -395,15 +809,18 @@ class Handler(SimpleHTTPRequestHandler):
 
     def set_run(self):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = self.read_json_body()
             run_dir = Path(str(payload.get("runDir") or "")).expanduser().resolve()
-            allowed = {run.resolve() for run in find_runs()}
-            if run_dir not in allowed:
-                self.send_error_json(HTTPStatus.BAD_REQUEST, "Unknown run directory")
+            if run_dir != self.state.run_dir.resolve():
+                self.send_error_json(
+                    HTTPStatus.CONFLICT,
+                    "This server is source-bound to one run; restart "
+                    "`docarag web --run ...` to switch documents",
+                )
                 return
-            self.state.set_run_dir(run_dir)
             self.send_json({"ok": True, "runDir": str(run_dir)})
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
         except Exception as exc:
             self.send_error_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -411,24 +828,59 @@ class Handler(SimpleHTTPRequestHandler):
                 str(exc),
             )
 
+    def read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise RequestBodyError("Invalid Content-Length") from exc
+        if length <= 0:
+            raise RequestBodyError("Request body is empty")
+        if length > MAX_REQUEST_BYTES:
+            raise RequestBodyError(
+                f"Request body exceeds {MAX_REQUEST_BYTES} bytes",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestBodyError("Request body is not valid UTF-8 JSON") from exc
+        if not isinstance(payload, dict):
+            raise RequestBodyError("JSON body must be an object")
+        return payload
+
     def log_message(self, fmt, *args):
         print(f"[web] {self.address_string()} - {fmt % args}")
 
     @staticmethod
     def _safe_doc_name(run):
         try:
-            meta = read_json(run / "tree.json").get("meta_info") or {}
-            return meta.get("file_name") or run.name
+            manifest = read_json(run / "run-manifest.json")
+            source = manifest.get("source") or {}
+            return Path(source.get("path") or "").name or run.name
         except Exception:
             return run.name
 
 
 def main():
+    # This executable is the composition root and may configure its own
+    # console. Importing it for tests or embedding must not mutate the host
+    # process's root logging configuration.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+
     parser = argparse.ArgumentParser(description="Run the local BookRAG web UI.")
     parser.add_argument("run_dir", nargs="?", help="BookRAG run directory")
     parser.add_argument("--host", default=os.environ.get("BOOKRAG_WEB_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("BOOKRAG_WEB_PORT", "8765")))
     args = parser.parse_args()
+
+    if not is_loopback_host(args.host):
+        raise SystemExit(
+            "The compatibility Web UI is intentionally loopback-only because it "
+            "has no authentication. Use 127.0.0.1/localhost and place a production "
+            "API behind authenticated infrastructure."
+        )
+    if not 1 <= args.port <= 65535:
+        raise SystemExit("Web port must be between 1 and 65535")
 
     run_dir = pick_run(args.run_dir)
     if not (run_dir / "tree.json").exists():

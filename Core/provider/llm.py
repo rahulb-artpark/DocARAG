@@ -1,17 +1,120 @@
-from typing import Dict, Optional, Any, List, Union
+from dataclasses import dataclass
+from threading import BoundedSemaphore, Event
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    TypeVar,
+    Union,
+)
 from abc import ABC, abstractmethod
-from openai import OpenAI
-import ollama
 import logging
 from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from Core.Common.Memory import Memory
 from Core.configs.llm_config import LLMConfig
+from Core.utils.bounded_executor import iter_bounded_ordered
 from Core.utils.utils import get_max_output_tokens
 from Core.provider.TokenTracker import TokenTracker
 import time
 
 log = logging.getLogger(__name__)
+
+CompletionKeyT = TypeVar("CompletionKeyT")
+
+
+def _close_controller_client(controller: object) -> None:
+    """Release a controller's HTTP client without depending on its SDK type.
+
+    OpenAI exposes ``close`` on its public client.  Some Ollama releases wrap
+    an httpx client without exposing that method, so the guarded fallback is
+    used only when no public close operation exists.  References are broken
+    before invoking close so repeated shutdown remains harmless even when the
+    SDK raises.
+    """
+
+    client = getattr(controller, "client", None)
+    if client is None:
+        return
+    controller.client = None
+    if not getattr(controller, "_owns_client", True):
+        return
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+        return
+    transport = getattr(client, "_client", None)
+    close_transport = getattr(transport, "close", None)
+    if callable(close_transport):
+        close_transport()
+
+
+def _unload_ollama_model(controller: object) -> None:
+    """Best-effort opt-in eviction of a model from a shared Ollama server."""
+
+    if not getattr(controller, "unload_on_close", False):
+        return
+    client = getattr(controller, "client", None)
+    model = getattr(controller, "model", None)
+    if client is None or not model:
+        return
+    try:
+        client.generate(model=model, prompt="", keep_alive=0)
+    except Exception as error:  # cleanup must still release the HTTP client
+        log.warning(
+            "Ollama model unload failed during close (%s)",
+            type(error).__name__,
+        )
+
+
+class CompletionAttemptsExhausted(RuntimeError):
+    """A single completion did not succeed within its retry budget."""
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionRequest(Generic[CompletionKeyT]):
+    """A keyed completion request used by streaming ingestion callers."""
+
+    key: CompletionKeyT
+    prompt: Union[str, Memory]
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionResult(Generic[CompletionKeyT]):
+    """Typed, per-item completion outcome."""
+
+    index: int
+    key: CompletionKeyT
+    value: Optional[str] = None
+    error: Optional[Exception] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    def unwrap(self) -> str:
+        if self.error is not None:
+            raise self.error
+        if self.value is None:
+            raise RuntimeError("Successful completion result has no value")
+        return self.value
+
+
+class BatchCompletionError(RuntimeError):
+    """One or more items in a compatibility batch failed."""
+
+    def __init__(self, failures: Iterable[CompletionResult[Any]]):
+        self.failures = tuple(failures)
+        keys = ", ".join(repr(result.key) for result in self.failures[:5])
+        if len(self.failures) > 5:
+            keys += ", ..."
+        super().__init__(
+            f"{len(self.failures)} completion request(s) failed"
+            + (f" (keys: {keys})" if keys else "")
+        )
 
 
 class BaseLLMController(ABC):
@@ -45,7 +148,12 @@ class OpenAIController(BaseLLMController):
     def __init__(
         self,
         llm_config: Optional[LLMConfig] = None,
+        *,
+        client: Optional[object] = None,
+        owns_client: Optional[bool] = None,
     ):
+        if owns_client is not None and not isinstance(owns_client, bool):
+            raise ValueError("owns_client must be a boolean when provided")
         self.model = (
             llm_config.model_name
             if llm_config and hasattr(llm_config, "model_name")
@@ -76,11 +184,31 @@ class OpenAIController(BaseLLMController):
             if llm_config and hasattr(llm_config, "presence_penalty")
             else 0.0
         )
+        self.request_timeout_seconds = (
+            llm_config.request_timeout_seconds if llm_config else 300.0
+        )
 
-        if base_url is not None:
-            self.client = OpenAI(api_key=llm_config.api_key, base_url=base_url)
+        if client is None:
+            from openai import OpenAI
+
+            parameters = {
+                "timeout": self.request_timeout_seconds,
+                # The LLM wrapper owns the explicit retry budget. Disabling
+                # hidden SDK retries keeps the configured attempt count exact;
+                # SDK timeouts use their underlying transport semantics.
+                "max_retries": 0,
+            }
+            api_key = llm_config.api_key if llm_config is not None else None
+            if api_key is not None:
+                parameters["api_key"] = api_key
+            if base_url is not None:
+                parameters["base_url"] = base_url
+            self.client = OpenAI(**parameters)
+            self._owns_client = True if owns_client is None else owns_client
         else:
-            self.client = OpenAI(api_key=llm_config.api_key)
+            self.client = client
+            self._owns_client = False if owns_client is None else owns_client
+        self._closed = False
 
     def _prepare_messages(
         self, prompt_or_memory: Union[str, Memory], add_system_prompt: bool = True
@@ -109,6 +237,7 @@ class OpenAIController(BaseLLMController):
             "max_tokens": get_max_output_tokens(messages, self.max_tokens),
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "timeout": self.request_timeout_seconds,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
         if json_response:
@@ -165,6 +294,10 @@ class OpenAIController(BaseLLMController):
             temperature=self.temperature,
             model=self.model,
             messages=messages,
+            max_tokens=get_max_output_tokens(messages, self.max_tokens),
+            frequency_penalty=self.frequency_penalty,
+            presence_penalty=self.presence_penalty,
+            timeout=self.request_timeout_seconds,
             response_format=schema,
             extra_body={
                 "chat_template_kwargs": {"enable_thinking": think_mode},
@@ -186,9 +319,23 @@ class OpenAIController(BaseLLMController):
         else:
             return {}
 
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        _close_controller_client(self)
+
 
 class OllamaController(BaseLLMController):
-    def __init__(self, llm_config: Optional[LLMConfig] = None):
+    def __init__(
+        self,
+        llm_config: Optional[LLMConfig] = None,
+        *,
+        client: Optional[object] = None,
+        owns_client: Optional[bool] = None,
+    ):
+        if owns_client is not None and not isinstance(owns_client, bool):
+            raise ValueError("owns_client must be a boolean when provided")
         self.model = (
             llm_config.model_name
             if llm_config and hasattr(llm_config, "model_name")
@@ -224,7 +371,28 @@ class OllamaController(BaseLLMController):
             if llm_config and hasattr(llm_config, "api_key")
             else None
         )
-        self.client = ollama.Client(host=self.api_base)
+        self.keep_alive = llm_config.keep_alive if llm_config else "5m"
+        self.unload_on_close = bool(llm_config and llm_config.unload_on_close)
+        self.request_timeout_seconds = (
+            llm_config.request_timeout_seconds if llm_config else 300.0
+        )
+        if client is None:
+            import ollama
+
+            parameters: Dict[str, Any] = {
+                "host": self.api_base,
+                "timeout": self.request_timeout_seconds,
+            }
+            if self.api_key:
+                parameters["headers"] = {
+                    "Authorization": f"Bearer {self.api_key}"
+                }
+            self.client = ollama.Client(**parameters)
+            self._owns_client = True if owns_client is None else owns_client
+        else:
+            self.client = client
+            self._owns_client = False if owns_client is None else owns_client
+        self._closed = False
 
     def _prepare_messages(
         self, prompt_or_memory: Union[str, Memory], add_system_prompt: bool = True
@@ -245,16 +413,19 @@ class OllamaController(BaseLLMController):
         self, prompt_or_memory: Union[str, Memory], json_response: bool = False
     ) -> str:
         messages = self._prepare_messages(prompt_or_memory)
-        response = self.client.chat(
-            model=self.model,
-            messages=messages,
-            options={
+        parameters = {
+            "model": self.model,
+            "messages": messages,
+            "options": {
                 "temperature": self.temperature,
                 "num_predict": self.max_tokens,
             },
-            keep_alive=-1,
-            think=False,
-        )
+            "keep_alive": self.keep_alive,
+            "think": False,
+        }
+        if json_response:
+            parameters["format"] = "json"
+        response = self.client.chat(**parameters)
 
         if response:
             tracker = TokenTracker.get_instance()
@@ -292,7 +463,8 @@ class OllamaController(BaseLLMController):
                 "temperature": self.temperature,
                 "num_predict": self.max_tokens,
             },
-            keep_alive=-1,
+            keep_alive=self.keep_alive,
+            think=think_mode,
         )
 
         if response:
@@ -301,14 +473,14 @@ class OllamaController(BaseLLMController):
             completion_tokens = response.get("eval_count", 0)
             try:
                 prompt_tokens = int(prompt_tokens)
-            except Exception as e:
-                logging.error(f"Error converting prompt_tokens: {e}")
+            except (TypeError, ValueError):
+                logging.warning("Ollama returned an invalid prompt token count")
                 prompt_tokens = 0
 
             try:
                 completion_tokens = int(completion_tokens)
-            except Exception as e:
-                logging.error(f"Error converting completion_tokens: {e}")
+            except (TypeError, ValueError):
+                logging.warning("Ollama returned an invalid completion token count")
                 completion_tokens = 0
             tracker.add_usage(
                 prompt_tokens=prompt_tokens,
@@ -316,6 +488,13 @@ class OllamaController(BaseLLMController):
             )
 
         return schema.model_validate_json(response["message"]["content"])
+
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        _unload_ollama_model(self)
+        _close_controller_client(self)
 
 
 class LLM:
@@ -332,7 +511,10 @@ class LLM:
         else:
             config = llm_config
         self.config: LLMConfig = config
+        self._closed = False
         self.max_workers = config.max_workers
+        self.max_in_flight = config.max_in_flight
+        self._admission = BoundedSemaphore(config.max_workers)
         backend = config.backend
         if backend == "openai":
             self.llm = OpenAIController(llm_config=config)
@@ -344,45 +526,107 @@ class LLM:
     def get_completion(
         self, prompt: Union[str, Memory], json_response: bool = False
     ) -> str:
-        retry = 0
-        max_retries = 3
-        while retry < max_retries:
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, self.config.max_retries + 1):
             try:
-                res = self.llm.get_completion(prompt, json_response)
-                if len(res.strip()) == 0:
+                admission = getattr(self, "_admission", None)
+                if admission is None:
+                    res = self.llm.get_completion(prompt, json_response)
+                else:
+                    with admission:
+                        res = self.llm.get_completion(prompt, json_response)
+                if not isinstance(res, str) or not res.strip():
                     raise ValueError("Empty response from LLM")
                 return res
             except Exception as e:
-                print(f"Error getting completion: {e}")
-                retry += 1
-                time.sleep(1)
-                if retry >= max_retries:
-                    raise RuntimeError(
-                        "Failed to get completion after multiple retries"
-                    )
-        # If we reach here, it means we failed to get a response after retries
-        logging.error("Max retries reached, returning empty response.")
-        # Log the error and return an empty string or handle it as needed
-        logging.error(f"Error: {e}")
-        logging.error("Returning empty response.")
-        return ""
+                last_exception = e
+                log.warning(
+                    "LLM completion attempt %d/%d failed (%s)",
+                    attempt,
+                    self.config.max_retries,
+                    type(e).__name__,
+                )
+                if (
+                    attempt < self.config.max_retries
+                    and self.config.retry_delay_seconds
+                ):
+                    time.sleep(self.config.retry_delay_seconds)
+        raise CompletionAttemptsExhausted(
+            f"LLM completion failed after {self.config.max_retries} attempt(s)"
+        ) from last_exception
+
+    def iter_completion_results(
+        self,
+        requests: Iterable[CompletionRequest[CompletionKeyT]],
+        json_response: bool = False,
+        *,
+        cancel_event: Optional[Event] = None,
+        max_in_flight: Optional[int] = None,
+    ) -> Iterator[CompletionResult[CompletionKeyT]]:
+        """Yield ordered outcomes while applying backpressure to ``requests``.
+
+        Unlike :meth:`batch_get_completion`, this method does not allocate a
+        result list and never turns an exception into response text.  It is the
+        preferred API for document-ingestion pipelines.
+        """
+
+        in_flight_limit = (
+            self.max_in_flight if max_in_flight is None else max_in_flight
+        )
+
+        def complete(request: CompletionRequest[CompletionKeyT]) -> str:
+            return self.get_completion(request.prompt, json_response)
+
+        for outcome in iter_bounded_ordered(
+            requests,
+            complete,
+            max_workers=self.max_workers,
+            max_in_flight=in_flight_limit,
+            cancel_event=cancel_event,
+            thread_name_prefix="llm-completion",
+        ):
+            yield CompletionResult(
+                index=outcome.index,
+                key=outcome.item.key,
+                value=outcome.value,
+                error=outcome.error,
+            )
+
+    def iter_batch_get_completion(
+        self,
+        prompts: Iterable[Union[str, Memory]],
+        json_response: bool = False,
+        *,
+        cancel_event: Optional[Event] = None,
+        max_in_flight: Optional[int] = None,
+    ) -> Iterator[CompletionResult[int]]:
+        """Compatibility-friendly typed stream keyed by prompt position."""
+
+        requests = (
+            CompletionRequest(key=index, prompt=prompt)
+            for index, prompt in enumerate(prompts)
+        )
+        return self.iter_completion_results(
+            requests,
+            json_response=json_response,
+            cancel_event=cancel_event,
+            max_in_flight=max_in_flight,
+        )
 
     def batch_get_completion(
-        self, prompts: List[Union[str, Memory]], json_response: bool = False
-    ) -> list:
-        """ """
-        results = [None] * len(prompts)
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_idx = {
-                executor.submit(self.get_completion, prompt, json_response): idx
-                for idx, prompt in enumerate(prompts)
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    results[idx] = f"Error: {e}"
+        self, prompts: Iterable[Union[str, Memory]], json_response: bool = False
+    ) -> List[str]:
+        """Return ordered strings for legacy callers, raising on any failure."""
+
+        results: List[str] = []
+        failures: List[CompletionResult[int]] = []
+        for outcome in self.iter_batch_get_completion(prompts, json_response):
+            if outcome.ok:
+                results.append(outcome.unwrap())
+            else:
+                failures.append(outcome)
+        if failures:
+            raise BatchCompletionError(failures)
         return results
 
     def get_json_completion(
@@ -392,26 +636,54 @@ class LLM:
         images: Optional[list] = None,
         think_mode: bool = False,
     ) -> dict:
-        retry = 0
-        max_retries = 3
-        while retry < max_retries:
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, self.config.max_retries + 1):
             try:
-                res = self.llm.get_json_completion(prompt, schema, images, think_mode=think_mode)
+                admission = getattr(self, "_admission", None)
+                if admission is None:
+                    res = self.llm.get_json_completion(
+                        prompt, schema, images, think_mode=think_mode
+                    )
+                else:
+                    with admission:
+                        res = self.llm.get_json_completion(
+                            prompt, schema, images, think_mode=think_mode
+                        )
                 if not res:
                     raise ValueError("Empty response from LLM")
                 return res
             except Exception as e:
-                print(f"Error getting JSON completion: {e}")
-                retry += 1
-                time.sleep(1)
-                if retry >= max_retries:
-                    raise RuntimeError(
-                        "Failed to get JSON completion after multiple retries"
-                    )
-        logging.error("Max retries reached, returning empty dict.")
-        logging.error(f"Error: {e}")
-        logging.error("Returning empty dict.")
-        return {}
+                last_exception = e
+                log.warning(
+                    "LLM JSON completion attempt %d/%d failed (%s)",
+                    attempt,
+                    self.config.max_retries,
+                    type(e).__name__,
+                )
+                if (
+                    attempt < self.config.max_retries
+                    and self.config.retry_delay_seconds
+                ):
+                    time.sleep(self.config.retry_delay_seconds)
+        raise CompletionAttemptsExhausted(
+            f"LLM JSON completion failed after {self.config.max_retries} attempt(s)"
+        ) from last_exception
+
+    def close(self) -> None:
+        """Release the selected controller and its network client idempotently."""
+
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        controller = getattr(self, "llm", None)
+        self.llm = None
+        if controller is None:
+            return
+        close = getattr(controller, "close", None)
+        if callable(close):
+            close()
+        else:  # compatibility with injected/older controllers
+            _close_controller_client(controller)
 
 
 if __name__ == "__main__":

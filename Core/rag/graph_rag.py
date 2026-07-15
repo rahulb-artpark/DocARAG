@@ -4,6 +4,7 @@ import os
 
 from Core.Index.Tree import NodeType
 from Core.rag.base_rag import BaseRAG
+from Core.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
 from Core.configs.rag.graph_config import GraphRAGConfig
@@ -112,6 +113,9 @@ class GraphRAG(BaseRAG):
         Qent_GBCent_map = defaultdict(list)
         for ent_str in entities_str:
             query_res = self.gbc_index.entity_vdb.search(query_text=ent_str, top_k=1)
+            if not query_res:
+                log.info("No graph entity candidate found for '%s'.", ent_str)
+                continue
             retrieve_name = query_res[0]["metadata"].get("entity_name")
             retrieve_type = query_res[0]["metadata"].get("entity_type")
             node_name = self.gbc_index.GraphIndex.get_node_name_from_str(
@@ -227,32 +231,84 @@ class GraphRAG(BaseRAG):
         graph_info = self.get_graph_info(Qent_GBCent_map)
         return graph_info
 
-    def _create_augmented_prompt(self, query: str, graph_info: dict):
+    def _load_usable_tree_evidence(self, graph_info: dict) -> List[Dict[str, Any]]:
+        """Resolve graph hits to source-bearing tree rows and reject empty rows."""
+
+        tree_node_ids = graph_info.get("TreeNode_ids")
+        if not isinstance(tree_node_ids, list) or not tree_node_ids:
+            return []
+        try:
+            tree_data = self.gbc_index.TreeIndex.get_nodes_data(tree_node_ids)
+        except Exception:
+            # Stale/corrupt graph-to-tree links must not become an ungrounded
+            # generation request. The caller records the explicit no-evidence
+            # outcome while this log retains the operational failure.
+            log.exception("Graph retrieval tree-node references could not be resolved")
+            return []
+
+        usable: List[Dict[str, Any]] = []
+        for node_data in tree_data or ():
+            if not isinstance(node_data, dict):
+                log.warning("Skipping malformed graph retrieval tree record")
+                continue
+            node_id = node_data.get("index_id")
+            if isinstance(node_id, bool) or not isinstance(node_id, int):
+                log.warning("Skipping graph retrieval record without a valid tree ID")
+                continue
+            node_type = node_data.get("type", "text")
+            content = node_data.get("content")
+            has_text = isinstance(content, str) and bool(content.strip())
+            if node_type == NodeType.IMAGE:
+                image_path = node_data.get("img_path")
+                has_image = isinstance(image_path, str) and os.path.isfile(image_path)
+                if not has_text and not has_image:
+                    log.warning("Skipping unusable image tree record %s", node_id)
+                    continue
+            elif node_type == NodeType.TABLE:
+                try:
+                    has_text = bool(table2text(node_data).strip())
+                except (TypeError, ValueError, AttributeError):
+                    has_text = False
+                if not has_text:
+                    log.warning("Skipping unusable table tree record %s", node_id)
+                    continue
+            elif not has_text:
+                log.warning("Skipping blank graph retrieval tree record %s", node_id)
+                continue
+            usable.append(node_data)
+        return usable
+
+    def _create_augmented_prompt(
+        self,
+        query: str,
+        graph_info: dict,
+        *,
+        tree_data: List[Dict[str, Any]] | None = None,
+    ):
         # 1. get retrieval data
 
-        TreeNode_ids = graph_info.get("TreeNode_ids")
-        # Get the data for the selected TreeNodes and Entity nodes
-        Tree_data = self.gbc_index.TreeIndex.get_nodes_data(TreeNode_ids)
+        if tree_data is None:
+            tree_data = self._load_usable_tree_evidence(graph_info)
 
         # context_text = "Please refer to the following background information to answer the question. And you should try you best to given the answer\n\n"
         context_text = "Please refer to the following background information to answer the question. You should answer the question based on the provided information. Don't make up any information.\n\n--- Background Information ---\n"
         context_images = []
         question_text = f"--- User Question ---\n{query}\n\n"
 
-        if Tree_data is None or len(Tree_data) == 0:
+        if not tree_data:
             context_text += "No relevant documents found.\n"
             context_text += question_text
             return context_text, context_images
 
-        for node_data in Tree_data:
+        for node_data in tree_data:
             node_type = node_data.get("type", "text")
             if node_type == NodeType.IMAGE:
                 image_path = node_data.get("img_path", "")
-                if image_path and os.path.exists(image_path):
+                if image_path and os.path.isfile(image_path):
                     context_images.append(image_path)
-                context_text += (
-                    f"Image: A relevant image is provided at the path: {image_path}\n"
-                )
+                image_content = node_data.get("content")
+                if isinstance(image_content, str) and image_content.strip():
+                    context_text += f"Image OCR/caption: {image_content}\n"
             elif node_type == NodeType.TABLE:
                 node_data["content"] = table2text(node_data)
                 context_text += f"Table: {node_data['content']}\n"
@@ -279,8 +335,26 @@ class GraphRAG(BaseRAG):
             # GBC retrieval process
             graph_info = self._retrieve(query)
 
+            if not graph_info or not graph_info.get("TreeNode_ids"):
+                log.warning("Graph retrieval returned no source tree evidence")
+                return NO_RETRIEVED_EVIDENCE_ANSWER, []
+
+            tree_data = self._load_usable_tree_evidence(graph_info)
+            if not tree_data:
+                log.warning(
+                    "Graph retrieval returned no usable source tree evidence"
+                )
+                return NO_RETRIEVED_EVIDENCE_ANSWER, []
+
+            used_graph_info = dict(graph_info)
+            used_graph_info["TreeNode_ids"] = [
+                node["index_id"] for node in tree_data
+            ]
+
             context_text, context_images = self._create_augmented_prompt(
-                query, graph_info
+                query,
+                used_graph_info,
+                tree_data=tree_data,
             )
             if len(context_images) > 0:
                 # if there are images, use VLM to generate the answer
@@ -294,7 +368,7 @@ class GraphRAG(BaseRAG):
                 )
 
             retrieval_ids = self._save_retrieval_res(
-                graph_info, query_output_dir=query_output_dir
+                used_graph_info, query_output_dir=query_output_dir
             )
             return final_answer, retrieval_ids
 
@@ -312,5 +386,10 @@ class GraphRAG(BaseRAG):
         return retrieval_ids
 
     def close(self):
-        self.embedder.close()
-        return super().close()
+        try:
+            gbc_index = getattr(self, "gbc_index", None)
+            self.gbc_index = None
+            self.embedder = None
+            self._close_owned_resources(("GBC index", gbc_index))
+        finally:
+            super().close()

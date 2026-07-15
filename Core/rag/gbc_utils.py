@@ -6,7 +6,7 @@ import networkx as nx
 import numpy as np
 from Core.Index.Tree import TreeNode, DocumentTree, NodeType
 from Core.provider.embedding import TextEmbeddingProvider
-from Core.rag.gbc_plan import Filter, PlanResult
+from Core.rag.gbc_plan import Filter, PlanResult, parse_page_filter_value
 import math
 import logging
 
@@ -23,6 +23,19 @@ class SubStep(BaseModel):
 
     supplementary_ids: List[int] = Field(default_factory=list)
     selected_explanation: str = ""
+    section_selection_status: str = "not_started"
+    section_selection_policy: str = ""
+    section_total_count: int = 0
+    section_linked_count: int = 0
+    section_candidate_limit: int = 0
+    section_prompt_primary_count: int = 0
+    section_prompt_remaining_count: int = 0
+    section_prompt_candidate_count: int = 0
+    section_prompt_candidate_ids: List[int] = Field(default_factory=list)
+    section_omitted_count: int = 0
+    section_prompt_chars: int = 0
+    section_prompt_truncated_fields: int = 0
+    section_selection_budget_exhausted: bool = False
 
     # store the retrieval info for visualization
     retrieval_sec_ids: List[int] = Field(default_factory=list)
@@ -30,9 +43,14 @@ class SubStep(BaseModel):
     iteration_text_nodes: Union[str | List[Any]] = Field(default_factory=list)
     iteration_image_nodes: Union[str | List[Any]] = Field(default_factory=list)
     iteration_graph_nodes: Union[str | List[Any]] = Field(default_factory=list)
+    iteration_graph_edges: Union[str | List[Any]] = Field(default_factory=list)
 
     partial_answers: Union[str | List[Any]] = Field(default_factory=list)
     generated_answer: str = ""
+    answer_validation: Dict[str, Any] = Field(default_factory=dict)
+    global_filtered_count: int = 0
+    global_evidence_limit: int = 0
+    global_budget_exhausted: bool = False
 
 
 class GBCRAGContext(BaseModel):
@@ -42,12 +60,14 @@ class GBCRAGContext(BaseModel):
 
     # Plan
     plan: PlanResult = None
+    planning_limits: Dict[str, int] = Field(default_factory=dict)
 
     # Interation/ subquestion result
     iterations: List[SubStep] = Field(default_factory=list)
 
     # Output
     final_answer: str = ""
+    answer_validation: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Pydantic Models for Structured Output (已更新) ---
@@ -61,38 +81,27 @@ def filter_tree_nodes(
     for f in filters:
         f_type = f.filter_type
         f_value = f.filter_value
-        if f_type == "image" or f_type == "table":
+        if f_type == "document":
+            # Explicit no-op scope. Whole-document requests must never be
+            # represented by an invalid/missing structural value.
+            continue
+        if f_type in {"image", "table", "equation", "title"}:
             f_type = NodeType(f_type)
             filtered_nodes = [node for node in filtered_nodes if node.type == f_type]
         elif f_type == "page":
-            if f_value is None:
-                continue
-            if "-" in f_value:
-                try:
-                    start_page, end_page = map(int, f_value.split("-"))
-                    filtered_nodes = [
-                        node
-                        for node in filtered_nodes
-                        if start_page <= node.meta_info.page_idx + 1 <= end_page
-                    ]
-                except ValueError:
-                    log.warning(f"Invalid page range format: {f_value}")
-                    continue
-            else:
-                try:
-                    target_page = int(f_value)
-                    filtered_nodes = [
-                        node
-                        for node in filtered_nodes
-                        if node.meta_info.page_idx + 1 == target_page
-                    ]
-                except ValueError:
-                    log.warning(f"Invalid page number format: {f_value}")
-                    continue
+            start_page, end_page = parse_page_filter_value(f_value)
+            filtered_nodes = [
+                node
+                for node in filtered_nodes
+                if start_page <= node.meta_info.page_idx + 1 <= end_page
+            ]
         elif f_type == "section":
             matched_nodes = []
-            if f_value is None:
-                continue
+            if not isinstance(f_value, str) or not f_value.strip():
+                raise ValueError(
+                    "section filter_value must be a non-empty section name"
+                )
+            section_name = f_value.strip().lower()
             for node in filtered_nodes:
                 node_idx = node.index_id
                 root_path = tree_index.get_path_from_root(node_idx)
@@ -100,12 +109,11 @@ def filter_tree_nodes(
                 for pnode in root_path:
                     if pnode.type == NodeType.TITLE:
                         title_str += pnode.meta_info.content.lower()
-                if f_value.lower() in title_str:
+                if section_name in title_str:
                     matched_nodes.append(node)
             filtered_nodes = matched_nodes
         else:
-            log.warning(f"Unknown filter type: {f_type}")
-            continue
+            raise ValueError(f"unknown global filter type: {f_type!r}")
 
     return filtered_nodes
 
@@ -138,6 +146,7 @@ def merge_ranker_scores(
 
 def calculate_skyline(
     merged_scores: Dict[int, List[float]],
+    max_results: Optional[int] = None,
 ) -> List[Dict[str, Union[int, List[float]]]]:
     """
     根据合并后的分数计算 skyline 集合。
@@ -152,20 +161,74 @@ def calculate_skyline(
         skyline_nodes: 不被任何其他节点支配的节点列表。
             格式: [{'node_id': id, 'dims': [score1, score2, ...]}, ...]
     """
-    # 将字典转换为元组列表 (node_id, scores)
-    nodes = list(merged_scores.items())
+    if max_results is not None and (
+        isinstance(max_results, bool)
+        or not isinstance(max_results, int)
+        or max_results < 1
+    ):
+        raise ValueError("max_results must be a positive integer or None")
+
+    # Normalize and validate dimensions before sorting. A deterministic score
+    # order plus node ID is also the deterministic preference order when a
+    # Pareto frontier contains more nodes than the configured result budget.
+    nodes = []
+    num_dims = None
+    for node_id, raw_scores in merged_scores.items():
+        try:
+            scores = [float(score) for score in raw_scores]
+        except (TypeError, ValueError) as error:
+            raise ValueError("skyline scores must be finite numbers") from error
+        if num_dims is None:
+            num_dims = len(scores)
+        elif len(scores) != num_dims:
+            raise ValueError("all skyline score vectors must have equal dimensions")
+        if any(not math.isfinite(score) for score in scores):
+            raise ValueError("skyline scores must be finite numbers")
+        nodes.append((node_id, scores))
+
+    nodes.sort(key=lambda item: tuple(-score for score in item[1]) + (item[0],))
 
     # 如果节点数少于2，则它们都在skyline中
     if len(nodes) < 2:
-        return [{"node_id": nid, "dims": scores} for nid, scores in nodes]
+        return [
+            {"node_id": nid, "dims": scores}
+            for nid, scores in nodes[:max_results]
+        ]
 
     # 获取维度数量
-    num_dims = len(nodes[0][1])
+    assert num_dims is not None
 
-    # 1. 根据第一个维度的分数进行降序排序
-    # 这是一种常见的优化策略，可以提高剪枝效率
-    nodes.sort(key=lambda item: item[1][0], reverse=True)
+    # The production fusion path has two dimensions (graph and text). After
+    # sorting by the first dimension, a point is on the exact frontier iff its
+    # second score is strictly greater than every earlier first-score group.
+    # Equal score vectors remain separate evidence nodes, matching Pareto's
+    # strict-dominance definition. This is O(n log n), including sorting.
+    if num_dims == 2:
+        skyline = []
+        best_second = -math.inf
+        index = 0
+        while index < len(nodes):
+            first_score = nodes[index][1][0]
+            group_end = index + 1
+            while (
+                group_end < len(nodes)
+                and nodes[group_end][1][0] == first_score
+            ):
+                group_end += 1
 
+            group_best_second = nodes[index][1][1]
+            if group_best_second > best_second:
+                for node_id, scores in nodes[index:group_end]:
+                    if scores[1] != group_best_second:
+                        break
+                    skyline.append({"node_id": node_id, "dims": scores})
+                    if max_results is not None and len(skyline) >= max_results:
+                        return skyline
+            best_second = max(best_second, group_best_second)
+            index = group_end
+        return skyline
+
+    # Generic fallback for future fusions with three or more rankers.
     skyline = []
     for p_id, p_scores in nodes:
         is_dominated = False
@@ -198,17 +261,39 @@ def calculate_skyline(
             new_skyline.append({"node_id": p_id, "dims": p_scores})
             skyline = new_skyline
 
-    return skyline
+    # Keep the generic path semantically exact before applying its presentation
+    # bound.  The optimized, bounded production path above covers the two
+    # graph/text dimensions; future higher-dimensional fusion should not make
+    # its Pareto result depend on an internal early-exit assumption.
+    skyline.sort(
+        key=lambda item: tuple(-score for score in item["dims"])
+        + (item["node_id"],)
+    )
+    return skyline[:max_results]
 
 
 def enhance_graph_with_semantic_links(
-    graph: nx.Graph, embedder: TextEmbeddingProvider, x_percentile: float = 0.85
+    graph: nx.Graph,
+    embedder: TextEmbeddingProvider,
+    x_percentile: float = 0.85,
+    max_nodes: int = 512,
 ) -> nx.Graph:
-    """
+    """Add bounded query-time semantic links to a selected graph scope.
 
-    Returns:
-        nx.Graph: 添加了新的语义链接后的增强图。
+    The legacy implementation allocates a dense ``n x n`` similarity matrix.
+    Keep that optional enhancement strictly bounded until the durable index can
+    provide offline ANN neighbors. Larger scopes retain their evidence-backed
+    graph rather than risking quadratic query memory and latency.
     """
+    if 1 < x_percentile <= 100:
+        log.warning(
+            "Interpreting legacy x_percentile=%s as a percentage; use a 0..1 fraction",
+            x_percentile,
+        )
+        x_percentile /= 100
+    if not 0 <= x_percentile <= 1:
+        raise ValueError("x_percentile must be a fraction in [0, 1]")
+
     enhanced_graph = graph.copy()
     nodes = list(graph.nodes())
     n_nodes = len(nodes)
@@ -217,12 +302,21 @@ def enhance_graph_with_semantic_links(
     if len(nodes) <= 1:
         return enhanced_graph
 
-    print(f"Enhancing graph with {len(nodes)} nodes...")
+    if n_nodes > max_nodes:
+        log.warning(
+            "Skipping query-time semantic graph augmentation for %s nodes; "
+            "bounded limit is %s. Original evidence-backed edges are retained.",
+            n_nodes,
+            max_nodes,
+        )
+        return enhanced_graph
+
+    log.info("Enhancing selected graph scope with %s nodes", n_nodes)
 
     try:
         node_embeddings = embedder.embed_texts(nodes)
     except Exception as e:
-        print(f"Error during bulk embedding: {e}")
+        log.warning("Semantic graph augmentation embedding failed: %s", e)
         return enhanced_graph
 
     # 计算所有节点对之间的余弦相似度矩阵

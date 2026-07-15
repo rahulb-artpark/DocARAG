@@ -1,6 +1,7 @@
 import os
 
 from Core.rag.base_rag import BaseRAG
+from Core.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
 from Core.provider.vdb import VectorStore
@@ -26,7 +27,7 @@ class GBCVanillaRAG(BaseRAG):
     def __init__(
         self,
         llm: LLM,
-        vlm: VLM,
+        vlm: VLM | None,
         config: GBCVanillaConfig,
         tree_vdb: VectorStore = None,
         graph_vdb: VectorStore = None,
@@ -87,13 +88,7 @@ class GBCVanillaRAG(BaseRAG):
 
         if len(tree_retrieval_res) == 0 and len(graph_retrieval_res) == 0:
             log.warning(f"No relevant information retrieved for query: {query}")
-            context_text = (
-                "No relevant information retrieved from the knowledge base.\n\n"
-            )
-            context_text += f"User Question: {query}\n\n"
-            context_text += "Based on the provided information, the answer is:\n"
-            final_answer = self.llm.get_completion(context_text, json_response=False)
-            return final_answer, []
+            return NO_RETRIEVED_EVIDENCE_ANSWER, []
 
         augmented_prompt = self._create_augmented_prompt(
             query=query,
@@ -152,5 +147,17 @@ class GBCVanillaRAG(BaseRAG):
         return retrieval_ids
 
     def close(self):
-        self.embedder.close()
-        return super().close()
+        try:
+            embedder = getattr(self, "embedder", None)
+            self.embedder = None
+            stores = []
+            for attribute in ("tree_vdb", "graph_vdb"):
+                store = getattr(self, attribute, None)
+                setattr(self, attribute, None)
+                stores.append((attribute, store))
+            self._close_owned_resources(
+                ("shared vector embedder", embedder),
+                *stores,
+            )
+        finally:
+            super().close()

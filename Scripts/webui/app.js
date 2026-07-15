@@ -251,6 +251,7 @@ async function loadRuns() {
     if (run.path === data.current) opt.selected = true;
     sel.appendChild(opt);
   }
+  sel.disabled = data.runs.length <= 1;
   sel.onchange = async () => {
     sel.disabled = true;
     try {

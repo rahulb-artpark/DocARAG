@@ -1,0 +1,92 @@
+schema_version = "docarag.runtime-compatibility.v1"
+manifest_revision = 1
+
+[[runtimes]]
+runtime_id = "controller"
+runtime_kind = "controller"
+contract_schema = "docarag.parser-contract.v1"
+accelerator = "any"
+minimum_vram_mib = 0
+minimum_vram_certified = true
+verification_level = "fixture-only"
+verification_notes = "The dependency-light controller contract is covered by automated fixtures; end-to-end real-model deployment certification is pending."
+package_version_constraints = [
+  { name = "docarag", allowed_versions = ["0.1.0"], certified = true, notes = "This manifest ships with the DocARAG 0.1.0 controller contract." },
+]
+model_version_constraints = []
+image_version_constraints = []
+
+[[runtimes]]
+runtime_id = "docling-worker"
+runtime_kind = "parser-worker"
+contract_schema = "docarag.parser-contract.v1"
+worker_protocol = "docarag.parser-worker-http.v1"
+adapter_name = "docling-export"
+adapter_versions = ["1.1.0"]
+parser_name = "docling"
+accelerator = "any"
+minimum_vram_mib = 0
+minimum_vram_certified = false
+health_location = "/v1/health"
+capability_location = "/v1/capabilities"
+verification_level = "fixture-only"
+verification_notes = "The JSON export translator is fixture-tested. No Docling package/model/image combination is certified by this revision."
+package_version_constraints = [
+  { name = "docling", allowed_versions = [], certified = false, notes = "Observed benchmark versions are not treated as a supported production range." },
+]
+model_version_constraints = [
+  { name = "docling-model-bundle", allowed_versions = [], certified = false, notes = "Model assets have not been pinned and real-model tested through the worker protocol." },
+]
+image_version_constraints = [
+  { name = "docling-worker-image", allowed_versions = [], certified = false, notes = "No reproducible worker image digest has been certified." },
+]
+
+[[runtimes]]
+runtime_id = "mineru-worker"
+runtime_kind = "parser-worker"
+contract_schema = "docarag.parser-contract.v1"
+worker_protocol = "docarag.parser-worker-http.v1"
+adapter_name = "mineru-normalized"
+adapter_versions = ["1.1.0"]
+parser_name = "mineru"
+accelerator = "any"
+minimum_vram_mib = 0
+minimum_vram_certified = false
+health_location = "/v1/health"
+capability_location = "/v1/capabilities"
+verification_level = "fixture-only"
+verification_notes = "The normalized-block translator is fixture-tested. MinerU 2.x/3.x package, backend, model, and image compatibility is not yet certified."
+package_version_constraints = [
+  { name = "mineru", allowed_versions = [], certified = false, notes = "The legacy repository pin and benchmark environment use different major versions; neither is certified for this worker contract." },
+]
+model_version_constraints = [
+  { name = "mineru-model-bundle", allowed_versions = [], certified = false, notes = "Pipeline, VLM, and hybrid model bundles require separate real-model qualification." },
+]
+image_version_constraints = [
+  { name = "mineru-worker-image", allowed_versions = [], certified = false, notes = "No reproducible worker image digest has been certified." },
+]
+
+[[runtimes]]
+runtime_id = "paddleocr-vl-worker"
+runtime_kind = "parser-worker"
+contract_schema = "docarag.parser-contract.v1"
+worker_protocol = "docarag.parser-worker-http.v1"
+adapter_name = "paddleocr-vl-page"
+adapter_versions = ["1.1.0"]
+parser_name = "paddleocr-vl"
+accelerator = "nvidia-cuda"
+minimum_vram_mib = 0
+minimum_vram_certified = false
+health_location = "/v1/health"
+capability_location = "/v1/capabilities"
+verification_level = "fixture-only"
+verification_notes = "The page-result translator is fixture-tested. PaddleOCR, PaddlePaddle, vLLM, model, CUDA, and image versions remain uncertified."
+package_version_constraints = [
+  { name = "paddleocr+paddlepaddle+vllm", allowed_versions = [], certified = false, notes = "The mutually compatible package and CUDA matrix has not been locked and real-model tested." },
+]
+model_version_constraints = [
+  { name = "PaddleOCR-VL-model", allowed_versions = [], certified = false, notes = "The benchmark model name is observational evidence, not a certified worker constraint." },
+]
+image_version_constraints = [
+  { name = "paddleocr-genai-vllm-server", allowed_versions = [], certified = false, notes = "The benchmark used a latest-tag image; no immutable digest is certified." },
+]

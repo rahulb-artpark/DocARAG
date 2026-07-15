@@ -1,0 +1,55 @@
+schema_version = "docarag.parser-worker-profile.v1"
+profile_id = "paddleocr-vl-local-example"
+vendor = "paddleocr-vl"
+parser_version = "paddleocr-vl-complete-pipeline-v1.6"
+model_version = "PaddleOCR-VL-1.6-0.9B"
+qualification = "uncertified"
+
+[server]
+host = "127.0.0.1"
+port = 8103
+max_request_bytes = 16777216
+max_response_bytes = 67108864
+max_in_flight = 1
+request_read_timeout_seconds = 30.0
+allow_non_loopback_bind = false
+# bearer_token_env = "DOCARAG_PADDLE_WORKER_TOKEN"
+
+[source]
+allowed_roots = ["/srv/docarag/source-snapshots"]
+max_source_bytes = 268435456
+chunk_size = 1048576
+
+[artifacts]
+root = "/srv/docarag/parser-artifacts/paddleocr-vl"
+max_artifact_bytes = 134217728
+max_total_bytes_per_request = 536870912
+max_artifacts_per_request = 5000
+chunk_size = 1048576
+
+[service]
+endpoint_kind = "complete-pipeline"
+base_url = "http://127.0.0.1:8080"
+pipeline_name = "PaddleOCR-VL-1.6"
+pipeline_version = "v1.6"
+layout_model_name = "PP-DocLayoutV3"
+recognition_model_name = "PaddleOCR-VL-1.6-0.9B"
+connect_timeout_seconds = 5.0
+operation_timeout_seconds = 300.0
+max_pages_per_request = 16
+max_source_bytes = 268435456
+max_page_bytes = 33554432
+max_total_page_bytes = 134217728
+max_request_bytes = 50331648
+max_response_bytes = 134217728
+max_response_json_depth = 128
+max_response_json_nodes = 2000000
+max_artifacts_per_page = 255
+max_artifact_bytes = 33554432
+max_total_artifact_bytes = 268435456
+allow_insecure_http = false
+# bearer_token_env = "DOCARAG_PADDLE_SERVICE_TOKEN"
+
+[paddle_page_render]
+dpi = 144
+max_page_pixels = 100000000

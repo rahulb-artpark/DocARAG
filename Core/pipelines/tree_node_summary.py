@@ -1,14 +1,62 @@
-from typing import Optional, List, Dict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, Mapping, Optional
 
 from Core.Index.Tree import TreeNode, NodeType, DocumentTree
 from Core.prompts.summary_prompt import NODE_SUMMARY_PROMPT, SEC_SUMMARY_PROMPT
-from Core.provider.llm import LLM
-from Core.provider.vlm import VLM
+from Core.provider.llm import CompletionRequest, CompletionResult, LLM
+from Core.provider.vlm import GenerationRequest, GenerationResult, VLM
+from Core.utils.summary_checkpoint import (
+    SummaryCheckpointStore,
+    summary_cache_identity,
+)
 from Core.utils.utils import num_tokens, TextProcessor
 import os
 import logging
 
 log = logging.getLogger(__name__)
+
+
+class TreeSummaryGenerationError(RuntimeError):
+    """A node summary could not be generated safely."""
+
+    def __init__(self, node_id: int, provider: str, error: Exception):
+        self.node_id = node_id
+        self.provider = provider
+        self.error = error
+        super().__init__(
+            f"{provider} summary generation failed for node {node_id}: {error}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingSummary:
+    node: TreeNode
+    cache_key: str
+    prompt_sha256: str
+    image_identities: tuple[dict[str, str], ...]
+    kind: str
+
+
+def _summary_model_identity(config: object) -> dict[str, object]:
+    """Return output-affecting, secret-free provider identity for checkpoints."""
+
+    identity: dict[str, object] = {}
+    for field in (
+        "backend",
+        "model_name",
+        "api_base",
+        "max_tokens",
+        "temperature",
+        "frequency_penalty",
+        "presence_penalty",
+    ):
+        value = getattr(config, field, None)
+        if value is not None:
+            identity[field] = value
+    if not identity:
+        raise ValueError("summary provider has no cacheable model identity")
+    return identity
 
 
 def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
@@ -159,109 +207,213 @@ def generate_section_summary(sec_node: TreeNode, llm: LLM) -> str:
 
 
 def generate_tree_node_summary(
-    tree_index: DocumentTree, llm: LLM, use_VLM: bool = False, vlm: Optional[VLM] = None
+    tree_index: DocumentTree,
+    llm: LLM,
+    use_VLM: bool = False,
+    vlm: Optional[VLM] = None,
+    *,
+    checkpoint_path: str | os.PathLike[str] | None = None,
 ) -> DocumentTree:
-    """Generate summaries for each node in the tree index.
-    The generating order is from the leaf nodes to the root node.
+    """Generate summaries bottom-up with bounded model request streams.
+
+    Levels remain sequential because a section prompt consumes its children's
+    summaries. Requests within one level execute concurrently, but only the
+    provider's configured ``max_in_flight`` prompts and futures exist at once.
+    Every successful item is committed to a content/model/image-keyed SQLite
+    checkpoint before it becomes authoritative in the tree. Any item failure
+    aborts the stage; exception text is never assigned to document data.
     """
     log.info("Generating summaries for tree nodes...")
 
-    def get_nodes_by_level_bottom_up(node, current_level=0, level_dict=None):
-        """Get all nodes organized by level from bottom to top"""
-        if level_dict is None:
-            level_dict = {}
+    if tree_index.root_node is None:
+        raise ValueError("Cannot summarize a tree without a root node")
+    if use_VLM and vlm is None:
+        raise ValueError("use_VLM=True requires a VLM instance")
 
-        if current_level not in level_dict:
-            level_dict[current_level] = []
+    # Iterative traversal avoids Python recursion limits on deeply nested input.
+    level_dict: dict[int, list[TreeNode]] = {}
+    stack = [(tree_index.root_node, 0)]
+    while stack:
+        node, level = stack.pop()
+        level_dict.setdefault(level, []).append(node)
+        stack.extend((child, level + 1) for child in reversed(node.children))
 
-        level_dict[current_level].append(node)
-
-        # Recursively process children
-        for child in node.children:
-            get_nodes_by_level_bottom_up(child, current_level + 1, level_dict)
-
-        return level_dict
-
-    # Get all nodes organized by level from bottom to top
-    level_dict = get_nodes_by_level_bottom_up(tree_index.root_node)
     log.info(f"Processing tree with {len(level_dict)} levels")
 
-    # Process nodes from the bottom level to the top
-    for level in sorted(level_dict.keys(), reverse=True):
-        log.info(f"Processing level {level} with {len(level_dict[level])} nodes.")
-        # Initialize lists for LLM and VLM prompts
-        llm_prompt_list = []
-        llm_node_idx_list = []
+    if checkpoint_path is None:
+        if not tree_index.save_dir:
+            raise ValueError("tree save directory is required for summary checkpoints")
+        checkpoint_path = Path(tree_index.save_dir) / "summary-checkpoints.sqlite3"
+    checkpoint_store = SummaryCheckpointStore(checkpoint_path)
+    llm_identity = _summary_model_identity(llm.config)
+    vlm_identity = _summary_model_identity(vlm.config) if vlm is not None else None
 
-        vlm_prompt_list = []
-        vlm_images_list = []
-        vlm_node_idx_list = []
+    def prompt_for(node: TreeNode) -> tuple[str, str]:
+        if node.children or node.type == NodeType.TITLE:
+            prompt = get_sec_summary_prompt(node, llm.config.max_tokens)
+            kind = "section-llm"
+        else:
+            prompt = get_node_summary_prompt(node, llm.config.max_tokens)
+            kind = "node-llm"
+        if not prompt:
+            raise TreeSummaryGenerationError(
+                node.index_id,
+                "prompt",
+                ValueError("summary prompt is empty or node type is unsupported"),
+            )
+        return prompt, kind
 
-        for node in level_dict[level]:
-            if node == tree_index.root_node:
-                # we skip the root node
+    def uses_vlm(node: TreeNode) -> bool:
+        return bool(
+            use_VLM
+            and not node.children
+            and node.type in [NodeType.IMAGE, NodeType.TABLE]
+        )
+
+    def pending_summary(
+        node: TreeNode,
+        *,
+        prompt: str,
+        kind: str,
+        model: Mapping[str, object],
+        images: tuple[str, ...] = (),
+    ) -> _PendingSummary | None:
+        cache_key, prompt_sha256, image_identities = summary_cache_identity(
+            kind=kind,
+            prompt=prompt,
+            model=model,
+            image_paths=images,
+        )
+        cached = checkpoint_store.get(cache_key)
+        if cached is not None:
+            node.summary = cached
+            log.info("Reused checkpointed summary for node %s", node.index_id)
+            return None
+        return _PendingSummary(
+            node=node,
+            cache_key=cache_key,
+            prompt_sha256=prompt_sha256,
+            image_identities=image_identities,
+            kind=kind,
+        )
+
+    def llm_requests(
+        nodes: list[TreeNode],
+    ) -> Iterator[CompletionRequest[_PendingSummary]]:
+        for node in nodes:
+            if node is tree_index.root_node or uses_vlm(node):
                 continue
-            children_len = len(node.children)
-            if children_len == 0:
-                # Leaf node, generate summary directly
-                summary_prompt = get_node_summary_prompt(
-                    node, max_token=llm.config.max_tokens
-                )
-                if use_VLM and node.type in [NodeType.IMAGE, NodeType.TABLE]:
-                    # Use VLM for image or table nodes
-                    image_path = node.meta_info.img_path
-                    if not os.path.exists(image_path):
-                        log.warning(
-                            f"Image path {image_path} does not exist for node {node.index_id}."
-                        )
-                        continue
-                    vlm_prompt_list.append(summary_prompt)
-                    vlm_images_list.append(image_path)
-                    vlm_node_idx_list.append(node.index_id)
-                else:
-                    # Use LLM for text nodes or if VLM is not used
-                    llm_prompt_list.append(summary_prompt)
-                    llm_node_idx_list.append(node.index_id)
-            else:
-                # Non-leaf node, prepare for section summary
-                summary_prompt = get_sec_summary_prompt(node, llm.config.max_tokens)
-                llm_prompt_list.append(summary_prompt)
-                llm_node_idx_list.append(node.index_id)
-        # Generate summaries using LLM
-        if llm_prompt_list:
-            log.info(
-                f"Generating summaries for {len(llm_prompt_list)} nodes using LLM."
+            prompt, kind = prompt_for(node)
+            pending = pending_summary(
+                node,
+                prompt=prompt,
+                kind=kind,
+                model=llm_identity,
             )
-            llm_summaries = llm.batch_get_completion(
-                prompts=llm_prompt_list, json_response=False
-            )
-            for idx, summary in zip(llm_node_idx_list, llm_summaries):
-                node = tree_index.get_node_by_index_id(idx)
-                if node:
-                    node.summary = summary.strip()
-                    log.info(f"Node {idx} summary generated: {summary.strip()}")
-                else:
-                    log.warning(f"Node with ID {idx} not found in the tree index.")
+            if pending is not None:
+                yield CompletionRequest(key=pending, prompt=prompt)
 
-        # Generate summaries using VLM if applicable
-        if use_VLM and vlm_prompt_list:
-            log.info(
-                f"Generating summaries for {len(vlm_prompt_list)} nodes using VLM."
+    def vlm_requests(
+        nodes: list[TreeNode],
+    ) -> Iterator[GenerationRequest[_PendingSummary]]:
+        for node in nodes:
+            if node is tree_index.root_node or not uses_vlm(node):
+                continue
+            image_path = node.meta_info.img_path
+            if not image_path or not os.path.isfile(image_path):
+                error = FileNotFoundError(
+                    f"image artifact does not exist: {image_path!r}"
+                )
+                raise TreeSummaryGenerationError(node.index_id, "VLM", error) from error
+            prompt, _kind = prompt_for(node)
+            assert vlm_identity is not None
+            pending = pending_summary(
+                node,
+                prompt=prompt,
+                kind="node-vlm",
+                model=vlm_identity,
+                images=(image_path,),
             )
-            vlm_summaries = vlm.batch_generate(
-                query=vlm_prompt_list, images=vlm_images_list
-            )
-            for idx, summary in zip(vlm_node_idx_list, vlm_summaries):
-                node = tree_index.get_node_by_index_id(idx)
-                if node:
-                    node.summary = summary.strip()
-                    log.info(f"Node {idx} summary generated: {summary.strip()}")
-                else:
-                    log.warning(f"Node with ID {idx} not found in the tree index.")
+            if pending is not None:
+                yield GenerationRequest(
+                    key=pending,
+                    prompt_or_memory=prompt,
+                    images=[image_path],
+                )
+
+    def apply_llm_result(result: CompletionResult[_PendingSummary]) -> None:
+        pending = result.key
+        if not result.ok:
+            assert result.error is not None
+            raise TreeSummaryGenerationError(
+                pending.node.index_id, "LLM", result.error
+            ) from result.error
+        summary = result.unwrap().strip()
+        if not summary:
+            error = ValueError("model returned an empty summary")
+            raise TreeSummaryGenerationError(
+                pending.node.index_id, "LLM", error
+            ) from error
+        pending.node.summary = checkpoint_store.put(
+            cache_key=pending.cache_key,
+            kind=pending.kind,
+            prompt_sha256=pending.prompt_sha256,
+            model=llm_identity,
+            image_identities=pending.image_identities,
+            summary=summary,
+        )
+        log.info(
+            "Generated LLM summary for node %s (%d characters)",
+            pending.node.index_id,
+            len(summary),
+        )
+
+    def apply_vlm_result(result: GenerationResult[_PendingSummary]) -> None:
+        pending = result.key
+        if not result.ok:
+            assert result.error is not None
+            raise TreeSummaryGenerationError(
+                pending.node.index_id, "VLM", result.error
+            ) from result.error
+        summary = result.unwrap().strip()
+        if not summary:
+            error = ValueError("model returned an empty summary")
+            raise TreeSummaryGenerationError(
+                pending.node.index_id, "VLM", error
+            ) from error
+        assert vlm_identity is not None
+        pending.node.summary = checkpoint_store.put(
+            cache_key=pending.cache_key,
+            kind=pending.kind,
+            prompt_sha256=pending.prompt_sha256,
+            model=vlm_identity,
+            image_identities=pending.image_identities,
+            summary=summary,
+        )
+        log.info(
+            "Generated VLM summary for node %s (%d characters)",
+            pending.node.index_id,
+            len(summary),
+        )
+
+    try:
+        for level in sorted(level_dict.keys(), reverse=True):
+            nodes = level_dict[level]
+            log.info("Processing level %s with %s nodes", level, len(nodes))
+
+            for result in llm.iter_completion_results(
+                llm_requests(nodes), json_response=False
+            ):
+                apply_llm_result(result)
+
+            if use_VLM:
+                assert vlm is not None
+                for result in vlm.iter_generation_results(vlm_requests(nodes)):
+                    apply_vlm_result(result)
+    finally:
+        checkpoint_store.close()
 
     log.info("All node summaries generated successfully.")
-    # Return the updated tree index with summaries
-
     return tree_index
 
 

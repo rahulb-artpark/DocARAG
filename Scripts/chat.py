@@ -7,7 +7,8 @@ in a loop until you type a terminate command. This is far faster than re-running
 main.py per question (which reloads all models each time).
 
 Usage (from repo root):
-    conda run -n gbc-rag python Scripts/chat.py
+    BOOKRAG_SAVE_PATH=/absolute/path/to/run \
+      conda run -n gbc-rag python Scripts/chat.py
 or via the wrapper:
     bash Scripts/chat.sh
 
@@ -21,9 +22,7 @@ import logging
 import warnings
 from pathlib import Path
 
-# Quiet startup noise (chromadb telemetry + library deprecation warnings).
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-os.environ.setdefault("CHROMA_TELEMETRY_ENABLED", "False")
+# Keep the interactive compatibility shell free of library deprecation noise.
 warnings.filterwarnings("ignore")
 
 # Repo root on the path, and run from it so relative config paths resolve.
@@ -33,11 +32,15 @@ sys.path.insert(0, str(REPO))
 
 # --- knobs (override via env) ---
 CONFIG = os.environ.get("BOOKRAG_CONFIG", "config/ollama-gbc.yaml")
-# Where the built index lives (working_dir/<doc_uuid> from the dataset config).
-SAVE_PATH = os.environ.get(
-    "BOOKRAG_SAVE_PATH",
-    str(REPO / "runs/mytest/47e6394c-4196-5105-8ff0-2b1885bceb3f"),
-)
+# The clean workspace has no implicit historical run. Select one explicitly so
+# this helper cannot accidentally reopen stale data after a storage reset.
+SAVE_PATH = os.environ.get("BOOKRAG_SAVE_PATH")
+if not SAVE_PATH:
+    raise SystemExit(
+        "BOOKRAG_SAVE_PATH must name an indexed DocARAG run; "
+        "for example: BOOKRAG_SAVE_PATH=/absolute/path/to/run "
+        "python Scripts/chat.py"
+    )
 VERBOSE = os.environ.get("BOOKRAG_VERBOSE", "0") == "1"
 # How to show retrieved nodes: "short" (snippets), "full" (whole text), "off".
 NODE_MODE = os.environ.get("BOOKRAG_SHOW_NODES", "short").lower()
@@ -48,9 +51,6 @@ logging.basicConfig(
     level=logging.INFO if VERBOSE else logging.WARNING,
     format="%(message)s",
 )
-# chromadb logs telemetry failures at ERROR; mute that one noisy logger.
-logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
-
 from Core.configs.system_config import load_system_config
 from Core.rag import create_rag_agent
 from Core.utils.resource_loader import prepare_rag_dependencies

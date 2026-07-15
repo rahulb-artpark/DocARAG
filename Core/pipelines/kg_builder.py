@@ -3,6 +3,8 @@ from Core.Index.Graph import Graph
 from Core.pipelines.kg_extractor import KGExtractor
 from Core.pipelines.kg_refiner import KGRefiner
 from Core.configs.system_config import SystemConfig
+from Core.configs.graph_config import graph_artifact_variant
+from Core.pipelines.vdb_index import tree_vector_scope
 
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
@@ -17,6 +19,7 @@ from rich.logging import RichHandler
 
 import os
 import time
+from itertools import batched
 
 # log_dir = "/home/wangshu/multimodal/GBC-RAG/test/index_qwen3/logs"
 # if not os.path.exists(log_dir):
@@ -55,24 +58,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
     # else:
     #     log.info("No existing knowledge graph found. Creating a new one...")
 
-    g = cfg.graph.g
-    reranker_model_name = cfg.graph.reranker_config.model_name
-    if cfg.graph.refine_type == "basic":
-        variant = "basic"
-    elif reranker_model_name.lower().startswith("bge"):
-        # BGE reranker gets its own variant (prefixed with g) to maximize reuse.
-        safe_model_name = reranker_model_name.replace("/", "_").replace(" ", "_")
-        variant = f"{g}_{safe_model_name}"
-    else:
-        embedding_model_name = cfg.graph.embedding_config.model_name
-        is_default_g = abs(g - 0.6) < 1e-9
-        is_default_qwen_model = embedding_model_name.lower().startswith("qwen")
-
-        if is_default_g and is_default_qwen_model:
-            variant = None
-        else:
-            safe_model_name = embedding_model_name.replace("/", "_").replace(" ", "_")
-            variant = f"{g}_{safe_model_name}"
+    variant = graph_artifact_variant(cfg.graph)
 
     # Try to load the graph index if it already exists
     target_graph_file = Graph._get_filename(variant)
@@ -100,103 +86,89 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
     kg_extractor = KGExtractor(
         cfg_graph=cfg.graph, llm=llm, vlm=vlm, save_path=cfg.save_path
     )
+    entity_scope = {
+        **tree_vector_scope(tree, cfg.vdb),
+        "index_kind": "entity",
+    }
     kg_refiner = KGRefiner(
         llm=llm,
         graph_config=cfg.graph,
         graph_index=graph_index,
         save_path=cfg.save_path,
+        vdb_config=cfg.vdb,
+        scope_filter=entity_scope,
         g=cfg.graph.g,
     )
 
-    kg_extract_res = []
+    try:
+        def refine_extraction(res):
+            if cfg.graph.refine_type == "basic":
+                kg_refiner.basic_kg_refiner(
+                    entities=res.get("entities", []),
+                    relationships=res.get("relations", []),
+                    source_id=res.get("node_idx", -1),
+                )
+            elif cfg.graph.refine_type == "advanced":
+                kg_refiner.advanced_kg_refiner(
+                    entities=res.get("entities", []),
+                    relationships=res.get("relations", []),
+                    source_id=res.get("node_idx", -1),
+                )
 
-    batch_process = True
+        # Keep at most one configured microbatch of extraction results in memory.
+        # Each successful node has its own durable extraction file before refinement,
+        # so a failed later node can be resumed without publishing an incomplete KG.
+        source_nodes = (node for node in tree.nodes if node is not tree.root_node)
+        extracted_count = 0
+        for node_batch in batched(source_nodes, cfg.graph.extraction_batch_size):
+            title_work = []
+            ordinary_nodes = []
+            for node in node_batch:
+                if node.type == NodeType.TITLE:
+                    title_work.append(
+                        (
+                            node,
+                            tree.get_path_from_root(node.index_id),
+                            tree.get_sibling_nodes(node.index_id),
+                        )
+                    )
+                else:
+                    ordinary_nodes.append(node)
 
-    if batch_process:
-        log.info("Batch processing is enabled for knowledge graph extraction.")
-        batch_nodes = []
-        batch_title_nodes = []
-        batch_title_paths = []
-        batch_sibling_nodes = []
-        for node in tree.nodes:
-            # for node in tree.nodes[:30]:
-            if node == tree.root_node:
-                # Skip the root node since it doesn't have any other information
-                continue
-            if node.type == NodeType.TITLE:
-                # For title nodes, we collect the path and sibling nodes for batch processing
-                title_path = tree.get_path_from_root(node.index_id)
-                sibling_nodes = tree.get_sibling_nodes(node.index_id)
-                batch_title_nodes.append(node)
-                batch_title_paths.append(title_path)
-                batch_sibling_nodes.append(sibling_nodes)
-            else:
-                # For other nodes, we collect them for batch processing
-                batch_nodes.append(node)
+            batch_results = []
+            if title_work:
+                batch_results.extend(kg_extractor.iter_extract_titles(title_work))
+            if ordinary_nodes:
+                batch_results.extend(kg_extractor.iter_extract_kg(ordinary_nodes))
 
-        # Process title nodes in batches
-        if batch_title_nodes:
-            log.info("Processing title nodes in batches...")
-            res_dict = kg_extractor.batch_extract_titles(
-                nodes=batch_title_nodes,
-                title_paths=batch_title_paths,
-                sibling_nodes_list=batch_sibling_nodes,
-            )
-            kg_extract_res.extend(res_dict)
-
-        if batch_nodes:
-            log.info("Processing non-title nodes in batches...------")
-            res_dict = kg_extractor.batch_extract_kg(nodes=batch_nodes)
-            kg_extract_res.extend(res_dict)
-
-        # resort the results based on node index
-        kg_extract_res.sort(key=lambda x: x.get("node_idx", -1))
-    else:
-        for node in tree.nodes[:30]:
-            # Extract entities and relationships from the node
-            if node == tree.root_node:
-                # Skip the root node since it doesn't have any other information
-                continue
-            if node.type == NodeType.TITLE:
-                title_path = tree.get_path_from_root(node.index_id)
-                sibling_nodes = tree.get_sibling_nodes(node.index_id)
-                res_dict = kg_extractor.extract_title(node, title_path, sibling_nodes)
-            else:
-                res_dict = kg_extractor.extract_kg(node)
-            kg_extract_res.append(res_dict)
-
-    log.info("Knowledge graph extraction completed.")
-    log.info(f"Extracted {len(kg_extract_res)} nodes from the document tree.")
-
-    token_tracker = TokenTracker.get_instance()
-    kg_extraction_cost = token_tracker.record_stage("kg_extraction")
-    log.info(f"Knowledge graph extraction cost: {kg_extraction_cost}")
-
-    for res in kg_extract_res:
-        if cfg.graph.refine_type == "basic":
-            log.info("Using basic KG refinement.")
-            kg_refiner.basic_kg_refiner(
-                entities=res.get("entities", []),
-                relationships=res.get("relations", []),
-                source_id=res.get("node_idx", -1),
-            )
-        elif cfg.graph.refine_type == "advanced":
-            kg_refiner.advanced_kg_refiner(
-                entities=res.get("entities", []),
-                relationships=res.get("relations", []),
-                source_id=res.get("node_idx", -1),
+            # Preserve the legacy deterministic node order even though title and
+            # non-title provider streams are executed separately within a batch.
+            batch_results.sort(key=lambda item: item.get("node_idx", -1))
+            for result in batch_results:
+                refine_extraction(result)
+                extracted_count += 1
+            log.info(
+                "Committed KG extraction/refinement for %d/%d tree nodes",
+                extracted_count,
+                max(0, len(tree.nodes) - 1),
             )
 
-    kg_refiner.refine_entities()
-    kg_refiner.refine_relation()
+        log.info("Knowledge graph extraction completed.")
+        log.info("Extracted %d nodes from the document tree.", extracted_count)
 
-    log.info("Knowledge graph refinement completed.")
-    kg_refinement_cost = token_tracker.record_stage("kg_refinement")
-    log.info(f"Knowledge graph refinement cost: {kg_refinement_cost}")
+        token_tracker = TokenTracker.get_instance()
+        kg_extraction_cost = token_tracker.record_stage("kg_extraction")
+        log.info(f"Knowledge graph extraction cost: {kg_extraction_cost}")
 
-    kg_refiner.close()
+        kg_refiner.refine_entities()
+        kg_refiner.refine_relation()
 
-    return graph_index
+        log.info("Knowledge graph refinement completed.")
+        kg_refinement_cost = token_tracker.record_stage("kg_refinement")
+        log.info(f"Knowledge graph refinement cost: {kg_refinement_cost}")
+        return graph_index
+    finally:
+        kg_refiner.close()
     # graph_index.save_graph()
 
 

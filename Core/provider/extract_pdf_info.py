@@ -7,22 +7,13 @@ import logging
 
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-from mineru.cli.common import (
-    convert_pdf_bytes_to_bytes_by_pypdfium2,
-    read_fn,
+# MinerU is deliberately imported only inside the parsing path.  Reconciliation,
+# configuration, provenance verification, and API startup must remain usable in
+# a lightweight controller environment that does not install CUDA/model extras.
+from Core.provider.mineru_reconciliation import (
+    MinerUReconciliationError,
+    reconcile_middle_content,
 )
-from mineru.data.data_reader_writer import FileBasedDataWriter
-from mineru.utils.enum_class import MakeMode
-from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
-from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
-from mineru.utils.draw_bbox import draw_layout_bbox
-from mineru.backend.pipeline.pipeline_middle_json_mkcontent import (
-    union_make as pipeline_union_make,
-)
-from mineru.backend.pipeline.model_json_to_middle_json import (
-    result_to_middle_json as pipeline_result_to_middle_json,
-)
-from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +40,11 @@ def do_parse(
     p_table_enable=True,  # Enable table parsing
     server_url=None,  # Server URL for vlm-sglang-client backend
 ):
+    from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
+    from mineru.data.data_reader_writer import FileBasedDataWriter
+    from mineru.utils.draw_bbox import draw_layout_bbox
+    from mineru.utils.enum_class import MakeMode
+
     local_image_dir, local_md_dir = prepare_result_dir(output_dir, parse_method)
     new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes)
     image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(
@@ -57,6 +53,16 @@ def do_parse(
     image_dir = str(os.path.basename(local_image_dir))
 
     if backend == "pipeline":
+        from mineru.backend.pipeline.model_json_to_middle_json import (
+            result_to_middle_json as pipeline_result_to_middle_json,
+        )
+        from mineru.backend.pipeline.pipeline_analyze import (
+            doc_analyze as pipeline_doc_analyze,
+        )
+        from mineru.backend.pipeline.pipeline_middle_json_mkcontent import (
+            union_make as pipeline_union_make,
+        )
+
         infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = (
             pipeline_doc_analyze(
                 [new_pdf_bytes],
@@ -88,6 +94,11 @@ def do_parse(
         content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
 
     else:
+        from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+        from mineru.backend.vlm.vlm_middle_json_mkcontent import (
+            union_make as vlm_union_make,
+        )
+
         if backend.startswith("vlm-"):
             backend = backend[4:]
         middle_json, infer_result = vlm_doc_analyze(
@@ -158,6 +169,8 @@ def parse_doc(
     server_url: When the backend is `sglang-client`, you need to specify the server_url, for example:`http://127.0.0.1:30000`
     """
     try:
+        from mineru.cli.common import read_fn
+
         file_name = str(Path(pdf_path).stem)
         pdf_bytes = read_fn(pdf_path)
         return do_parse(
@@ -175,47 +188,53 @@ def parse_doc(
 
 
 def merge_middle_content(
-    middle_json, content_list, parse_dir, save_dir=None, file_name=None
+    middle_json,
+    content_list,
+    parse_dir,
+    save_dir=None,
+    file_name=None,
+    mismatch_policy="retain",
 ):
-    """Merge middle JSON content with corresponding content list.
+    """Reconcile MinerU layout blocks with normalized content page-by-page.
 
     Args:
         middle_json (dict): The middle JSON object containing PDF information.
         content_list (list): The list of content extracted from the PDF.
         save_dir (str, optional): The directory to save the merged content. Defaults to None.
         file_name (str, optional): The name of the file to save the merged content. Defaults to None.
+        mismatch_policy (str): ``retain`` preserves unmatched observations with
+            explicit markers; ``error`` raises :class:`MinerUReconciliationError`.
 
     Returns:
-        list: A list of merged PDF information.
+        list: Content items carrying their correctly matched ``middle_json``.
     """
-    pdf_info = middle_json["pdf_info"]
-    middle_json_para_list = []
-    for info in pdf_info:
-        para_blocks = info.get("para_blocks", [])
-        middle_json_para_list.extend(para_blocks)
-    n_mid, n_con = len(middle_json_para_list), len(content_list)
-    if n_mid != n_con:
-        # Tolerant merge: MinerU sometimes emits a few more structure blocks than
-        # content items (or vice-versa). Instead of aborting, pair up to the
-        # shorter list. NOTE: if the extra blocks are not at the very end, node
-        # metadata can drift after the first divergence.
-        log.warning(
-            f"Count mismatch: middle_json has {n_mid} para_blocks but content_list "
-            f"has {n_con} items (diff {abs(n_mid - n_con)}). Pairing up to the "
-            f"shorter list; trailing extras are dropped."
+    try:
+        reconciliation = reconcile_middle_content(
+            middle_json,
+            content_list,
+            parse_dir,
+            mismatch_policy=mismatch_policy,
         )
+    except MinerUReconciliationError as exc:
+        if save_dir:
+            diagnostics_path = os.path.join(
+                save_dir, f"{file_name}_reconciliation.json"
+            )
+            with open(diagnostics_path, "w", encoding="utf-8") as diagnostics_file:
+                json.dump(exc.diagnostics, diagnostics_file, ensure_ascii=False, indent=4)
+            log.error("Reconciliation diagnostics saved to %s", diagnostics_path)
+        raise
 
-    res_pdf_info_list = []
-    for i in range(min(n_mid, n_con)):
-        res_pdf_info = copy.deepcopy(content_list[i])
-        res_pdf_info["middle_json"] = copy.deepcopy(middle_json_para_list[i])
-        if "img_path" in res_pdf_info:
-            res_pdf_info["img_path"] = os.path.join(parse_dir, res_pdf_info["img_path"])
-            if not os.path.exists(res_pdf_info["img_path"]):
-                log.error(f"Image path does not exist: {res_pdf_info['img_path']}")
-        res_pdf_info_list.append(res_pdf_info)
-
-    log.info(f"Total {len(res_pdf_info_list)} items merged.")
+    res_pdf_info_list = reconciliation.items
+    summary = reconciliation.diagnostics["summary"]
+    if summary["unmatched_middle_count"] or summary["unmatched_content_count"]:
+        log.warning(
+            "MinerU reconciliation retained %d unmatched middle-json and %d "
+            "unmatched content-list observations; no positional shifting was used.",
+            summary["unmatched_middle_count"],
+            summary["unmatched_content_count"],
+        )
+    log.info("Total %d items reconciled.", len(res_pdf_info_list))
 
     save_path = (
         os.path.join(save_dir, f"{file_name}_merged_content.json") if save_dir else None
@@ -224,6 +243,17 @@ def merge_middle_content(
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(res_pdf_info_list, f, ensure_ascii=False, indent=4)
         log.info(f"Merged content saved to {save_path}")
+        diagnostics_path = os.path.join(
+            save_dir, f"{file_name}_reconciliation.json"
+        )
+        with open(diagnostics_path, "w", encoding="utf-8") as diagnostics_file:
+            json.dump(
+                reconciliation.diagnostics,
+                diagnostics_file,
+                ensure_ascii=False,
+                indent=4,
+            )
+        log.info("Reconciliation diagnostics saved to %s", diagnostics_path)
     else:
         log.info("Merged content not saved, no save_dir provided.")
 

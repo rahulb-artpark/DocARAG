@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Optional, List, Dict
 
 from Core.provider.llm import LLM
@@ -13,7 +14,504 @@ import re
 import logging
 from bs4 import BeautifulSoup
 
+from docarag.derived_identity import (
+    derived_evidence_id,
+    derived_identity_payload,
+    derived_output_identity,
+)
+
 log = logging.getLogger(__name__)
+
+
+_DIRECT_EVIDENCE_FIELDS = (
+    "canonical_block_id",
+    "canonical_revision_id",
+    "observation_id",
+)
+
+
+def _ordered_unique(values) -> list[str]:
+    """Return non-empty strings in first-seen order."""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _source_evidence_refs(content: dict) -> list[dict]:
+    """Return the ordered immutable-source references supporting ``content``."""
+
+    existing = content.get("source_evidence_refs")
+    content_semantic_refs = _semantic_substructure_references(
+        content.get("semantic_substructures")
+    )
+    refs: list[dict] = []
+    if isinstance(existing, list):
+        for raw_ref in existing:
+            if not isinstance(raw_ref, dict):
+                continue
+            ref = deepcopy(raw_ref)
+            # Migrate early semantic projections away from duplicating the
+            # complete graph in every source reference.
+            legacy_structures = ref.pop("semantic_substructures", None)
+            if "semantic_substructure_refs" not in ref:
+                semantic_refs = _semantic_substructure_references(
+                    legacy_structures
+                )
+                if semantic_refs:
+                    ref["semantic_substructure_refs"] = semantic_refs
+            elif content_semantic_refs is not None:
+                upgraded = _upgrade_legacy_semantic_receipts(
+                    ref.get("semantic_substructure_refs"),
+                    content_semantic_refs,
+                )
+                if upgraded is not None:
+                    ref["semantic_substructure_refs"] = upgraded
+            refs.append(ref)
+    observation_ids = _ordered_unique(
+        [
+            content.get("observation_id"),
+            *(content.get("source_observation_ids") or []),
+        ]
+    )
+    has_direct_identity = any(
+        (
+            content.get("canonical_block_id"),
+            content.get("canonical_revision_id"),
+            content.get("observation_id"),
+        )
+    )
+    if refs and not has_direct_identity:
+        return refs
+    if not has_direct_identity and not any(
+        (
+            content.get("page_id"),
+            content.get("geometry", content.get("source_geometry")),
+        )
+    ):
+        return refs
+
+    direct_ref = {
+        "canonical_block_id": content.get("canonical_block_id"),
+        "canonical_revision_id": content.get("canonical_revision_id"),
+        "observation_id": content.get("observation_id"),
+        "source_observation_ids": observation_ids,
+        "document_version_id": content.get("document_version_id"),
+        "source_sha256": content.get("source_sha256"),
+        "page_id": content.get("page_id"),
+        "page_idx": content.get("page_idx"),
+        "geometry": deepcopy(
+            content.get("geometry", content.get("source_geometry"))
+        ),
+        "representation_ids": deepcopy(
+            content.get("canonical_representation_ids")
+        ),
+        "asset_ids": deepcopy(content.get("canonical_asset_ids")),
+        "selected_representation_ids": deepcopy(
+            content.get("selected_representation_ids")
+        ),
+        "selected_asset_ids": deepcopy(content.get("selected_asset_ids")),
+        "canonical_relations": deepcopy(content.get("canonical_relations")),
+    }
+    if content_semantic_refs:
+        direct_ref["semantic_substructure_refs"] = content_semantic_refs
+    direct_key = _ref_identity(direct_ref)
+    if direct_key not in {_ref_identity(ref) for ref in refs}:
+        refs.append(direct_ref)
+    return refs
+
+
+def _ref_identity(ref: dict) -> str:
+    """Create a stable equality key without changing the reference payload."""
+
+    return json.dumps(ref, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _validated_semantic_substructures(raw_structures: object):
+    """Parse a bounded full-graph array exactly once."""
+
+    from docarag.domain import (
+        MAX_SEMANTIC_SUBSTRUCTURES_PER_BLOCK,
+        SemanticSubstructure,
+    )
+
+    if raw_structures is None:
+        return []
+    if not isinstance(raw_structures, list) or len(
+        raw_structures
+    ) > MAX_SEMANTIC_SUBSTRUCTURES_PER_BLOCK:
+        return None
+    by_id = {}
+    for raw_structure in raw_structures:
+        if not isinstance(raw_structure, dict):
+            return None
+        try:
+            structure = SemanticSubstructure.from_dict(raw_structure)
+        except (TypeError, ValueError):
+            return None
+        if not structure.is_source_bound:
+            return None
+        previous = by_id.get(structure.substructure_id)
+        if previous is not None and previous != structure:
+            return None
+        by_id[structure.substructure_id] = structure
+    return [by_id[substructure_id] for substructure_id in sorted(by_id)]
+
+
+def _semantic_substructure_references(
+    raw_structures: object,
+) -> list[dict] | None:
+    """Validate full graph DTOs and reduce them to bounded lineage receipts."""
+
+    structures = _validated_semantic_substructures(raw_structures)
+    if structures is None:
+        return None
+    receipts: list[dict] = []
+    for structure in structures:
+        receipt = {
+            "substructure_id": structure.substructure_id,
+            "semantic_sha256": structure.semantic_sha256,
+            "comparison_sha256": structure.comparison_sha256,
+            "source_observation_ids": list(structure.source_observation_ids),
+            "source_substructure_ids": list(structure.source_substructure_ids),
+        }
+        receipts.append(receipt)
+    return receipts
+
+
+def _upgrade_legacy_semantic_receipts(
+    raw_receipts: object,
+    authoritative_receipts: list[dict],
+) -> list[dict] | None:
+    """Add comparison digests to the explicit transitional receipt shape."""
+
+    if not isinstance(raw_receipts, list):
+        return None
+    comparison_by_id = {
+        receipt.get("substructure_id"): receipt.get("comparison_sha256")
+        for receipt in authoritative_receipts
+    }
+    upgraded: list[dict] = []
+    for raw_receipt in raw_receipts:
+        if not isinstance(raw_receipt, dict):
+            return None
+        receipt = deepcopy(raw_receipt)
+        if "comparison_sha256" not in receipt:
+            comparison_sha256 = comparison_by_id.get(
+                receipt.get("substructure_id")
+            )
+            if not isinstance(comparison_sha256, str):
+                return None
+            receipt["comparison_sha256"] = comparison_sha256
+        upgraded.append(receipt)
+    return upgraded
+
+
+def _normalized_semantic_receipts(
+    raw_receipts: object,
+    *,
+    source_observation_ids: object,
+    legacy_comparison_by_id: dict[str, str],
+) -> list[dict] | None:
+    """Preflight a source reference's small semantic lineage receipts."""
+
+    from docarag.domain import (
+        MAX_SEMANTIC_SOURCE_IDS,
+        MAX_SEMANTIC_SUBSTRUCTURES_PER_BLOCK,
+    )
+
+    if raw_receipts is None:
+        return []
+    if not isinstance(raw_receipts, list) or len(
+        raw_receipts
+    ) > MAX_SEMANTIC_SUBSTRUCTURES_PER_BLOCK:
+        return None
+    if not isinstance(source_observation_ids, list) or len(
+        source_observation_ids
+    ) > MAX_SEMANTIC_SOURCE_IDS:
+        return None
+    owner_observations = {
+        value
+        for value in source_observation_ids
+        if isinstance(value, str) and 0 < len(value) <= 256
+    }
+    if len(owner_observations) != len(source_observation_ids):
+        return None
+
+    expected_fields = {
+        "substructure_id",
+        "semantic_sha256",
+        "comparison_sha256",
+        "source_observation_ids",
+        "source_substructure_ids",
+    }
+    legacy_fields = expected_fields.difference({"comparison_sha256"})
+    by_id: dict[str, dict] = {}
+    for raw_receipt in raw_receipts:
+        if not isinstance(raw_receipt, dict) or set(raw_receipt) not in (
+            expected_fields,
+            legacy_fields,
+        ):
+            return None
+        substructure_id = raw_receipt.get("substructure_id")
+        semantic_sha256 = raw_receipt.get("semantic_sha256")
+        comparison_sha256 = raw_receipt.get("comparison_sha256")
+        observations = raw_receipt.get("source_observation_ids")
+        raw_ids = raw_receipt.get("source_substructure_ids")
+        if (
+            not isinstance(substructure_id, str)
+            or not 0 < len(substructure_id) <= 256
+            or not isinstance(semantic_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", semantic_sha256)
+            or not isinstance(observations, list)
+            or not observations
+            or len(observations) > MAX_SEMANTIC_SOURCE_IDS
+            or not isinstance(raw_ids, list)
+            or len(raw_ids) != 1
+        ):
+            return None
+        if comparison_sha256 is None:
+            # Explicit compatibility for receipts emitted by the short-lived
+            # pre-comparison schema. Never guess: the full exact graph must be
+            # present at top level so its computed comparison digest can bind
+            # this receipt by substructure ID.
+            comparison_sha256 = legacy_comparison_by_id.get(substructure_id)
+        if not isinstance(comparison_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", comparison_sha256
+        ):
+            return None
+        if any(
+            not isinstance(value, str) or not 0 < len(value) <= 256
+            for value in [*observations, *raw_ids]
+        ):
+            return None
+        if not set(observations).issubset(owner_observations):
+            return None
+        receipt = {
+            "substructure_id": substructure_id,
+            "semantic_sha256": semantic_sha256,
+            "comparison_sha256": comparison_sha256,
+            "source_observation_ids": observations,
+            "source_substructure_ids": raw_ids,
+        }
+        previous = by_id.get(substructure_id)
+        if previous is not None and previous != receipt:
+            return None
+        by_id[substructure_id] = receipt
+    return [by_id[substructure_id] for substructure_id in sorted(by_id)]
+
+
+def _semantic_substructure_union(
+    inputs: list[dict], refs: list[dict]
+) -> list[dict] | None:
+    """Union full source graphs only when their lineage receipts match exactly."""
+
+    structures_by_id: dict[str, dict] = {}
+    expected_receipts: dict[str, dict] = {}
+    for source in inputs:
+        raw_structures = source.get("semantic_substructures")
+        if raw_structures is None:
+            continue
+        structures = _validated_semantic_substructures(raw_structures)
+        if structures is None:
+            return None
+        for structure in structures:
+            payload = structure.to_dict()
+            previous = structures_by_id.get(structure.substructure_id)
+            if previous is not None and previous != payload:
+                return None
+            structures_by_id[structure.substructure_id] = payload
+            expected_receipts[structure.substructure_id] = {
+                "substructure_id": structure.substructure_id,
+                "semantic_sha256": structure.semantic_sha256,
+                "comparison_sha256": structure.comparison_sha256,
+                "source_observation_ids": list(
+                    structure.source_observation_ids
+                ),
+                "source_substructure_ids": list(
+                    structure.source_substructure_ids
+                ),
+            }
+
+    declared_receipts: dict[str, dict] = {}
+    for ref in refs:
+        receipts = _normalized_semantic_receipts(
+            ref.get("semantic_substructure_refs"),
+            source_observation_ids=ref.get("source_observation_ids"),
+            legacy_comparison_by_id={
+                substructure_id: receipt["comparison_sha256"]
+                for substructure_id, receipt in expected_receipts.items()
+            },
+        )
+        if receipts is None:
+            return None
+        for receipt in receipts:
+            substructure_id = receipt["substructure_id"]
+            previous = declared_receipts.get(substructure_id)
+            if previous is not None and previous != receipt:
+                return None
+            declared_receipts[substructure_id] = receipt
+
+    if expected_receipts != declared_receipts:
+        return None
+    return [
+        structures_by_id[substructure_id]
+        for substructure_id in sorted(structures_by_id)
+    ]
+
+
+def _derived_output_content(content: dict) -> dict:
+    """Select output fields whose value determines derived evidence identity."""
+
+    return derived_output_identity(
+        content_type=content.get("type", "unknown"),
+        text=content.get("text", ""),
+        table_body=content.get("table_body", ""),
+        table_caption=content.get("table_caption", []),
+        table_footnote=content.get("table_footnote", []),
+    )
+
+
+def _mark_derived_evidence(
+    content: dict,
+    contributors: list[dict],
+    transformation: str,
+) -> None:
+    """Bind changed content to ordered canonical inputs instead of one direct block.
+
+    ``content`` must already contain its transformed output. The canonical parser
+    artifact remains untouched; this helper only annotates the mutable legacy
+    block consumed by BookRAG.
+    """
+
+    inputs = [content, *contributors]
+    refs: list[dict] = []
+    ref_keys: set[str] = set()
+    for source in inputs:
+        for ref in _source_evidence_refs(source):
+            key = _ref_identity(ref)
+            if key not in ref_keys:
+                ref_keys.add(key)
+                refs.append(ref)
+
+    canonical_block_ids = _ordered_unique(
+        [
+            *(
+                value
+                for source in inputs
+                for value in [
+                    *(source.get("source_canonical_block_ids") or []),
+                    source.get("canonical_block_id"),
+                ]
+            ),
+            *(ref.get("canonical_block_id") for ref in refs),
+        ]
+    )
+    canonical_revision_ids = _ordered_unique(
+        [
+            *(
+                value
+                for source in inputs
+                for value in [
+                    *(source.get("source_canonical_revision_ids") or []),
+                    source.get("canonical_revision_id"),
+                ]
+            ),
+            *(ref.get("canonical_revision_id") for ref in refs),
+        ]
+    )
+    observation_ids = _ordered_unique(
+        [
+            *(
+                value
+                for source in inputs
+                for value in [
+                    *(source.get("source_observation_ids") or []),
+                    source.get("observation_id"),
+                ]
+            ),
+            *(
+                value
+                for ref in refs
+                for value in [
+                    *(ref.get("source_observation_ids") or []),
+                    ref.get("observation_id"),
+                ]
+            ),
+        ]
+    )
+    transformations = _ordered_unique(
+        [
+            *(
+                item
+                for source in inputs
+                for item in (source.get("transformations") or [])
+            ),
+            transformation,
+        ]
+    )
+    representation_ids = _ordered_unique(
+        value
+        for ref in refs
+        for value in (ref.get("representation_ids") or [])
+    )
+    asset_ids = _ordered_unique(
+        value for ref in refs for value in (ref.get("asset_ids") or [])
+    )
+    selected_representation_ids = _ordered_unique(
+        value
+        for ref in refs
+        for value in (ref.get("selected_representation_ids") or [])
+    )
+    selected_asset_ids = _ordered_unique(
+        value
+        for ref in refs
+        for value in (ref.get("selected_asset_ids") or [])
+    )
+    semantic_substructures = _semantic_substructure_union(inputs, refs)
+
+    identity_payload = derived_identity_payload(
+        output=_derived_output_content(content),
+        source_revision_ids=canonical_revision_ids,
+        # Some legacy/adaptor inputs predate canonical revision IDs.  Binding
+        # their document/block/observation/reference identities prevents the
+        # same transformed text on two source pages from colliding.
+        source_document_version_ids=_ordered_unique(
+            [
+                *(source.get("document_version_id") for source in inputs),
+                *(ref.get("document_version_id") for ref in refs),
+            ]
+        ),
+        source_block_ids=canonical_block_ids,
+        source_observation_ids=observation_ids,
+        source_references=refs,
+        transformations=transformations,
+    )
+
+    for field in _DIRECT_EVIDENCE_FIELDS:
+        content[field] = None
+    content["source_evidence_refs"] = refs
+    content["source_canonical_block_ids"] = canonical_block_ids
+    content["source_canonical_revision_ids"] = canonical_revision_ids
+    content["source_observation_ids"] = observation_ids
+    content["canonical_representation_ids"] = representation_ids
+    content["canonical_asset_ids"] = asset_ids
+    content["selected_representation_ids"] = selected_representation_ids
+    content["selected_asset_ids"] = selected_asset_ids
+    content["selected_representation_id"] = None
+    content["selected_asset_id"] = None
+    if semantic_substructures:
+        content["semantic_substructures"] = semantic_substructures
+    else:
+        # No top-level graph is more accurate than a malformed or ambiguous
+        # aggregate. Receipts remain available in ``refs`` for audit/debugging.
+        content.pop("semantic_substructures", None)
+    content["transformations"] = transformations
+    content["derived_evidence_id"] = derived_evidence_id(identity_payload)
 
 
 def is_likely_incomplete_paragraph(text: str) -> bool:
@@ -334,6 +832,9 @@ def merge_text_and_mark_invalid(prev_content: dict, merged_list: list[dict]):
     :param prev_content: Previous content to merge into
     :param merged_list: List of content to merge
     """
+    if not merged_list:
+        return
+
     prev_text = prev_content.get("text", "")
     merged_text = [prev_text]
     for content in merged_list:
@@ -349,6 +850,11 @@ def merge_text_and_mark_invalid(prev_content: dict, merged_list: list[dict]):
         else:
             merged_str += text + " "
     prev_content["text"] = merged_str.strip()
+    _mark_derived_evidence(
+        prev_content,
+        merged_list,
+        "bookrag.text_merge.v1",
+    )
 
     print(f"Merged text in page: {prev_content.get('page_idx', -1) + 1}")
     print(f"Index in Page: {prev_content['middle_json'].get("index", -1) + 1}")
@@ -497,12 +1003,22 @@ def merge_tables_and_mark_invalid(prev_content: dict, cur_content: dict):
         # fallback: 直接拼接字符串
         prev_content["table_body"] += cur_html
         cur_content["invalid"] = True
+        _mark_derived_evidence(
+            prev_content,
+            [cur_content],
+            "bookrag.table_merge.v1",
+        )
         return
 
     # 更新prev_content的table_body
     prev_content["table_body"] = str(prev_table)
     # 标记cur_content为无效
     cur_content["invalid"] = True
+    _mark_derived_evidence(
+        prev_content,
+        [cur_content],
+        "bookrag.table_merge.v1",
+    )
 
 
 def get_json_str_table_pairs(
@@ -671,6 +1187,8 @@ def table_merger(pdf_list: list[Optional[str]], llm: LLM) -> list[Optional[str]]
 
 def dash_line_refiner(pdf_list: list[Optional[str]]):
     for content in pdf_list:
+        if content is None:
+            continue
         content_type = content.get("type", "unknown")
         if content_type == "text":
             # If the content is a paragraph, we need to check for dash line errors
@@ -678,7 +1196,13 @@ def dash_line_refiner(pdf_list: list[Optional[str]]):
             # If a space follows a dash line, it is likely a dash line error
             # We need to remove the space after the dash line
             refined_text = re.sub(r'-\s+', '-', text)
-            content["text"] = refined_text
+            if refined_text != text:
+                content["text"] = refined_text
+                _mark_derived_evidence(
+                    content,
+                    [],
+                    "bookrag.dash_line_normalization.v1",
+                )
     return pdf_list
 
 
@@ -740,6 +1264,11 @@ def truncate_ocr_error_refiner(
                 log.info(
                     f"Truncated OCR garbage. Original length: {len(text)}, New length: {len(refined_text)}")
                 content["text"] = refined_text
+                _mark_derived_evidence(
+                    content,
+                    [],
+                    "bookrag.ocr_garbage_truncation.v1",
+                )
 
     return pdf_list
 

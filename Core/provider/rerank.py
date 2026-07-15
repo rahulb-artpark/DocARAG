@@ -1,14 +1,17 @@
-from Core.Index.Graph import Entity
-import torch
-from modelscope import AutoModelForCausalLM, AutoTokenizer
-from typing import List, Dict, Optional
+from __future__ import annotations
+
+from Core.configs.llm_config import _normalize_api_base
+from typing import TYPE_CHECKING, Any, List, Dict, Optional
+import importlib
 import math
 from tqdm import tqdm
 import logging
 import gc
-import requests
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from Core.Index.Graph import Entity
 
 
 class TextRerankerProvider:
@@ -22,12 +25,17 @@ class TextRerankerProvider:
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-Reranker-4B",
-        device: str = "auto",
+        device: Optional[str] = None,
         max_length: int = 4096,
-        use_flash_attention: bool = True,
-        torch_dtype: torch.dtype = torch.bfloat16,
+        use_flash_attention: Optional[bool] = None,
+        torch_dtype: Any = None,
         backend: str = "local",
         api_base: str = None,
+        request_timeout_seconds: Optional[float] = None,
+        flash_attention_fallback: Optional[bool] = None,
+        *,
+        session: Optional[object] = None,
+        owns_session: Optional[bool] = None,
     ):
         """
         初始化Reranker Provider。
@@ -41,53 +49,143 @@ class TextRerankerProvider:
             backend (str): 后端类型，支持 'local' 和 'vllm'。
             api_base (str): 如果使用 'vllm' 后端，必须提供API基础URL。
         """
-        self.model_name = model_name
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("model_name must be a non-empty string")
+        if not isinstance(backend, str):
+            raise ValueError("backend must be 'local' or 'vllm'")
+        if (
+            isinstance(max_length, bool)
+            or not isinstance(max_length, int)
+            or max_length < 1
+        ):
+            raise ValueError("max_length must be at least 1")
+        if owns_session is not None and not isinstance(owns_session, bool):
+            raise ValueError("owns_session must be a boolean when provided")
+        self.model_name = model_name.strip()
         self.max_length = max_length
-        self.backend = backend.lower()
+        self.backend = backend.strip().lower()
+        self._closed = False
 
         # ==========================================================
         # vLLM 后端逻辑
         # ==========================================================
         if self.backend == "vllm":
-            if not api_base:
+            if device is not None:
+                raise ValueError("device is only supported by the local reranker backend")
+            if use_flash_attention is not None:
+                raise ValueError(
+                    "use_flash_attention is only supported by the local reranker backend"
+                )
+            if flash_attention_fallback is not None:
+                raise ValueError(
+                    "flash_attention_fallback is only supported by the local reranker backend"
+                )
+            if torch_dtype is not None:
+                raise ValueError("torch_dtype is only supported by the local backend")
+            if request_timeout_seconds is None:
+                request_timeout_seconds = 30.0
+            if (
+                isinstance(request_timeout_seconds, bool)
+                or not isinstance(request_timeout_seconds, (int, float))
+                or not math.isfinite(request_timeout_seconds)
+                or request_timeout_seconds <= 0
+            ):
+                raise ValueError(
+                    "request_timeout_seconds must be finite and greater than 0"
+                )
+            self.request_timeout_seconds = float(request_timeout_seconds)
+            if not isinstance(api_base, str) or not api_base.strip():
                 raise ValueError("api_base must be provided for the 'vllm' backend.")
-            # 您可以根据实际情况修改
-            if api_base.strip("/").endswith("rerank"):
-                self.rerank_url = api_base
+            normalized_api_base = _normalize_api_base(api_base)
+            if normalized_api_base.endswith("/rerank"):
+                self.rerank_url = normalized_api_base
             else:
-                self.rerank_url = f"{api_base.strip('/')}/rerank"
-            # 创建一个 session 以复用连接，提升性能
-            self.session = requests.Session()
-            log.info(f"Using vLLM backend. Rerank endpoint: {self.rerank_url}")
+                self.rerank_url = f"{normalized_api_base}/rerank"
+            if session is None:
+                import requests
+
+                self.session = requests.Session()
+                self._owns_session = True if owns_session is None else owns_session
+            else:
+                self.session = session
+                self._owns_session = False if owns_session is None else owns_session
+            # Do not log the endpoint: deployment URLs can contain credentials.
+            log.info("Using remote reranker backend.")
         # ==========================================================
         # 本地后端逻辑 (将原有代码移入此分支)
         # ==========================================================
         elif self.backend == "local":
+            if session is not None or owns_session is not None:
+                raise ValueError("session settings are only supported by the vllm backend")
+            if api_base is not None and str(api_base).strip():
+                raise ValueError("api_base is only supported by the vllm backend")
+            if request_timeout_seconds is not None:
+                raise ValueError(
+                    "request_timeout_seconds is only supported by the vllm backend"
+                )
+            device = device or "auto"
+            if not isinstance(device, str) or not device.strip():
+                raise ValueError("device must be a non-empty string")
+            import torch
+
+            self._torch = torch
             if device == "auto":
                 self.device = "cuda" if torch.cuda.is_available() else "cpu"
             else:
                 self.device = device
 
-            log.info(f"Using reranker on device: {self.device}")
-            log.info(f"Loading reranker model: {self.model_name}...")
+            if use_flash_attention is None:
+                use_flash_attention = "cuda" in self.device
+            if not isinstance(use_flash_attention, bool):
+                raise ValueError("use_flash_attention must be a boolean")
+            if use_flash_attention:
+                if "cuda" not in self.device:
+                    raise ValueError("use_flash_attention requires a CUDA device")
+                flash_attention_fallback = (
+                    True
+                    if flash_attention_fallback is None
+                    else flash_attention_fallback
+                )
+            elif flash_attention_fallback is not None:
+                raise ValueError(
+                    "flash_attention_fallback requires use_flash_attention=true"
+                )
+            if flash_attention_fallback is not None and not isinstance(
+                flash_attention_fallback, bool
+            ):
+                raise ValueError("flash_attention_fallback must be a boolean")
+
+            log.info("Using local reranker on device %s", self.device)
+
+            model_args = {"trust_remote_code": True}
+            if torch_dtype is not None:
+                model_args["torch_dtype"] = torch_dtype
+            if "cuda" in self.device:
+                model_args.setdefault("torch_dtype", torch.bfloat16)
+                if use_flash_attention:
+                    try:
+                        # Importing catches missing wheels and binary/ABI failures
+                        # before any tokenizer or model weights are allocated.
+                        importlib.import_module("flash_attn")
+                    except Exception as error:
+                        if not flash_attention_fallback:
+                            raise RuntimeError(
+                                "Flash Attention 2 was requested but is unavailable"
+                            ) from error
+                        log.warning(
+                            "Flash Attention 2 unavailable; using default attention (%s)",
+                            type(error).__name__,
+                        )
+                    else:
+                        model_args["attn_implementation"] = "flash_attention_2"
+                        log.info("Using Flash Attention 2.")
+
+            from modelscope import AutoModelForCausalLM, AutoTokenizer
 
             # 加载分词器，Qwen Reranker要求左填充
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name, padding_side="left"
             )
-
-            # 加载模型
-            model_args = {"trust_remote_code": True}
-            if "cuda" in self.device:
-                model_args["torch_dtype"] = torch_dtype
-                if use_flash_attention:
-                    try:
-                        model_args["attn_implementation"] = "flash_attention_2"
-                        log.info("Using Flash Attention 2.")
-                    except ImportError:
-                        log.info(
-                            "Flash Attention 2 not available. Falling back to default attention."
-                        )
 
             self.model = (
                 AutoModelForCausalLM.from_pretrained(model_name, **model_args)
@@ -108,7 +206,7 @@ class TextRerankerProvider:
             log.info("Cleaning cache...")
             gc.collect()
             if "cuda" in self.device:
-                torch.cuda.empty_cache()
+                self._torch.cuda.empty_cache()
             log.info("Cache cleaned.")
         else:
             log.info(f"{self.backend} backend requires no local cache cleaning.")
@@ -117,7 +215,10 @@ class TextRerankerProvider:
         """
         close the reranker provider and release resources.
         """
-        log.info(f"Closing TextRerankerProvider for model: {self.model_name}...")
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        log.info("Closing TextRerankerProvider.")
 
         if self.backend == "local":
             if hasattr(self, "model"):
@@ -127,14 +228,18 @@ class TextRerankerProvider:
 
             if "cuda" in self.device:
                 log.info("Reranker: Emptying CUDA cache.")
-                torch.cuda.empty_cache()
+                self._torch.cuda.empty_cache()
 
             gc.collect()
             log.info("Local reranker resources released.")
 
         elif self.backend == "vllm":
-            if hasattr(self, "session"):
-                self.session.close()  # 关闭 requests session
+            if (
+                getattr(self, "session", None) is not None
+                and getattr(self, "_owns_session", True)
+            ):
+                self.session.close()
+            self.session = None
             log.info("vLLM backend session closed.")
 
         log.info("TextRerankerProvider closed.")
@@ -172,7 +277,7 @@ class TextRerankerProvider:
             instruction = "Given a web search query, retrieve relevant passages that answer the query"
         return f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}"
 
-    def _process_batch(self, batch_pairs: List[str]) -> Dict[str, torch.Tensor]:
+    def _process_batch(self, batch_pairs: List[str]) -> Dict[str, Any]:
         """
         对一批格式化后的文本对进行分词、添加特殊token和填充。
         """
@@ -207,15 +312,15 @@ class TextRerankerProvider:
 
         return inputs
 
-    @torch.no_grad()
     def _compute_scores_from_inputs(
-        self, inputs: Dict[str, torch.Tensor]
+        self, inputs: Dict[str, Any]
     ) -> List[float]:
         """
         从处理好的输入中计算相关性得分。
         """
         # 模型前向传播，获取最后一个token的logits
-        outputs = self.model(**inputs)
+        with self._torch.no_grad():
+            outputs = self.model(**inputs)
         logits = outputs.logits[:, -1, :]
 
         # 提取"yes"和"no"的logits
@@ -223,8 +328,10 @@ class TextRerankerProvider:
         false_vector = logits[:, self.token_false_id]
 
         # 计算Log-Softmax并转换为概率
-        scores_tensor = torch.stack([false_vector, true_vector], dim=1)
-        log_softmax_scores = torch.nn.functional.log_softmax(scores_tensor, dim=1)
+        scores_tensor = self._torch.stack([false_vector, true_vector], dim=1)
+        log_softmax_scores = self._torch.nn.functional.log_softmax(
+            scores_tensor, dim=1
+        )
 
         # 返回"yes"的概率作为最终得分
         final_scores = log_softmax_scores[:, 1].exp().tolist()
@@ -262,6 +369,16 @@ class TextRerankerProvider:
         """
         if not documents or not isinstance(documents, list):
             raise ValueError("Input 'documents' must be a non-empty list of strings.")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if any(not isinstance(document, str) for document in documents):
+            raise ValueError("documents must contain only strings")
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size < 1
+        ):
+            raise ValueError("batch_size must be at least 1")
 
         if self.backend == "vllm":
 
@@ -281,56 +398,63 @@ class TextRerankerProvider:
             ]
 
             
-            all_results = []
+            all_scores: List[float] = []
             num_docs = len(documents)
             num_batches = math.ceil(num_docs / batch_size)
 
-            try:
-                for i in tqdm(
-                    range(0, num_docs, batch_size),
-                    desc="Reranking Batches (vLLM)",
-                    total=num_batches,
-                    disable=num_docs < batch_size,
-                ):
-                    # 1. 直接从预先格式化好的列表中获取当前批次
-                    batch_formatted_documents = all_formatted_documents[i : i + batch_size]
+            for i in tqdm(
+                range(0, num_docs, batch_size),
+                desc="Reranking Batches (vLLM)",
+                total=num_batches,
+                disable=num_docs < batch_size,
+            ):
+                batch_formatted_documents = all_formatted_documents[
+                    i : i + batch_size
+                ]
+                payload = {
+                    "model": self.model_name,
+                    "query": formatted_query,
+                    "documents": batch_formatted_documents,
+                }
+                response = self.session.post(
+                    self.rerank_url,
+                    json=payload,
+                    timeout=self.request_timeout_seconds,
+                )
+                response.raise_for_status()
 
-                    # 2. 为当前批次构建 payload
-                    payload = {
-                        "model": self.model_name,
-                        "query": formatted_query,
-                        "documents": batch_formatted_documents, # 使用已格式化的批次
-                    }
-                    
-                    # 3. 发送 API 请求
-                    response = self.session.post(self.rerank_url, json=payload)
-                    response.raise_for_status()
-                    
-                    data = response.json()
-                    results = data.get("results")
-                    
-                    if results is None or not isinstance(results, list):
-                        log.error(f"Unexpected response format from vLLM reranker: 'results' key not found or not a list. Response: {data}")
-                        raise ValueError("Failed to parse 'results' from vLL-M response.")
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("Remote reranker returned a non-object response")
+                results = data.get("results")
+                if not isinstance(results, list):
+                    raise ValueError("Remote reranker response has no results list")
+                expected_indices = set(range(len(batch_formatted_documents)))
+                by_index: Dict[int, float] = {}
+                for result in results:
+                    if not isinstance(result, dict):
+                        raise ValueError("Remote reranker returned an invalid result")
+                    index = result.get("index")
+                    score = result.get("relevance_score")
+                    if (
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index not in expected_indices
+                        or index in by_index
+                    ):
+                        raise ValueError("Remote reranker returned invalid indices")
+                    if (
+                        isinstance(score, bool)
+                        or not isinstance(score, (int, float))
+                        or not math.isfinite(score)
+                    ):
+                        raise ValueError("Remote reranker returned an invalid score")
+                    by_index[index] = float(score)
+                if set(by_index) != expected_indices:
+                    raise ValueError("Remote reranker returned incomplete results")
+                all_scores.extend(by_index[index] for index in sorted(by_index))
 
-                    # 4. 使用全局索引聚合结果
-                    for r in results:
-                        r['global_index'] = i + r.get('index', 0)
-                    all_results.extend(results)
-
-                # --- 分批处理结束 ---
-
-                # 5. 根据全局索引对所有结果进行排序
-                all_results.sort(key=lambda r: r.get('global_index', 0))
-                
-                # 6. 从排好序的结果中提取分数
-                all_scores = [r['relevance_score'] for r in all_results]
-                
-                return all_scores
-
-            except requests.exceptions.RequestException as e:
-                log.error(f"Error calling vLLM reranker API: {e}")
-                raise e
+            return all_scores
 
 
         elif self.backend == "local":
@@ -395,6 +519,8 @@ def format_entity_for_reranking(entity: Entity) -> str:
 
 
 def test_example_1(reranker: TextRerankerProvider, instruction: str):
+    from Core.Index.Graph import Entity
+
     query_entity = Entity(
         entity_name="Michael Jordan",
         entity_type="Person",
@@ -494,6 +620,8 @@ def test_example_1(reranker: TextRerankerProvider, instruction: str):
 
 # --- 测试用例 2: 不存在正确匹配的实体 ---
 def test_example_2(reranker: "TextRerankerProvider", instruction: str):
+    from Core.Index.Graph import Entity
+
     """
     运行实体解析的第二个测试用例，该场景中不存在任何正确的匹配项。
     查询: Katsushika Hokusai
@@ -560,6 +688,8 @@ def test_example_2(reranker: "TextRerankerProvider", instruction: str):
 
 # --- 测试用例 3: 完全不相关的候选实体 (健全性检查) ---
 def test_example_3(reranker: "TextRerankerProvider", instruction: str):
+    from Core.Index.Graph import Entity
+
     """
     运行实体解析的第三个测试用例，该场景中所有候选实体都与查询实体完全不相关。
     这是一个健全性检查，预期所有分数都应极低。
@@ -629,6 +759,8 @@ def test_example_3(reranker: "TextRerankerProvider", instruction: str):
 
 # --- 使用示例 ---
 if __name__ == "__main__":
+    import torch
+
     # 1. 初始化Reranker
     # 如果GPU内存有限，可以尝试更小的数据类型，如 torch.float16
     try:

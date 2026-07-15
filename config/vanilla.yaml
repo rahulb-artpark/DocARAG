@@ -25,10 +25,6 @@ vlm:
 
 index_type: "vanilla"
 
-index:
-  chunk_size: 512
-  overlap: 50
-
 mineru:
   backend: vlm-sglang-client
   method: vlm
@@ -49,24 +45,24 @@ graph:
     model_name: Qwen3-Embedding-0.6B
     backend: openai
     max_length: 4096
-    device: "cuda:2"
     api_base: "http://localhost:8007/v1"
   reranker_config:
     model_name: Qwen3-Reranker-4B
     max_length: 4096
-    device: "cuda:2"
     backend: vllm
     api_base: "http://localhost:8011/v1"
 
 vdb:
   mm_embedding: False
-  vdb_dir_name: "vanilla_vdb"
+  manifest_dir_name: "qdrant-vanilla-attestation"
+  qdrant_url: "http://127.0.0.1:6333"
+  api_key_env: "QDRANT_API_KEY"
+  timeout_seconds: 10.0
   collection_name: "VanillaVDB"
   embedding_config:
     model_name: Qwen3-Embedding-0.6B
     backend: openai
     max_length: 4096
-    device: "cuda:2"
     api_base: "http://localhost:8007/v1"
 
 rag_force_reprocess: True
@@ -77,12 +73,14 @@ rag:
   retrieval_method: vanilla
   vdb_config: 
     mm_embedding: False
-    vdb_dir_name: "vanilla_vdb"
+    manifest_dir_name: "qdrant-vanilla-attestation"
+    qdrant_url: "http://127.0.0.1:6333"
+    api_key_env: "QDRANT_API_KEY"
+    timeout_seconds: 10.0
     collection_name: "VanillaVDB"
     embedding_config:
       type: "text"
       model_name: Qwen3-Embedding-0.6B
       backend: openai
       max_length: 4096
-      device: "cuda:2"
       api_base: "http://localhost:8007/v1"

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docarag"
+dynamic = ["version"]
+description = "Maintainable command-line and API foundation for DocARAG/BookRAG"
+readme = "README.md"
+# The dependency-light controller and parser-worker layer supports the Python
+# versions used by current Docling/MinerU/Paddle environments. The separate
+# BookRAG compatibility interpreter remains pinned and diagnosed as 3.12.x.
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "psycopg[binary]==3.3.4",
+    "psycopg-pool==3.3.1",
+    "qdrant-client==1.18.0",
+]
+
+[project.scripts]
+docarag = "docarag.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "docarag.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["docarag*"]
+exclude = ["Core*", "Eval*", "Scripts*", "tests*"]
+
+[tool.setuptools.package-data]
+docarag = [
+    "runtime_compatibility.toml",
+    "profiles/*.toml",
+]

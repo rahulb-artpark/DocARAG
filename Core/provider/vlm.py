@@ -1,23 +1,124 @@
-from typing import Dict, Any, Optional, List, Union, Type
+from dataclasses import dataclass
+from itertools import zip_longest
+from threading import BoundedSemaphore, Event
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
 from abc import ABC, abstractmethod
 from PIL import Image
 import base64
 from io import BytesIO
-import os
 from pydantic import BaseModel
 
 from Core.Common.Message import Message
 from Core.Common.Memory import Memory
 from Core.provider.TokenTracker import TokenTracker
 
-os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
-
-from Core.configs import vlm_config
 from Core.configs.vlm_config import VLMConfig
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import gc
+
+from Core.utils.bounded_executor import iter_bounded_ordered
 
 log = logging.getLogger(__name__)
+
+GenerationKeyT = TypeVar("GenerationKeyT")
+VLMInput = Union[str, List[Dict[str, Any]]]
+
+
+def _close_controller_client(controller: object) -> None:
+    """Release an API controller client across supported SDK versions."""
+
+    client = getattr(controller, "client", None)
+    if client is None:
+        return
+    controller.client = None
+    if not getattr(controller, "_owns_client", True):
+        return
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+        return
+    transport = getattr(client, "_client", None)
+    close_transport = getattr(transport, "close", None)
+    if callable(close_transport):
+        close_transport()
+
+
+def _unload_ollama_model(controller: object) -> None:
+    """Evict an Ollama model only when the caller explicitly opted in."""
+
+    if not getattr(controller, "unload_on_close", False):
+        return
+    client = getattr(controller, "client", None)
+    model_name = getattr(controller, "model_name", None)
+    if client is None or not model_name:
+        return
+    try:
+        client.generate(model=model_name, prompt="", keep_alive=0)
+    except Exception as error:
+        log.warning(
+            "Ollama VLM unload failed during close (%s)",
+            type(error).__name__,
+        )
+
+
+class GenerationAttemptsExhausted(RuntimeError):
+    """A single VLM generation did not succeed within its retry budget."""
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationRequest(Generic[GenerationKeyT]):
+    """A keyed VLM request for bounded streaming execution."""
+
+    key: GenerationKeyT
+    prompt_or_memory: VLMInput
+    images: Optional[List[str]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationResult(Generic[GenerationKeyT]):
+    """Typed, per-item VLM generation outcome."""
+
+    index: int
+    key: GenerationKeyT
+    value: Optional[str] = None
+    error: Optional[Exception] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    def unwrap(self) -> str:
+        if self.error is not None:
+            raise self.error
+        if self.value is None:
+            raise RuntimeError("Successful generation result has no value")
+        return self.value
+
+
+class BatchGenerationError(RuntimeError):
+    """One or more items in a compatibility VLM batch failed."""
+
+    def __init__(self, failures: Iterable[GenerationResult[Any]]):
+        self.failures = tuple(failures)
+        keys = ", ".join(repr(result.key) for result in self.failures[:5])
+        if len(self.failures) > 5:
+            keys += ", ..."
+        super().__init__(
+            f"{len(self.failures)} VLM generation request(s) failed"
+            + (f" (keys: {keys})" if keys else "")
+        )
 
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -51,7 +152,26 @@ class QwenVLController(BaseVLMController):
             torch_dtype="bfloat16",
             attn_implementation="sdpa",
         )
+        self.input_device = self._resolve_input_device()
         self.processor = AutoProcessor.from_pretrained(config.model_name, use_fast=True)
+        self.temperature = config.temperature
+        self.max_tokens = config.max_tokens
+        self._closed = False
+
+    def _resolve_input_device(self):
+        """Resolve the loaded model's execution device without assuming CUDA."""
+
+        device = getattr(self.model, "device", None)
+        if device is None:
+            try:
+                device = next(self.model.parameters()).device
+            except (AttributeError, StopIteration, TypeError) as error:
+                raise RuntimeError(
+                    "Could not determine the Qwen VLM input device after model load"
+                ) from error
+        if str(device) == "meta":
+            raise RuntimeError("Qwen VLM resolved to the non-executable meta device")
+        return device
 
     def _prepare_messages(
         self,
@@ -129,8 +249,17 @@ class QwenVLController(BaseVLMController):
             padding=True,
             return_tensors="pt",
         )
-        inputs = inputs.to("cuda")
-        generated_ids = self.model.generate(**inputs, max_new_tokens=4096)
+        input_device = getattr(self, "input_device", None)
+        if input_device is None:
+            input_device = self._resolve_input_device()
+        inputs = inputs.to(input_device)
+        generation_parameters = {
+            "max_new_tokens": self.max_tokens,
+            "do_sample": self.temperature > 0,
+        }
+        if self.temperature > 0:
+            generation_parameters["temperature"] = self.temperature
+        generated_ids = self.model.generate(**inputs, **generation_parameters)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -148,22 +277,85 @@ class QwenVLController(BaseVLMController):
         images=None,
         schema=None,
     ):
-        log.warning("generate_json is not implemented for QwenVLController.")
-        pass
+        if schema is None:
+            raise ValueError("A Pydantic schema must be provided for generate_json.")
+        instruction = (
+            "\nReturn only JSON conforming to this schema: "
+            f"{schema.model_json_schema()}"
+        )
+        if isinstance(prompt_or_memory, str):
+            prepared_prompt = prompt_or_memory + instruction
+        else:
+            if not prompt_or_memory:
+                raise ValueError("Message list cannot be empty.")
+            prepared_prompt = [dict(message) for message in prompt_or_memory]
+            last_message = prepared_prompt[-1]
+            content = last_message.get("content")
+            if isinstance(content, str):
+                last_message["content"] = content + instruction
+            elif isinstance(content, list):
+                last_message["content"] = list(content) + [
+                    {"type": "text", "text": instruction}
+                ]
+            else:
+                raise ValueError("Last message content must be text or content parts")
+        generated = self.generate(prepared_prompt, images)
+        return schema.model_validate_json(generated)
+
+    def close(self) -> None:
+        """Drop in-process model weights and return cached CUDA memory."""
+
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "processor"):
+            del self.processor
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:  # impossible for a normally constructed controller
+            pass
 
 
 class GPTVLMController(BaseVLMController):
-    def __init__(self, config: VLMConfig):
-        from openai import OpenAI
-
+    def __init__(
+        self,
+        config: VLMConfig,
+        *,
+        client: Optional[object] = None,
+        owns_client: Optional[bool] = None,
+    ):
+        if owns_client is not None and not isinstance(owns_client, bool):
+            raise ValueError("owns_client must be a boolean when provided")
         self.model_name = config.model_name or "gpt-4o"
-        self.client = (
-            OpenAI(api_key=config.api_key, base_url=config.api_base)
-            if config.api_base
-            else OpenAI(api_key=config.api_key)
-        )
-        self.temperature = config.temperature or 0.1
-        self.max_tokens = config.max_tokens or 1000
+        self.request_timeout_seconds = config.request_timeout_seconds
+        if self.request_timeout_seconds is None:  # guarded by VLMConfig
+            raise ValueError("remote GPT VLM requires request_timeout_seconds")
+        if client is None:
+            from openai import OpenAI
+
+            parameters = {
+                "api_key": config.api_key,
+                "timeout": self.request_timeout_seconds,
+                # VLM owns its retry loop; disable the SDK's additional retry
+                # multiplier so the configured latency bound is truthful.
+                "max_retries": 0,
+            }
+            if config.api_base:
+                parameters["base_url"] = config.api_base
+            self.client = OpenAI(**parameters)
+            self._owns_client = True if owns_client is None else owns_client
+        else:
+            self.client = client
+            self._owns_client = False if owns_client is None else owns_client
+        self.temperature = config.temperature
+        self.max_tokens = config.max_tokens
+        self._closed = False
 
     def _encode_image(self, image_path):
         if isinstance(image_path, Image.Image):
@@ -203,12 +395,18 @@ class GPTVLMController(BaseVLMController):
             return [{"role": "user", "content": content}]
 
         # --- Case 2: Input is a pre-structured list of messages ---
-        elif isinstance(prompt_or_memory, Memory):
-            if not prompt_or_memory:
+        elif isinstance(prompt_or_memory, (Memory, list)):
+            if isinstance(prompt_or_memory, Memory):
+                messages = [
+                    {"role": message.role, "content": message.content}
+                    for message in prompt_or_memory.get()
+                ]
+            else:
+                if any(not isinstance(message, dict) for message in prompt_or_memory):
+                    raise TypeError("Each message must be a dictionary")
+                messages = [dict(message) for message in prompt_or_memory]
+            if not messages:
                 raise ValueError("Message list cannot be empty.")
-
-            messages = prompt_or_memory.get()
-            messages = [{"role": m.role, "content": m.content} for m in messages]
 
             # If images are provided, find the last message and append images to its content
             if images:
@@ -262,6 +460,7 @@ class GPTVLMController(BaseVLMController):
             messages=content,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            timeout=self.request_timeout_seconds,
         )
 
         if completion.usage:
@@ -302,6 +501,9 @@ class GPTVLMController(BaseVLMController):
         completion = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=self.request_timeout_seconds,
             response_format={"type": "json_object"},  # Use modern JSON mode
         )
 
@@ -317,13 +519,48 @@ class GPTVLMController(BaseVLMController):
 
         return schema.model_validate_json(completion.choices[0].message.content)
 
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        _close_controller_client(self)
+
 
 class OllamaVLMController(BaseVLMController):
-    def __init__(self, config: VLMConfig):
-        import ollama
-
+    def __init__(
+        self,
+        config: VLMConfig,
+        *,
+        client: Optional[object] = None,
+        owns_client: Optional[bool] = None,
+    ):
+        if owns_client is not None and not isinstance(owns_client, bool):
+            raise ValueError("owns_client must be a boolean when provided")
         self.model_name = config.model_name or "qwen2.5vl:latest"
-        self.client = ollama.Client(host=config.api_base or "http://127.0.0.1:11434")
+        self.temperature = config.temperature
+        self.max_tokens = config.max_tokens
+        self.keep_alive = config.keep_alive
+        self.unload_on_close = config.unload_on_close
+        self.request_timeout_seconds = config.request_timeout_seconds
+        if self.request_timeout_seconds is None:  # guarded by VLMConfig
+            raise ValueError("remote Ollama VLM requires request_timeout_seconds")
+        if client is None:
+            import ollama
+
+            parameters: Dict[str, Any] = {
+                "host": config.api_base or "http://127.0.0.1:11434",
+                "timeout": self.request_timeout_seconds,
+            }
+            if config.api_key:
+                parameters["headers"] = {
+                    "Authorization": f"Bearer {config.api_key}"
+                }
+            self.client = ollama.Client(**parameters)
+            self._owns_client = True if owns_client is None else owns_client
+        else:
+            self.client = client
+            self._owns_client = False if owns_client is None else owns_client
+        self._closed = False
 
     def _prepare_messages(
         self,
@@ -380,7 +617,13 @@ class OllamaVLMController(BaseVLMController):
         try:
             messages = self._prepare_messages(prompt_or_memory, images)
             response = self.client.chat(
-                model=self.model_name, messages=messages, keep_alive=-1
+                model=self.model_name,
+                messages=messages,
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": self.max_tokens,
+                },
+                keep_alive=self.keep_alive,
             )
 
             if response:
@@ -389,14 +632,14 @@ class OllamaVLMController(BaseVLMController):
                 completion_tokens = response.get("eval_count", 0)
                 try:
                     prompt_tokens = int(prompt_tokens)
-                except Exception as e:
-                    logging.error(f"Error converting prompt_tokens: {e}")
+                except (TypeError, ValueError):
+                    logging.warning("Ollama returned an invalid prompt token count")
                     prompt_tokens = 0
 
                 try:
                     completion_tokens = int(completion_tokens)
-                except Exception as e:
-                    logging.error(f"Error converting completion_tokens: {e}")
+                except (TypeError, ValueError):
+                    logging.warning("Ollama returned an invalid completion token count")
                     completion_tokens = 0
                 tracker.add_usage(
                     prompt_tokens=prompt_tokens,
@@ -404,8 +647,9 @@ class OllamaVLMController(BaseVLMController):
                 )
             return response["message"]["content"]
         except Exception as e:
-            log.error(f"OllamaVLMController error: {e}")
-            return f"Error: Could not get a response from Ollama model '{self.model_name}'."
+            raise RuntimeError(
+                f"Could not get a response from Ollama model '{self.model_name}'"
+            ) from e
 
     def generate_json(
         self,
@@ -414,12 +658,19 @@ class OllamaVLMController(BaseVLMController):
         schema: BaseModel = None,
     ) -> Dict:
         images = images or []
+        if schema is None:
+            raise ValueError("A Pydantic schema must be provided for generate_json.")
         try:
             messages = self._prepare_messages(prompt_or_memory, images)
             response = self.client.chat(
                 model=self.model_name,
                 messages=messages,
                 format=schema.model_json_schema(),
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": self.max_tokens,
+                },
+                keep_alive=self.keep_alive,
             )
 
             if response:
@@ -428,14 +679,14 @@ class OllamaVLMController(BaseVLMController):
                 completion_tokens = response.get("eval_count", 0)
                 try:
                     prompt_tokens = int(prompt_tokens)
-                except Exception as e:
-                    logging.error(f"Error converting prompt_tokens: {e}")
+                except (TypeError, ValueError):
+                    logging.warning("Ollama returned an invalid prompt token count")
                     prompt_tokens = 0
 
                 try:
                     completion_tokens = int(completion_tokens)
-                except Exception as e:
-                    logging.error(f"Error converting completion_tokens: {e}")
+                except (TypeError, ValueError):
+                    logging.warning("Ollama returned an invalid completion token count")
                     completion_tokens = 0
                 tracker.add_usage(
                     prompt_tokens=prompt_tokens,
@@ -444,10 +695,16 @@ class OllamaVLMController(BaseVLMController):
 
             return schema.model_validate_json(response["message"]["content"])
         except Exception as e:
-            log.error(f"OllamaVLMController error: {e}")
-            return {
-                "error": f"Could not get a JSON response from Ollama model '{self.model_name}'."
-            }
+            raise RuntimeError(
+                f"Could not get a JSON response from Ollama model '{self.model_name}'"
+            ) from e
+
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        _unload_ollama_model(self)
+        _close_controller_client(self)
 
 
 class VLM:
@@ -459,7 +716,12 @@ class VLM:
         else:
             config = vlm_config
         self.config = config
+        self._closed = False
+        self.max_workers = config.max_workers
+        self.max_in_flight = config.max_in_flight
         backend = config.backend.lower()
+        provider_concurrency = 1 if backend == "qwen" else config.max_workers
+        self._admission = BoundedSemaphore(provider_concurrency)
         if backend == "qwen":
             self.vlm = QwenVLController(config)
         elif backend == "gpt":
@@ -474,22 +736,34 @@ class VLM:
         prompt_or_memory: Union[str, List[Dict[str, Any]]],
         images: Optional[List[str]] = None,
     ) -> str:
-        retry = 0
-        max_retries = 3
-        last_exception = None
-        while retry < max_retries:
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, self.config.max_retries + 1):
             try:
-                return self.vlm.generate(prompt_or_memory, images)
+                admission = getattr(self, "_admission", None)
+                if admission is None:
+                    response = self.vlm.generate(prompt_or_memory, images)
+                else:
+                    with admission:
+                        response = self.vlm.generate(prompt_or_memory, images)
+                if not isinstance(response, str) or not response.strip():
+                    raise ValueError("Empty response from VLM")
+                return response
             except Exception as e:
-                log.warning(f"Error in VLM.generate (attempt {retry + 1}): {e}")
-                retry += 1
                 last_exception = e
-        log.error("Max retries reached for VLM.generate.")
-        if last_exception:
-            raise RuntimeError(
-                "Failed to generate after multiple retries"
-            ) from last_exception
-        return ""
+                log.warning(
+                    "VLM generation attempt %d/%d failed (%s)",
+                    attempt,
+                    self.config.max_retries,
+                    type(e).__name__,
+                )
+                if (
+                    attempt < self.config.max_retries
+                    and self.config.retry_delay_seconds
+                ):
+                    time.sleep(self.config.retry_delay_seconds)
+        raise GenerationAttemptsExhausted(
+            f"VLM generation failed after {self.config.max_retries} attempt(s)"
+        ) from last_exception
 
     def generate_json(
         self,
@@ -497,47 +771,138 @@ class VLM:
         images: Optional[List[str]] = None,
         schema: BaseModel = None,
     ) -> Dict:
-        retry = 0
-        max_retries = 3
-        last_exception = None
-        while retry < max_retries:
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, self.config.max_retries + 1):
             try:
-                return self.vlm.generate_json(prompt_or_memory, images, schema)
+                admission = getattr(self, "_admission", None)
+                if admission is None:
+                    response = self.vlm.generate_json(prompt_or_memory, images, schema)
+                else:
+                    with admission:
+                        response = self.vlm.generate_json(
+                            prompt_or_memory, images, schema
+                        )
+                if not response:
+                    raise ValueError("Empty JSON response from VLM")
+                return response
             except Exception as e:
-                log.warning(f"Error in VLM.generate_json (attempt {retry + 1}): {e}")
-                retry += 1
                 last_exception = e
-        log.error("Max retries reached for VLM.generate_json.")
-        if last_exception:
-            raise RuntimeError(
-                "Failed to generate JSON after multiple retries"
-            ) from last_exception
-        return {}
+                log.warning(
+                    "VLM JSON generation attempt %d/%d failed (%s)",
+                    attempt,
+                    self.config.max_retries,
+                    type(e).__name__,
+                )
+                if (
+                    attempt < self.config.max_retries
+                    and self.config.retry_delay_seconds
+                ):
+                    time.sleep(self.config.retry_delay_seconds)
+        raise GenerationAttemptsExhausted(
+            f"VLM JSON generation failed after {self.config.max_retries} attempt(s)"
+        ) from last_exception
+
+    def iter_generation_results(
+        self,
+        requests: Iterable[GenerationRequest[GenerationKeyT]],
+        *,
+        cancel_event: Optional[Event] = None,
+        max_workers: Optional[int] = None,
+        max_in_flight: Optional[int] = None,
+    ) -> Iterator[GenerationResult[GenerationKeyT]]:
+        """Yield ordered VLM outcomes with bounded request submission."""
+
+        worker_limit = self.max_workers if max_workers is None else max_workers
+        if isinstance(self.vlm, QwenVLController):
+            # The in-process Qwen model is not thread-safe, but it can process a
+            # large request stream safely when serialized.
+            worker_limit = 1
+        in_flight_limit = (
+            self.max_in_flight if max_in_flight is None else max_in_flight
+        )
+
+        def generate(request: GenerationRequest[GenerationKeyT]) -> str:
+            return self.generate(request.prompt_or_memory, request.images)
+
+        for outcome in iter_bounded_ordered(
+            requests,
+            generate,
+            max_workers=worker_limit,
+            max_in_flight=in_flight_limit,
+            cancel_event=cancel_event,
+            thread_name_prefix="vlm-generation",
+        ):
+            yield GenerationResult(
+                index=outcome.index,
+                key=outcome.item.key,
+                value=outcome.value,
+                error=outcome.error,
+            )
 
     def batch_generate(
-        self, queries: list, images_list: list = None, max_workers: int = 8
-    ):
-        if isinstance(self.vlm, QwenVLController):
-            if len(queries) > 1:
-                raise RuntimeError(
-                    "QwenVLController does not support parallel batch inference in a single process."
+        self,
+        queries: Iterable[VLMInput],
+        images_list: Optional[Iterable[Optional[Union[str, List[str]]]]] = None,
+        max_workers: Optional[int] = None,
+        max_in_flight: Optional[int] = None,
+    ) -> List[str]:
+        """Return ordered strings for legacy callers, raising on any failure."""
+
+        def requests() -> Iterator[GenerationRequest[int]]:
+            if images_list is None:
+                for index, query in enumerate(queries):
+                    yield GenerationRequest(key=index, prompt_or_memory=query)
+                return
+
+            missing = object()
+            for index, pair in enumerate(
+                zip_longest(queries, images_list, fillvalue=missing)
+            ):
+                query, images = pair
+                if query is missing or images is missing:
+                    raise ValueError("queries and images_list must have equal lengths")
+                if isinstance(images, str):
+                    normalized_images: Optional[List[str]] = [images]
+                elif images is None:
+                    normalized_images = None
+                else:
+                    normalized_images = list(images)
+                yield GenerationRequest(
+                    key=index,
+                    prompt_or_memory=query,
+                    images=normalized_images,
                 )
-            return [self.generate(queries[0], images_list[0] if images_list else None)]
-        results = [None] * len(queries)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
-                executor.submit(
-                    self.generate, queries[i], images_list[i] if images_list else None
-                ): i
-                for i in range(len(queries))
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    results[idx] = f"Error: {e}"
+
+        results: List[str] = []
+        failures: List[GenerationResult[int]] = []
+        for outcome in self.iter_generation_results(
+            requests(),
+            max_workers=max_workers,
+            max_in_flight=max_in_flight,
+        ):
+            if outcome.ok:
+                results.append(outcome.unwrap())
+            else:
+                failures.append(outcome)
+        if failures:
+            raise BatchGenerationError(failures)
         return results
+
+    def close(self) -> None:
+        """Release the selected VLM controller idempotently."""
+
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        controller = getattr(self, "vlm", None)
+        self.vlm = None
+        if controller is None:
+            return
+        close = getattr(controller, "close", None)
+        if callable(close):
+            close()
+        else:  # compatibility with injected/older controllers
+            _close_controller_client(controller)
 
 
 if __name__ == "__main__":

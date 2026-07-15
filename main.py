@@ -1,13 +1,16 @@
 import logging
 import argparse
+import os
+from contextlib import contextmanager
 import pandas as pd
 import yaml
 from pathlib import Path
 import time
-import math
+from typing import Iterator
+from urllib.parse import urlsplit
 from rich.logging import RichHandler
 
-from Core.configs.system_config import load_system_config, SystemConfig
+from Core.configs.system_config import load_system_config, SourceIdentity, SystemConfig
 from Core.configs.dataset_config import load_dataset_config, DatasetConfig
 from Core.construct_index import (
     construct_GBC_index,
@@ -16,9 +19,66 @@ from Core.construct_index import (
     rebuild_graph_vdb,
 )
 from Core.inference import inference
-from Core.provider.TokenTracker import TokenTracker
+from Core.pipelines.doc_tree_builder import CanonicalIngestionProvider
+from docarag.run_logging import RunLogInfo, RunLogScope
+from docarag.sharding import document_shard_number
 
 log = logging.getLogger(__name__)  # Get logger for main
+
+_SENSITIVE_CONFIG_KEYS = {
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "access_token",
+    "refresh_token",
+}
+
+
+def redact_config(value):
+    """Return a log-safe copy without changing the runtime configuration."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "***REDACTED***"
+                if str(key).casefold() in _SENSITIVE_CONFIG_KEYS
+                else redact_config(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_config(item) for item in value]
+    return value
+
+
+def write_config_snapshot(path: Path, config: SystemConfig) -> None:
+    """Atomically write, or safely reuse, an owner-only config snapshot."""
+
+    payload = yaml.safe_dump(config.model_dump(), allow_unicode=True)
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        if existing != payload:
+            raise RuntimeError(
+                f"Refusing to overwrite a different run configuration: {path}"
+            )
+        path.chmod(0o400)
+        return
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(temporary, "x", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o400)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def create_args():
@@ -119,7 +179,21 @@ def create_args():
     return parser.parse_args()
 
 
-def build_index(config: SystemConfig, stage: str = "all", data_df: pd.DataFrame = None):
+def build_index(
+    config: SystemConfig,
+    stage: str = "all",
+    data_df: pd.DataFrame = None,
+    *,
+    parsing_provider: CanonicalIngestionProvider | None = None,
+):
+    """Build BookRAG artifacts from the legacy or injected ingestion path.
+
+    ``parsing_provider=None`` preserves the supported MinerU compatibility
+    behavior.  A composition root may inject a routed canonical provider.  In
+    an ``all`` build the provider is consumed only by the tree stage; graph and
+    vector stages read the already source-bound tree and therefore never parse
+    the document a second or third time.
+    """
     log.info(
         f"  - build_index called. Indexing '{config.pdf_path}' into '{config.save_path}'"
     )
@@ -128,28 +202,109 @@ def build_index(config: SystemConfig, stage: str = "all", data_df: pd.DataFrame 
     if stage in ["tree", "all"]:
         log.info("  - STAGE: Building Document Tree...")
         # This function should build the tree and save it to config.save_path
-        construct_GBC_index(config, tree_only=True)
+        construct_GBC_index(
+            config,
+            tree_only=True,
+            parsing_provider=parsing_provider,
+        )
 
     # Stage 2: Build the Knowledge Graph
     if stage in ["graph", "all"]:
         log.info("  - STAGE: Building Knowledge Graph...")
         # This function should LOAD the pre-existing tree and then build/save the graph
         graph_flag = stage == "graph"
-        construct_GBC_index(config, graph_only=graph_flag)
+        construct_GBC_index(
+            config,
+            graph_only=graph_flag,
+            parsing_provider=(parsing_provider if stage == "graph" else None),
+        )
 
     # Stage 3: Build the Vector Database
     if stage in ["vdb", "all"]:
         log.info("  - STAGE: Building Vector Database...")
         # This function should LOAD the pre-existing tree and then build/save the VDB
-        construct_vdb(config)
+        construct_vdb(
+            config,
+            parsing_provider=(parsing_provider if stage == "vdb" else None),
+        )
 
     if stage == "mm_reranker":
         log.info("  - STAGE: Building MM Reranker Embedding...")
-        compute_mm_reranker(config, data_df)
+        compute_mm_reranker(
+            config,
+            data_df,
+            parsing_provider=parsing_provider,
+        )
     
     if stage == "rebuild_graph_vdb":
         log.info("  - STAGE: Rebuilding Graph VDB...")
         rebuild_graph_vdb(config)
+
+
+@contextmanager
+def routed_parsing_provider(stage: str) -> Iterator[CanonicalIngestionProvider | None]:
+    """Build the explicitly selected routed runtime for the parse-bearing stage.
+
+    The detached controller exports an immutable profile snapshot.  Every
+    digest is revalidated inside the BookRAG interpreter before any worker is
+    contacted.  Graph/vector-only subprocesses deliberately reuse the verified
+    canonical tree without reacquiring parser models or GPU memory.
+    """
+
+    profile_path = os.environ.get("DOCARAG_ROUTED_PROFILE")
+    if not profile_path or stage not in {"tree", "all"}:
+        yield None
+        return
+
+    from docarag.routed_profile import load_routed_runtime_profile
+    from docarag.runtime_composition import build_balanced_routed_runtime
+
+    profile = load_routed_runtime_profile(profile_path)
+    issues = profile.configuration_issues()
+    if issues:
+        rendered = "; ".join(
+            f"{item.runtime_id}.{item.field}: {item.message}" for item in issues
+        )
+        raise RuntimeError(
+            "routed parser profile is not configuration-ready: " + rendered
+        )
+    expected = (
+        ("profile_id", os.environ.get("DOCARAG_ROUTED_PROFILE_ID"), profile.profile_id),
+        (
+            "source_sha256",
+            os.environ.get("DOCARAG_ROUTED_PROFILE_SOURCE_SHA256"),
+            profile.source_sha256,
+        ),
+        (
+            "configuration_sha256",
+            os.environ.get("DOCARAG_ROUTED_PROFILE_CONFIGURATION_SHA256"),
+            profile.configuration_sha256,
+        ),
+    )
+    for field_name, supplied, actual in expected:
+        if not supplied:
+            raise RuntimeError(
+                f"routed indexing is missing immutable {field_name} binding"
+            )
+        if supplied != actual:
+            raise RuntimeError(
+                f"routed parser profile {field_name} differs from the admitted revision"
+            )
+
+    runtime = build_balanced_routed_runtime(profile.config)
+    try:
+        identities = ", ".join(
+            f"{item.adapter_name}@{item.adapter_version}"
+            for item in runtime.worker_identities
+        )
+        log.info(
+            "Routed canonical ingestion ready from profile %s (%s)",
+            profile.profile_id,
+            identities,
+        )
+        yield runtime.provider
+    finally:
+        runtime.close()
 
 
 def run_inference(config: SystemConfig, data_df: pd.DataFrame, dataset_name: str):
@@ -161,85 +316,193 @@ def run_inference(config: SystemConfig, data_df: pd.DataFrame, dataset_name: str
     )
 
 
-def setup_logging(save_path: str, config_to_log: SystemConfig):
+@contextmanager
+def setup_logging(
+    save_path: str,
+    config_to_log: SystemConfig,
+) -> Iterator[RunLogInfo]:
     """
-    Sets up the root logger to output to both a Rich console and a timestamped file.
-    A new log file is created for each run inside the specified save_path.
+    Isolate this run's logs without altering the process root logger.
+
+    File records carry a context-local run ID, so concurrent requests cannot
+    leak into another document's log.  An embedding application that already
+    owns console logging remains in control of it.
 
     :param save_path: The base directory for the current run, where logs will be saved.
     :param config_to_log: The configuration object to be logged at the start.
     """
-    log_dir = Path(save_path) / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate a timestamped log file name
-    log_file = log_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}.log"
-
-    # It's better to get the root logger and configure it directly
-    # than to use basicConfig, especially for re-configuration.
     root_logger = logging.getLogger()
+    console_handler = None
+    if not root_logger.handlers:
+        console_handler = RichHandler(rich_tracebacks=True, show_path=False)
 
-    # Clear any existing handlers to prevent duplicate logging
-    if root_logger.hasHandlers():
-        root_logger.handlers.clear()
-
-    root_logger.setLevel(logging.INFO)
-
-    # --- Create Handlers ---
-    # 1. RichHandler for beautiful console output
-    console_handler = RichHandler(rich_tracebacks=True, show_path=False)
-
-    # 2. FileHandler for saving logs to a file
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="[%X]"
+    scope = RunLogScope(
+        save_path,
+        logger_names=("Core", "docarag", log.name),
+        console_handler=console_handler,
     )
-    file_handler.setFormatter(file_formatter)
+    with scope as run_info:
+        log.info(
+            "Logging initialized for run %s. Log file: %s",
+            run_info.run_id,
+            run_info.log_file,
+        )
+        config_dict = redact_config(config_to_log.model_dump())
+        config_yaml_string = yaml.safe_dump(
+            config_dict,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
+        log.info("--- Starting Run with Configuration ---\n%s", config_yaml_string)
+        try:
+            yield run_info
+        except BaseException:
+            log.exception("Run %s failed", run_info.run_id)
+            raise
 
-    # --- Add Handlers to the Root Logger ---
-    root_logger.addHandler(console_handler)
-    root_logger.addHandler(file_handler)
 
-    # --- Log the Initial Configuration ---
-    # Get a logger instance for this setup function
-    log = logging.getLogger("LoggerSetup")
-    log.info(f"Logging initialized. Log file will be saved to: {log_file}")
+def process_document(
+    base_system_cfg: SystemConfig,
+    dataset_cfg: DatasetConfig,
+    args,
+    doc_uuid,
+    doc_path,
+    group: pd.DataFrame,
+) -> None:
+    """Process one document, allowing the caller to aggregate any failure."""
+    current_config = base_system_cfg.model_copy(deep=True)
+    pdf_full_path = Path(doc_path)
+    output_full_path = Path(dataset_cfg.working_dir) / str(doc_uuid)
 
-    # Prettify the config output using yaml.dump
-    config_dict = config_to_log.model_dump()
-    config_yaml_string = yaml.dump(
-        config_dict, allow_unicode=True, default_flow_style=False
+    current_config.pdf_path = str(pdf_full_path)
+    current_config.save_path = str(output_full_path)
+    first_row = group.iloc[0]
+    original_uri = first_row.get("source_uri")
+    display_name = first_row.get("source_name")
+    source_sha256 = first_row.get("source_sha256")
+    if not isinstance(original_uri, str) or not original_uri:
+        original_uri = pdf_full_path.expanduser().resolve().as_uri()
+    elif not urlsplit(original_uri).scheme:
+        original_uri = Path(original_uri).expanduser().resolve().as_uri()
+    if not isinstance(display_name, str) or not display_name:
+        display_name = Path(original_uri).name or pdf_full_path.name
+    if not isinstance(source_sha256, str) or not source_sha256:
+        source_sha256 = None
+    document_id = first_row.get("document_id")
+    document_version_id = first_row.get("document_version_id")
+    index_revision_id = first_row.get("index_revision_id")
+    tenant_id = first_row.get("tenant_id")
+    corpus_id = first_row.get("corpus_id")
+    if not isinstance(index_revision_id, str) or not index_revision_id:
+        index_revision_id = str(doc_uuid)
+    if str(doc_uuid) != index_revision_id:
+        raise ValueError("dataset doc_uuid must equal index_revision_id")
+    for field_name, supplied, configured in (
+        ("tenant_id", tenant_id, current_config.vdb.tenant_id),
+        ("corpus_id", corpus_id, current_config.vdb.corpus_id),
+    ):
+        if isinstance(supplied, str) and supplied and supplied != configured:
+            raise ValueError(
+                f"dataset {field_name} differs from the configured PostgreSQL/Qdrant scope"
+            )
+
+    if source_sha256 is not None:
+        from docarag.domain.evidence import DocumentRef
+
+        expected_document = DocumentRef.identified(
+            content_sha256=source_sha256,
+            mime_type="application/pdf",
+            source_uri=original_uri,
+            display_name=display_name,
+        )
+        supplied_ids = (document_id, document_version_id)
+        if any(isinstance(value, str) and value for value in supplied_ids):
+            if (
+                document_id != expected_document.document_id
+                or document_version_id != expected_document.document_version_id
+            ):
+                raise ValueError(
+                    "dataset document IDs do not match source_uri and source_sha256"
+                )
+        document_id = expected_document.document_id
+        document_version_id = expected_document.document_version_id
+        for field_name, configured, expected in (
+            ("document_id", current_config.vdb.document_id, document_id),
+            (
+                "document_version_id",
+                current_config.vdb.document_version_id,
+                document_version_id,
+            ),
+            (
+                "index_revision_id",
+                current_config.vdb.index_revision_id,
+                index_revision_id,
+            ),
+        ):
+            if configured is not None and configured != expected:
+                raise ValueError(
+                    f"configured {field_name} differs from the dataset/source identity"
+                )
+        current_config.vdb.document_id = document_id
+        current_config.vdb.document_version_id = document_version_id
+        current_config.vdb.index_revision_id = index_revision_id
+    elif any(
+        isinstance(value, str) and value for value in (document_id, document_version_id)
+    ):
+        raise ValueError("dataset document IDs require source_sha256")
+    current_config.source = SourceIdentity(
+        display_name=display_name,
+        original_uri=original_uri,
+        sha256=source_sha256,
+        snapshot_path=str(pdf_full_path),
+        document_id=document_id if isinstance(document_id, str) else None,
+        document_version_id=(
+            document_version_id if isinstance(document_version_id, str) else None
+        ),
+        index_revision_id=index_revision_id,
     )
-    log.info(f"--- Starting Run with Configuration ---\n{config_yaml_string}")
 
+    output_full_path.mkdir(parents=True, exist_ok=True)
+    with setup_logging(
+        save_path=current_config.save_path,
+        config_to_log=current_config,
+    ):
+        log.info(f"--- Processing Document UUID: {doc_uuid} ---")
+        log.info(f"  - PDF Path: {pdf_full_path}")
+        log.info(f"  - Save Path: {output_full_path}")
 
-def process_resource(base_system_cfg: SystemConfig, args):
-    # Ensure the nested models exist before assigning
-    base_system_cfg.mineru.server_url = "http://localhost:30001"
+        data_df = group.reset_index(drop=True)
+        if args.command == "index":
+            config_snapshot_path = output_full_path / "run_config.yaml"
+            write_config_snapshot(config_snapshot_path, current_config)
+            log.info(f"  - Saved index config snapshot to: {config_snapshot_path}")
+            with routed_parsing_provider(args.stage) as parsing_provider:
+                build_index(
+                    config=current_config,
+                    stage=args.stage,
+                    data_df=data_df,
+                    parsing_provider=parsing_provider,
+                )
+            return
 
-    # For Graph construction
-    # base_system_cfg.graph.reranker_config.api_base = "http://localhost:8010/v1"
-    # base_system_cfg.llm.api_base = "http://10.26.1.21:8002/v1"
-    # base_system_cfg.llm.api_base = "http://localhost:8003/v1"
-
-    if base_system_cfg.rag.strategy_config.strategy == "mmr":
-        base_system_cfg.rag.strategy_config.vdb_config.embedding_config.device = (
-            "cuda:4"
+        rag_strategy = current_config.rag.strategy_config.strategy
+        config_snapshot_path = output_full_path / f"rag_config_{rag_strategy}.yaml"
+        write_config_snapshot(config_snapshot_path, current_config)
+        log.info(f"  - Saved RAG config snapshot to: {config_snapshot_path}")
+        run_inference(
+            config=current_config,
+            data_df=data_df,
+            dataset_name=dataset_cfg.dataset_name,
         )
 
-    # For GBC inference
-    if base_system_cfg.rag.strategy_config.strategy == "gbc":
-        base_system_cfg.rag.strategy_config.mm_reranker_config.device = "cuda:3"
 
-    if args.debug and base_system_cfg.rag.strategy_config.strategy == "gbc":
-        base_system_cfg.rag.strategy_config.mm_reranker_config.device = "cuda:3"
-
-    return base_system_cfg
-
-
-def main():
+def main() -> int:
     """
-    The main function to run the script.
+    Run the requested command and return a process exit code.
+
+    Batch document failures are collected so that one bad document does not prevent
+    the remaining documents in the split from being attempted.  A non-zero result is
+    returned after the split finishes if any document failed.
     """
     args = create_args()
 
@@ -250,18 +513,22 @@ def main():
 
     base_system_cfg: SystemConfig = load_system_config(args.config)
 
-    token_tracker = TokenTracker.get_instance()
-    token_tracker.reset()
-
-    if args.num % 2 == 0 or args.debug:
-        # modify the device config for mineru, embedding, reranker
-        # assign 30001 to a half of the num
-        log.info(
-            f"  - Split {args.num}: Overriding mineru.server_url to http://localhost:30001"
-        )
-        base_system_cfg = process_resource(base_system_cfg, args)
-
     if args.dataset_config:
+        if (
+            isinstance(args.nsplit, bool)
+            or not isinstance(args.nsplit, int)
+            or args.nsplit < 1
+            or isinstance(args.num, bool)
+            or not isinstance(args.num, int)
+            or args.num < 1
+            or args.num > args.nsplit
+        ):
+            print(
+                f"  - ERROR: --num ({args.num}) must be between 1 and "
+                f"--nsplit ({args.nsplit}), and --nsplit must be positive."
+            )
+            return 1
+
         dataset_cfg: DatasetConfig = load_dataset_config(args.dataset_config)
 
         # 1. Load the entire dataset from the JSON file into a pandas DataFrame
@@ -271,109 +538,48 @@ def main():
             print(f"Dataset shape: {df.shape}")
         except FileNotFoundError:
             log.error(f"ERROR: Dataset file not found at '{dataset_cfg.dataset_path}'")
-            return
+            return 1
         except Exception as e:
             log.error(f" ERROR: Failed to parse JSON file. Reason: {e}")
-            return
+            return 1
 
         # 2. Group by document identifiers to find unique documents
-        document_groups = df.groupby(["doc_uuid", "doc_path"])
-        print(f"  - Found {len(document_groups)} unique documents in the dataset.")
-
-        # Convert groupby object to a list to allow slicing
-        all_groups = list(document_groups)
-        total_docs = len(all_groups)
-
-        if args.num > args.nsplit or args.num <= 0:
-            print(
-                f"  - ERROR: --num ({args.num}) must be between 1 and --nsplit ({args.nsplit})."
-            )
-            return
-
-        # Calculate the start and end index for the current split
-        items_per_split = math.ceil(total_docs / args.nsplit)
-        start_index = (args.num - 1) * items_per_split
-        end_index = min(
-            start_index + items_per_split, total_docs
-        )  # Ensure we don't go past the end
-
-        docs_to_process = all_groups[start_index:end_index]
+        document_groups = df.groupby(["doc_uuid", "doc_path"], sort=False)
+        total_docs = document_groups.ngroups
+        selected_docs = sum(
+            1
+            for doc_uuid, doc_path in document_groups.indices
+            if document_shard_number(doc_uuid, doc_path, args.nsplit) == args.num
+        )
+        print(f"  - Found {total_docs} unique documents in the dataset.")
 
         print(
-            f" This worker (split {args.num}/{args.nsplit}) will process {len(docs_to_process)} documents (from index {start_index} to {end_index-1})."
+            f" This worker (stable shard {args.num}/{args.nsplit}) will process "
+            f"{selected_docs} documents."
         )
 
         # 3. Loop over each unique document group
         index_error_list = []
         rag_error_list = []
 
-        for (doc_uuid, doc_path), group in docs_to_process:
-            if args.debug and doc_uuid != "fe4f4a15-bc6c-5bf1-a21d-7fe10130b991":
+        for (doc_uuid, doc_path), group in document_groups:
+            if document_shard_number(doc_uuid, doc_path, args.nsplit) != args.num:
                 continue
-
-            # a. Create a deep copy of the base config for this specific document run.
-            current_config = base_system_cfg.model_copy(deep=True)
-
-            # b. Dynamically set the paths based on the dataset's content
-            # The doc_path from JSON is the source PDF
-            pdf_full_path = Path(doc_path)
-            output_full_path = Path(dataset_cfg.working_dir) / str(
-                doc_uuid
-            )  # working_dir + uuid = save_path
-
-            current_config.pdf_path = str(pdf_full_path)
-            current_config.save_path = str(output_full_path)
-
-            setup_logging(
-                save_path=current_config.save_path, config_to_log=current_config
-            )
-
-            log.info(f"--- Processing Document UUID: {doc_uuid} ---")
-            log.info(f"  - PDF Path: {pdf_full_path}")
-            log.info(f"  - Save Path: {output_full_path}")
-
-            # d. Ensure output directory exists and save a config snapshot for reproducibility
-            output_full_path.mkdir(parents=True, exist_ok=True)
-
-            if args.command == "index":
-                # For indexing, save the general run_config.yaml
-                config_snapshot_path = output_full_path / "run_config.yaml"
-                with open(config_snapshot_path, "w", encoding="utf-8") as f:
-                    yaml.dump(current_config.model_dump(), f, allow_unicode=True)
-                log.info(f"  - Saved index config snapshot to: {config_snapshot_path}")
-
-                try:
-                    data_df = group.reset_index(drop=True)
-                    build_index(
-                        config=current_config, stage=args.stage, data_df=data_df
-                    )
-                except Exception as e:
+            try:
+                process_document(
+                    base_system_cfg=base_system_cfg,
+                    dataset_cfg=dataset_cfg,
+                    args=args,
+                    doc_uuid=doc_uuid,
+                    doc_path=doc_path,
+                    group=group,
+                )
+            except Exception as e:
+                if args.command == "index":
                     log.error(f"  - ERROR: Failed to build index. Reason: {e}")
                     index_error_list.append((doc_uuid, str(e)))
-
-            elif args.command == "rag":
-                # For RAG, create a strategy-specific config name
-                # We assume the path to the strategy is like: cfg.rag.strategy_config.strategy
-                rag_strategy = current_config.rag.strategy_config.strategy
-                config_snapshot_filename = f"rag_config_{rag_strategy}.yaml"
-                config_snapshot_path = output_full_path / config_snapshot_filename
-
-                with open(config_snapshot_path, "w", encoding="utf-8") as f:
-                    yaml.dump(current_config.model_dump(), f, allow_unicode=True)
-                log.info(f"  - Saved RAG config snapshot to: {config_snapshot_path}")
-
-                dataset_name = dataset_cfg.dataset_name
-                data_df = group.reset_index(drop=True)
-                try:
-                    run_inference(
-                        config=current_config,
-                        data_df=data_df,
-                        dataset_name=dataset_name,
-                    )
-                except Exception as e:
-                    import traceback
+                else:
                     log.error(f"  - ERROR: Failed to run inference. Reason: {e}")
-                    log.error(traceback.format_exc())
                     rag_error_list.append((doc_uuid, str(e)))
 
         # get the base directory of the script
@@ -389,7 +595,7 @@ def main():
             with open(error_log_path, "w", encoding="utf-8") as f:
                 for item in index_error_list:
                     f.write(f"{item}\n")
-            log.info(
+            log.error(
                 f"  - Indexing completed with errors. See {error_log_path} for details."
             )
 
@@ -401,34 +607,59 @@ def main():
             with open(error_log_path, "w", encoding="utf-8") as f:
                 for item in rag_error_list:
                     f.write(f"{item}\n")
-            log.info(
+            log.error(
                 f"  - RAG completed with errors. See {error_log_path} for details."
             )
         log.info(f"--- All documents in this split processed. ---\n")
+
+        failure_count = len(index_error_list) + len(rag_error_list)
+        if failure_count:
+            log.error(
+                "  - Split %s/%s completed with %s document failure(s).",
+                args.num,
+                args.nsplit,
+                failure_count,
+            )
+            return 1
+
+        return 0
     else:
         # SINGLE FILE MODE
 
-        setup_logging(
-            save_path=base_system_cfg.save_path, config_to_log=base_system_cfg
-        )
+        with setup_logging(
+            save_path=base_system_cfg.save_path,
+            config_to_log=base_system_cfg,
+        ):
+            log.info(f"🚀 No dataset config provided. Starting SINGLE mode...")
+            log.info(f"  - Using paths and settings from '{args.config}'")
 
-        log.info(f"🚀 No dataset config provided. Starting SINGLE mode...")
-        log.info(f"  - Using paths and settings from '{args.config}'")
+            if args.command == "index":
+                with routed_parsing_provider(args.stage) as parsing_provider:
+                    build_index(
+                        config=base_system_cfg,
+                        stage=args.stage,
+                        parsing_provider=parsing_provider,
+                    )
 
-        if args.command == "index":
-            build_index(config=base_system_cfg)
+            elif args.command == "rag":
+                # Check if the --query argument was provided
+                if args.query:
+                    log.info(f"  - Running inference on single query: '{args.query}'")
+                    query_df = pd.DataFrame([{"question": args.query}])
+                    run_inference(
+                        config=base_system_cfg,
+                        data_df=query_df,
+                        dataset_name="single",
+                    )
+                else:
+                    log.error(
+                        "  - ERROR: RAG command in single mode requires a query."
+                    )
+                    log.error("  - Please provide one with the -q/--query argument.")
+                    return 1
 
-        elif args.command == "rag":
-            # Check if the --query argument was provided
-            if args.query:
-                log.info(f"  - Running inference on single query: '{args.query}'")
-                # Note: run_inference expects a list of queries, so we wrap the single query in a list
-                run_inference(config=base_system_cfg, queries=[args.query])
-            else:
-                # If no query is provided, print a helpful message and exit.
-                log.error("  - ERROR: RAG command in single mode requires a query.")
-                log.error("  - Please provide one with the -q/--query argument.")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

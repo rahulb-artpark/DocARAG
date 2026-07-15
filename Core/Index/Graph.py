@@ -1,6 +1,7 @@
 import networkx as nx
 from networkx.readwrite import json_graph
 import os
+import heapq
 from collections import defaultdict
 from typing import Iterable, Union, Set, List
 from numpy import source
@@ -141,9 +142,21 @@ class Graph:
             entities = [entities]
         for entity in entities:
             node_name = self.get_node_name_from_entity(entity)
-            # node_name = f"{entity.entity_name} ({entity.entity_type})"
+            source_ids = set(entity.source_ids)
+            source_ids.add(tree_node_id)
             if node_name not in self.kg:
-                self.add_kg_node(entity)
+                self.add_kg_node(
+                    entity.model_copy(update={"source_ids": source_ids})
+                )
+            else:
+                existing = self.kg.nodes[node_name].get("source_ids", set())
+                try:
+                    source_ids.update(existing or ())
+                except TypeError as exc:
+                    raise ValueError(
+                        f"Entity '{node_name}' has invalid source_ids"
+                    ) from exc
+                self.kg.nodes[node_name]["source_ids"] = source_ids
             self.link(tree_node_id, entity.entity_name, entity.entity_type)
 
     def update_entity(
@@ -233,26 +246,79 @@ class Graph:
         sub = self.kg.subgraph(kg_nodes)
         return sub.copy() if copy else sub
 
-    def get_subgraph_data(self, entities: List[str]) -> dict:
-        # Return the subgraph entities data, excluding description and source_ids in entities
-        # If the relation connects two entities in the subgraph, it will be included
+    def get_subgraph_data(self, entities: List[str], max_edges: int = 64) -> dict:
+        """Return bounded, evidence-bearing entity and relation data.
+
+        Relation selection is ``O(E log max_edges)`` time and ``O(max_edges)``
+        memory, favoring relations with stronger weight and source provenance.
+        Counts retain an explicit trace that the answer-facing view was bounded.
+        """
+        if max_edges < 0:
+            raise ValueError("max_edges must be non-negative")
         subgraph = self.kg.subgraph(entities)
-        # data = {"nodes": [], "edges": []}
-        data = {"nodes": []}
-        for node in subgraph.nodes(data=True):
+
+        def normalized_source_ids(value) -> list:
+            if value is None:
+                return []
+            if isinstance(value, (str, bytes)):
+                value = [value]
+            try:
+                return sorted(set(value), key=lambda item: (str(type(item)), str(item)))
+            except TypeError:
+                return [value]
+
+        def numeric_weight(value) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        data = {
+            "nodes": [],
+            "edges": [],
+            "edge_count_total": subgraph.number_of_edges(),
+            "edges_truncated": False,
+        }
+        for node_name, attributes in subgraph.nodes(data=True):
             node_data = {
-                "entity_name": node[1]["entity_name"],
-                "entity_type": node[1]["entity_type"],
+                "node_name": node_name,
+                "entity_name": attributes.get("entity_name", ""),
+                "entity_type": attributes.get("entity_type", ""),
+                "description": attributes.get("description", ""),
+                "source_ids": normalized_source_ids(attributes.get("source_ids")),
             }
             data["nodes"].append(node_data)
-        # for edge in subgraph.edges(data=True):
-        #     edge_data = {
-        #         "src_entity_name": edge[2]["src_entity_name"],
-        #         "tgt_entity_name": edge[2]["tgt_entity_name"],
-        #         "relation_name": edge[2]["relation_name"],
-        #         "weight": edge[2]["weight"],
-        #     }
-        #     data["edges"].append(edge_data)
+        selected_edges = []
+        for ordinal, (source, target, attributes) in enumerate(
+            subgraph.edges(data=True)
+        ):
+            edge_data = {
+                "source_node": source,
+                "target_node": target,
+                "src_entity_name": attributes.get("src_entity_name", ""),
+                "tgt_entity_name": attributes.get("tgt_entity_name", ""),
+                "relation_name": attributes.get("relation_name", ""),
+                "description": attributes.get("description", ""),
+                "weight": attributes.get("weight", 0.0),
+                "source_ids": normalized_source_ids(attributes.get("source_ids")),
+            }
+            source_count = len(edge_data["source_ids"])
+            score = (
+                numeric_weight(edge_data["weight"]),
+                source_count,
+                bool(edge_data["description"]),
+                str(edge_data["relation_name"]),
+                str(source),
+                str(target),
+            )
+            candidate = (score, ordinal, edge_data)
+            if len(selected_edges) < max_edges:
+                heapq.heappush(selected_edges, candidate)
+            elif max_edges and candidate[:2] > selected_edges[0][:2]:
+                heapq.heapreplace(selected_edges, candidate)
+        selected_edges.sort(key=lambda item: item[:2], reverse=True)
+        data["edges"] = [edge for _, _, edge in selected_edges]
+        data["edges_truncated"] = data["edge_count_total"] > len(selected_edges)
         return data
 
     def Entities2TreeNodes(self, entities: List[Entity]) -> List[int]:
@@ -261,10 +327,8 @@ class Graph:
         """
         result = set()
         for ent in entities:
-            source_ids = ent.source_ids
-            result.union(source_ids)
-        result = list(result)
-        return result
+            result.update(ent.source_ids)
+        return sorted(result)
 
     def Entity2TreeNodes(self, ent: Entity) -> List[int]:
         """
@@ -339,9 +403,14 @@ class Graph:
         with open(load_path, "r", encoding="utf-8") as f:
             loaded_data = json.load(f)
 
-        graph_instance = cls(save_path=load_dir)
+        graph_instance = cls(save_path=load_dir, variant=variant)
 
-        graph_instance.kg = json_graph.node_link_graph(loaded_data["graph"])
+        # Match ``save_graph(edges="links")`` explicitly. NetworkX 3.6 changes
+        # the default edge-key name, so relying on the library default would
+        # make existing BookRAG graph artifacts version-sensitive.
+        graph_instance.kg = json_graph.node_link_graph(
+            loaded_data["graph"], edges="links"
+        )
 
         for _, node_data in graph_instance.kg.nodes(data=True):
             if "source_ids" in node_data and isinstance(node_data["source_ids"], list):

@@ -7,6 +7,7 @@ from Core.provider.vdb import VectorStore
 from Core.provider.vlm import VLM
 from Core.provider.llm import LLM
 from Core.rag.base_rag import BaseRAG
+from Core.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
 from Core.configs.rag.vanilla_config import VanillaConfig
 from Core.utils.bm25 import BM25
 from Core.utils.utils import TextProcessor
@@ -71,6 +72,22 @@ class VanillaRAG(BaseRAG):
         context_text = context_text[0]  # take the first chunk only
         return context_text
 
+    @staticmethod
+    def _select_usable_evidence(retrieved_docs) -> List[Dict[str, Any]]:
+        """Keep only retrieval records containing non-blank textual evidence."""
+
+        usable: List[Dict[str, Any]] = []
+        for doc in retrieved_docs or ():
+            if not isinstance(doc, dict):
+                log.warning("Skipping malformed text retrieval record")
+                continue
+            content = doc.get("content")
+            if not isinstance(content, str) or not content.strip():
+                log.warning("Skipping blank text retrieval record %s", doc.get("id"))
+                continue
+            usable.append(doc)
+        return usable
+
     def _save_retrieval_res(self, context_nodes, query_output_dir) -> List[Dict]:
         retrieval_ids = []
         for doc in context_nodes:
@@ -107,22 +124,41 @@ class VanillaRAG(BaseRAG):
         """
         retrieved_docs = self._retrieve(query, top_k=self.topk)
         if not retrieved_docs:
-            # not found any relevant documents, fallback to LLM generation
-            final_answer = self.llm.get_completion(query, json_response=False)
-            return final_answer, []
+            log.warning("No retrieval evidence found; refusing an ungrounded answer")
+            return NO_RETRIEVED_EVIDENCE_ANSWER, []
 
-        context_text = self._create_augmented_prompt(query, retrieved_docs)
+        usable_docs = self._select_usable_evidence(retrieved_docs)
+        if not usable_docs:
+            log.warning(
+                "Retrieved text records contained no usable evidence; refusing "
+                "an ungrounded answer"
+            )
+            return NO_RETRIEVED_EVIDENCE_ANSWER, []
+
+        context_text = self._create_augmented_prompt(query, usable_docs)
 
         final_answer = self.llm.get_completion(context_text, json_response=False)
 
         retrieval_ids = self._save_retrieval_res(
-            retrieved_docs, query_output_dir=query_output_dir
+            usable_docs, query_output_dir=query_output_dir
         )
         return final_answer, retrieval_ids
 
     def close(self):
-        if self.cfg.retrieval_method == "bm25":
-            log.info("Closing BM25 resources...")
-            self.bm25.close()
-        else:
-            self.vdb.embedding_model.close()
+        try:
+            if self.cfg.retrieval_method == "bm25":
+                bm25 = getattr(self, "bm25", None)
+                self.bm25 = None
+                if bm25 is not None:
+                    log.info("Closing BM25 resources...")
+                self._close_owned_resources(("BM25", bm25))
+            else:
+                store = getattr(self, "vdb", None)
+                self.vdb = None
+                embedder = getattr(store, "embedding_model", None)
+                self._close_owned_resources(
+                    ("vector embedder", embedder),
+                    ("vector store", store),
+                )
+        finally:
+            super().close()

@@ -1,22 +1,22 @@
+from __future__ import annotations
+
 import os
 
-import torch
 import numpy as np
-import pandas as pd
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 import math
 from tqdm import tqdm
 import json
 
 from abc import ABC, abstractmethod
 
-from modelscope import AutoTokenizer, AutoModel
-from transformers import AutoModel as transformer_AutoModel
-import ollama
-import openai
-import torch.nn.functional as F
 import logging
 import gc
+import weakref
+from contextlib import contextmanager
+from threading import Condition, Event, Lock, RLock
+
+from Core.configs.llm_config import _normalize_api_base
 
 log = logging.getLogger(__name__)
 
@@ -34,63 +34,238 @@ class BaseEmbedder(ABC):
         pass
 
 
+class _GmeSharedRuntime:
+    """One heavyweight GME runtime shared by explicit provider handles.
+
+    The owner count is protected by ``GmeEmbeddingProvider._pool_lock``.  The
+    condition protects in-flight calls so the final owner cannot unload model
+    weights while a request is still using them.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device_strategy: str,
+        *,
+        max_active_calls: int = 1,
+    ) -> None:
+        if (
+            isinstance(max_active_calls, bool)
+            or not isinstance(max_active_calls, int)
+            or max_active_calls < 1
+        ):
+            raise ValueError("max_active_calls must be at least 1")
+        self.model_name = model_name
+        self.device_strategy = device_strategy
+        self.max_active_calls = max_active_calls
+        self.owner_count = 0
+        self._active_calls = 0
+        self._waiting_calls = 0
+        self._closing = False
+        self._condition = Condition()
+        self.torch = None
+        self.torch_functional = None
+        self.model = None
+        try:
+            self._load_model()
+        except BaseException:
+            # A failed load is never inserted into the shared pool.  Release
+            # any partially allocated CUDA/model state before propagating it.
+            try:
+                self.release_weights()
+            except Exception:
+                log.exception("Failed to clean a partially loaded GME runtime")
+            raise
+
+    def _load_model(self) -> None:
+        import torch
+        from torch.nn import functional as torch_functional
+        from transformers import AutoModel
+
+        self.torch = torch
+        self.torch_functional = torch_functional
+        self.model = AutoModel.from_pretrained(
+            self.model_name,
+            torch_dtype="auto",
+            trust_remote_code=True,
+            device_map=self.device_strategy,
+            use_fast=True,
+        )
+        self.model.eval()
+
+    def acquire_call(self, *, cancelled=None) -> None:
+        """Admit one bounded inference call or reject a closing owner.
+
+        A single admitted call is the conservative default because concurrent
+        forward passes on one local model can multiply transient GPU memory.
+        ``cancelled`` belongs to the provider handle, allowing its ``close``
+        path to wake a queued call without holding the provider state lock.
+        """
+
+        is_cancelled = cancelled or (lambda: False)
+        with self._condition:
+            while (
+                not self._closing
+                and self.model is not None
+                and not is_cancelled()
+                and self._active_calls >= self.max_active_calls
+            ):
+                self._waiting_calls += 1
+                # This notification also makes admission state observable to
+                # deterministic lifecycle tests and operational diagnostics.
+                self._condition.notify_all()
+                try:
+                    self._condition.wait()
+                finally:
+                    self._waiting_calls -= 1
+
+            if is_cancelled():
+                raise RuntimeError("GME embedding provider closed while waiting")
+            if self._closing or self.model is None:
+                raise RuntimeError("GME embedding runtime is closing")
+            self._active_calls += 1
+
+    def release_call(self) -> None:
+        with self._condition:
+            self._active_calls -= 1
+            if self._active_calls < 0:
+                # This indicates an internal lifecycle error, not a caller
+                # input error.  Restore a valid counter before failing loudly.
+                self._active_calls = 0
+                raise RuntimeError("GME runtime call lease released twice")
+            self._condition.notify_all()
+
+    def notify_waiters(self) -> None:
+        """Wake admission waiters after a provider handle is closed."""
+
+        with self._condition:
+            self._condition.notify_all()
+
+    def wait_until_idle(self) -> None:
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+            while self._active_calls:
+                self._condition.wait()
+
+    def release_weights(self) -> None:
+        model = self.model
+        self.model = None
+        torch_runtime = self.torch
+        self.torch = None
+        self.torch_functional = None
+
+        if model is not None:
+            del model
+        gc.collect()
+        if torch_runtime is not None and torch_runtime.cuda.is_available():
+            torch_runtime.cuda.empty_cache()
+
+
 class GmeEmbeddingProvider(BaseEmbedder):
-    """ """
+    """An owned handle over a keyed, process-local GME model runtime.
+
+    Constructing a provider acquires one ownership reference. Providers with
+    the same ``(model_name, device)`` reuse the heavyweight model, but remain
+    distinct handles and must each be closed. The last close waits for active
+    calls and then unloads the shared weights. Different configurations never
+    silently share a model.
+
+    ``_instance`` remains only as a compatibility hook for old manually
+    constructed test doubles; normal construction no longer uses a singleton.
+    """
 
     MM_EMBEDDER: bool = True
 
-    _instance = None  # 类变量，用于存储唯一的实例
-
-    def __new__(cls, *args, **kwargs):
-        # 如果实例还不存在，就创建一个新的
-        if cls._instance is None:
-            log.info("Creating a new GmeEmbeddingProvider instance...")
-            cls._instance = super(GmeEmbeddingProvider, cls).__new__(cls)
-            # 标记一下，确保 __init__ 只被调用一次
-            cls._instance._initialized = False
-        else:
-            log.info("Returning existing GmeEmbeddingProvider instance.")
-        return cls._instance
+    _instance = None
+    _pool_lock = RLock()
+    _runtime_pool: dict[tuple[str, str], _GmeSharedRuntime] = {}
 
     def __init__(
         self,
         model_name: str = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
         device: str = "auto",
     ):
-        if hasattr(self, "_initialized") and self._initialized:
-            return
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("model_name must be a non-empty string")
+        if not isinstance(device, str) or not device.strip():
+            raise ValueError("device must be a non-empty string")
 
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        self.model_name = model_name
-        self.device_strategy = device.lower()
+        self.model_name = model_name.strip()
+        self.device_strategy = device.strip().lower()
+        self._pool_key = (self.model_name, self.device_strategy)
+        self._state_lock = Lock()
+        self._closed_event = Event()
+        self._runtime = None
+        self._closed = True
+        self._initialized = False
+        self._torch = None
+        self._torch_functional = None
 
         log.info(
-            f"Using local backend (ModelScope) with device strategy: {self.device_strategy}"
+            "Acquiring GME runtime for model=%s device=%s",
+            self.model_name,
+            self.device_strategy,
         )
-        log.info(f"Loading model: {self.model_name}...")
+        with type(self)._pool_lock:
+            runtime = type(self)._runtime_pool.get(self._pool_key)
+            if runtime is None:
+                log.info("Loading a new shared GME model runtime...")
+                try:
+                    runtime = _GmeSharedRuntime(
+                        self.model_name,
+                        self.device_strategy,
+                    )
+                except BaseException:
+                    log.error(
+                        "Error loading GME model '%s'.",
+                        self.model_name,
+                        exc_info=True,
+                    )
+                    raise
+                type(self)._runtime_pool[self._pool_key] = runtime
+                log.info("GME model loaded successfully.")
+            else:
+                log.info("Reusing compatible shared GME model runtime.")
+            runtime.owner_count += 1
 
+        self._runtime = runtime
+        # These aliases preserve the historical inspection surface while all
+        # operations and shutdown decisions remain bound to ``_runtime``.
+        self.model = runtime.model
+        self._torch = runtime.torch
+        self._torch_functional = runtime.torch_functional
+        self._initialized = True
+        self._closed = False
+
+    @contextmanager
+    def _use_runtime(self):
+        with self._state_lock:
+            runtime = self._runtime
+            if self._closed or runtime is None:
+                raise RuntimeError("GME embedding provider is closed")
+            closed_event = self._closed_event
+
+        # Admission can wait behind another handle. Do not retain the provider
+        # lock: close() must be able to cancel this waiter and release its
+        # ownership without deadlocking on the gate.
+        runtime.acquire_call(cancelled=closed_event.is_set)
         try:
-            self.model = transformer_AutoModel.from_pretrained(
-                self.model_name,
-                torch_dtype="auto",
-                trust_remote_code=True,
-                device_map=self.device_strategy,
-                use_fast=True,
-            )
-            self.model.eval()
-            log.info("GME model loaded successfully.")
-            self._initialized = True  # 标记为已初始化
-        except Exception as e:
-            log.error(
-                f"Error loading GME model '{self.model_name}' from ModelScope.",
-                exc_info=True,
-            )
-            raise e
+            yield runtime
+        finally:
+            runtime.release_call()
 
-    def _normalize(self, embeddings: torch.Tensor) -> np.ndarray:
-        """对PyTorch张量进行L2归一化，并转换为numpy数组。"""
-        normalized_embeddings = F.normalize(embeddings, p=2, dim=-1)
+    @staticmethod
+    def _normalize_with_runtime(
+        runtime: _GmeSharedRuntime,
+        embeddings: Any,
+    ) -> np.ndarray:
+        functional = runtime.torch_functional
+        if functional is None:
+            raise RuntimeError("GME embedding provider is closed")
+        normalized_embeddings = functional.normalize(embeddings, p=2, dim=-1)
         return normalized_embeddings.cpu().numpy()
 
     def embed_texts(
@@ -109,20 +284,24 @@ class GmeEmbeddingProvider(BaseEmbedder):
         if not texts or not isinstance(texts, list):
             raise ValueError("Input 'texts' must be a non-empty list of strings.")
 
-        all_embeddings = []
-        with torch.no_grad():
-            for i in tqdm(range(0, len(texts), batch_size), desc="Embedding Texts"):
-                batch_texts = texts[i : i + batch_size]
+        with self._use_runtime() as runtime:
+            torch_runtime = runtime.torch
+            all_embeddings = []
+            with torch_runtime.no_grad():
+                for i in tqdm(
+                    range(0, len(texts), batch_size), desc="Embedding Texts"
+                ):
+                    batch_texts = texts[i : i + batch_size]
 
-                embeddings_tensor = self.model.get_text_embeddings(
-                    texts=batch_texts, instruction=instruction
-                )
-                all_embeddings.append(embeddings_tensor.cpu())
+                    embeddings_tensor = runtime.model.get_text_embeddings(
+                        texts=batch_texts, instruction=instruction
+                    )
+                    all_embeddings.append(embeddings_tensor.cpu())
 
-        # 将所有批次的结果拼接成一个Tensor
-        full_embeddings_tensor = torch.cat(all_embeddings, dim=0)
+            # 将所有批次的结果拼接成一个Tensor
+            full_embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
 
-        return self._normalize(full_embeddings_tensor)
+            return self._normalize_with_runtime(runtime, full_embeddings_tensor)
 
     def embed_images(self, images: List[str], batch_size: int = 4) -> np.ndarray:
         """
@@ -138,17 +317,23 @@ class GmeEmbeddingProvider(BaseEmbedder):
         if not images or not isinstance(images, list):
             raise ValueError("Input 'images' must be a non-empty list of image paths.")
 
-        all_embeddings = []
-        with torch.no_grad():
-            for i in tqdm(range(0, len(images), batch_size), desc="Embedding Images"):
-                batch_images = images[i : i + batch_size]
+        with self._use_runtime() as runtime:
+            torch_runtime = runtime.torch
+            all_embeddings = []
+            with torch_runtime.no_grad():
+                for i in tqdm(
+                    range(0, len(images), batch_size), desc="Embedding Images"
+                ):
+                    batch_images = images[i : i + batch_size]
 
-                embeddings_tensor = self.model.get_image_embeddings(images=batch_images)
-                all_embeddings.append(embeddings_tensor.cpu())
+                    embeddings_tensor = runtime.model.get_image_embeddings(
+                        images=batch_images
+                    )
+                    all_embeddings.append(embeddings_tensor.cpu())
 
-        full_embeddings_tensor = torch.cat(all_embeddings, dim=0)
+            full_embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
 
-        return self._normalize(full_embeddings_tensor)
+            return self._normalize_with_runtime(runtime, full_embeddings_tensor)
 
     def embed_fused(
         self, images: List[str], texts: List[str], batch_size: int = 4
@@ -169,38 +354,93 @@ class GmeEmbeddingProvider(BaseEmbedder):
                 "'texts' and 'images' must be non-empty lists of the same length."
             )
 
-        all_embeddings = []
-        with torch.no_grad():
-            for i in tqdm(range(0, len(texts), batch_size), desc="Embedding Fused"):
-                batch_texts = texts[i : i + batch_size]
-                batch_images = images[i : i + batch_size]
+        with self._use_runtime() as runtime:
+            torch_runtime = runtime.torch
+            all_embeddings = []
+            with torch_runtime.no_grad():
+                for i in tqdm(
+                    range(0, len(texts), batch_size), desc="Embedding Fused"
+                ):
+                    batch_texts = texts[i : i + batch_size]
+                    batch_images = images[i : i + batch_size]
 
-                embeddings_tensor = self.model.get_fused_embeddings(
-                    texts=batch_texts, images=batch_images
-                )
-                all_embeddings.append(embeddings_tensor.cpu())
+                    embeddings_tensor = runtime.model.get_fused_embeddings(
+                        texts=batch_texts, images=batch_images
+                    )
+                    all_embeddings.append(embeddings_tensor.cpu())
 
-        full_embeddings_tensor = torch.cat(all_embeddings, dim=0)
+            full_embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
 
-        return self._normalize(full_embeddings_tensor)
+            return self._normalize_with_runtime(runtime, full_embeddings_tensor)
+
+    @classmethod
+    def _release_runtime(
+        cls,
+        key: tuple[str, str],
+        runtime: _GmeSharedRuntime,
+    ) -> None:
+        with cls._pool_lock:
+            pooled = cls._runtime_pool.get(key)
+            if pooled is not runtime:
+                raise RuntimeError("GME runtime ownership does not match its pool key")
+            runtime.owner_count -= 1
+            if runtime.owner_count < 0:
+                runtime.owner_count = 0
+                raise RuntimeError("GME runtime ownership released twice")
+            if runtime.owner_count:
+                return
+
+            # Keep the key reserved while waiting so a new owner cannot race
+            # with teardown and temporarily allocate duplicate GPU weights.
+            runtime.wait_until_idle()
+            try:
+                runtime.release_weights()
+            finally:
+                cls._runtime_pool.pop(key, None)
+
+    def _close_legacy_unpooled_instance(self) -> None:
+        """Close old manually-constructed doubles without reviving singleton use."""
+
+        if not getattr(self, "_initialized", False):
+            return
+        torch_runtime = getattr(self, "_torch", None)
+        if hasattr(self, "model"):
+            del self.model
+        gc.collect()
+        if torch_runtime is not None and torch_runtime.cuda.is_available():
+            torch_runtime.cuda.empty_cache()
+        self._torch = None
+        self._torch_functional = None
+        self._initialized = False
+        if type(self)._instance is self:
+            type(self)._instance = None
 
     def close(self) -> None:
-        """关闭GmeEmbeddingProvider并释放资源。"""
-        log.info(f"Closing GmeEmbeddingProvider for model: {self.model_name}...")
+        """Release this handle and unload weights only after the last owner."""
 
-        if hasattr(self, "model"):
-            log.info("Releasing GME model resources...")
-            del self.model
+        state_lock = getattr(self, "_state_lock", None)
+        if state_lock is None:
+            self._close_legacy_unpooled_instance()
+            return
 
-            # 如果模型是加载到CUDA上的，清空缓存
-            if torch.cuda.is_available():
-                log.info("Embedder: Emptying CUDA cache.")
-                torch.cuda.empty_cache()
+        with state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._closed_event.set()
+            runtime = self._runtime
+            self._runtime = None
+            key = self._pool_key
+            if hasattr(self, "model"):
+                del self.model
+            self._torch = None
+            self._torch_functional = None
+            self._initialized = False
 
-            gc.collect()
-            log.info("GME model resources released.")
-
-        log.info("GmeEmbeddingProvider closed.")
+        if runtime is not None:
+            runtime.notify_waiters()
+            self._release_runtime(key, runtime)
+        log.info("GmeEmbeddingProvider handle closed.")
 
     def clear_cache(self) -> None:
         """
@@ -208,8 +448,10 @@ class GmeEmbeddingProvider(BaseEmbedder):
         注意：这是一个同步操作，可能会影响性能，请仅在必要时（如处理完一个大任务后）调用。
         """
         log.info("Clearing CUDA cache...")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        with self._use_runtime() as runtime:
+            torch_runtime = runtime.torch
+            if torch_runtime is not None and torch_runtime.cuda.is_available():
+                torch_runtime.cuda.empty_cache()
         gc.collect()
         log.info("CUDA cache cleared.")
 
@@ -290,19 +532,54 @@ class MMRerankerProvider(BaseEmbedder):
         index_path: str,
         model_name: str = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
         device: str = "auto",
+        *,
+        gme_provider: Optional[GmeEmbeddingProvider] = None,
+        owns_gme_provider: Optional[bool] = None,
     ):
+        if owns_gme_provider is not None and not isinstance(
+            owns_gme_provider, bool
+        ):
+            raise ValueError("owns_gme_provider must be a boolean when provided")
+        if gme_provider is None and owns_gme_provider is False:
+            raise ValueError(
+                "an internally-created GME provider must be owned by the reranker"
+            )
+
         self.index_path = index_path
         self.doc_metadata = {}
         self.doc_embeddings = np.array([])
         self.question_embeddings = {}
+        self.gme_provider = gme_provider
+        # Injected resources are borrowed unless ownership is explicitly
+        # transferred. Internally-created provider handles are always owned.
+        self._owns_gme_provider = (
+            True if gme_provider is None else bool(owns_gme_provider)
+        )
+        self._closed = False
 
         log.info(f"Initializing MMRerankerProvider from path: {self.index_path}")
-        self._load_embeddings()
-
-        self.gme_provider = GmeEmbeddingProvider(
-            model_name=model_name,
-            device=device,
-        )
+        try:
+            self._load_embeddings()
+            if self.gme_provider is None:
+                self.gme_provider = GmeEmbeddingProvider(
+                    model_name=model_name,
+                    device=device,
+                )
+        except BaseException:
+            provider = self.gme_provider
+            self.gme_provider = None
+            self.doc_metadata.clear()
+            self.doc_embeddings = np.array([])
+            self.question_embeddings.clear()
+            self._closed = True
+            if self._owns_gme_provider and provider is not None:
+                try:
+                    provider.close()
+                except Exception:
+                    log.exception(
+                        "Failed to close owned GME provider after reranker startup failure"
+                    )
+            raise
 
     def _load_embeddings(self):
         """
@@ -333,12 +610,12 @@ class MMRerankerProvider(BaseEmbedder):
 
         if os.path.exists(q_metadata_path) and os.path.exists(q_embeddings_path):
             log.info("Loading question metadata and embeddings...")
-            # Use pandas to easily read the json records
-            q_metadata_df = pd.read_json(q_metadata_path, orient="records")
+            with open(q_metadata_path, "r", encoding="utf-8") as f:
+                q_metadata = json.load(f)
             q_embeddings = np.load(q_embeddings_path)
 
             # Create a dictionary mapping question text to its embedding for fast lookup
-            for _, row in q_metadata_df.iterrows():
+            for row in q_metadata:
                 question_text = row["question"]
                 embedding_idx = row["question_embedding_idx"]
                 self.question_embeddings[question_text] = q_embeddings[embedding_idx]
@@ -371,6 +648,8 @@ class MMRerankerProvider(BaseEmbedder):
         doc_list: List[Dict[str, str]],
         instruction: Optional[str] = None,
     ) -> List[float]:
+        if self._closed or self.gme_provider is None:
+            raise RuntimeError("MM reranker provider is closed")
         if not query:
             raise ValueError("Query cannot be empty.")
         if not doc_list:
@@ -383,7 +662,6 @@ class MMRerankerProvider(BaseEmbedder):
             query_embedding = self.gme_provider.embed_texts(
                 [query], instruction=instruction
             )[0]
-            self.gme_provider.clear_cache()
 
         if query_embedding is None:
             log.error(
@@ -433,42 +711,91 @@ class MMRerankerProvider(BaseEmbedder):
         return similarities
 
     def close(self) -> None:
-        """
-        Releases resources. In this implementation, data is in memory, so no action is needed.
-        """
-        log.info("MMRerankerProvider does not hold resources to release.")
+        """Release in-memory data and this reranker's owned GME handle once."""
+
+        if self._closed:
+            return
+        self._closed = True
         self.doc_metadata.clear()
         self.doc_embeddings = np.array([])
         self.question_embeddings.clear()
+        provider = self.gme_provider
+        self.gme_provider = None
+        if self._owns_gme_provider and provider is not None:
+            provider.close()
 
 
 class TextEmbeddingProvider(BaseEmbedder):
 
     MM_EMBEDDER: bool = False
+    _instances: "weakref.WeakSet[TextEmbeddingProvider]" = weakref.WeakSet()
 
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-Embedding-4B",
         backend: str = "local",
-        device: str = "auto",
+        device: Optional[str] = None,
         max_length: int = 8192,
         api_base: str = None,
+        api_key: Optional[str] = None,
+        *,
+        client: Optional[object] = None,
+        owns_client: Optional[bool] = None,
     ):
 
-        self.model_name = model_name
-        self.backend = backend.lower()
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError("model_name must be a non-empty string")
+        if not isinstance(backend, str):
+            raise ValueError("backend must be 'local', 'ollama', or 'openai'")
+        if (
+            isinstance(max_length, bool)
+            or not isinstance(max_length, int)
+            or max_length < 1
+        ):
+            raise ValueError("max_length must be at least 1")
+        if api_key is not None and (
+            not isinstance(api_key, str) or not api_key
+        ):
+            raise ValueError("api_key must be a non-empty string when provided")
+        api_base = _normalize_api_base(api_base)
+        if owns_client is not None and not isinstance(owns_client, bool):
+            raise ValueError("owns_client must be a boolean when provided")
+
+        self._closed = False
+        self.model_name = model_name.strip()
+        self.backend = backend.strip().lower()
         self.max_length = max_length
+        self._torch = None
+        self._torch_functional = None
 
         if self.backend == "local":
-            if device == "auto":
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            else:
-                self.device = device
-
-            log.info(f"Using local backend (ModelScope) on device: {self.device}")
-            log.info(f"Loading model: {self.model_name}...")
+            if api_key or api_base:
+                raise ValueError(
+                    "api_key and api_base are not supported by the local backend"
+                )
+            if client is not None or owns_client is not None:
+                raise ValueError("client settings are only supported by remote backends")
+            device = device or "auto"
+            if not isinstance(device, str) or not device.strip():
+                raise ValueError("device must be a non-empty string")
 
             try:
+                import torch
+                from torch.nn import functional as torch_functional
+                from modelscope import AutoModel, AutoTokenizer
+
+                self._torch = torch
+                self._torch_functional = torch_functional
+                if device == "auto":
+                    self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                else:
+                    self.device = device
+
+                log.info(
+                    "Using local backend (ModelScope) on device: %s", self.device
+                )
+                log.info("Loading model: %s...", self.model_name)
+
                 # 根据官方示例，使用AutoTokenizer和AutoModel，并设置padding_side
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     self.model_name, padding_side="left", trust_remote_code=True
@@ -477,56 +804,118 @@ class TextEmbeddingProvider(BaseEmbedder):
                     self.model_name, trust_remote_code=True
                 ).to(self.device)
                 self.model.eval()
-            except Exception as e:
-                log.info(f"Error loading model '{self.model_name}' from Hugging Face.")
-                raise e
+            except Exception:
+                log.exception(
+                    "Error loading local embedding model '%s'.", self.model_name
+                )
+                torch_runtime = self._torch
+                if hasattr(self, "model"):
+                    del self.model
+                if hasattr(self, "tokenizer"):
+                    del self.tokenizer
+                gc.collect()
+                if (
+                    torch_runtime is not None
+                    and "cuda" in str(getattr(self, "device", ""))
+                    and torch_runtime.cuda.is_available()
+                ):
+                    torch_runtime.cuda.empty_cache()
+                self._torch = None
+                self._torch_functional = None
+                raise
 
             log.info("Local model loaded successfully.")
 
         elif self.backend == "ollama":
+            if device is not None:
+                raise ValueError("device is only supported by the local backend")
             self.device = "ollama_service"
+            if client is None:
+                import ollama
+
+                parameters: Dict[str, Any] = {}
+                if api_base:
+                    parameters["host"] = api_base
+                if api_key:
+                    parameters["headers"] = {
+                        "Authorization": f"Bearer {api_key}"
+                    }
+                self.client = ollama.Client(**parameters)
+                self._owns_client = True if owns_client is None else owns_client
+            else:
+                self.client = client
+                self._owns_client = False if owns_client is None else owns_client
         elif self.backend == "openai":
-            self.client = openai.OpenAI(api_key="empty", base_url=api_base)
+            if device is not None:
+                raise ValueError("device is only supported by the local backend")
+            if client is None:
+                from openai import OpenAI
+
+                parameters: Dict[str, Any] = {}
+                if api_key is not None:
+                    parameters["api_key"] = api_key
+                if api_base is not None:
+                    parameters["base_url"] = api_base
+                self.client = OpenAI(**parameters)
+                self._owns_client = True if owns_client is None else owns_client
+            else:
+                self.client = client
+                self._owns_client = False if owns_client is None else owns_client
         else:
             raise ValueError(
-                f"Unsupported backend: '{self.backend}'. Choose 'local' or 'ollama'."
+                f"Unsupported backend: '{self.backend}'. Choose 'local', 'ollama', or 'openai'."
             )
+        self._instances.add(self)
 
     @classmethod
     def close_instance(cls) -> None:
-        """
-        作为类方法，用于在程序结束时关闭单例并释放资源。
-        """
-        if cls._instance is not None:
-            log.info(
-                f"Closing GmeEmbeddingProvider singleton for model: {cls._instance.model_name}..."
-            )
+        """Backward-compatible shutdown of every live provider instance."""
 
-            if hasattr(cls._instance, "model"):
-                log.info("Releasing GME model resources...")
-                del cls._instance.model
+        for instance in list(cls._instances):
+            instance.close()
 
-                if torch.cuda.is_available():
-                    log.info("Embedder: Emptying CUDA cache.")
-                    torch.cuda.empty_cache()
-
-                gc.collect()
-                log.info("GME model resources released.")
-
-            cls._instance = None  # 销毁实例
-            log.info("GmeEmbeddingProvider singleton instance closed.")
-
-    # (旧的 close 方法可以移除或保留，但不再建议实例级别调用)
     def close(self) -> None:
-        """实例级别的 close 方法现在应提醒用户使用类方法。"""
-        log.warning(
-            "Calling close() on a singleton instance is discouraged. Use GmeEmbeddingProvider.close_instance() at application shutdown."
-        )
-        # 或者直接调用类方法： GmeEmbeddingProvider.close_instance()
+        """Release local weights or remote client resources idempotently."""
+
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        backend = getattr(self, "backend", None)
+        if backend == "local":
+            if hasattr(self, "model"):
+                del self.model
+            if hasattr(self, "tokenizer"):
+                del self.tokenizer
+        elif backend in {"openai", "ollama"}:
+            client = getattr(self, "client", None)
+            if (
+                client is not None
+                and getattr(self, "_owns_client", True)
+                and hasattr(client, "close")
+            ):
+                client.close()
+            self.client = None
+
+        torch_runtime = getattr(self, "_torch", None)
+        self._torch = None
+        self._torch_functional = None
+        gc.collect()
+        device = str(getattr(self, "device", ""))
+        if (
+            backend == "local"
+            and "cuda" in device
+            and torch_runtime is not None
+            and torch_runtime.cuda.is_available()
+        ):
+            torch_runtime.cuda.empty_cache()
+        log.info("TextEmbeddingProvider closed for model %s.", self.model_name)
 
     def _last_token_pool(
-        self, last_hidden_states: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
+        self, last_hidden_states: Any, attention_mask: Any
+    ) -> Any:
+        torch_runtime = self._torch
+        if torch_runtime is None:
+            raise RuntimeError("Local embedding provider is closed")
         left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
         if left_padding:
             return last_hidden_states[:, -1]
@@ -534,18 +923,30 @@ class TextEmbeddingProvider(BaseEmbedder):
             sequence_lengths = attention_mask.sum(dim=1) - 1
             batch_size = last_hidden_states.shape[0]
             return last_hidden_states[
-                torch.arange(batch_size, device=last_hidden_states.device),
+                torch_runtime.arange(batch_size, device=last_hidden_states.device),
                 sequence_lengths,
             ]
 
-    def _normalize(self, embeddings: torch.Tensor) -> np.ndarray:
+    def _normalize(self, embeddings: Any) -> np.ndarray:
         """
         对PyTorch张量进行L2归一化，并转换为numpy数组。
         """
+        if self._torch_functional is None:
+            raise RuntimeError("Local embedding provider is closed")
         # 使用torch.nn.functional.normalize进行归一化
-        normalized_embeddings = F.normalize(embeddings, p=2, dim=1)
+        normalized_embeddings = self._torch_functional.normalize(
+            embeddings, p=2, dim=1
+        )
         # 移动到CPU并转换为numpy数组
         return normalized_embeddings.cpu().numpy()
+
+    @staticmethod
+    def _normalize_numpy(embeddings: np.ndarray) -> np.ndarray:
+        """L2-normalize remote embeddings without importing PyTorch."""
+
+        values = np.asarray(embeddings, dtype=np.float32)
+        norms = np.linalg.norm(values, ord=2, axis=1, keepdims=True)
+        return values / np.maximum(norms, np.float32(1e-12))
 
     def embed_texts(self, texts: List[str]) -> np.ndarray:
         """
@@ -561,6 +962,9 @@ class TextEmbeddingProvider(BaseEmbedder):
             raise ValueError("Input 'texts' must be a non-empty list of strings.")
 
         if self.backend == "local":
+            torch_runtime = self._torch
+            if torch_runtime is None:
+                raise RuntimeError("Local embedding provider is closed")
             batch_size = 16
             all_embeddings = []
             n = len(texts)
@@ -573,13 +977,13 @@ class TextEmbeddingProvider(BaseEmbedder):
                     return_tensors="pt",
                 )
                 batch_dict.to(self.device)
-                with torch.no_grad():
+                with torch_runtime.no_grad():
                     outputs = self.model(**batch_dict)
                 embeddings_tensor = self._last_token_pool(
                     outputs.last_hidden_state, batch_dict["attention_mask"]
                 )
                 all_embeddings.append(embeddings_tensor.cpu())
-                embeddings_tensor = torch.cat(all_embeddings, dim=0)
+                embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
             else:
                 num_batches = math.ceil(n / batch_size)
                 for i in tqdm(
@@ -596,22 +1000,49 @@ class TextEmbeddingProvider(BaseEmbedder):
                         return_tensors="pt",
                     )
                     batch_dict.to(self.device)
-                    with torch.no_grad():
+                    with torch_runtime.no_grad():
                         outputs = self.model(**batch_dict)
                     embeddings_tensor = self._last_token_pool(
                         outputs.last_hidden_state, batch_dict["attention_mask"]
                     )
                     all_embeddings.append(embeddings_tensor.cpu())
-                embeddings_tensor = torch.cat(all_embeddings, dim=0)
+                embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
 
         elif self.backend == "ollama":
-            # --- Ollama 推理路径 ---
-            all_embeddings = []
-            for text in texts:
-                response = ollama.embeddings(model=self.model_name, prompt=text)
-                all_embeddings.append(response["embedding"])
+            # Always use the configured client. The module-level Ollama helper
+            # silently targets its default localhost and used to ignore
+            # ``EmbeddingConfig.api_base`` entirely.
+            embed = getattr(self.client, "embed", None)
+            if callable(embed):
+                response = embed(model=self.model_name, input=texts)
+                if isinstance(response, dict):
+                    all_embeddings = response.get("embeddings")
+                else:
+                    all_embeddings = getattr(response, "embeddings", None)
+                if not isinstance(all_embeddings, list) or len(all_embeddings) != len(
+                    texts
+                ):
+                    raise ValueError(
+                        "Ollama embedding response did not match the input batch"
+                    )
+            else:
+                # Compatibility with Ollama SDKs predating ``Client.embed``.
+                legacy_embed = getattr(self.client, "embeddings", None)
+                if not callable(legacy_embed):
+                    raise RuntimeError("Ollama client does not provide an embedding API")
+                all_embeddings = []
+                for text in texts:
+                    response = legacy_embed(model=self.model_name, prompt=text)
+                    embedding = (
+                        response.get("embedding")
+                        if isinstance(response, dict)
+                        else getattr(response, "embedding", None)
+                    )
+                    if not isinstance(embedding, list):
+                        raise ValueError("Ollama returned an invalid embedding response")
+                    all_embeddings.append(embedding)
             embeddings_np = np.array(all_embeddings, dtype=np.float32)
-            embeddings_tensor = torch.from_numpy(embeddings_np).to("cpu")  # 确保在CPU上
+            return self._normalize_numpy(embeddings_np)
 
         elif self.backend == "openai":
             BATCH_SIZE = 8
@@ -630,9 +1061,9 @@ class TextEmbeddingProvider(BaseEmbedder):
                 all_embeddings.extend(embeddings_from_this_batch)
 
             embeddings_np = np.array(all_embeddings, dtype=np.float32)
-            embeddings_tensor = torch.from_numpy(embeddings_np).to("cpu")  # 确保在CPU上
+            return self._normalize_numpy(embeddings_np)
 
-        # 对来自任何后端的输出都进行归一化
+        # Local outputs retain the original torch normalization path.
         return self._normalize(embeddings_tensor)
 
     def compute_texts_sim(self, text1: str, text2: str) -> float:

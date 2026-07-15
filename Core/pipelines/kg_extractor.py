@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
 from Core.configs.graph_config import GraphConfig
@@ -35,20 +37,127 @@ from Core.utils.table_utils import (
     identify_header_rows,
     parse_html_table_to_grid,
 )
+from Core.utils.bounded_executor import iter_bounded_ordered
 
 from abc import ABC, abstractmethod
-import spacy
-import textacy.extract
-from typing import List, Dict, Tuple, Any, Union, final
+from dataclasses import fields, is_dataclass
+from enum import Enum
+from typing import Iterable, Iterator, List, Dict, Tuple, Any, Union, final
+import hashlib
 import logging
 import re
 import json
 import os
+import tempfile
+from urllib.parse import urlsplit, urlunsplit
 from nltk.metrics.distance import edit_distance
-from concurrent.futures import ThreadPoolExecutor
-import re
 
 logger = logging.getLogger(__name__)
+
+
+KG_CHECKPOINT_SCHEMA_VERSION = "docarag.kg-extraction-checkpoint.v1"
+
+_SENSITIVE_CONFIG_FIELDS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "password",
+        "secret",
+        "client_secret",
+        "credential",
+        "credentials",
+        "authorization",
+        "proxy_authorization",
+        "cookie",
+        "headers",
+    }
+)
+
+
+def _is_sensitive_config_field(name: Any) -> bool:
+    normalized = str(name).strip().lower().replace("-", "_")
+    return (
+        normalized in _SENSITIVE_CONFIG_FIELDS
+        or normalized == "token"
+        or normalized.endswith("_token")
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_password")
+        or normalized.endswith("_secret")
+        or normalized.endswith("_private_key")
+        or normalized.endswith("_credential")
+        or normalized.endswith("_credentials")
+    )
+
+
+def _is_url_config_field(name: Any) -> bool:
+    normalized = str(name).strip().lower().replace("-", "_")
+    return (
+        normalized in {"api_base", "base_url", "endpoint", "server_url", "url"}
+        or normalized.endswith("_api_base")
+        or normalized.endswith("_endpoint")
+        or normalized.endswith("_url")
+        or normalized.endswith("_uri")
+    )
+
+
+def _sanitize_endpoint(value: str) -> str:
+    """Retain endpoint routing identity without persisting URL credentials."""
+
+    has_authority_marker = "://" in value
+    parse_value = value if has_authority_marker else f"//{value}"
+    try:
+        parsed = urlsplit(parse_value)
+        hostname = parsed.hostname
+        if not hostname:
+            return value.split("?", 1)[0].split("#", 1)[0]
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        port = parsed.port
+        netloc = f"{host}:{port}" if port is not None else host
+        sanitized = urlunsplit(
+            (parsed.scheme if has_authority_marker else "", netloc, parsed.path, "", "")
+        )
+        return sanitized if has_authority_marker else sanitized.removeprefix("//")
+    except ValueError:
+        # Even malformed endpoints must not retain query/fragment credentials.
+        without_suffix = value.split("?", 1)[0].split("#", 1)[0]
+        if "@" in without_suffix:
+            prefix, suffix = without_suffix.rsplit("@", 1)
+            if ":" in prefix:
+                return suffix
+        return without_suffix
+
+
+def _canonical_json(value: Any) -> str:
+    """Return the stable JSON representation used by checkpoint identities."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class KGExtractionError(RuntimeError):
+    """One source node could not produce a trustworthy KG observation."""
+
+    def __init__(self, node_id: int, modality: str, error: Exception):
+        self.node_id = node_id
+        self.modality = modality
+        self.error = error
+        super().__init__(
+            f"KG extraction failed for {modality} node {node_id}: {error}"
+        )
 
 
 # 定义一个函数，用于通过空格和所有非字母数字的符号来分割字符串
@@ -70,18 +179,25 @@ class LocalExtractor(BaseExtractor):
     Extractor that uses local NLP libraries (mainly spaCy) to extract entities and relations.
     """
 
-    def __init__(self, model_name: str = "en_core_web_trf"):
+    def __init__(
+        self, model_name: str = "en_core_web_trf", device: str = "cpu"
+    ):
         """
         Initializes the extractor with GPU support.
 
         Args:
             model_name (str): The name of the spaCy transformer model.
         """
-        try:
+        import spacy
+
+        if device == "cuda":
             spacy.require_gpu()
             logger.info("GPU activated for spaCy.")
-        except Exception as e:
-            logger.info(f"GPU activation failed: {e}. Falling back to CPU.")
+        elif device == "auto":
+            using_gpu = spacy.prefer_gpu()
+            logger.info("spaCy device selected: %s", "cuda" if using_gpu else "cpu")
+        else:
+            logger.info("spaCy device selected: cpu")
 
         logger.info(f"Loading spaCy model '{model_name}'...")
         self.nlp = spacy.load(model_name)
@@ -168,8 +284,31 @@ class LocalExtractor(BaseExtractor):
         text = node.meta_info.content
         node_idx = node.index_id
         doc = self.nlp(text)
-        entities = self._extract_entities(doc)
-        relations = self._extract_relations(doc)
+        raw_entities = self._extract_entities(doc)
+        raw_relations = self._extract_relations(doc)
+        entities = [
+            Entity(
+                entity_name=entity["text"],
+                entity_type=entity["label"],
+                description=(
+                    f"Named entity recognized by the local parser as "
+                    f"{entity['label']}."
+                ),
+                source_ids={node_idx},
+            )
+            for entity in raw_entities
+        ]
+        relations = [
+            Relationship(
+                src_entity_name=subject,
+                tgt_entity_name=object_name,
+                relation_name=predicate,
+                weight=1.0,
+                description=f"{subject} {predicate} {object_name}",
+                source_ids={node_idx},
+            )
+            for subject, predicate, object_name in raw_relations
+        ]
 
         return {
             "entities": entities,
@@ -187,6 +326,8 @@ class LocalExtractor(BaseExtractor):
         A simpler method: Use the Textacy library to directly extract SVO triples.
         This can serve as a quick baseline or a simplified approach.
         """
+        import textacy.extract
+
         doc = self.nlp(text)
         svo_triples = textacy.extract.subject_verb_object_triples(doc)
 
@@ -563,10 +704,11 @@ class LLMExtractor(BaseExtractor):
                     ]
                     all_body_entities.extend(batch_entities)
             except Exception as e:
-                logger.error(
-                    f"LLM call failed for batch {i+1} of node {node.index_id}: {e}"
-                )
-                continue
+                raise KGExtractionError(
+                    node.index_id,
+                    "table",
+                    RuntimeError(f"body batch {i + 1}/{len(prompts)} failed: {e}"),
+                ) from e
 
         return all_body_entities
 
@@ -673,6 +815,7 @@ class LLMExtractor(BaseExtractor):
                     description=description,
                     source_ids={node.index_id},
                 )
+                final_entities.append(image_entity)
 
             # create relationship from the image entity to all other entities
             final_relations = [
@@ -691,7 +834,7 @@ class LLMExtractor(BaseExtractor):
 
         except Exception as e:
             logger.exception(f"Error extracting entities and relations from image: {e}")
-            return [], []
+            raise KGExtractionError(node.index_id, "image", e) from e
 
     def _extract_kg_from_equation(self, node: TreeNode):
         latex_text = node.meta_info.content
@@ -731,7 +874,7 @@ class LLMExtractor(BaseExtractor):
             logger.exception(
                 f"Error extracting entities and relations from equation: {e}"
             )
-            return [], []
+            raise KGExtractionError(node.index_id, "equation", e) from e
 
     def extract(self, node: TreeNode) -> Dict[str, Any]:
         try:
@@ -756,6 +899,10 @@ class LLMExtractor(BaseExtractor):
 
         except Exception as e:
             logger.exception(f"Error extracting entities and relation: {e}")
+            if isinstance(e, KGExtractionError):
+                raise
+            modality = getattr(node.type, "value", str(node.type))
+            raise KGExtractionError(node.index_id, modality, e) from e
         finally:
             logger.info(
                 f"Finish extracting entities and relations in TreeNode {node.index_id}."
@@ -800,8 +947,7 @@ class LLMExtractor(BaseExtractor):
         try:
             res = self.llm.get_json_completion(prompt=prompt, schema=ExtractionResult)
             if res is None:
-                logger.warning("No response from LLM.")
-                return {"entities": [], "relations": [], "node_idx": node.index_id}
+                raise ValueError("LLM returned no title extraction response")
             entities = res.entities if res.entities else []
             relations = res.relationships if res.relationships else []
 
@@ -831,7 +977,7 @@ class LLMExtractor(BaseExtractor):
             }
         except Exception as e:
             logger.exception(f"Error extracting entities and relations from title: {e}")
-            return {"entities": [], "relations": [], "node_idx": node.index_id}
+            raise KGExtractionError(node.index_id, "title", e) from e
 
 
 class KGExtractor:
@@ -847,10 +993,14 @@ class KGExtractor:
         self.cfg_graph = cfg_graph
         extractor_type = cfg_graph.extractor_type
         if extractor_type == "local":
-            self.extractor = LocalExtractor(cfg_graph.local_model_name)
+            self.extractor = LocalExtractor(
+                cfg_graph.local_model_name, device=cfg_graph.local_device
+            )
         elif extractor_type == "llm":
             self.extractor = LLMExtractor(graph_config=cfg_graph, llm=llm, vlm=vlm)
 
+        self.llm = llm
+        self.vlm = vlm
         self.save_path = os.path.join(save_path, "kg_extractor_res")
         os.makedirs(self.save_path, exist_ok=True)
         logger.info(f"KG extraction results will be saved to {self.save_path}")
@@ -921,28 +1071,35 @@ class KGExtractor:
                 return relation_entity_name
 
         entity_name_set = set()
+        entity_map: dict[tuple[str, str], Entity] = {}
+        entity_descriptions: dict[tuple[str, str], list[str]] = {}
         for entity in res.get("entities", []):
             entity.entity_name = _clean_name(entity.entity_name)
             entity.entity_type = entity.entity_type.upper()
             entity.entity_type = entity.entity_type.replace(" ", "_")
             entity_name_set.add(entity.entity_name)
-
-        # check if have the same name and type entities, merge the description and then delete the duplicate one
-        entity_map = {}
-        for entity in res.get("entities", []):
             key = (entity.entity_name, entity.entity_type)
-            if key not in entity_map:
+            existing_entity = entity_map.get(key)
+            if existing_entity is None:
                 entity_map[key] = entity
-            else:
-                # Merge descriptions.
-                # Use the old source_id, since they are extracted from the save node
-                existing_entity: Entity = entity_map[key]
-                existing_entity.description += " " + entity.description
-                # Remove the duplicate entity
-                res["entities"].remove(entity)
-                logger.info(
-                    f"Removed duplicate entity: {entity.entity_name} of type {entity.entity_type}"
-                )
+                entity_descriptions[key] = [entity.description]
+                continue
+
+            entity_descriptions[key].append(entity.description)
+            existing_entity.source_ids.update(entity.source_ids)
+            logger.info(
+                "Aggregated duplicate entity: %s of type %s",
+                entity.entity_name,
+                entity.entity_type,
+            )
+
+        # Dict insertion order preserves the first occurrence of every entity.
+        # Building a replacement avoids skipped duplicates from list.remove while
+        # iterating. Joining each description group once keeps work linear in the
+        # number of entities plus the total description size.
+        for key, entity in entity_map.items():
+            entity.description = " ".join(entity_descriptions[key])
+        res["entities"] = list(entity_map.values())
 
         valid_relations = []
         relation_map = {}
@@ -976,91 +1133,440 @@ class KGExtractor:
 
         return res
 
-    def save_tmp_res(self, res: Dict[str, Any], node_idx: int):
-        """
-        Save the extracted knowledge graph result to a temporary file.
-        This is useful for debugging and intermediate results.
-        """
+    @classmethod
+    def _checkpoint_value(cls, value: Any) -> Any:
+        """Convert config values to deterministic, secret-free JSON data."""
 
-        file_path = os.path.join(self.save_path, f"kg_extractor_res_{node_idx}.json")
-        entities = [e.model_dump() for e in res["entities"]]
-        relations = [r.model_dump() for r in res["relations"]]
-        res_to_save = {
-            "entities": entities,
-            "relations": relations,
-            "node_idx": res["node_idx"],
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Enum):
+            return cls._checkpoint_value(value.value)
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                field.name: cls._checkpoint_config_item(
+                    field.name, getattr(value, field.name)
+                )
+                for field in fields(value)
+                if not _is_sensitive_config_field(field.name)
+            }
+        if hasattr(value, "model_dump"):
+            return cls._checkpoint_value(value.model_dump())
+        if isinstance(value, dict):
+            return {
+                str(key): cls._checkpoint_config_item(key, item)
+                for key, item in value.items()
+                if not _is_sensitive_config_field(key)
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._checkpoint_value(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            converted = [cls._checkpoint_value(item) for item in value]
+            return sorted(converted, key=_canonical_json)
+        if hasattr(value, "__dict__"):
+            return {
+                str(key): cls._checkpoint_config_item(key, item)
+                for key, item in vars(value).items()
+                if not str(key).startswith("_")
+                and not _is_sensitive_config_field(key)
+            }
+        return {
+            "python_type": f"{type(value).__module__}.{type(value).__qualname__}"
         }
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(
-                res_to_save,
-                f,
-                ensure_ascii=False,
-                indent=2,
-                cls=SetEncoder,
-            )
-        logger.info(f"Saved temporary KG extraction result to {file_path}.")
 
-    def load_tmp_res(self, node_idx: int) -> Dict[str, Any]:
-        """
-        Load the extracted knowledge graph result from a temporary file.
-        This is useful for debugging and intermediate results.
-        """
-        file_path = os.path.join(self.save_path, f"kg_extractor_res_{node_idx}.json")
-        if os.path.exists(file_path) and not self.force_rebuild:
-            logger.info(
-                f"Temporary result for node {node_idx} already exists. Loading from {file_path}."
-            )
-        else:
+    @classmethod
+    def _checkpoint_config_item(cls, name: Any, value: Any) -> Any:
+        if _is_url_config_field(name) and isinstance(value, str):
+            return _sanitize_endpoint(value)
+        return cls._checkpoint_value(value)
+
+    @classmethod
+    def _model_checkpoint_identity(cls, model: Any) -> Any:
+        if model is None:
             return None
+        config = getattr(model, "config", None)
+        return {
+            "controller": f"{type(model).__module__}.{type(model).__qualname__}",
+            "config": cls._checkpoint_value(config),
+        }
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            res = json.load(f)
+    @staticmethod
+    def _node_type(node: TreeNode) -> str:
+        node_type = node.type
+        return node_type.value if isinstance(node_type, Enum) else str(node_type)
 
-        # 还原 Entity/Relationship 对象，并处理 source_ids
+    @staticmethod
+    def _value_digest(value: Any) -> Dict[str, Any]:
+        return {
+            "present": value is not None,
+            "sha256": _sha256_json(value),
+        }
+
+    @staticmethod
+    def _file_identity(path: Any) -> Dict[str, Any]:
+        if not path:
+            return {"status": "not-configured"}
+
+        path_text = os.fspath(path)
+        path_digest = _sha256_text(path_text)
+        digest = hashlib.sha256()
+        try:
+            with open(path_text, "rb") as image_file:
+                while True:
+                    chunk = image_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return {
+                "status": "present",
+                "path_sha256": path_digest,
+                "bytes_sha256": digest.hexdigest(),
+                "size": os.path.getsize(path_text),
+            }
+        except OSError as error:
+            return {
+                "status": "unreadable",
+                "path_sha256": path_digest,
+                "error_type": type(error).__name__,
+            }
+
+    @classmethod
+    def _node_evidence_identity(cls, node: TreeNode) -> Dict[str, Any]:
+        meta = node.meta_info
+        source_observation_ids = list(meta.source_observation_ids or [])
+        source_observation_ids.sort()
+        source_canonical_block_ids = list(meta.source_canonical_block_ids or [])
+        source_canonical_revision_ids = list(
+            meta.source_canonical_revision_ids or []
+        )
+        identity: Dict[str, Any] = {
+            "node_idx": node.index_id,
+            "node_type": cls._node_type(node),
+            "source": {
+                "source_sha256": meta.source_sha256,
+                "document_version_id": meta.document_version_id,
+                "canonical_block_id": meta.canonical_block_id,
+                "canonical_revision_id": meta.canonical_revision_id,
+                "observation_id": meta.observation_id,
+                "source_observation_ids": source_observation_ids,
+                "derived_evidence_id": meta.derived_evidence_id,
+                "source_canonical_block_ids": source_canonical_block_ids,
+                "source_canonical_revision_ids": source_canonical_revision_ids,
+                "canonical_representation_ids": cls._value_digest(
+                    meta.canonical_representation_ids
+                ),
+                "canonical_asset_ids": cls._value_digest(meta.canonical_asset_ids),
+                "selected_representation_ids": cls._value_digest(
+                    meta.selected_representation_ids
+                ),
+                "selected_asset_ids": cls._value_digest(meta.selected_asset_ids),
+                "source_evidence_refs": cls._value_digest(meta.source_evidence_refs),
+                "parser_provenance": cls._value_digest(meta.parser_provenance),
+                "quality_status": meta.quality_status,
+                "reconciliation_method": meta.reconciliation_method,
+                "transformations": cls._value_digest(meta.transformations),
+            },
+            "page": {
+                "page_idx": meta.page_idx,
+                "page_id": meta.page_id,
+                "page_path": cls._value_digest(meta.page_path),
+                "source_geometry": cls._value_digest(meta.source_geometry),
+            },
+            "evidence": {
+                "content": cls._value_digest(meta.content),
+                "table_body": cls._value_digest(meta.table_body),
+                "caption": cls._value_digest(meta.caption),
+                "footnote": cls._value_digest(meta.footnote),
+            },
+        }
+        if cls._node_type(node) == NodeType.IMAGE.value:
+            identity["evidence"]["image"] = cls._file_identity(meta.img_path)
+        return identity
+
+    def _graph_checkpoint_identity(self) -> Dict[str, Any]:
+        setting_names = (
+            "extractor_type",
+            "local_model_name",
+            "local_device",
+            "image_description_force",
+            "max_gleaning",
+            "extraction_max_workers",
+            "extraction_max_in_flight",
+            "extraction_batch_size",
+        )
+        return {
+            name: self._checkpoint_value(getattr(self.cfg_graph, name, None))
+            for name in setting_names
+        }
+
+    def _prompt_checkpoint_identity(self, node_type: str, kind: str) -> Dict[str, str]:
+        if getattr(self.cfg_graph, "extractor_type", None) != "llm":
+            return {}
+
+        if kind == "title":
+            templates = {"SECTION_ENTITY_EXTRACTION": SECTION_ENTITY_EXTRACTION}
+        elif node_type == NodeType.TEXT.value:
+            templates = {
+                "ENTITY_EXTRACTION": ENTITY_EXTRACTION,
+                "ENTITY_CONTINUE_EXTRACTION": ENTITY_CONTINUE_EXTRACTION,
+                "ENTITY_IF_LOOP_EXTRACTION": ENTITY_IF_LOOP_EXTRACTION,
+            }
+        elif node_type == NodeType.TABLE.value:
+            templates = {
+                "TABLE_DESCRIPTION_EXTRACTION": TABLE_DESCRIPTION_EXTRACTION,
+                "TABLE_BODY_EXTRACTION": TABLE_BODY_EXTRACTION,
+            }
+        elif node_type == NodeType.IMAGE.value:
+            templates = {"IMAGE_ENTITY_EXTRACTION": IMAGE_ENTITY_EXTRACTION}
+        elif node_type == NodeType.EQUATION.value:
+            templates = {"EQUATION_ENTITY_EXTRACTION": EQUATION_ENTITY_EXTRACTION}
+        else:
+            templates = {}
+
+        templates["extraction_protocol"] = _canonical_json(
+            {
+                "entity_types": DEFAULT_ENTITY_TYPES,
+                "tuple_delimiter": DEFAULT_TUPLE_DELIMITER,
+                "record_delimiter": DEFAULT_RECORD_DELIMITER,
+                "completion_delimiter": DEFAULT_COMPLETION_DELIMITER,
+            }
+        )
+        return {name: _sha256_text(template) for name, template in templates.items()}
+
+    @classmethod
+    def _title_context_identity(cls, nodes: Iterable[TreeNode]) -> List[Dict[str, Any]]:
+        # Title extraction uses only each context node's order/index and displayed
+        # text.  Hash exactly that prompt-shaping state; reading sibling image bytes
+        # here would make every title cache lookup scale with unrelated assets.
+        return [
+            {
+                "node_idx": context_node.index_id,
+                "node_type": cls._node_type(context_node),
+                "content": cls._value_digest(context_node.meta_info.content),
+            }
+            for context_node in nodes
+        ]
+
+    def _checkpoint_identity(
+        self,
+        node: TreeNode,
+        *,
+        kind: str,
+        title_path: Iterable[TreeNode] = (),
+        sibling_nodes: Iterable[TreeNode] = (),
+    ) -> Dict[str, Any]:
+        llm = getattr(self, "llm", None)
+        vlm = getattr(self, "vlm", None)
+        if llm is None:
+            llm = getattr(self.extractor, "llm", None)
+        if vlm is None:
+            vlm = getattr(self.extractor, "vlm", None)
+
+        node_type = self._node_type(node)
+        identity = {
+            "kind": kind,
+            "node": self._node_evidence_identity(node),
+            "models": {
+                "llm": self._model_checkpoint_identity(llm),
+                "vlm": self._model_checkpoint_identity(vlm),
+            },
+            "graph_extraction": self._graph_checkpoint_identity(),
+            "prompt_sha256": self._prompt_checkpoint_identity(node_type, kind),
+        }
+        if kind == "title":
+            identity["title_context"] = {
+                "title_path": self._title_context_identity(title_path),
+                "sibling_nodes": self._title_context_identity(sibling_nodes),
+            }
+        return identity
+
+    def _checkpoint_path(self, node_idx: int) -> str:
+        return os.path.join(self.save_path, f"kg_extractor_res_{node_idx}.json")
+
+    @staticmethod
+    def _payload_to_objects(payload: Dict[str, Any], node_idx: int) -> Dict[str, Any]:
+        if payload.get("node_idx") != node_idx:
+            raise ValueError(
+                f"payload node_idx {payload.get('node_idx')!r} does not match "
+                f"requested node_idx {node_idx!r}"
+            )
+        raw_entities = payload.get("entities")
+        raw_relations = payload.get("relations")
+        if not isinstance(raw_entities, list) or not isinstance(raw_relations, list):
+            raise ValueError("checkpoint payload must contain entity and relation lists")
+
         entities = [
             Entity(
-                entity_name=e["entity_name"],
-                entity_type=e["entity_type"],
-                description=e["description"],
-                source_ids=set(e.get("source_ids", [])),
+                entity_name=entity["entity_name"],
+                entity_type=entity["entity_type"],
+                description=entity["description"],
+                source_ids=set(entity.get("source_ids", [])),
             )
-            for e in res.get("entities", [])
+            for entity in raw_entities
         ]
         relations = [
             Relationship(
-                src_entity_name=r["src_entity_name"],
-                tgt_entity_name=r["tgt_entity_name"],
-                relation_name=r.get("relation_name", ""),
-                weight=r.get("weight", 0.0),
-                description=r.get("description", ""),
-                source_ids=set(r.get("source_ids", [])),
+                src_entity_name=relation["src_entity_name"],
+                tgt_entity_name=relation["tgt_entity_name"],
+                relation_name=relation.get("relation_name", ""),
+                weight=relation.get("weight", 0.0),
+                description=relation.get("description", ""),
+                source_ids=set(relation.get("source_ids", [])),
             )
-            for r in res.get("relations", [])
+            for relation in raw_relations
         ]
-        res_obj = {
-            "entities": entities,
-            "relations": relations,
-            "node_idx": res.get("node_idx"),
-        }
+        return {"entities": entities, "relations": relations, "node_idx": node_idx}
 
-        logger.info(f"Loaded temporary KG extraction result from {file_path}.")
-        return res_obj
+    @staticmethod
+    def _atomic_write_json(path: str, value: Dict[str, Any]) -> None:
+        directory = os.path.dirname(path)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            checkpoint_file = os.fdopen(descriptor, "w", encoding="utf-8")
+            descriptor = -1
+            with checkpoint_file:
+                json.dump(
+                    value,
+                    checkpoint_file,
+                    ensure_ascii=False,
+                    indent=2,
+                    cls=SetEncoder,
+                )
+                checkpoint_file.flush()
+                os.fsync(checkpoint_file.fileno())
+            os.replace(temporary_path, path)
+            os.chmod(path, 0o600)
+            directory_descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def save_tmp_res(
+        self,
+        res: Dict[str, Any],
+        node_idx: int,
+        checkpoint_identity: Dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically save a source- and model-bound KG checkpoint envelope."""
+
+        if checkpoint_identity is None:
+            raise ValueError("checkpoint identity is required for KG checkpoint writes")
+        if res.get("node_idx") != node_idx:
+            raise ValueError("cannot checkpoint a result for a different node_idx")
+
+        raw_payload = {
+            "entities": [entity.model_dump() for entity in res["entities"]],
+            "relations": [relation.model_dump() for relation in res["relations"]],
+            "node_idx": res["node_idx"],
+        }
+        payload = self._checkpoint_value(raw_payload)
+        if not isinstance(payload, dict):
+            raise TypeError("KG checkpoint payload did not normalize to an object")
+        envelope = {
+            "schema_version": KG_CHECKPOINT_SCHEMA_VERSION,
+            "identity_sha256": _sha256_json(checkpoint_identity),
+            "payload_sha256": _sha256_json(payload),
+            "identity": checkpoint_identity,
+            "payload": payload,
+        }
+        file_path = self._checkpoint_path(node_idx)
+        self._atomic_write_json(file_path, envelope)
+        logger.info("Saved KG extraction checkpoint to %s.", file_path)
+
+    def load_tmp_res(
+        self,
+        node_idx: int,
+        checkpoint_identity: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any] | None:
+        """Load a checkpoint only when its full extraction identity matches."""
+
+        file_path = self._checkpoint_path(node_idx)
+        if self.force_rebuild or not os.path.exists(file_path):
+            return None
+        if checkpoint_identity is None:
+            logger.warning(
+                "Ignoring unbound KG checkpoint read for node %s; recomputation is required.",
+                node_idx,
+            )
+            return None
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as checkpoint_file:
+                envelope = json.load(checkpoint_file)
+            if not isinstance(envelope, dict):
+                raise ValueError("checkpoint envelope is not an object")
+            if envelope.get("schema_version") != KG_CHECKPOINT_SCHEMA_VERSION:
+                raise ValueError("legacy or unsupported checkpoint schema")
+            saved_identity = envelope.get("identity")
+            saved_identity_hash = envelope.get("identity_sha256")
+            if not isinstance(saved_identity, dict) or not isinstance(
+                saved_identity_hash, str
+            ):
+                raise ValueError("checkpoint identity is incomplete")
+            if _sha256_json(saved_identity) != saved_identity_hash:
+                raise ValueError("checkpoint identity digest is invalid")
+            expected_identity_hash = _sha256_json(checkpoint_identity)
+            if saved_identity_hash != expected_identity_hash:
+                raise ValueError("checkpoint extraction identity does not match")
+            if saved_identity != checkpoint_identity:
+                raise ValueError("checkpoint extraction identity is inconsistent")
+            payload = envelope.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("checkpoint payload is missing")
+            payload_hash = envelope.get("payload_sha256")
+            if not isinstance(payload_hash, str):
+                raise ValueError("checkpoint payload digest is missing")
+            if _sha256_json(payload) != payload_hash:
+                raise ValueError("checkpoint payload digest is invalid")
+            result = self._payload_to_objects(payload, node_idx)
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+        ) as error:
+            logger.warning(
+                "Ignoring invalid KG checkpoint %s for node %s: %s",
+                file_path,
+                node_idx,
+                error,
+            )
+            return None
+
+        logger.info("Loaded KG extraction checkpoint from %s.", file_path)
+        return result
 
     def extract_kg(self, node: TreeNode) -> Dict[str, Any]:
-        tmp_res = self.load_tmp_res(node.index_id)
+        checkpoint_identity = self._checkpoint_identity(node, kind="node")
+        tmp_res = self.load_tmp_res(node.index_id, checkpoint_identity)
         if tmp_res is not None:
-            # if node.type == NodeType.IMAGE:
-            #     logger.info(f"Image node should be re-extracted")
-            #     kg = self.extractor.extract(node)
-            # else:
-            #     kg = tmp_res
-            kg = tmp_res
-        else:
-            kg = self.extractor.extract(node)
+            return self.res_repair(tmp_res)
 
+        kg = self.extractor.extract(node)
         res = self.res_repair(kg)
-        # Save the result to a temporary file
-        self.save_tmp_res(res, node.index_id)
+        final_identity = self._checkpoint_identity(node, kind="node")
+        if final_identity != checkpoint_identity:
+            raise KGExtractionError(
+                node.index_id,
+                self._node_type(node),
+                RuntimeError("checkpoint identity changed during extraction"),
+            )
+        self.save_tmp_res(res, node.index_id, final_identity)
         return res
 
     def extract_title(
@@ -1069,86 +1575,148 @@ class KGExtractor:
         title_path: List[TreeNode],
         sibling_nodes: List[TreeNode],
     ) -> Dict[str, Any]:
-        tmp_res = self.load_tmp_res(node.index_id)
+        checkpoint_identity = self._checkpoint_identity(
+            node,
+            kind="title",
+            title_path=title_path,
+            sibling_nodes=sibling_nodes,
+        )
+        tmp_res = self.load_tmp_res(node.index_id, checkpoint_identity)
         if tmp_res is not None:
-            kg = tmp_res
-        else:
-            kg = self.extractor.extract_title(node, title_path, sibling_nodes)
-            logger.info(
-                f"Extracted title entities and relations for node {node.index_id}."
-            )
+            return self.res_repair(tmp_res)
+
+        kg = self.extractor.extract_title(node, title_path, sibling_nodes)
+        logger.info(
+            f"Extracted title entities and relations for node {node.index_id}."
+        )
 
         res = self.res_repair(kg)
-        # Save the result to a temporary file
-        self.save_tmp_res(res, node.index_id)
+        final_identity = self._checkpoint_identity(
+            node,
+            kind="title",
+            title_path=title_path,
+            sibling_nodes=sibling_nodes,
+        )
+        if final_identity != checkpoint_identity:
+            raise KGExtractionError(
+                node.index_id,
+                "title",
+                RuntimeError("checkpoint identity changed during extraction"),
+            )
+        self.save_tmp_res(res, node.index_id, final_identity)
         return res
 
+    def iter_extract_kg(
+        self,
+        nodes: Iterable[TreeNode],
+        max_workers: int | None = None,
+        max_in_flight: int | None = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield node results in input order with bounded submission.
+
+        A node whose extraction fails after retries is logged and skipped with an
+        empty result so one unreliable node cannot abort the whole document. Its
+        checkpoint is not committed, so a later run re-attempts it.
+        """
+
+        worker_limit = max_workers or self.cfg_graph.extraction_max_workers
+        in_flight_limit = (
+            max_in_flight
+            if max_in_flight is not None
+            else self.cfg_graph.extraction_max_in_flight
+        )
+        for outcome in iter_bounded_ordered(
+            nodes,
+            self.extract_kg,
+            max_workers=worker_limit,
+            max_in_flight=in_flight_limit,
+            thread_name_prefix="kg-extraction",
+        ):
+            if not outcome.ok:
+                assert outcome.error is not None
+                node = outcome.item
+                logger.error(
+                    "Skipping KG extraction for node %s after failure: %s",
+                    node.index_id,
+                    outcome.error,
+                )
+                yield {"entities": [], "relations": [], "node_idx": node.index_id}
+                continue
+            yield outcome.unwrap()
+
     def batch_extract_kg(
-        self, nodes: List[TreeNode], max_workers: int = 4
+        self,
+        nodes: Iterable[TreeNode],
+        max_workers: int | None = None,
+        max_in_flight: int | None = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Batch extract knowledge graphs from a list of nodes.
-        This is useful for processing multiple nodes in one go.
-        """
-        results = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.extract_kg, node): node for node in nodes}
-            for future in futures:
-                try:
-                    res = future.result()
-                    results.append(res)
-                except Exception as e:
-                    logger.error(
-                        f"Error extracting KG for node {futures[future].index_id}: {e}"
-                    )
-                    results.append(
-                        {
-                            "entities": [],
-                            "relations": [],
-                            "node_idx": futures[future].index_id,
-                        }
-                    )
-        return results
+        """Compatibility materialization over :meth:`iter_extract_kg`."""
+
+        return list(
+            self.iter_extract_kg(
+                nodes,
+                max_workers=max_workers,
+                max_in_flight=max_in_flight,
+            )
+        )
+
+    def iter_extract_titles(
+        self,
+        work_items: Iterable[tuple[TreeNode, List[TreeNode], List[TreeNode]]],
+        max_workers: int | None = None,
+        max_in_flight: int | None = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield title results with the same bounded/fail-fast contract."""
+
+        worker_limit = max_workers or self.cfg_graph.extraction_max_workers
+        in_flight_limit = (
+            max_in_flight
+            if max_in_flight is not None
+            else self.cfg_graph.extraction_max_in_flight
+        )
+
+        def extract(
+            item: tuple[TreeNode, List[TreeNode], List[TreeNode]],
+        ) -> Dict[str, Any]:
+            node, title_path, sibling_nodes = item
+            return self.extract_title(node, title_path, sibling_nodes)
+
+        for outcome in iter_bounded_ordered(
+            work_items,
+            extract,
+            max_workers=worker_limit,
+            max_in_flight=in_flight_limit,
+            thread_name_prefix="kg-title-extraction",
+        ):
+            if not outcome.ok:
+                assert outcome.error is not None
+                node = outcome.item[0]
+                logger.error(
+                    "Skipping KG extraction for title node %s after failure: %s",
+                    node.index_id,
+                    outcome.error,
+                )
+                yield {"entities": [], "relations": [], "node_idx": node.index_id}
+                continue
+            yield outcome.unwrap()
 
     def batch_extract_titles(
         self,
-        nodes: List[TreeNode],
-        title_paths: List[List[TreeNode]],
-        sibling_nodes_list: List[List[TreeNode]],
-        max_workers: int = 4,
+        nodes: Iterable[TreeNode],
+        title_paths: Iterable[List[TreeNode]],
+        sibling_nodes_list: Iterable[List[TreeNode]],
+        max_workers: int | None = None,
+        max_in_flight: int | None = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Batch extract knowledge graphs from a list of title nodes.
-        This is useful for processing multiple title nodes in one go.
-        """
-        results = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.extract_title, node, title_path, sibling_nodes): (
-                    node,
-                    title_path,
-                    sibling_nodes,
-                )
-                for node, title_path, sibling_nodes in zip(
-                    nodes, title_paths, sibling_nodes_list
-                )
-            }
-            for future in futures:
-                try:
-                    res = future.result()
-                    results.append(res)
-                except Exception as e:
-                    logger.error(
-                        f"Error extracting KG for title node {futures[future][0].index_id}: {e}"
-                    )
-                    results.append(
-                        {
-                            "entities": [],
-                            "relations": [],
-                            "node_idx": futures[future][0].index_id,
-                        }
-                    )
-        return results
+        """Compatibility materialization over :meth:`iter_extract_titles`."""
+
+        return list(
+            self.iter_extract_titles(
+                zip(nodes, title_paths, sibling_nodes_list),
+                max_workers=max_workers,
+                max_in_flight=max_in_flight,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from xmlrpc.client import Boolean
 from Core.provider.llm import LLM
 from Core.provider.vdb import VectorStore
 from Core.configs.graph_config import GraphConfig
+from Core.configs.vdb_config import VDBConfig
 from Core.provider.embedding import TextEmbeddingProvider
 from Core.provider.rerank import TextRerankerProvider
 from Core.Index.Graph import Entity, Relationship, Graph
@@ -16,18 +17,25 @@ from Core.prompts.kg_prompt import (
     DESCRIPTION_SYNTHESIS,
 )
 from Core.utils.utils import truncate_description
+from Core.utils.bounded_executor import iter_bounded_ordered
 
 
 from collections import defaultdict
 from typing import Optional, List
-import os
 import json
-import shutil
 import logging
 import gc
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger(__name__)
+
+
+class KGRefinementError(RuntimeError):
+    """An entity could not be refined without losing evidence."""
+
+    def __init__(self, entity_name: str, error: Exception):
+        self.entity_name = entity_name
+        self.error = error
+        super().__init__(f"KG refinement failed for entity {entity_name!r}: {error}")
 
 
 class KGRefiner:
@@ -47,11 +55,14 @@ class KGRefiner:
         graph_config: GraphConfig,
         graph_index: Graph,
         save_path: str,
+        vdb_config: VDBConfig,
+        scope_filter: dict[str, str],
         g: float = 0.6,
     ):
         self.llm = llm
         self.graph_index = graph_index
         self.graph_config = graph_config
+        self.scope_filter = dict(scope_filter)
         # Similarity search configuration:
         # `g` is configurable from init; others are fixed defaults.
         self.similar_search_topk = 10
@@ -60,39 +71,48 @@ class KGRefiner:
         self.similar_search_g = g
         log.info(f"KGRefiner initialized with g={g}")
 
-        # The following used for advanced refiner
-        self.embedder = TextEmbeddingProvider(
-            model_name=graph_config.embedding_config.model_name,
-            backend=graph_config.embedding_config.backend,
-            max_length=graph_config.embedding_config.max_length,
-            device=graph_config.embedding_config.device,
-            api_base=graph_config.embedding_config.api_base,
-        )
-        self.reranker = TextRerankerProvider(
-            model_name=graph_config.reranker_config.model_name,
-            device=graph_config.reranker_config.device,
-            max_length=graph_config.reranker_config.max_length,
-            backend=graph_config.reranker_config.backend,
-            api_base=graph_config.reranker_config.api_base,
-        )
-        # delete the old vector database if exists
-        embed_model_name = graph_config.embedding_config.model_name.replace("/", "_")
-        rerank_model_name = graph_config.reranker_config.model_name.replace("/", "_")
-        self.vdb_path = os.path.join(
-            save_path, f"kg_vdb_{g}_{embed_model_name}_{rerank_model_name}"
-        )
-        if os.path.exists(self.vdb_path):
-            log.info(f"Deleting old vector database at {self.vdb_path}")
-            # delete this dir
-            shutil.rmtree(self.vdb_path)
-        self.vdb = VectorStore(
-            embedding_model=self.embedder,
-            db_path=self.vdb_path,
-            collection_name="kg_collection",
-        )
-        # self.entity_merge_times: dict[str, int] = defaultdict(int)
+        self.embedder = None
+        self.reranker = None
+        self.vdb = None
         self.entity_to_vdb_id: dict[str, str] = defaultdict(str)
         self.entity_alias_map: dict[str, str] = defaultdict(str)
+        try:
+            self.embedder = TextEmbeddingProvider(
+                model_name=graph_config.embedding_config.model_name,
+                backend=graph_config.embedding_config.backend,
+                max_length=graph_config.embedding_config.max_length,
+                device=graph_config.embedding_config.device,
+                api_base=graph_config.embedding_config.api_base,
+                api_key=getattr(graph_config.embedding_config, "api_key", None),
+            )
+            self.reranker = TextRerankerProvider(
+                model_name=graph_config.reranker_config.model_name,
+                device=graph_config.reranker_config.device,
+                max_length=graph_config.reranker_config.max_length,
+                backend=graph_config.reranker_config.backend,
+                api_base=graph_config.reranker_config.api_base,
+                request_timeout_seconds=(
+                    graph_config.reranker_config.request_timeout_seconds
+                ),
+                use_flash_attention=(
+                    graph_config.reranker_config.use_flash_attention
+                ),
+                flash_attention_fallback=(
+                    graph_config.reranker_config.flash_attention_fallback
+                ),
+            )
+            self.vdb = VectorStore(
+                embedding_model=self.embedder,
+                qdrant_url=vdb_config.qdrant_url,
+                collection_name=graph_config.entity_collection_name,
+                api_key_env=vdb_config.api_key_env,
+                timeout_seconds=vdb_config.timeout_seconds,
+                scope_filter=self.scope_filter,
+            )
+            self.vdb.reset()
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         """
@@ -101,42 +121,65 @@ class KGRefiner:
         """
         log.info("Closing KGRefiner and all its resources...")
 
-        # 1. Close the Reranker and release its reference
-        if (
-            hasattr(self, "reranker")
-            and self.reranker
-            and hasattr(self.reranker, "close")
-        ):
-            self.reranker.close()
-        self.reranker = None
+        for resource_name in ("reranker", "vdb", "embedder"):
+            resource = getattr(self, resource_name, None)
+            if resource is not None and hasattr(resource, "close"):
+                try:
+                    resource.close()
+                except Exception:
+                    log.exception("Failed to close KG resource %s", resource_name)
+            setattr(self, resource_name, None)
 
-        # 2. Close the Embedder and release its reference
-        if (
-            hasattr(self, "embedder")
-            and self.embedder
-            and hasattr(self.embedder, "close")
-        ):
-            self.embedder.close()
-        self.embedder = None
+        if hasattr(self, "entity_to_vdb_id"):
+            self.entity_to_vdb_id.clear()
+        if hasattr(self, "entity_alias_map"):
+            self.entity_alias_map.clear()
 
-        # 6. Perform a final garbage collection and empty the CUDA cache
         log.info("Performing final cleanup...")
         gc.collect()
 
         log.info("✅ KGRefiner resources closed successfully.")
 
     def get_latest_entity_name(self, node_name: str) -> str:
-        if node_name not in self.entity_alias_map.keys():
+        if node_name not in self.entity_alias_map:
             raise ValueError(
                 f"Entity name '{node_name}' not found in the alias map. "
                 "Please ensure the entity has been processed before."
             )
-        latest_node_name = self.entity_alias_map[node_name]
-        if latest_node_name == node_name:
-            return latest_node_name
-        else:
-            # Recursively find the latest entity name
-            return self.get_latest_entity_name(latest_node_name)
+
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current = node_name
+        while True:
+            if current in positions:
+                cycle_start = positions[current]
+                cycle = path[cycle_start:] + [current]
+                raise ValueError(
+                    "Entity alias cycle detected: " + " -> ".join(cycle)
+                )
+            positions[current] = len(path)
+            path.append(current)
+
+            if current not in self.entity_alias_map:
+                raise ValueError(
+                    f"Entity alias '{path[-2]}' points to missing entity "
+                    f"'{current}'."
+                )
+            latest_node_name = self.entity_alias_map[current]
+            if not latest_node_name:
+                raise ValueError(
+                    f"Entity alias '{current}' has an empty destination."
+                )
+            if latest_node_name == current:
+                root = current
+                break
+            current = latest_node_name
+
+        # Union-find-style path compression makes future lookups effectively
+        # constant time while avoiding recursion depth failures on long chains.
+        for alias in path:
+            self.entity_alias_map[alias] = root
+        return root
 
     def entity_merge(
         self,
@@ -221,7 +264,7 @@ class KGRefiner:
             merged_node_name = self.graph_index.get_node_name_from_entity(merged_entity)
             if (
                 merged_node_name != old_node_name
-                and merged_node_name in self.graph_index.get_all_nodes()
+                and merged_node_name in self.graph_index.kg
             ):
                 # If the merged entity is another entity (entityC) in the graph,
                 # merge entityC to old entity and then update the graph index.
@@ -295,7 +338,7 @@ class KGRefiner:
             entity_node_name = self.graph_index.get_node_name_from_entity(entity=entity)
             # If the entity is not in the graph index, add it
             # Otherwise, merge it with the existing entity
-            if entity_node_name not in self.graph_index.get_all_nodes():
+            if entity_node_name not in self.graph_index.kg:
                 self.graph_index.add_and_link(tree_node_id=source_id, entities=entity)
                 entity_map[entity.entity_name] = entity
                 add_entity_list.append(entity)
@@ -334,6 +377,8 @@ class KGRefiner:
             "entity_name": entity.entity_name,
             "entity_type": entity.entity_type,
             "description": entity.description,
+            "node_id": self.graph_index.get_node_name_from_entity(entity),
+            **self.scope_filter,
         }
 
     def add_entities_to_vdb(self, entities: List[Entity]) -> None:
@@ -374,7 +419,11 @@ class KGRefiner:
         if not embed_texts:
             return
 
-        vdbids: List[str] = self.vdb.add_texts(texts=embed_texts, metadatas=metadatas)
+        vdbids: List[str] = self.vdb.add_texts(
+            texts=embed_texts,
+            metadatas=metadatas,
+            strict_source_identity=True,
+        )
         for embed_text, vdbid in zip(embed_texts, vdbids):
             if embed_text in self.entity_to_vdb_id:
                 log.warning(
@@ -487,7 +536,7 @@ class KGRefiner:
             else:
                 break
 
-        if len(sel_entities) == ranked_results:
+        if len(sel_entities) == len(ranked_results):
             # 4.3 If all entities are selected, return empty list
             return []
 
@@ -583,7 +632,7 @@ class KGRefiner:
 
         # 1.1 the same entity name and entity type, merge them directly
         node_name = self.graph_index.get_node_name_from_entity(entity=new_entity)
-        if node_name in self.graph_index.get_all_nodes():
+        if node_name in self.graph_index.kg:
             # If the entity already exists in the graph index with the same type, merge them
             existing_entity = self.graph_index.get_entity(
                 new_entity.entity_name, new_entity.entity_type
@@ -667,7 +716,7 @@ class KGRefiner:
         """
         for k, v in entity_map.items():
             node_name = self.graph_index.get_node_name_from_entity(v)
-            if node_name not in self.graph_index.get_all_nodes():
+            if node_name not in self.graph_index.kg:
                 new_node_name = self.get_latest_entity_name(node_name=node_name)
                 entity_map[k] = self.graph_index.get_entity_by_node_name(new_node_name)
                 log.info(
@@ -699,7 +748,7 @@ class KGRefiner:
 
     def _debug_check_num(self):
         num_node_graph = len(self.graph_index.kg.nodes())
-        num_node_vdb = self.vdb.collection.count()
+        num_node_vdb = self.vdb.count()
         if num_node_graph != num_node_vdb:
             log.warning(
                 f"Number of nodes in the graph index ({num_node_graph}) "
@@ -731,7 +780,7 @@ class KGRefiner:
         entity_map: dict[str, Entity] = {}
 
         # 1. for the first time to refine the KG, the vector database and graph index are initialized.
-        if self.vdb.collection.count() <= 10:
+        if self.vdb.count() <= 10:
             # If the vector database is empty or has very few entities, we can skip entity resolution.
             # Not entity resolution for normal entities.
 
@@ -791,10 +840,9 @@ class KGRefiner:
         # for debug check the number of nodes in graph and vdb
         self._debug_check_num()
 
-    def refine_entity_description(self, entity: Entity) -> Entity:
-        # use LLM to refine the entity description
-        # update the graph
-        # delete the old entity from the vector database, insert new one later
+    def _synthesize_entity_description(self, entity: Entity) -> str:
+        """Run the model only; graph and vector-store changes stay serialized."""
+
         log.info(
             f"Refining entity description for {entity.entity_name} of type {entity.entity_type}."
         )
@@ -802,80 +850,110 @@ class KGRefiner:
         prompt = DESCRIPTION_SYNTHESIS.format(
             input_json=json.dumps(json_entity, indent=2, ensure_ascii=False)
         )
+        refined_description = self.llm.get_completion(
+            prompt=prompt, json_response=False
+        )
+        if not refined_description or not refined_description.strip():
+            raise ValueError("LLM returned an empty entity description")
+        return refined_description
+
+    def _apply_refined_description(
+        self, entity: Entity, refined_description: str
+    ) -> Entity:
+        previous_entity = entity.model_copy(deep=True)
+        node_name = self.graph_index.get_node_name_from_entity(entity)
+        vdb_id = self.entity_to_vdb_id.get(node_name)
+        entity.description = refined_description
+        graph_updated = False
         try:
-            refined_description = self.llm.get_completion(
-                prompt=prompt, json_response=False
+            self.graph_index.update_entity(
+                old_entity_name=entity.entity_name,
+                old_entity_type=entity.entity_type,
+                new_entity=entity,
             )
-            if not refined_description:
-                log.warning(
-                    f"LLM returned an empty description for entity {entity.entity_name}."
-                )
-                return entity
+            graph_updated = True
+            if vdb_id is None:
+                # A missing mapping is repaired once. The embedding input is the
+                # stable node name; normal refinement only updates metadata.
+                self.add_entities_to_vdb([entity])
             else:
-                # Update the entity description
-                entity.description = refined_description
-                # Update the graph index with the new description
-                self.graph_index.update_entity(
-                    old_entity_name=entity.entity_name,
-                    old_entity_type=entity.entity_type,
-                    new_entity=entity,
+                self.vdb.update_text_metadatas(
+                    ids=[vdb_id],
+                    metadatas=[self.get_vdb_meta_data(entity)],
                 )
-                # Delete the old entity from the vector database
-                self.delete_entity_from_vdb(entity)
-                log.info(
-                    f"Entity {entity.entity_name} description refined successfully."
-                )
-                return entity
-        except Exception as e:
-            log.error(
-                f"Failed to refine entity description for {entity.entity_name}: {e}"
-            )
-            return entity
+        except Exception:
+            entity.description = previous_entity.description
+            if graph_updated:
+                try:
+                    self.graph_index.update_entity(
+                        old_entity_name=previous_entity.entity_name,
+                        old_entity_type=previous_entity.entity_type,
+                        new_entity=previous_entity,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to roll back graph state for entity %s",
+                        previous_entity.entity_name,
+                    )
+            raise
+        log.info(
+            f"Entity {entity.entity_name} description refined successfully."
+        )
+        return entity
+
+    def refine_entity_description(self, entity: Entity) -> Entity:
+        """Compatibility wrapper for one fail-fast, serialized refinement."""
+
+        try:
+            description = self._synthesize_entity_description(entity)
+            return self._apply_refined_description(entity, description)
+        except KGRefinementError:
+            raise
+        except Exception as error:
+            raise KGRefinementError(entity.entity_name, error) from error
 
     def refine_entities(self):
         merged_entity_set = set()
-        need_refine_entities = []
-        for node_name in self.entity_alias_map.keys():
-            latest_entity_name = self.get_latest_entity_name(node_name)
-            if latest_entity_name not in merged_entity_set:
-                merged_entity_set.add(latest_entity_name)
-                # Get the entity from the graph index
-                entity = self.graph_index.get_entity_by_node_name(latest_entity_name)
 
-                # check the sep in the description
-                if self._DESCRIPTION_SEP_ in entity.description:
-                    # If the description contains the separator, we need to refine it
-                    need_refine_entities.append(entity)
-                else:
-                    # If the description does not contain the separator, we can skip it
+        def entities_to_refine():
+            for node_name in self.entity_alias_map.keys():
+                latest_entity_name = self.get_latest_entity_name(node_name)
+                if latest_entity_name in merged_entity_set:
                     continue
+                merged_entity_set.add(latest_entity_name)
+                entity = self.graph_index.get_entity_by_node_name(latest_entity_name)
+                if self._DESCRIPTION_SEP_ in entity.description:
+                    yield entity
 
-        if not need_refine_entities:
+        refined_count = 0
+        outcomes = iter_bounded_ordered(
+            entities_to_refine(),
+            self._synthesize_entity_description,
+            max_workers=self.graph_config.refinement_max_workers,
+            max_in_flight=self.graph_config.refinement_max_in_flight,
+            thread_name_prefix="kg-refinement",
+        )
+        for outcome in outcomes:
+            if not outcome.ok:
+                assert outcome.error is not None
+                raise KGRefinementError(
+                    outcome.item.entity_name, outcome.error
+                ) from outcome.error
+            try:
+                self._apply_refined_description(outcome.item, outcome.unwrap())
+            except KGRefinementError:
+                raise
+            except Exception as error:
+                raise KGRefinementError(
+                    outcome.item.entity_name, error
+                ) from error
+            refined_count += 1
+        if refined_count == 0:
             log.info("No entities need to be refined.")
             return
-
-        log.info(f"Found {len(need_refine_entities)} entities that need to be refined.")
-
-        # parallel processing of entity refinement
-        add_entities = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(self.refine_entity_description, entity): entity
-                for entity in need_refine_entities
-            }
-            for future in as_completed(futures):
-                entity = futures[future]
-                try:
-                    refined_entity = future.result()
-                    add_entities.append(refined_entity)
-                except Exception as e:
-                    log.error(f"Failed to refine entity {entity.entity_name}: {e}")
-                    add_entities.append(entity)
-
-        # Add the refined entities to the vector database
-        self.add_entities_to_vdb(add_entities)
         log.info(
-            f"Refined {len(add_entities)} entities and added them to the vector database."
+            "Refined %d entity descriptions and synchronized vector metadata.",
+            refined_count,
         )
         self._debug_check_num()
         return

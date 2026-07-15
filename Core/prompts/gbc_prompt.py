@@ -7,8 +7,8 @@ class QuestionEntity(BaseModel):
     Represents an entity extracted from a question.
     """
 
-    entity_name: str = Field(default="")
-    entity_type: str = Field(default="")
+    entity_name: str = Field(default="", max_length=1024)
+    entity_type: str = Field(default="", max_length=128)
 
 
 class QuestionEntityExtraction(BaseModel):
@@ -16,7 +16,7 @@ class QuestionEntityExtraction(BaseModel):
     Represents the result of entity extraction from a question.
     """
 
-    entities: List[QuestionEntity]
+    entities: List[QuestionEntity] = Field(max_length=32)
 
 
 QUESTION_ENTITY_TYPES = [
@@ -255,8 +255,8 @@ Output:
 
 
 class SecEXPSelection(BaseModel):
-    supplementary_ids: List[int]
-    explanation: str
+    supplementary_ids: List[int] = Field(max_length=32)
+    explanation: str = Field(max_length=4096)
 
 
 LLM_EXPANSION_SELECT_PROMPT = """
@@ -275,6 +275,7 @@ Your task is to analyze a user's question and a list of remaining document secti
 4.  **Select and Justify:**
     * **If you find one or more relevant sections:** Place their integer `id`s in the `supplementary_ids` list. In the `explanation` field, briefly justify why each selected section is relevant based on its title.
     * **If no remaining sections are relevant:** You **MUST** return an empty list for `supplementary_ids` and state in the `explanation` that no further relevant sections were found.
+5.  **Selection Budget:** Return at most {max_supplementary_sections} IDs. Every ID MUST appear in Input 3; sections omitted from Input 3 are outside this request's bounded candidate pool.
 
 -Output Schema & Format-
 Your response MUST be a single, valid JSON object. Do not include any other text or markdown.
@@ -285,11 +286,11 @@ Your response MUST be a single, valid JSON object. Do not include any other text
   "supplementary_ids": "<A list of integer IDs for the chosen supplementary sections. Can be empty.>",
   "explanation": "<A concise justification for your selection(s), or a statement that none were relevant.>"
 }}
-````
+```
 
 -----
 
-\-CONTEXT-
+-CONTEXT-
 
 Here is the information you must use to make your decision:
 

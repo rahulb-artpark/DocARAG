@@ -1,6 +1,6 @@
 from .base_config import BaseRAGStrategyConfig
 from typing import Literal
-from pydantic import Field
+from pydantic import AliasChoices, Field
 
 class GraphRAGConfig(BaseRAGStrategyConfig):
     """
@@ -15,6 +15,7 @@ class GraphRAGConfig(BaseRAGStrategyConfig):
     )
     sim_threshold_e: float = Field(
         default=0.3,
+        validation_alias=AliasChoices("sim_threshold_e", "sim_threshold"),
         description="The similarity threshold for filtering retrieved results.",
     )
     x_percentile: float = Field(

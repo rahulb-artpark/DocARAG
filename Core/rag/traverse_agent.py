@@ -2,6 +2,7 @@ from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
 from Core.Index.Tree import DocumentTree, TreeNode, NodeType, MetaInfo
 from Core.rag.base_rag import BaseRAG
+from Core.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
 from Core.prompts.traverseagent_prompt import (
     NAVIGATOR_PROMPT_TEMPLATE,
     ANSWER_GENERATOR_INSTRUCTION_TEMPLATE,
@@ -237,6 +238,10 @@ class TraverseAgent(BaseRAG):
         (This method's logic remains unchanged)
         """
         context_nodes = self._retrieve(query)
+
+        if not context_nodes:
+            log.warning("Tree traversal returned no evidence")
+            return NO_RETRIEVED_EVIDENCE_ANSWER, []
 
         # 1. Get the augmented prompt and image paths
         final_prompt, image_paths = self._create_augmented_prompt(query, context_nodes)
