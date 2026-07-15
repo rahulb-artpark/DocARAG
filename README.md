@@ -63,12 +63,15 @@ the retrieval and reasoning core; Qdrant stores rebuildable vector candidates,
 not the source of truth.
 
 The current compatibility `docarag index` path requires a current PostgreSQL
-schema and records document-version admission plus dispatch stage events. Its
+schema. It records document-version admission and dispatch plus append-only
+`parse`, `tree`, `summary`, `graph`, `entity`, and `vector` stage events with
+per-stage artifact receipts and index-revision publication; a verified live run
+completes tree -> graph -> vector and publishes `artifact-manifest.json`. Its
 tree-vector read/write path uses Qdrant with tenant/corpus/document/source/index
 payload scoping. The PostgreSQL schema and transactional lease/index APIs are
-implemented, but every internal legacy BookRAG stage has not yet been converted
-to resumable ledger work. Routed parsing also remains opt-in and is not selected
-by `docarag index`.
+implemented, and the pipeline stages now emit ledger events and receipts, but
+item-level resumable leased work is not yet adopted by every stage. Routed
+parsing also remains opt-in and is not selected by `docarag index`.
 
 Use the supported storage lifecycle commands:
 
@@ -502,7 +505,9 @@ stratification pass is `O(S log M)`. Represented IDs, omitted count, prompt
 size, policy name, and status are persisted in `retrieval_res.json`. Successful
 tree summaries and KG extractions are checkpointed by their source, prompt, model and
 asset identities, so changing evidence or a behavior-relevant setting causes
-recomputation instead of unsafe reuse.
+recomputation instead of unsafe reuse. A node whose KG extraction fails after
+its retries is logged and skipped with an empty result rather than aborting the
+whole document; its checkpoint is not committed, so a later run re-attempts it.
 
 LLM, VLM, embedding, and reranker configuration is backend-specific and strict:
 unsupported combinations fail before allocation, while endpoint, credentials,
