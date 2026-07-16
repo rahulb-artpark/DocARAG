@@ -1266,9 +1266,13 @@ class GBCRAG(BaseRAG):
                 "answer asset materialization requires an active GBCRAG query"
             )
         if self.asset_cas_root is None:
-            raise AnswerAssetMaterializationError(
-                "visual evidence requires DOCARAG_ASSET_CAS_ROOT for verified CAS bytes"
+            log.warning(
+                "Skipping verified visual material for %d node(s); "
+                "DOCARAG_ASSET_CAS_ROOT is not set. Text evidence (table cells, "
+                "OCR, captions) still grounds the answer.",
+                len(assets_by_node),
             )
+            return
 
         if new_assets:
             remaining_assets = MAX_ANSWER_ASSETS - len(self._query_asset_refs)
