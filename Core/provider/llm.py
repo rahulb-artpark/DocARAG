@@ -372,6 +372,7 @@ class OllamaController(BaseLLMController):
             else None
         )
         self.keep_alive = llm_config.keep_alive if llm_config else "5m"
+        self.num_ctx = getattr(llm_config, "num_ctx", None) if llm_config else None
         self.unload_on_close = bool(llm_config and llm_config.unload_on_close)
         self.request_timeout_seconds = (
             llm_config.request_timeout_seconds if llm_config else 300.0
@@ -393,6 +394,15 @@ class OllamaController(BaseLLMController):
             self.client = client
             self._owns_client = False if owns_client is None else owns_client
         self._closed = False
+
+    def _options(self) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "temperature": self.temperature,
+            "num_predict": self.max_tokens,
+        }
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
+        return options
 
     def _prepare_messages(
         self, prompt_or_memory: Union[str, Memory], add_system_prompt: bool = True
@@ -416,10 +426,7 @@ class OllamaController(BaseLLMController):
         parameters = {
             "model": self.model,
             "messages": messages,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            },
+            "options": self._options(),
             "keep_alive": self.keep_alive,
             "think": False,
         }
@@ -459,10 +466,7 @@ class OllamaController(BaseLLMController):
             model=self.model,
             messages=messages,
             format=schema.model_json_schema(),  # 关键：传递schema
-            options={
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            },
+            options=self._options(),
             keep_alive=self.keep_alive,
             think=think_mode,
         )

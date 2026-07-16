@@ -27,8 +27,15 @@ class VLMConfig:
     request_timeout_seconds: Optional[float] = None
     keep_alive: OllamaKeepAlive = "5m"
     unload_on_close: bool = False
+    num_ctx: Optional[int] = None
 
     def __post_init__(self):
+        if self.num_ctx is not None and (
+            isinstance(self.num_ctx, bool)
+            or not isinstance(self.num_ctx, int)
+            or self.num_ctx < 1
+        ):
+            raise ValueError("num_ctx must be a positive integer when provided")
         if not isinstance(self.backend, str):
             raise ValueError("backend must be 'qwen', 'gpt', or 'ollama'")
         self.backend = self.backend.strip().lower()

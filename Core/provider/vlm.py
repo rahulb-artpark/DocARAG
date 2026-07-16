@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from PIL import Image
 import base64
 from io import BytesIO
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from Core.Common.Message import Message
 from Core.Common.Memory import Memory
@@ -526,6 +526,17 @@ class GPTVLMController(BaseVLMController):
         _close_controller_client(self)
 
 
+def _parse_structured(payload: str, schema: BaseModel):
+    """Validate a structured reply, which some models serialize as YAML."""
+
+    try:
+        return schema.model_validate_json(payload)
+    except ValidationError:
+        import yaml
+
+        return schema.model_validate(yaml.safe_load(payload))
+
+
 class OllamaVLMController(BaseVLMController):
     def __init__(
         self,
@@ -540,6 +551,7 @@ class OllamaVLMController(BaseVLMController):
         self.temperature = config.temperature
         self.max_tokens = config.max_tokens
         self.keep_alive = config.keep_alive
+        self.num_ctx = config.num_ctx
         self.unload_on_close = config.unload_on_close
         self.request_timeout_seconds = config.request_timeout_seconds
         if self.request_timeout_seconds is None:  # guarded by VLMConfig
@@ -561,6 +573,15 @@ class OllamaVLMController(BaseVLMController):
             self.client = client
             self._owns_client = False if owns_client is None else owns_client
         self._closed = False
+
+    def _options(self) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "temperature": self.temperature,
+            "num_predict": self.max_tokens,
+        }
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
+        return options
 
     def _prepare_messages(
         self,
@@ -619,11 +640,9 @@ class OllamaVLMController(BaseVLMController):
             response = self.client.chat(
                 model=self.model_name,
                 messages=messages,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": self.max_tokens,
-                },
+                options=self._options(),
                 keep_alive=self.keep_alive,
+                think=False,
             )
 
             if response:
@@ -666,11 +685,9 @@ class OllamaVLMController(BaseVLMController):
                 model=self.model_name,
                 messages=messages,
                 format=schema.model_json_schema(),
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": self.max_tokens,
-                },
+                options=self._options(),
                 keep_alive=self.keep_alive,
+                think=False,
             )
 
             if response:
@@ -693,7 +710,7 @@ class OllamaVLMController(BaseVLMController):
                     completion_tokens=completion_tokens,
                 )
 
-            return schema.model_validate_json(response["message"]["content"])
+            return _parse_structured(response["message"]["content"], schema)
         except Exception as e:
             raise RuntimeError(
                 f"Could not get a JSON response from Ollama model '{self.model_name}'"

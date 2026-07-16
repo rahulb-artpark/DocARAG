@@ -73,6 +73,7 @@ class LLMConfig:
     # Closing a client normally releases only its HTTP resources. Model
     # eviction affects every user of a shared Ollama server and is opt-in.
     unload_on_close: bool = False
+    num_ctx: Optional[int] = None
 
     def __post_init__(self):
         if not isinstance(self.backend, str):
