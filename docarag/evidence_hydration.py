@@ -1085,17 +1085,23 @@ class CanonicalEvidenceHydrator:
         projected = project_canonical_blocks(
             self.catalog.document, (block,), validate_relation_targets=False
         )[0]
-        for field_name in (
-            "selected_representation_ids",
-            "selected_asset_ids",
-        ):
-            declared = tree_node.get(field_name)
-            if declared is not None and _unique_strings(
-                declared, field_name
-            ) != tuple(projected.get(field_name, [])):
-                _fail(
-                    f"direct tree node {field_name} differs from canonical projection"
-                )
+        declared = tree_node.get("selected_representation_ids")
+        if declared is not None and _unique_strings(
+            declared, "selected_representation_ids"
+        ) != tuple(projected.get("selected_representation_ids", [])):
+            _fail(
+                "direct tree node selected_representation_ids differs from "
+                "canonical projection"
+            )
+        # Which asset became the row's image is decided by the index-time
+        # materialization lease, and this hydrator is deliberately
+        # reference-only, so that choice is not reproducible here.  Verify the
+        # node cites only assets the canonical block actually owns.
+        declared_assets = tree_node.get("selected_asset_ids")
+        if declared_assets is not None and not set(
+            _unique_strings(declared_assets, "selected_asset_ids")
+        ) <= {item.asset_id for item in block.assets}:
+            _fail("direct tree node selected_asset_ids are not canonical block assets")
         projected_type = projected.get("type")
         node_type = _json_value(tree_node.get("type"))
         if projected_type == "text":

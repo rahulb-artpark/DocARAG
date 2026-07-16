@@ -18,6 +18,7 @@ from Core.pipelines.doc_tree_builder import (
     bind_canonical_evidence,
 )
 from Core.pipelines.tree_node_builder import create_node_by_type
+from docarag.bookrag_projection import project_canonical_blocks
 from docarag.domain import CanonicalBlock, DocumentRef, ParseResult, RelationType
 
 
@@ -91,6 +92,37 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             merged_content_path=merged_path,
         )
         return cfg, request, canonical
+
+    def test_image_row_takes_its_caption_channels_from_the_canonical_projection(
+        self,
+    ):
+        # BookRAG builds an image node's content from these channels while the
+        # evidence hydrator re-derives it from the canonical projection.  The
+        # row must carry the projection's text, not MinerU's own caption list.
+        blocks = [
+            {
+                "type": "image",
+                "img_path": "/evidence/figure-1.png",
+                "image_caption": ["Figure 1: system overview"],
+                "image_footnote": [],
+                "page_idx": 0,
+                "middle_json": {
+                    "type": "image",
+                    "bbox": [10, 10, 200, 200],
+                    "index": 1,
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+            projected = project_canonical_blocks(request.document, canonical)[0]
+            self.assertEqual(
+                list(projected["image_caption"]), blocks[0]["image_caption"]
+            )
+            self.assertEqual(
+                list(projected["image_footnote"]), blocks[0]["image_footnote"]
+            )
 
     def test_canonical_artifacts_tree_node_and_retrieval_share_source_binding(self):
         with tempfile.TemporaryDirectory() as tmp:

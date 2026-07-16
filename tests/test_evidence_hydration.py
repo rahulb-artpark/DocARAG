@@ -8,7 +8,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag.bookrag_projection import project_canonical_blocks
+from docarag.artifact_store import LocalContentAddressedArtifactStore
+from docarag.bookrag_projection import (
+    BookRAGAssetMaterializationLease,
+    project_canonical_blocks,
+)
 from docarag.canonical_artifacts import (
     CANONICAL_CONTRACT_SCHEMA_VERSION,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
@@ -258,6 +262,73 @@ class EvidenceHydrationTests(unittest.TestCase):
             expected_source_uri=self.document.source_uri,
             **limits,
         )
+
+    def test_hydrates_a_node_whose_image_asset_was_leased_at_index_time(self):
+        # An index-time projection holds a materialization lease and records the
+        # leased crop in ``selected_asset_ids``.  This hydrator is deliberately
+        # reference-only, so it can never reproduce that selection; it must
+        # still accept the node instead of reporting a projection mismatch.
+        store = LocalContentAddressedArtifactStore(
+            Path(self.temporary_directory.name) / "asset_cas", create=True
+        )
+        stored = store.publish(b"\x89PNG\r\n\x1a\n workflow", media_type="image/png")
+        asset = stored.to_asset_ref(kind=AssetKind.REGION_CROP)
+        leased_diagram = make_block(
+            self.document,
+            "diagram",
+            page_index=2,
+            block_type=BlockType.DIAGRAM,
+            semantic_subtype="workflow",
+            representations=(
+                Representation(
+                    kind=RepresentationKind.OCR_TEXT,
+                    content="INPUT VALIDATE INDEX",
+                    media_type="text/plain",
+                ),
+            ),
+            assets=(asset,),
+        )
+        lease = BookRAGAssetMaterializationLease(
+            store.make_asset_resolver(), (asset,)
+        )
+        with lease:
+            row = project_canonical_blocks(
+                self.document,
+                (leased_diagram,),
+                asset_materialization_lease=lease,
+            )[0]
+        self.assertEqual([asset.asset_id], list(row["selected_asset_ids"]))
+
+        record = {
+            **tree_record(self.document, leased_diagram, 1),
+            "selected_asset_ids": list(row["selected_asset_ids"]),
+        }
+        self._write_artifact((leased_diagram,))
+        hydrator = CanonicalEvidenceHydrator.from_artifact(
+            self.artifact,
+            node_resolver=lambda ids: [deepcopy(record) for _ in ids],
+            expected_document_version_id=self.document.document_version_id,
+        )
+
+        hydrated = hydrator.hydrate([{**deepcopy(record), "distance": 0.1}])
+
+        self.assertEqual("INPUT VALIDATE INDEX", hydrated[0]["content"])
+
+    def test_node_citing_an_asset_the_block_does_not_own_is_rejected(self):
+        record = {
+            **deepcopy(self.records[3]),
+            "selected_asset_ids": ["asset_forged"],
+        }
+        hydrator = CanonicalEvidenceHydrator.from_artifact(
+            self.artifact,
+            node_resolver=lambda ids: [deepcopy(record) for _ in ids],
+            expected_document_version_id=self.document.document_version_id,
+        )
+
+        with self.assertRaisesRegex(
+            EvidenceHydrationError, "not canonical block assets"
+        ):
+            hydrator.hydrate([{**deepcopy(record), "distance": 0.1}])
 
     def test_hydrates_table_formula_and_diagram_without_mutating_candidates(self):
         candidates = [

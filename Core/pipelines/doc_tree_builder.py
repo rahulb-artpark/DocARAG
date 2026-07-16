@@ -719,6 +719,16 @@ def bind_canonical_evidence(
         attachment["semantic_substructures"] = projected.get(
             "semantic_substructures"
         )
+        # BookRAG builds its tree nodes from these legacy rows while the
+        # evidence hydrator re-derives node content from the canonical
+        # projection.  MinerU leaves a figure's caption list empty, so without
+        # this the recovered text and description stay in the canonical layer
+        # and every figure reaches retrieval as an empty node.
+        if projected.get("type") == "image":
+            attachment["image_caption"] = list(projected.get("image_caption", []))
+            attachment["image_footnote"] = list(
+                projected.get("image_footnote", [])
+            )
 
     canonical_payload = {
         "artifact_schema_version": CANONICAL_EVIDENCE_SCHEMA_VERSION,

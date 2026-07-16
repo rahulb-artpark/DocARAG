@@ -5,6 +5,10 @@ import tempfile
 import unittest
 
 from docarag.artifact_store import LocalContentAddressedArtifactStore
+from docarag.bookrag_projection import (
+    BookRAGAssetMaterializationLease,
+    project_canonical_blocks,
+)
 from docarag.domain import (
     AssetKind,
     BlockType,
@@ -253,6 +257,59 @@ class FigureEnrichmentTest(unittest.TestCase):
         kinds = {item.kind for item in enriched[0].representations}
         self.assertIn(RepresentationKind.OCR_TEXT, kinds)
         self.assertEqual(stats.described_blocks, 0)
+
+
+class EnrichedFigureProjectionTest(unittest.TestCase):
+    """The recovered text must reach the BookRAG rows the tree is built from."""
+
+    def setUp(self) -> None:
+        self.document = make_document()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = LocalContentAddressedArtifactStore(
+            Path(self._tmp.name) / "asset_cas", create=True
+        )
+        stored = self.store.publish(CROP_BYTES, media_type="image/png")
+        self.asset = stored.to_asset_ref(kind=AssetKind.REGION_CROP)
+
+    def test_recovered_text_and_description_reach_the_projected_row(self) -> None:
+        block = make_block(self.document, "figure-1", assets=(self.asset,))
+        enriched, _ = enrich_visual_blocks(
+            (block,),
+            resolver=self.store.make_asset_resolver(),
+            ocr_engine=lambda _data: table_spans(),
+            describer=RecordingDescriber("A table of purchase orders."),
+        )
+
+        lease = BookRAGAssetMaterializationLease(
+            self.store.make_asset_resolver(), (self.asset,)
+        )
+        with lease:
+            row = project_canonical_blocks(
+                self.document, enriched, asset_materialization_lease=lease
+            )[0]
+
+        self.assertEqual("image", row["type"])
+        caption = " ".join(row["image_caption"])
+        self.assertIn("Purchase Orders 126", caption)
+        self.assertIn("A table of purchase orders.", caption)
+
+    def test_a_figure_with_no_recovered_text_still_projects(self) -> None:
+        # Before enrichment a caption-less figure could not be projected at all:
+        # with no text and no leased crop the projector refused the block.
+        block = make_block(self.document, "photo-1", assets=(self.asset,))
+        enriched, _ = enrich_visual_blocks(
+            (block,),
+            resolver=self.store.make_asset_resolver(),
+            ocr_engine=lambda _data: FigureOCRResult(spans=(), width=64, height=64),
+            describer=RecordingDescriber("A photograph of a factory floor."),
+        )
+
+        row = project_canonical_blocks(self.document, enriched)[0]
+
+        self.assertEqual(
+            ["A photograph of a factory floor."], row["image_caption"]
+        )
 
 
 class GroundedFigureDescriberTest(unittest.TestCase):

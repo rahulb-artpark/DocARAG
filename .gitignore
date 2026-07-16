@@ -205,4 +205,4 @@ test/
 /Scripts/cfg/MMLongBench.yaml
 /Scripts/cfg/Qasper.yaml
 /config/tmp/*
-/runs/*tmp/
+/runs/
