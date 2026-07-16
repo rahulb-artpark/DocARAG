@@ -293,7 +293,7 @@ elif stage == "vdb":
 class IndexDriverIntegrationTests(unittest.TestCase):
     def setUp(self):
         qdrant = patch(
-            "docarag.compat.qdrant_collection_state",
+            "Core.utils.artifact_paths.qdrant_collection_state",
             return_value=SimpleNamespace(exists=True, point_count=1),
         )
         qdrant.start()

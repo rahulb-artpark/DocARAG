@@ -24,12 +24,6 @@ import yaml
 
 from docarag.provenance import verify_query_artifacts
 from docarag.run_logging import RunLogInfo, RunLogScope
-from Core.utils.artifact_paths import (
-    QdrantProtocolError,
-    QdrantUnavailableError,
-    qdrant_collection_state,
-    qdrant_endpoint_sha256,
-)
 
 
 _READY_MARKERS = (".ask-ready", ".docarag-ready", "READY")
@@ -236,6 +230,13 @@ def _published_store_readiness(
     roles: dict[str, str],
 ) -> tuple[bool, bool, tuple[str, ...]]:
     """Validate published local bindings against exact live Qdrant scopes."""
+
+    from Core.utils.artifact_paths import (
+        QdrantProtocolError,
+        QdrantUnavailableError,
+        qdrant_collection_state,
+        qdrant_endpoint_sha256,
+    )
 
     errors: list[str] = []
     lexical = _role_path(run_dir, roles, "lexical_store")

@@ -258,7 +258,7 @@ class ProvenanceBindingTests(unittest.TestCase):
         provenance._sha256_for_stat.cache_clear()
         provenance._json_for_stat.cache_clear()
         qdrant = patch(
-            "docarag.compat.qdrant_collection_state",
+            "Core.utils.artifact_paths.qdrant_collection_state",
             return_value=SimpleNamespace(exists=True, point_count=1),
         )
         qdrant.start()
