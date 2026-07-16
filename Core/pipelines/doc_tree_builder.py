@@ -20,7 +20,12 @@ from Core.provider.extract_pdf_info import merge_middle_content, parse_doc
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
 from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
-from docarag.bookrag_projection import project_to_bookrag_pdf_list
+from docarag.artifact_store import LocalContentAddressedArtifactStore
+from docarag.bookrag_projection import (
+    BookRAGAssetMaterializationLease,
+    project_to_bookrag_pdf_list,
+)
+from docarag.crop_materialization import materialize_visual_crops
 from docarag.canonical_artifacts import (
     CANONICAL_EVIDENCE_FILE,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
@@ -543,8 +548,15 @@ def bind_canonical_evidence(
             "MinerU complete-observation reconciliation failed"
         ) from exc
 
+    crop_store = LocalContentAddressedArtifactStore(
+        Path(cfg.save_path) / "asset_cas", create=True
+    )
+    reconciled_blocks, cas_crop_assets = materialize_visual_crops(
+        tuple(reconciled.canonical_blocks), crop_store, cfg.save_path
+    )
+
     canonical_by_observation_id: dict[str, CanonicalBlock] = {}
-    for canonical in reconciled.canonical_blocks:
+    for canonical in reconciled_blocks:
         for observation_id in canonical.source_observation_ids:
             if observation_id in canonical_by_observation_id:
                 raise CanonicalEvidenceBindingError(
@@ -620,9 +632,28 @@ def bind_canonical_evidence(
             }
         )
 
+    crop_lease = (
+        BookRAGAssetMaterializationLease(
+            crop_store.make_asset_resolver(), cas_crop_assets
+        )
+        if cas_crop_assets
+        else None
+    )
+    if crop_lease is not None:
+        with crop_lease:
+            projected_rows = list(
+                project_to_bookrag_pdf_list(
+                    request.document,
+                    canonical_blocks,
+                    asset_materialization_lease=crop_lease,
+                )
+            )
+    else:
+        projected_rows = list(
+            project_to_bookrag_pdf_list(request.document, canonical_blocks)
+        )
     projected_by_block_id = {
-        row["canonical_block_id"]: row
-        for row in project_to_bookrag_pdf_list(request.document, canonical_blocks)
+        row["canonical_block_id"]: row for row in projected_rows
     }
     for attachment in attachments:
         projected = projected_by_block_id.get(attachment["canonical_block_id"])
