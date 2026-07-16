@@ -44,6 +44,53 @@ class StableVectorIdentityTests(unittest.TestCase):
             store.add_texts(["bad"], [{"quality": math.nan}])
         self.assertEqual(1, embedder.embed_texts.call_count)
 
+    def test_two_semantic_elements_with_the_same_text_get_separate_records(self):
+        base = {
+            "document_version_id": "document-v1",
+            "source_sha256": SOURCE_SHA256,
+            "node_id": 17,
+            "canonical_block_id": "block_" + "a" * 32,
+        }
+        value = "diagram | diagram_element | output | Speaker"
+
+        first = stable_vector_record_id(
+            value,
+            {**base, "semantic_element_id": "selem_" + "a" * 32},
+            modality="text",
+            strict_source_identity=True,
+        )
+        second = stable_vector_record_id(
+            value,
+            {**base, "semantic_element_id": "selem_" + "b" * 32},
+            modality="text",
+            strict_source_identity=True,
+        )
+
+        self.assertNotEqual(
+            first,
+            second,
+            "a diagram may draw the same label twice; each element is its own record",
+        )
+
+    def test_records_without_a_semantic_element_keep_their_identity(self):
+        metadata = {
+            "document_version_id": "document-v1",
+            "source_sha256": SOURCE_SHA256,
+            "node_id": 17,
+        }
+
+        self.assertEqual(
+            stable_vector_record_id(
+                "revenue table", metadata, modality="text", strict_source_identity=True
+            ),
+            stable_vector_record_id(
+                "revenue table",
+                {**metadata, "semantic_element_id": None},
+                modality="text",
+                strict_source_identity=True,
+            ),
+        )
+
     def test_strict_text_upsert_is_idempotent_and_source_content_bound(self):
         store, collection, _embedder = text_store()
         metadata = {

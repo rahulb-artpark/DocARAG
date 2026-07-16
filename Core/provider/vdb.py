@@ -52,6 +52,7 @@ _SOURCE_IDENTITY_FIELDS = (
     "canonical_block_id",
     "observation_id",
     "pdf_id",
+    "semantic_element_id",
 )
 
 
