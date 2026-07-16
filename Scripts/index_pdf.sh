@@ -1308,6 +1308,11 @@ PY
     DRIVER_FINALIZED=1
     return "$status"
   fi
+  if "${python_runner[@]}" -m docarag.evidence_persist --run "$run_dir"; then
+    echo "[driver] $(date) canonical evidence persisted to PostgreSQL and asset CAS"
+  else
+    echo "[driver] $(date) evidence persistence did not complete; index remains usable" >&2
+  fi
   update_index_state "$state_file" "$revision_id" "$$" run_succeeded "" 0
   archive_attempt_state "$state_file" "$DRIVER_ATTEMPT_DIR" || true
   DRIVER_FINALIZED=1

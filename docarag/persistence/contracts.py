@@ -440,18 +440,131 @@ def scope_for_document(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AssetRecord:
+    asset_id: str
+    mime_type: str
+    byte_size: int
+    cas_uri: str
+    width: int | None = None
+    height: int | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class RepresentationRecord:
+    kind: str
+    content_sha256: str | None = None
+    content: str | None = None
+    cas_uri: str | None = None
+    confidence: float | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class BlockAssetLink:
+    asset_id: str
+    role: str
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class BlockRecord:
+    block_id: str
+    revision_id: str
+    block_type: str
+    page_index: int
+    semantic_subtype: str | None = None
+    page_id: str | None = None
+    reading_order: int | None = None
+    parent_block_id: str | None = None
+    content_sha256: str | None = None
+    quality_status: str | None = None
+    reconciliation_method: str | None = None
+    geometry: Mapping[str, object] | None = None
+    source_observation_ids: tuple[str, ...] = ()
+    metadata: Mapping[str, object] = field(default_factory=dict)
+    representations: tuple[RepresentationRecord, ...] = ()
+    asset_links: tuple[BlockAssetLink, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TreeNodeRecord:
+    node_id: int
+    node_path: str
+    node_type: str
+    level: int
+    parent_id: int | None = None
+    reading_order: int | None = None
+    block_id: str | None = None
+    summary_sha256: str | None = None
+    summary: str | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class EntityRecord:
+    entity_id: str
+    entity_name: str
+    entity_type: str
+    description: str | None = None
+    description_sha256: str | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class RelationRecord:
+    relation_id: str
+    src_entity_id: str
+    dst_entity_id: str
+    relation_type: str
+    directed: bool = True
+    weight: float | None = None
+    description: str | None = None
+    evidence: tuple[object, ...] = ()
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class GTLinkRecord:
+    entity_id: str
+    node_id: int
+    block_id: str | None = None
+    provenance: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentEvidence:
+    index_revision_id: str
+    assets: tuple[AssetRecord, ...] = ()
+    blocks: tuple[BlockRecord, ...] = ()
+    tree_nodes: tuple[TreeNodeRecord, ...] = ()
+    entities: tuple[EntityRecord, ...] = ()
+    relations: tuple[RelationRecord, ...] = ()
+    gt_links: tuple[GTLinkRecord, ...] = ()
+
+
 __all__ = [
     "ArtifactAvailability",
     "ArtifactReceiptRecord",
+    "AssetRecord",
+    "BlockAssetLink",
+    "BlockRecord",
     "CorpusScope",
+    "DocumentEvidence",
     "DocumentScope",
+    "EntityRecord",
+    "GTLinkRecord",
     "IndexPublication",
     "IndexRevisionSpec",
     "IndexRevisionState",
     "PostgresHealth",
+    "RelationRecord",
+    "RepresentationRecord",
     "SchemaStatus",
     "StageEvent",
     "StageEventStatus",
+    "TreeNodeRecord",
     "WorkLease",
     "WorkSpec",
     "WorkState",
