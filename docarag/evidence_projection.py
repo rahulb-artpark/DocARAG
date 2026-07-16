@@ -45,6 +45,25 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _resolve_local_asset(asset: dict, run: Path) -> Path | None:
+    uri = asset.get("uri")
+    if not isinstance(uri, str) or not uri:
+        return None
+    if uri.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        uri = unquote(urlparse(uri).path)
+    candidate = Path(uri)
+    if not candidate.is_absolute():
+        candidate = run / candidate
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(run)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
 def publish_asset_bytes(data: bytes, cas_root: Path) -> str:
     """Store bytes at <cas_root>/<digest[:2]>/<digest>; return the digest."""
 
@@ -98,7 +117,7 @@ def build_document_evidence(
     run = Path(run_dir).expanduser().resolve()
     cas_root = Path(asset_cas_root).expanduser().resolve() if asset_cas_root else None
 
-    assets: list[AssetRecord] = []
+    asset_by_id: dict[str, AssetRecord] = {}
     blocks: list[BlockRecord] = []
     canonical_path = run / "canonical_blocks.json"
     if canonical_path.is_file():
@@ -118,11 +137,28 @@ def build_document_evidence(
             for asset in block.get("assets") or []:
                 if not isinstance(asset, dict):
                     continue
-                digest = asset.get("sha256") or asset.get("asset_id")
-                if isinstance(digest, str) and len(digest) == 64:
-                    asset_links.append(
-                        BlockAssetLink(asset_id=digest, role=str(asset.get("role") or "asset"))
+                role = str(asset.get("kind") or asset.get("role") or "asset")
+                digest = asset.get("sha256")
+                if not (isinstance(digest, str) and len(digest) == 64):
+                    resolved = _resolve_local_asset(asset, run)
+                    if resolved is None or cas_root is None:
+                        continue
+                    data = resolved.read_bytes()
+                    digest = publish_asset_bytes(data, cas_root)
+                    asset_by_id.setdefault(
+                        digest,
+                        AssetRecord(
+                            asset_id=digest,
+                            mime_type=str(
+                                asset.get("media_type")
+                                or _IMAGE_MIME.get(resolved.suffix.lower(), "application/octet-stream")
+                            ),
+                            byte_size=len(data),
+                            cas_uri=f"cas://sha256/{digest}",
+                            metadata={"kind": role},
+                        ),
                     )
+                asset_links.append(BlockAssetLink(asset_id=digest, role=role))
             blocks.append(
                 BlockRecord(
                     block_id=str(block["block_id"]),
@@ -143,23 +179,6 @@ def build_document_evidence(
                     metadata=block.get("metadata") or {},
                     representations=representations,
                     asset_links=tuple(asset_links),
-                )
-            )
-
-    images_dir = run / "vlm" / "images"
-    if cas_root is not None and images_dir.is_dir():
-        for image in sorted(images_dir.iterdir()):
-            if not image.is_file() or image.suffix.lower() not in _IMAGE_MIME:
-                continue
-            data = image.read_bytes()
-            digest = publish_asset_bytes(data, cas_root)
-            assets.append(
-                AssetRecord(
-                    asset_id=digest,
-                    mime_type=_IMAGE_MIME[image.suffix.lower()],
-                    byte_size=len(data),
-                    cas_uri=f"cas://sha256/{digest}",
-                    metadata={"origin_name": image.name},
                 )
             )
 
@@ -268,7 +287,7 @@ def build_document_evidence(
 
     return DocumentEvidence(
         index_revision_id=index_revision_id,
-        assets=tuple(assets),
+        assets=tuple(asset_by_id.values()),
         blocks=tuple(blocks),
         tree_nodes=tuple(tree_nodes),
         entities=tuple(entities),

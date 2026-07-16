@@ -112,7 +112,23 @@ class EvidenceProjectionTests(unittest.TestCase):
                             "revision_id": "r0",
                             "representations": [{"kind": "text", "content": "Title"}],
                             "assets": [],
-                        }
+                        },
+                        {
+                            "block_id": "blk1",
+                            "block_type": "table",
+                            "page_index": 0,
+                            "reading_order": 1,
+                            "revision_id": "r0",
+                            "representations": [{"kind": "html", "content": "<table/>"}],
+                            "assets": [
+                                {
+                                    "kind": "region_crop",
+                                    "media_type": "image/jpeg",
+                                    "sha256": None,
+                                    "uri": str(run / "vlm" / "images" / "fig.jpg"),
+                                }
+                            ],
+                        },
                     ]
                 }
             ),
@@ -160,8 +176,10 @@ class EvidenceProjectionTests(unittest.TestCase):
 
             evidence = build_document_evidence(run, "rev1", asset_cas_root=cas)
 
-            self.assertEqual(1, len(evidence.blocks))
-            self.assertEqual("title", evidence.blocks[0].block_type)
+            self.assertEqual(2, len(evidence.blocks))
+            self.assertEqual({"title", "table"}, {b.block_type for b in evidence.blocks})
+            table = next(b for b in evidence.blocks if b.block_type == "table")
+            self.assertEqual("html", table.representations[0].kind)
             paths = {node.node_id: node.node_path for node in evidence.tree_nodes}
             self.assertEqual({0: "0", 1: "0.1", 2: "0.1.2"}, paths)
             self.assertEqual(2, len(evidence.entities))
@@ -171,10 +189,13 @@ class EvidenceProjectionTests(unittest.TestCase):
             self.assertEqual(2, len({r.relation_id for r in evidence.relations}))
             # gt-links: node1->{a}, node2->{a,b} == 3
             self.assertEqual(3, len(evidence.gt_links))
-            # one figure published to the content-addressed asset store
+            # the table crop is content-addressed, linked to its block, and in CAS
             self.assertEqual(1, len(evidence.assets))
             digest = evidence.assets[0].asset_id
+            self.assertEqual(64, len(digest))
             self.assertTrue((cas / digest[:2] / digest).is_file())
+            self.assertEqual(digest, table.asset_links[0].asset_id)
+            self.assertEqual("region_crop", table.asset_links[0].role)
 
     def test_projection_is_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:
