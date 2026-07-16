@@ -15,7 +15,12 @@ import os
 from typing import Any, ContextManager, Protocol, TypeVar
 from urllib.parse import urlsplit
 
-from docarag.domain.base import canonical_json_bytes, content_sha256, json_ready
+from docarag.domain.base import (
+    canonical_json_bytes,
+    content_sha256,
+    json_ready,
+    require_non_empty,
+)
 from docarag.domain.evidence import DocumentRef
 from docarag.persistence.contracts import (
     ArtifactReceiptRecord,
@@ -41,6 +46,18 @@ from docarag.settings import DEFAULT_DATABASE_URL, DEFAULT_DATABASE_URL_ENV
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 _SCHEMA_ADVISORY_LOCK = 7_640_227_241_925_119_841
+
+
+_REVISION_SCOPED_TABLES = (
+    "gt_links",
+    "kg_relations",
+    "kg_entities",
+    "tree_nodes",
+    "block_assets",
+    "block_representations",
+    "canonical_blocks",
+)
+
 
 
 class PostgresLedgerError(RuntimeError):
@@ -1212,6 +1229,39 @@ class PostgresLedger:
             raise LeaseLostError("work lease is stale, expired, or owned by another worker")
         return WorkState(str(row["state"]))
 
+    def delete_revision_evidence(
+        self, scope: DocumentScope, index_revision_id: str
+    ) -> dict[str, int]:
+        """Delete one revision's derived evidence rows.
+
+        The ledger itself is deliberately append-only: document versions,
+        index revisions, artifact receipts, and stage events are protected by
+        database triggers because they record that this document was admitted
+        and what ran over it. Only the derived evidence, which a reindex
+        rebuilds, is removable. Assets are content addressed and shared by
+        every revision resolving to the same bytes, so they stay too.
+        """
+
+        require_non_empty(index_revision_id, "index_revision_id")
+        base = (
+            scope.tenant_id,
+            scope.corpus_id,
+            scope.document_id,
+            scope.document_version_id,
+            index_revision_id,
+        )
+        removed: dict[str, int] = {}
+        with self._connection() as connection:
+            for table in _REVISION_SCOPED_TABLES:
+                cursor = connection.execute(
+                    f"DELETE FROM docarag.{table} WHERE tenant_id = %s AND "
+                    "corpus_id = %s AND document_id = %s AND "
+                    "document_version_id = %s AND index_revision_id = %s",
+                    base,
+                )
+                removed[table] = max(getattr(cursor, "rowcount", 0) or 0, 0)
+        return {name: count for name, count in removed.items() if count}
+
     def persist_document_evidence(
         self, scope: DocumentScope, evidence: DocumentEvidence
     ) -> None:
@@ -1225,15 +1275,7 @@ class PostgresLedger:
             evidence.index_revision_id,
         )
         with self._connection() as connection:
-            for table in (
-                "gt_links",
-                "kg_relations",
-                "kg_entities",
-                "tree_nodes",
-                "block_assets",
-                "block_representations",
-                "canonical_blocks",
-            ):
+            for table in _REVISION_SCOPED_TABLES:
                 connection.execute(
                     f"DELETE FROM docarag.{table} WHERE tenant_id = %s AND "
                     "corpus_id = %s AND document_id = %s AND "

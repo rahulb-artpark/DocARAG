@@ -153,6 +153,20 @@ def run_progress(run_dir):
     }
 
 
+def run_completed(run_dir):
+    """True when every stage of this run finished and left a viewable tree."""
+
+    state = _read_json_if_present(run_dir / "index-state.json")
+    if not (run_dir / "tree.json").is_file():
+        return False
+    if not state:
+        return True
+    stages = state.get("stages") or {}
+    return state.get("overall_status") == "succeeded" and all(
+        (stages.get(name) or {}).get("status") == "succeeded" for name in STAGE_ORDER
+    )
+
+
 def run_summary(run_dir):
     progress = run_progress(run_dir)
     meta = _read_json_if_present(run_dir / "tree.json").get("meta_info") or {}
@@ -164,6 +178,102 @@ def run_summary(run_dir):
     progress["name"] = name
     progress["mtime"] = run_dir.stat().st_mtime
     return progress
+
+
+def _qdrant_delete_scope(qdrant_url, timeout_seconds, collection, scope):
+    """Delete exactly one run's points, leaving every other run untouched."""
+
+    from qdrant_client import QdrantClient, models
+
+    client = QdrantClient(url=qdrant_url, timeout=timeout_seconds)
+    try:
+        names = {item.name for item in client.get_collections().collections}
+        if collection not in names:
+            return 0
+        scope_filter = models.Filter(
+            must=[
+                models.FieldCondition(key=key, match=models.MatchValue(value=value))
+                for key, value in sorted(scope.items())
+            ]
+        )
+        before = client.count(collection, count_filter=scope_filter, exact=True).count
+        if before:
+            client.delete(
+                collection_name=collection,
+                points_selector=models.FilterSelector(filter=scope_filter),
+                wait=True,
+            )
+        return before
+    finally:
+        client.close()
+
+
+def delete_run_everywhere(run_dir):
+    """Remove one run's vectors, ledger rows, and files."""
+
+    import shutil
+
+    manifest = _read_json_if_present(run_dir / "run-manifest.json")
+    config = read_run_config(run_dir) or {}
+    removed = {"vectors": {}, "rows": {}, "runDir": str(run_dir)}
+
+    tenant = manifest.get("tenant_id")
+    corpus = manifest.get("corpus_id")
+    document_id = manifest.get("document_id")
+    document_version_id = manifest.get("document_version_id")
+    revision_id = manifest.get("revision_id")
+    identified = all(
+        isinstance(value, str) and value
+        for value in (tenant, corpus, document_id, document_version_id, revision_id)
+    )
+
+    if identified:
+        vdb_cfg = config.get("vdb") or {}
+        graph_cfg = config.get("graph") or {}
+        qdrant_url = vdb_cfg.get("qdrant_url")
+        scope = {
+            "tenant_id": tenant,
+            "corpus_id": corpus,
+            "document_version_id": document_version_id,
+            "index_revision_id": revision_id,
+        }
+        collections = [
+            name
+            for name in (
+                vdb_cfg.get("collection_name"),
+                graph_cfg.get("entity_collection_name"),
+            )
+            if isinstance(name, str) and name
+        ]
+        if qdrant_url:
+            for collection in collections:
+                try:
+                    removed["vectors"][collection] = _qdrant_delete_scope(
+                        qdrant_url,
+                        float(vdb_cfg.get("timeout_seconds") or 10.0),
+                        collection,
+                        scope,
+                    )
+                except Exception as exc:
+                    removed["vectors"][collection] = f"failed: {type(exc).__name__}"
+
+        try:
+            from docarag.persistence import DocumentScope, PostgresLedger
+            from docarag.settings import load_settings
+
+            ledger = PostgresLedger(load_settings().resolve_database_url())
+            removed["rows"] = ledger.delete_revision_evidence(
+                DocumentScope(tenant, corpus, document_id, document_version_id),
+                revision_id,
+            )
+        except Exception as exc:
+            removed["rows"] = {"error": f"{type(exc).__name__}: {exc}"}
+    else:
+        removed["rows"] = {"error": "run has no published identity to purge"}
+
+    shutil.rmtree(run_dir)
+    removed["filesRemoved"] = True
+    return removed
 
 
 def start_index(pdf_path):
@@ -859,8 +969,14 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/runs":
+            # Only completed indexes belong in the picker. A run whose vector
+            # stage failed still publishes a tree, so it looks selectable while
+            # its chat cannot answer anything.
             runs = []
+            current = self.state.run_dir.resolve()
             for run in find_runs():
+                if not run_completed(run) and run.resolve() != current:
+                    continue
                 graph_artifact = find_graph_artifact(run)
                 runs.append(
                     {
@@ -1002,6 +1118,40 @@ class Handler(SimpleHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "Chat request failed",
                 str(exc),
+            )
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        origin = self.headers.get("Origin")
+        if origin and not is_loopback_host(urlparse(origin).hostname or ""):
+            self.send_error_json(HTTPStatus.FORBIDDEN, "Cross-origin request denied")
+            return
+        if parsed.path != "/api/run":
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint")
+            return
+        run_dir = self.resolve_run_argument((parse_qs(parsed.query).get("run") or [""])[0])
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+            return
+        if run_dir == self.state.run_dir.resolve():
+            self.send_error_json(
+                HTTPStatus.CONFLICT,
+                "This document is open; open another one before deleting it",
+            )
+            return
+        try:
+            self.send_json(delete_run_everywhere(run_dir))
+        except OSError as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not delete the run", str(exc)
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Delete failed", str(exc)
             )
 
     def upload_document(self):

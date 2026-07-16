@@ -293,6 +293,7 @@ function runCardHtml(run) {
       <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
       ${isCurrent ? '<span class="pill">open</span>' : ""}
       ${canOpen ? '<button class="btn openRun">Open</button>' : ""}
+      <button class="btn danger deleteRun" ${isCurrent ? "disabled title='Open another document first'" : ""}>Delete</button>
     </div>
     <div class="runMeta">Started ${escapeHtml(fmtWhen(run.startedAt))}</div>
     <div class="stages">${stages}</div>
@@ -341,6 +342,31 @@ async function loadLibrary() {
         alert("Could not open document: " + err.message);
         btn.disabled = false;
         btn.textContent = "Open";
+      }
+    });
+  });
+
+  $("runGrid").querySelectorAll(".deleteRun").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const card = btn.closest(".runCard");
+      const runDir = card.dataset.run;
+      const name = card.querySelector(".runName").textContent;
+      const ok = confirm(
+        `Delete "${name}" completely?\n\n` +
+          "This removes its vectors from Qdrant, its rows from PostgreSQL, and " +
+          "its extracted content from disk. This cannot be undone."
+      );
+      if (!ok) return;
+      btn.disabled = true;
+      btn.textContent = "Deleting…";
+      try {
+        await api(`/api/run?run=${encodeURIComponent(runDir)}`, { method: "DELETE" });
+        await loadRuns();
+        await loadLibrary();
+      } catch (err) {
+        alert("Could not delete: " + err.message);
+        btn.disabled = false;
+        btn.textContent = "Delete";
       }
     });
   });

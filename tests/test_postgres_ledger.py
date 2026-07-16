@@ -316,6 +316,55 @@ class PostgresSchemaTests(unittest.TestCase):
         self.assertNotIn("top-secret", rendered)
 
 
+class DeleteRevisionEvidenceTests(unittest.TestCase):
+    def _delete(self):
+        connection = _FakeConnection()
+        ledger = PostgresLedger(connection_factory=lambda: connection)
+        ledger.delete_revision_evidence(_scope(), "rev-a")
+        return connection
+
+    def test_every_evidence_table_is_scoped_to_one_revision(self):
+        connection = self._delete()
+
+        deletes = [q for q, _ in connection.executions if q.startswith("DELETE")]
+        self.assertEqual(7, len(deletes))
+        for query, params in connection.executions:
+            self.assertIn("index_revision_id = %s", query)
+            self.assertEqual(
+                ("tenant-a", "corpus-a", "doc-a", "docv-a", "rev-a"), params
+            )
+
+    def test_the_append_only_ledger_is_never_touched(self):
+        # Document versions, index revisions, artifact receipts, and stage
+        # events are protected by database triggers because they record that a
+        # document was admitted and what ran over it.
+        connection = self._delete()
+
+        touched = " ".join(query for query, _ in connection.executions)
+        for table in (
+            "document_versions",
+            "index_revisions",
+            "artifact_receipts",
+            "stage_events",
+            "documents",
+        ):
+            self.assertNotIn(f"docarag.{table}", touched)
+
+    def test_shared_content_addressed_assets_survive(self):
+        connection = self._delete()
+
+        touched = " ".join(query for query, _ in connection.executions)
+        self.assertNotIn("docarag.assets", touched)
+
+    def test_an_empty_revision_id_is_refused(self):
+        connection = _FakeConnection()
+        ledger = PostgresLedger(connection_factory=lambda: connection)
+
+        with self.assertRaises(Exception):
+            ledger.delete_revision_evidence(_scope(), "")
+        self.assertEqual([], connection.executions)
+
+
 class PostgresTruthRecordTests(unittest.TestCase):
     def test_document_version_admission_is_idempotent_and_content_bound(self):
         document = _document()
