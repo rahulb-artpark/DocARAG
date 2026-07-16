@@ -40,6 +40,7 @@ from docarag.domain.base import CONTRACT_SCHEMA_VERSION, content_sha256
 from docarag.ports import ParserRegistry
 from docarag.persistence.stage_runtime import durable_stage
 from docarag.reconciliation import ReconciliationError, reconcile_observations
+from docarag.text_recovery import recover_and_prune_empty_text_blocks
 
 log = logging.getLogger(__name__)
 
@@ -1227,6 +1228,15 @@ def build_tree_from_pdf(
                 # tmp pdf_list save for fast test
                 log.info(f"Content extracted and saved to {tmp_save_path}")
 
+            pdf_list, recovered_blocks, dropped_blocks = (
+                recover_and_prune_empty_text_blocks(cfg.pdf_path, pdf_list)
+            )
+            if recovered_blocks or dropped_blocks:
+                log.info(
+                    "Native text-layer recovery: recovered %d, dropped %d empty block(s)",
+                    recovered_blocks,
+                    dropped_blocks,
+                )
             parse_request, _canonical_blocks = bind_canonical_evidence(
                 cfg,
                 pdf_list,

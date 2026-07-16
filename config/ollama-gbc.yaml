@@ -29,9 +29,9 @@ vlm:
   backend: ollama
 
 mineru:
-  backend: vlm-transformers      # local VLM parser; consumes local RAM/VRAM
-  method: vlm                    # forced to "vlm" for non-pipeline backends
-  server_url: http://localhost:30000   # unused with the transformers backend
+  backend: pipeline              # native text layer + dedicated layout/table/formula/OCR models
+  method: auto                   # per page: native text for digital pages, OCR for scanned
+  server_url: http://localhost:30000   # unused with the pipeline backend
   lang: en
 
 tree:
