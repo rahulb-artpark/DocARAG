@@ -27,6 +27,7 @@
         <select id="runSelect"></select>
       </label>
       <nav class="tabs" aria-label="Views">
+        <button class="tab" data-view="library">Library</button>
         <button class="tab active" data-view="graph">Graph</button>
         <button class="tab" data-view="tree">Tree</button>
         <button class="tab" data-view="chat">Chat</button>
@@ -34,6 +35,27 @@
     </header>
 
     <main>
+      <!-- =========================== LIBRARY =========================== -->
+      <section id="libraryView" class="view">
+        <div class="library">
+          <form id="uploadForm" class="uploader" aria-label="Add a document">
+            <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
+            <div class="dropZone" id="dropZone" tabindex="0" role="button"
+                 aria-label="Choose a PDF or drop one here">
+              <strong>Drop a PDF here</strong>
+              <span>or click to choose · indexing starts immediately</span>
+            </div>
+            <div class="uploadStatus" id="uploadStatus" hidden></div>
+          </form>
+
+          <div class="libraryHead">
+            <h2>Documents</h2>
+            <span class="libraryCount" id="libraryCount"></span>
+          </div>
+          <div class="runGrid" id="runGrid"></div>
+        </div>
+      </section>
+
       <!-- ============================ GRAPH ============================ -->
       <section id="graphView" class="view active">
         <aside class="rail">

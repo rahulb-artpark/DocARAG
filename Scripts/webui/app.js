@@ -12,7 +12,11 @@ const state = {
   treeNodesById: new Map(),
   entitiesBySourceNode: new Map(), // tree node id -> [entity, ...]
   chatBusy: false,
+  currentRun: null,
+  libraryTimer: null,
 };
+
+const LIBRARY_POLL_MS = 4000;
 
 const PALETTE = [
   "#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2",
@@ -131,6 +135,7 @@ async function boot() {
   wireGraphControls();
   wireTreeControls();
   wireChat();
+  wireLibrary();
   wireResizers();
   attachNetControls("#graphView .stage", () => state.graphNet);
   attachNetControls("#treeView .stage", () => state.treeNet);
@@ -237,6 +242,169 @@ function activateView(name) {
     else { state.treeNet.redraw(); state.treeNet.fit(); }
   }
   if (name === "chat") $("question").focus();
+  if (name === "library") loadLibrary();
+  else scheduleLibraryPoll(false);
+}
+
+/* =============================== library ================================ */
+const fmtDuration = (sec) => {
+  if (sec === null || sec === undefined) return "—";
+  if (sec < 60) return `${sec.toFixed(0)}s`;
+  const m = Math.floor(sec / 60);
+  return m < 60 ? `${m}m ${Math.round(sec % 60)}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+};
+
+const fmtTokens = (n) => {
+  if (!n) return "—";
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+};
+
+const fmtWhen = (iso) => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return isNaN(d) ? "—" : d.toLocaleString();
+};
+
+function stageStepHtml(stage) {
+  const detail =
+    stage.status === "running"
+      ? "running…"
+      : stage.seconds !== null && stage.seconds !== undefined
+        ? fmtDuration(stage.seconds)
+        : stage.status;
+  return `<div class="stageStep ${escapeHtml(stage.status)}">
+    <div class="nm">${escapeHtml(stage.name)}</div>
+    <div class="st">${escapeHtml(detail)}</div>
+    <div class="bar"><i></i></div>
+  </div>`;
+}
+
+function runCardHtml(run) {
+  const status = run.overallStatus || (run.viewable ? "succeeded" : "pending");
+  const isCurrent = run.runDir === state.currentRun;
+  const canOpen = run.viewable && !isCurrent;
+  const stages = run.stages.map(stageStepHtml).join("");
+  const total = run.stages.reduce((a, s) => a + (s.seconds || 0), 0);
+  return `<article class="runCard ${isCurrent ? "current" : ""}" data-run="${escapeHtml(run.runDir)}">
+    <div class="runCardTop">
+      <span class="runName" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
+      <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
+      ${isCurrent ? '<span class="pill">open</span>' : ""}
+      ${canOpen ? '<button class="btn openRun">Open</button>' : ""}
+    </div>
+    <div class="runMeta">Started ${escapeHtml(fmtWhen(run.startedAt))}</div>
+    <div class="stages">${stages}</div>
+    <div class="runStats">
+      <div class="runStat"><div class="k">Index time</div><div class="v">${escapeHtml(fmtDuration(total || null))}</div></div>
+      <div class="runStat"><div class="k">Tree build</div><div class="v">${escapeHtml(fmtDuration(run.metrics.buildTreeSeconds))}</div></div>
+      <div class="runStat"><div class="k">Tokens</div><div class="v">${escapeHtml(fmtTokens(run.metrics.totalTokens))}</div></div>
+      <div class="runStat"><div class="k">Viewable</div><div class="v">${run.viewable ? "yes" : "no"}</div></div>
+    </div>
+    ${run.error ? `<div class="runError">${escapeHtml(String(run.error))}</div>` : ""}
+  </article>`;
+}
+
+async function loadLibrary() {
+  let data;
+  try {
+    data = await api("/api/library");
+  } catch (err) {
+    $("runGrid").innerHTML = `<div class="libraryEmpty">Could not load documents: ${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  state.currentRun = data.current;
+  const runs = data.runs || [];
+  $("libraryCount").textContent = runs.length ? `${runs.length} indexed` : "";
+  $("runGrid").innerHTML = runs.length
+    ? runs.map(runCardHtml).join("")
+    : '<div class="libraryEmpty">No documents yet. Drop a PDF above to index one.</div>';
+
+  $("runGrid").querySelectorAll(".openRun").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const runDir = btn.closest(".runCard").dataset.run;
+      btn.disabled = true;
+      btn.textContent = "Opening…";
+      try {
+        await api("/api/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ runDir }),
+        });
+        resetForNewRun();
+        await loadRuns();
+        await loadData();
+        await loadLibrary();
+        activateView("tree");
+      } catch (err) {
+        alert("Could not open document: " + err.message);
+        btn.disabled = false;
+        btn.textContent = "Open";
+      }
+    });
+  });
+
+  const active = runs.some((r) => r.phase === "indexing" || r.overallStatus === "running");
+  scheduleLibraryPoll(active);
+}
+
+function scheduleLibraryPoll(active) {
+  if (state.libraryTimer) { clearTimeout(state.libraryTimer); state.libraryTimer = null; }
+  const visible = $("libraryView").classList.contains("active");
+  if (active && visible) {
+    state.libraryTimer = setTimeout(loadLibrary, LIBRARY_POLL_MS);
+  }
+}
+
+function setUploadStatus(message, isError) {
+  const box = $("uploadStatus");
+  box.hidden = false;
+  box.className = "uploadStatus" + (isError ? " err" : "");
+  box.innerHTML = message;
+}
+
+async function uploadPdf(file) {
+  if (!file) return;
+  if (!/\.pdf$/i.test(file.name)) {
+    setUploadStatus("Only PDF files can be indexed.", true);
+    return;
+  }
+  const zone = $("dropZone");
+  zone.classList.add("busy");
+  setUploadStatus(`<span class="spinner"></span>Uploading and starting <b>${escapeHtml(file.name)}</b>…`);
+  try {
+    const res = await api("/api/upload", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/pdf",
+        "X-Filename": encodeURIComponent(file.name),
+      },
+      body: file,
+    });
+    setUploadStatus(`Indexing <b>${escapeHtml(res.name)}</b> — progress appears below.`);
+    await loadLibrary();
+  } catch (err) {
+    setUploadStatus("Upload failed: " + escapeHtml(err.message), true);
+  } finally {
+    zone.classList.remove("busy");
+    $("fileInput").value = "";
+  }
+}
+
+function wireLibrary() {
+  const zone = $("dropZone");
+  const input = $("fileInput");
+  zone.addEventListener("click", () => input.click());
+  zone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
+  });
+  input.addEventListener("change", () => uploadPdf(input.files[0]));
+  ["dragenter", "dragover"].forEach((evt) =>
+    zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.add("dragging"); }));
+  ["dragleave", "drop"].forEach((evt) =>
+    zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.remove("dragging"); }));
+  zone.addEventListener("drop", (e) => uploadPdf(e.dataTransfer.files[0]));
 }
 
 /* ============================== run picker =============================== */

@@ -9,20 +9,24 @@ or:
 """
 import argparse
 import errno
+import hashlib
 import ipaddress
 import json
 import logging
 import mimetypes
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
 import traceback
 import uuid
+from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
 
@@ -42,8 +46,141 @@ from docarag.run_logging import RunLogInfo, RunLogScope
 from Core.provider.TokenTracker import TokenTracker
 
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+PDF_MAGIC = b"%PDF-"
+STAGE_ORDER = ("tree", "graph", "vdb")
 _GRAPH_VALIDATION_CACHE = {}
 _ROLE_CACHE = {}
+
+
+def uploads_dir():
+    return runs_root() / "_uploads"
+
+
+def safe_pdf_name(raw):
+    """Return a bounded ``.pdf`` filename that cannot escape the upload dir."""
+
+    stem = Path(unquote(str(raw or ""))).name
+    cleaned = re.sub(r"[^\w.\- ]+", "_", stem).strip(" .") or "document"
+    if cleaned.lower().endswith(".pdf"):
+        cleaned = cleaned[:-4].strip(" .") or "document"
+    return f"{cleaned[:80]}.pdf"
+
+
+def find_run_dirs():
+    """Return every run directory, including ones still being indexed.
+
+    ``find_runs`` only sees a published ``tree.json``, so a run whose first
+    stage is still building would be missing from the library exactly while its
+    progress matters most.
+    """
+
+    root = runs_root()
+    if not root.is_dir():
+        return []
+    runs = set()
+    for marker in ("**/tree.json", "**/index-state.json"):
+        for path in root.glob(marker):
+            run_dir = path.parent.resolve()
+            try:
+                relative = run_dir.relative_to(root)
+            except ValueError:
+                continue
+            if relative != Path(".") and run_dir.is_dir():
+                runs.add(run_dir)
+    return sorted(runs, key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def _iso_seconds(start, end):
+    if not start or not end:
+        return None
+    try:
+        started = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max((ended - started).total_seconds(), 0.0)
+
+
+def _read_json_if_present(path):
+    try:
+        return read_json(path) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def run_progress(run_dir):
+    """Report one run's stages and metrics from its own published state."""
+
+    state = _read_json_if_present(run_dir / "index-state.json")
+    stats = _read_json_if_present(run_dir / "indexing_stats.json")
+    raw_stages = state.get("stages") or {}
+    stages = []
+    for name in STAGE_ORDER:
+        entry = raw_stages.get(name) or {}
+        status = entry.get("status") or "pending"
+        stages.append(
+            {
+                "name": name,
+                "status": status,
+                "startedAt": entry.get("started_at"),
+                "endedAt": entry.get("ended_at"),
+                "seconds": _iso_seconds(entry.get("started_at"), entry.get("ended_at")),
+                "error": entry.get("error"),
+            }
+        )
+    tokens = {}
+    for stage_name, usage in (stats.get("token_stage_history") or {}).items():
+        if isinstance(usage, dict):
+            tokens[stage_name] = usage.get("total_tokens")
+    tree_path = run_dir / "tree.json"
+    return {
+        "runDir": str(run_dir),
+        "phase": state.get("phase"),
+        "overallStatus": state.get("overall_status"),
+        "currentStage": state.get("current_stage"),
+        "startedAt": state.get("started_at"),
+        "updatedAt": state.get("updated_at"),
+        "endedAt": state.get("ended_at"),
+        "error": state.get("error"),
+        "stages": stages,
+        "viewable": tree_path.is_file(),
+        "metrics": {
+            "buildTreeSeconds": stats.get("build_tree_time"),
+            "tokensByStage": tokens,
+            "totalTokens": sum(v for v in tokens.values() if isinstance(v, int)),
+        },
+    }
+
+
+def run_summary(run_dir):
+    progress = run_progress(run_dir)
+    meta = _read_json_if_present(run_dir / "tree.json").get("meta_info") or {}
+    source = _read_json_if_present(run_dir / "run-manifest.json").get("source") or {}
+    source_name = source.get("display_name")
+    if not source_name and source.get("path"):
+        source_name = Path(str(source["path"])).name
+    name = meta.get("file_name") or source_name or run_dir.name
+    progress["name"] = name
+    progress["mtime"] = run_dir.stat().st_mtime
+    return progress
+
+
+def start_index(pdf_path):
+    """Launch the CLI indexer, which owns admission and the stage ledger."""
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "docarag.cli", "index", str(pdf_path)],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode != 0:
+        raise RuntimeError(output.strip() or "docarag index failed")
+    match = re.search(r"run dir\s*:\s*(\S+)", output)
+    return match.group(1) if match else None
 
 
 def token_usage_payload(scope, query_id):
@@ -335,6 +472,26 @@ class AppState:
         self._graph_cache = None
         self._readiness_cache_key = None
         self._readiness_cache = None
+
+    def switch_run(self, run_dir):
+        """Rebind every cache and release the agent held for the old run."""
+
+        with self.chat_lock:
+            if run_dir == self.run_dir:
+                return
+            if self.rag_agent is not None:
+                close = getattr(self.rag_agent, "close", None)
+                if callable(close):
+                    close()
+            self.rag_agent = None
+            self._rag_identity_key = None
+            self._tree_cache_key = None
+            self._tree_cache = None
+            self._graph_cache_key = None
+            self._graph_cache = None
+            self._readiness_cache_key = None
+            self._readiness_cache = None
+            self.run_dir = run_dir
 
     def chat_readiness(self):
         """Cache readiness until a query-loaded artifact/store identity changes."""
@@ -702,19 +859,20 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/runs":
-            run = self.state.run_dir
-            graph_artifact = find_graph_artifact(run)
-            runs = [
-                {
-                    "path": str(run),
-                    "name": self._safe_doc_name(run),
-                    "hasGraph": graph_artifact is not None,
-                    "graphArtifact": (
-                        str(graph_artifact) if graph_artifact is not None else None
-                    ),
-                    "mtime": run.stat().st_mtime,
-                }
-            ]
+            runs = []
+            for run in find_runs():
+                graph_artifact = find_graph_artifact(run)
+                runs.append(
+                    {
+                        "path": str(run),
+                        "name": self._safe_doc_name(run),
+                        "hasGraph": graph_artifact is not None,
+                        "graphArtifact": (
+                            str(graph_artifact) if graph_artifact is not None else None
+                        ),
+                        "mtime": run.stat().st_mtime,
+                    }
+                )
             self.send_json({"current": str(self.state.run_dir), "runs": runs})
             return
         if parsed.path == "/api/tree":
@@ -728,6 +886,17 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             self.send_json({"ok": True, "runDir": str(self.state.run_dir)})
+            return
+        if parsed.path == "/api/library":
+            self.send_json(
+                {
+                    "current": str(self.state.run_dir),
+                    "runs": [run_summary(item) for item in find_run_dirs()],
+                }
+            )
+            return
+        if parsed.path == "/api/progress":
+            self.send_progress(parsed)
             return
 
         path = Path(self.translate_path(self.path))
@@ -743,6 +912,31 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def resolve_run_argument(self, raw):
+        """Resolve a caller-supplied run strictly below the runs directory."""
+
+        root = runs_root().resolve()
+        run_dir = Path(str(raw or "")).expanduser().resolve()
+        try:
+            relative = run_dir.relative_to(root)
+        except ValueError:
+            return None
+        if relative == Path(".") or not run_dir.is_dir():
+            return None
+        return run_dir
+
+    def send_progress(self, parsed):
+        requested = (parse_qs(parsed.query).get("run") or [""])[0]
+        run_dir = (
+            self.state.run_dir
+            if not requested
+            else self.resolve_run_argument(requested)
+        )
+        if run_dir is None:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown run")
+            return
+        self.send_json(run_summary(run_dir))
 
     def send_tree_image(self, parsed):
         query = parse_qs(parsed.query)
@@ -784,6 +978,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/run":
             self.set_run()
             return
+        if parsed.path == "/api/upload":
+            self.upload_document()
+            return
         if parsed.path != "/api/chat":
             self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint")
             return
@@ -807,21 +1004,80 @@ class Handler(SimpleHTTPRequestHandler):
                 str(exc),
             )
 
+    def upload_document(self):
+        name = safe_pdf_name(self.headers.get("X-Filename"))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
+            return
+        if length <= 0:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Empty upload")
+            return
+        if length > MAX_UPLOAD_BYTES:
+            self.send_error_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"PDF exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit",
+            )
+            return
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Upload was truncated")
+            return
+        if not body.startswith(PDF_MAGIC):
+            self.send_error_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Not a PDF file")
+            return
+
+        target = uploads_dir() / name
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and hashlib.sha256(body).hexdigest() != sha256_file(
+                target
+            ):
+                target = target.with_name(
+                    f"{target.stem}-{uuid.uuid4().hex[:8]}{target.suffix}"
+                )
+            target.write_bytes(body)
+        except OSError as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not store the upload", str(exc)
+            )
+            return
+
+        try:
+            run_dir = start_index(target)
+        except Exception as exc:
+            traceback.print_exc()
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Indexing did not start", str(exc)
+            )
+            return
+        self.send_json(
+            {"ok": True, "name": name, "path": str(target), "runDir": run_dir}
+        )
+
     def set_run(self):
         try:
             payload = self.read_json_body()
-            run_dir = Path(str(payload.get("runDir") or "")).expanduser().resolve()
-            if run_dir != self.state.run_dir.resolve():
+            run_dir = self.resolve_run_argument(payload.get("runDir"))
+            if run_dir is None:
                 self.send_error_json(
-                    HTTPStatus.CONFLICT,
-                    "This server is source-bound to one run; restart "
-                    "`docarag web --run ...` to switch documents",
+                    HTTPStatus.NOT_FOUND,
+                    "Run must be an indexed directory below the configured runs "
+                    "directory",
                 )
                 return
+            if not (run_dir / "tree.json").is_file():
+                self.send_error_json(
+                    HTTPStatus.CONFLICT, "Run has no published tree yet"
+                )
+                return
+            self.state.switch_run(run_dir)
             self.send_json({"ok": True, "runDir": str(run_dir)})
         except RequestBodyError as exc:
             self.send_error_json(exc.status, str(exc))
         except Exception as exc:
+            traceback.print_exc()
             self.send_error_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "Could not switch run",

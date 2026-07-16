@@ -215,3 +215,66 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .spinner { display:inline-block; width:13px; height:13px; border:2px solid var(--accent-soft);
   border-top-color: var(--accent); border-radius:50%; animation: spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------------- library ---------------- */
+#libraryView.active { display: block; overflow-y: auto; }
+.library { max-width: 1080px; margin: 0 auto; padding: 26px 22px 40px; }
+
+.uploader { margin-bottom: 30px; }
+.dropZone {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
+  padding: 30px; border: 2px dashed var(--line); border-radius: var(--radius);
+  background: var(--panel); cursor: pointer; text-align: center;
+  transition: border-color .15s, background .15s;
+}
+.dropZone:hover, .dropZone:focus-visible { border-color: var(--accent); background: var(--accent-soft); outline: none; }
+.dropZone.dragging { border-color: var(--accent); background: var(--accent-soft); }
+.dropZone.busy { pointer-events: none; opacity: .6; }
+.dropZone strong { font-size: 15px; }
+.dropZone span { font-size: 12.5px; color: var(--muted); }
+.uploadStatus { margin-top: 10px; font-size: 13px; padding: 9px 12px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
+.uploadStatus.err { color: #b91c1c; border-color: #f3c9c9; }
+
+.libraryHead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+.libraryHead h2 { margin: 0; font-size: 16px; }
+.libraryCount { font-size: 12.5px; color: var(--muted); }
+
+.runGrid { display: grid; gap: 12px; }
+.runCard {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px; box-shadow: var(--shadow);
+}
+.runCard.current { border-color: var(--accent); }
+.runCardTop { display: flex; align-items: center; gap: 10px; }
+.runName { font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runCardTop .btn { margin-left: auto; }
+.pill {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 3px 9px; border-radius: 999px; background: #eef1f4; color: var(--muted); white-space: nowrap;
+}
+.pill.succeeded { background: var(--accent-soft); color: var(--accent); }
+.pill.running { background: #fef3c7; color: #92400e; }
+.pill.failed { background: #fde8e8; color: #b91c1c; }
+.runMeta { margin-top: 4px; font-size: 12px; color: var(--muted); }
+
+.stages { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.stageStep { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fbfcfd; }
+.stageStep .nm { font-size: 12px; font-weight: 700; text-transform: capitalize; }
+.stageStep .st { font-size: 11.5px; color: var(--muted); }
+.stageStep .bar { height: 3px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
+.stageStep .bar i { display: block; height: 100%; width: 0; background: var(--line); }
+.stageStep.succeeded .bar i { width: 100%; background: var(--accent); }
+.stageStep.succeeded .st { color: var(--accent); }
+.stageStep.running { border-color: #fcd34d; background: #fffbeb; }
+.stageStep.running .bar i { width: 45%; background: #f59e0b; animation: slide 1.2s ease-in-out infinite; }
+.stageStep.running .st { color: #92400e; }
+.stageStep.failed { border-color: #f3c9c9; background: #fef4f4; }
+.stageStep.failed .bar i { width: 100%; background: #b91c1c; }
+.stageStep.failed .st { color: #b91c1c; }
+@keyframes slide { 0% { margin-left: 0; } 50% { margin-left: 55%; } 100% { margin-left: 0; } }
+
+.runStats { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.runStat .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.runStat .v { font-size: 13px; font-weight: 700; }
+.runError { margin-top: 9px; font-size: 12px; color: #b91c1c; word-break: break-word; }
+.libraryEmpty { padding: 30px; text-align: center; color: var(--muted); }
