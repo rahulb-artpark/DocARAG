@@ -74,6 +74,44 @@ def _evidence_identity(node: Dict[str, Any], position: int) -> str:
     return f"legacy:retrieval-position:{position}"
 
 
+_CANONICAL_TEXT_KINDS = (
+    "text",
+    "ocr_text",
+    "visual_description",
+    "caption",
+    "footnote",
+    "markdown",
+)
+
+
+def _canonical_representation_text(node: Dict[str, Any]) -> str:
+    """Text carried by the node's canonical evidence.
+
+    The legacy tree leaves some records without content (figures/diagrams have
+    only a crop). Their canonical block may still carry OCR, a visual
+    description, or a caption; read it rather than answering from nothing.
+    """
+
+    sources = node.get("canonical_sources")
+    if not isinstance(sources, list):
+        return ""
+    parts: list[str] = []
+    for block in sources:
+        if not isinstance(block, dict):
+            continue
+        for representation in block.get("representations") or []:
+            if not isinstance(representation, dict):
+                continue
+            if representation.get("kind") not in _CANONICAL_TEXT_KINDS:
+                continue
+            content = representation.get("content")
+            if isinstance(content, str) and content.strip():
+                text = content.strip()
+                if text not in parts:
+                    parts.append(text)
+    return "\n".join(parts)
+
+
 def _evidence_text(node: Dict[str, Any], content: object) -> str:
     """Render a compact, source-bound evidence header for model prompts."""
 
@@ -358,6 +396,10 @@ class AnswerAgent:
             )
             node["evidence_id"] = evidence_id
             node["evidence_label"] = evidence_label
+            if not str(node.get("content") or "").strip():
+                canonical_text = _canonical_representation_text(node)
+                if canonical_text:
+                    node["content"] = canonical_text
             node_type = node.get("type", "text")
             if isinstance(node.get("page"), int):
                 node["page"] += 1  # make page start from 1

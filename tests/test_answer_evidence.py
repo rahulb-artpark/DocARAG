@@ -29,6 +29,56 @@ class AnswerEvidenceTests(unittest.TestCase):
         self.assertEqual(1, len(text_nodes))
         self.assertEqual("verified canonical OCR description", text_nodes[0]["content"])
 
+    def test_canonical_representations_fill_content_the_legacy_tree_left_empty(self):
+        agent = AnswerAgent.__new__(AnswerAgent)
+        node = {
+            "type": NodeType.IMAGE,
+            "page": 0,
+            "content": "",
+            "canonical_revision_id": "blockrev_figure",
+            "canonical_sources": [
+                {
+                    "representations": [
+                        {"kind": "ocr_text", "content": "Revenue 2024: 4.2M"},
+                        {"kind": "visual_description", "content": "Bar chart of revenue"},
+                        {"kind": "table_grid", "content": "ignored-non-text-kind"},
+                    ]
+                }
+            ],
+            "citation": {
+                "citation_id": "citation_" + "c" * 32,
+                "asset_material_status": "reference_only",
+            },
+        }
+
+        text_nodes, image_nodes = agent._prepare_evidence([node])
+
+        self.assertEqual([], image_nodes)
+        self.assertEqual(1, len(text_nodes))
+        self.assertIn("Revenue 2024: 4.2M", text_nodes[0]["content"])
+        self.assertIn("Bar chart of revenue", text_nodes[0]["content"])
+        self.assertNotIn("ignored-non-text-kind", text_nodes[0]["content"])
+
+    def test_canonical_fill_does_not_override_existing_content(self):
+        agent = AnswerAgent.__new__(AnswerAgent)
+        node = {
+            "type": NodeType.IMAGE,
+            "page": 0,
+            "content": "legacy content wins",
+            "canonical_revision_id": "blockrev_figure",
+            "canonical_sources": [
+                {"representations": [{"kind": "ocr_text", "content": "canonical text"}]}
+            ],
+            "citation": {
+                "citation_id": "citation_" + "d" * 32,
+                "asset_material_status": "reference_only",
+            },
+        }
+
+        text_nodes, _ = agent._prepare_evidence([node])
+
+        self.assertEqual("legacy content wins", text_nodes[0]["content"])
+
     def test_answer_path_hydrates_before_prompting_and_reports_citation_ids(self):
         citation_id = "citation_" + "a" * 32
         captured_prompts = []
