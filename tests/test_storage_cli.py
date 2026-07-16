@@ -20,7 +20,9 @@ class _Health:
     ok = True
     endpoint = "postgresql://127.0.0.1:5432/docarag"
     error_code = None
-    schema = SchemaStatus(True, (1,), (1,), ())
+    schema = SchemaStatus(
+        present=True, current=True, schema_sha256="a" * 64, applied_sha256="a" * 64
+    )
 
     def as_dict(self):
         return {
@@ -41,8 +43,15 @@ class _Ledger:
     def health(self):
         return _Health()
 
-    def migrate(self):
-        return SchemaStatus(True, (1,), (1,), ())
+    def ensure_schema(self):
+        return SchemaStatus(
+            present=True, current=True, schema_sha256="a" * 64, applied_sha256="a" * 64
+        )
+
+    def reset_schema(self):
+        return SchemaStatus(
+            present=True, current=True, schema_sha256="a" * 64, applied_sha256="a" * 64
+        )
 
     def record_document(self, corpus_scope, document):
         self.document = document
@@ -122,7 +131,8 @@ class StorageCLITests(unittest.TestCase):
         for arguments, handler in (
             (("storage", "up"), cli.command_storage_up),
             (("storage", "down"), cli.command_storage_down),
-            (("storage", "migrate"), cli.command_storage_migrate),
+            (("storage", "init"), cli.command_storage_init),
+            (("storage", "reset"), cli.command_storage_reset),
             (("storage", "status"), cli.command_storage_status),
         ):
             parsed = parser.parse_args(arguments)

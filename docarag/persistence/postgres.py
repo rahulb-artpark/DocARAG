@@ -34,12 +34,12 @@ from docarag.persistence.contracts import (
     MAX_LEDGER_URI_CHARACTERS,
     scope_for_document,
 )
-from docarag.persistence.migrations import MIGRATIONS
+from docarag.persistence.schema import SCHEMA_SHA256, SCHEMA_SQL
 from docarag.settings import DEFAULT_DATABASE_URL, DEFAULT_DATABASE_URL_ENV
 
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
-_MIGRATION_ADVISORY_LOCK = 7_640_227_241_925_119_841
+_SCHEMA_ADVISORY_LOCK = 7_640_227_241_925_119_841
 
 
 class PostgresLedgerError(RuntimeError):
@@ -79,15 +79,14 @@ ConnectionFactory = Callable[[], _ConnectionResource]
 T = TypeVar("T")
 
 
-_BOOTSTRAP_MIGRATIONS_SQL = """
+_SCHEMA_META_SQL = """
 CREATE SCHEMA IF NOT EXISTS docarag;
-CREATE TABLE IF NOT EXISTS docarag.schema_migrations (
-    version integer PRIMARY KEY,
-    name text NOT NULL UNIQUE,
-    checksum char(64) NOT NULL,
+CREATE TABLE IF NOT EXISTS docarag.schema_meta (
+    id boolean PRIMARY KEY DEFAULT true,
+    schema_sha256 char(64) NOT NULL,
     applied_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    CONSTRAINT schema_migrations_version CHECK (version >= 1),
-    CONSTRAINT schema_migrations_checksum CHECK (checksum ~ '^[0-9a-f]{64}$')
+    CONSTRAINT schema_meta_singleton CHECK (id),
+    CONSTRAINT schema_meta_sha CHECK (schema_sha256 ~ '^[0-9a-f]{64}$')
 )
 """.strip()
 
@@ -276,29 +275,38 @@ class PostgresLedger:
             if callable(close):
                 close()
 
-    def migrate(self) -> SchemaStatus:
-        """Apply all pending migrations under one transaction-scoped advisory lock."""
+    def ensure_schema(self) -> SchemaStatus:
+        """Create the declarative schema if absent; never drop existing objects."""
 
         with self._connection() as connection:
             connection.execute(
                 "SELECT pg_advisory_xact_lock(%s)",
-                (_MIGRATION_ADVISORY_LOCK,),
+                (_SCHEMA_ADVISORY_LOCK,),
             )
-            connection.execute(_BOOTSTRAP_MIGRATIONS_SQL)
-            applied_rows = connection.execute(
-                "SELECT version, name, checksum "
-                "FROM docarag.schema_migrations ORDER BY version"
-            ).fetchall()
-            applied = self._validate_applied_migrations(applied_rows)
-            for migration in MIGRATIONS:
-                if migration.version in applied:
-                    continue
-                connection.execute(migration.sql)
+            connection.execute(_SCHEMA_META_SQL)
+            if self._applied_schema_sha256(connection) is None:
+                connection.execute(SCHEMA_SQL)
                 connection.execute(
-                    "INSERT INTO docarag.schema_migrations "
-                    "(version, name, checksum) VALUES (%s, %s, %s)",
-                    (migration.version, migration.name, migration.sha256),
+                    "INSERT INTO docarag.schema_meta (schema_sha256) VALUES (%s)",
+                    (SCHEMA_SHA256,),
                 )
+        return self.schema_status()
+
+    def reset_schema(self) -> SchemaStatus:
+        """Drop the entire schema and recreate it from the current definition."""
+
+        with self._connection() as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (_SCHEMA_ADVISORY_LOCK,),
+            )
+            connection.execute("DROP SCHEMA IF EXISTS docarag CASCADE")
+            connection.execute(_SCHEMA_META_SQL)
+            connection.execute(SCHEMA_SQL)
+            connection.execute(
+                "INSERT INTO docarag.schema_meta (schema_sha256) VALUES (%s)",
+                (SCHEMA_SHA256,),
+            )
         return self.schema_status()
 
     def schema_status(self) -> SchemaStatus:
@@ -306,82 +314,60 @@ class PostgresLedger:
             return self._schema_status_on_connection(connection)
 
     def _schema_status_on_connection(self, connection: _Connection) -> SchemaStatus:
-        expected = tuple(migration.version for migration in MIGRATIONS)
+        applied = self._applied_schema_sha256(connection)
+        if applied is None:
+            return SchemaStatus(
+                present=False,
+                current=False,
+                schema_sha256=SCHEMA_SHA256,
+                applied_sha256=None,
+                errors=("schema not initialized; run `docarag storage init`",),
+            )
+        if applied != SCHEMA_SHA256:
+            return SchemaStatus(
+                present=True,
+                current=False,
+                schema_sha256=SCHEMA_SHA256,
+                applied_sha256=applied,
+                errors=(
+                    "schema definition changed since it was applied; "
+                    "run `docarag storage reset`",
+                ),
+            )
+        return SchemaStatus(
+            present=True,
+            current=True,
+            schema_sha256=SCHEMA_SHA256,
+            applied_sha256=applied,
+        )
+
+    @staticmethod
+    def _applied_schema_sha256(connection: _Connection) -> str | None:
         relation = _mapping(
             connection.execute(
-                "SELECT to_regclass('docarag.schema_migrations') AS relation"
+                "SELECT to_regclass('docarag.schema_meta') AS relation"
             ).fetchone(),
             operation="schema discovery",
         )
         if relation is None or relation.get("relation") is None:
-            return SchemaStatus(
-                current=False,
-                expected_versions=expected,
-                applied_versions=(),
-                pending_versions=expected,
-                errors=("schema_not_initialized",),
-            )
-        rows = connection.execute(
-            "SELECT version, name, checksum "
-            "FROM docarag.schema_migrations ORDER BY version"
-        ).fetchall()
-        try:
-            applied = self._validate_applied_migrations(rows)
-        except SchemaDriftError as exc:
-            versions = tuple(
-                int(row["version"])
-                for raw in rows
-                if (row := _mapping(raw, operation="schema status")) is not None
-                and isinstance(row.get("version"), int)
-            )
-            return SchemaStatus(
-                current=False,
-                expected_versions=expected,
-                applied_versions=versions,
-                pending_versions=tuple(v for v in expected if v not in versions),
-                errors=(str(exc),),
-            )
-        versions = tuple(sorted(applied))
-        pending = tuple(version for version in expected if version not in applied)
-        return SchemaStatus(
-            current=not pending,
-            expected_versions=expected,
-            applied_versions=versions,
-            pending_versions=pending,
+            return None
+        row = _mapping(
+            connection.execute(
+                "SELECT schema_sha256 FROM docarag.schema_meta WHERE id"
+            ).fetchone(),
+            operation="schema status",
         )
-
-    @staticmethod
-    def _validate_applied_migrations(rows: Sequence[object]) -> dict[int, str]:
-        expected = {migration.version: migration for migration in MIGRATIONS}
-        applied: dict[int, str] = {}
-        for raw in rows:
-            row = _mapping(raw, operation="migration verification")
-            if row is None:
-                continue
-            version = row.get("version")
-            name = row.get("name")
-            checksum = row.get("checksum")
-            if isinstance(version, bool) or not isinstance(version, int):
-                raise SchemaDriftError("schema migration table contains an invalid version")
-            migration = expected.get(version)
-            if migration is None:
-                raise SchemaDriftError(
-                    f"database has unsupported migration version {version}"
-                )
-            if name != migration.name or checksum != migration.sha256:
-                raise SchemaDriftError(
-                    f"database migration {version} does not match this build"
-                )
-            applied[version] = str(checksum)
-        return applied
+        if row is None:
+            return None
+        applied = row.get("schema_sha256")
+        return str(applied) if isinstance(applied, str) else None
 
     def health(self) -> PostgresHealth:
-        expected = tuple(migration.version for migration in MIGRATIONS)
         unavailable_schema = SchemaStatus(
+            present=False,
             current=False,
-            expected_versions=expected,
-            applied_versions=(),
-            pending_versions=expected,
+            schema_sha256=SCHEMA_SHA256,
+            applied_sha256=None,
             errors=("database_unreachable",),
         )
         try:

@@ -1,37 +1,11 @@
-"""Ordered, checksummed PostgreSQL schema migrations.
-
-Migrations live in Python so they are included in wheels without relying on
-package-data configuration.  Existing checksums are verified before any newer
-migration runs; modifying an already-applied migration is therefore a hard
-error instead of an implicit schema fork.
-"""
+"""Declarative PostgreSQL schema for the docarag store: defined once, applied whole."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 
 
-@dataclass(frozen=True, slots=True)
-class Migration:
-    version: int
-    name: str
-    sql: str
-    sha256: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        if self.version < 1:
-            raise ValueError("migration versions must be positive")
-        if not self.name or not self.sql.strip():
-            raise ValueError("migration name and SQL are required")
-        object.__setattr__(
-            self,
-            "sha256",
-            hashlib.sha256(self.sql.encode("utf-8")).hexdigest(),
-        )
-
-
-INITIAL_LEDGER_SQL = r"""
+LEDGER_SQL = r"""
 CREATE TABLE docarag.tenants (
     tenant_id text PRIMARY KEY,
     display_name text NOT NULL,
@@ -369,20 +343,283 @@ CREATE TRIGGER index_revision_transitions_are_guarded
 """.strip()
 
 
-MIGRATIONS: tuple[Migration, ...] = (
-    Migration(version=1, name="initial_durable_ledger", sql=INITIAL_LEDGER_SQL),
-)
+EVIDENCE_STORE_SQL = r"""
+CREATE EXTENSION IF NOT EXISTS ltree WITH SCHEMA public;
+
+CREATE TABLE docarag.assets (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    asset_id char(64) NOT NULL,
+    mime_type text NOT NULL,
+    byte_size bigint NOT NULL,
+    width integer,
+    height integer,
+    cas_uri text NOT NULL,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, corpus_id, asset_id),
+    FOREIGN KEY (tenant_id, corpus_id) REFERENCES docarag.corpora(tenant_id, corpus_id),
+    CONSTRAINT assets_asset_id_sha CHECK (asset_id ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT assets_byte_size CHECK (byte_size >= 0),
+    CONSTRAINT assets_dims CHECK (
+        (width IS NULL OR width >= 0) AND (height IS NULL OR height >= 0)
+    ),
+    CONSTRAINT assets_cas_uri_length CHECK (char_length(cas_uri) BETWEEN 1 AND 32768),
+    CONSTRAINT assets_mime_length CHECK (char_length(mime_type) BETWEEN 1 AND 512)
+);
+
+CREATE TABLE docarag.canonical_blocks (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    block_id text NOT NULL,
+    revision_id text NOT NULL,
+    block_type text NOT NULL,
+    semantic_subtype text,
+    page_id text,
+    page_index integer NOT NULL,
+    reading_order integer,
+    parent_block_id text,
+    content_sha256 char(64),
+    quality_status text,
+    reconciliation_method text,
+    geometry jsonb,
+    source_observation_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id
+    ),
+    FOREIGN KEY (tenant_id, corpus_id, document_id, document_version_id)
+        REFERENCES docarag.document_versions(
+            tenant_id, corpus_id, document_id, document_version_id
+        ),
+    CONSTRAINT canonical_blocks_page_index CHECK (page_index >= 0),
+    CONSTRAINT canonical_blocks_reading_order CHECK (
+        reading_order IS NULL OR reading_order >= 0
+    ),
+    CONSTRAINT canonical_blocks_content_sha CHECK (
+        content_sha256 IS NULL OR content_sha256 ~ '^[0-9a-f]{64}$'
+    )
+);
+
+CREATE INDEX canonical_blocks_page_idx
+    ON docarag.canonical_blocks (
+        tenant_id, corpus_id, document_version_id, index_revision_id,
+        page_index, reading_order
+    );
+CREATE INDEX canonical_blocks_type_idx
+    ON docarag.canonical_blocks (
+        tenant_id, corpus_id, document_version_id, index_revision_id, block_type
+    );
+
+CREATE TABLE docarag.block_representations (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    block_id text NOT NULL,
+    representation_no integer NOT NULL,
+    kind text NOT NULL,
+    content_sha256 char(64),
+    content text,
+    cas_uri text,
+    confidence double precision,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id, representation_no
+    ),
+    FOREIGN KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id
+    ) REFERENCES docarag.canonical_blocks(
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id
+    ) ON DELETE CASCADE,
+    CONSTRAINT block_representations_no CHECK (representation_no >= 0),
+    CONSTRAINT block_representations_content_sha CHECK (
+        content_sha256 IS NULL OR content_sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT block_representations_confidence CHECK (
+        confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
+    )
+);
+
+CREATE TABLE docarag.block_assets (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    block_id text NOT NULL,
+    asset_id char(64) NOT NULL,
+    role text NOT NULL,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id, asset_id, role
+    ),
+    FOREIGN KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id
+    ) REFERENCES docarag.canonical_blocks(
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, block_id
+    ) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, corpus_id, asset_id)
+        REFERENCES docarag.assets(tenant_id, corpus_id, asset_id),
+    CONSTRAINT block_assets_asset_sha CHECK (asset_id ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX block_assets_asset_idx
+    ON docarag.block_assets (tenant_id, corpus_id, asset_id);
+
+CREATE TABLE docarag.tree_nodes (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    node_id integer NOT NULL,
+    parent_id integer,
+    node_path public.ltree NOT NULL,
+    node_type text NOT NULL,
+    level integer NOT NULL,
+    reading_order integer,
+    block_id text,
+    summary_sha256 char(64),
+    summary text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, node_id
+    ),
+    FOREIGN KEY (tenant_id, corpus_id, document_id, document_version_id)
+        REFERENCES docarag.document_versions(
+            tenant_id, corpus_id, document_id, document_version_id
+        ),
+    CONSTRAINT tree_nodes_node_id CHECK (node_id >= 0),
+    CONSTRAINT tree_nodes_parent_id CHECK (parent_id IS NULL OR parent_id >= 0),
+    CONSTRAINT tree_nodes_level CHECK (level >= 0),
+    CONSTRAINT tree_nodes_summary_sha CHECK (
+        summary_sha256 IS NULL OR summary_sha256 ~ '^[0-9a-f]{64}$'
+    )
+);
+
+CREATE INDEX tree_nodes_path_idx
+    ON docarag.tree_nodes USING gist (node_path);
+CREATE INDEX tree_nodes_parent_idx
+    ON docarag.tree_nodes (
+        tenant_id, corpus_id, document_version_id, index_revision_id, parent_id
+    );
+
+CREATE TABLE docarag.kg_entities (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    entity_id text NOT NULL,
+    entity_name text NOT NULL,
+    entity_type text NOT NULL,
+    description text,
+    description_sha256 char(64),
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, entity_id
+    ),
+    FOREIGN KEY (tenant_id, corpus_id, document_id, document_version_id)
+        REFERENCES docarag.document_versions(
+            tenant_id, corpus_id, document_id, document_version_id
+        ),
+    CONSTRAINT kg_entities_desc_sha CHECK (
+        description_sha256 IS NULL OR description_sha256 ~ '^[0-9a-f]{64}$'
+    )
+);
+
+CREATE INDEX kg_entities_type_idx
+    ON docarag.kg_entities (
+        tenant_id, corpus_id, document_version_id, index_revision_id, entity_type
+    );
+CREATE INDEX kg_entities_name_idx
+    ON docarag.kg_entities (tenant_id, corpus_id, entity_name);
+
+CREATE TABLE docarag.kg_relations (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    relation_id text NOT NULL,
+    src_entity_id text NOT NULL,
+    dst_entity_id text NOT NULL,
+    relation_type text NOT NULL,
+    directed boolean NOT NULL DEFAULT true,
+    weight double precision,
+    description text,
+    evidence jsonb NOT NULL DEFAULT '[]'::jsonb,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, relation_id
+    ),
+    FOREIGN KEY (tenant_id, corpus_id, document_id, document_version_id)
+        REFERENCES docarag.document_versions(
+            tenant_id, corpus_id, document_id, document_version_id
+        ),
+    CONSTRAINT kg_relations_weight CHECK (weight IS NULL OR weight >= 0)
+);
+
+CREATE INDEX kg_relations_src_idx
+    ON docarag.kg_relations (
+        tenant_id, corpus_id, document_version_id, index_revision_id, src_entity_id
+    );
+CREATE INDEX kg_relations_dst_idx
+    ON docarag.kg_relations (
+        tenant_id, corpus_id, document_version_id, index_revision_id, dst_entity_id
+    );
+
+CREATE TABLE docarag.gt_links (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    document_id text NOT NULL,
+    document_version_id text NOT NULL,
+    index_revision_id text NOT NULL,
+    entity_id text NOT NULL,
+    node_id integer NOT NULL,
+    block_id text,
+    provenance jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (
+        tenant_id, corpus_id, document_id, document_version_id,
+        index_revision_id, entity_id, node_id
+    ),
+    FOREIGN KEY (tenant_id, corpus_id, document_id, document_version_id)
+        REFERENCES docarag.document_versions(
+            tenant_id, corpus_id, document_id, document_version_id
+        ),
+    CONSTRAINT gt_links_node_id CHECK (node_id >= 0)
+);
+
+CREATE INDEX gt_links_node_idx
+    ON docarag.gt_links (
+        tenant_id, corpus_id, document_version_id, index_revision_id, node_id
+    );
+CREATE INDEX gt_links_entity_idx
+    ON docarag.gt_links (
+        tenant_id, corpus_id, document_version_id, index_revision_id, entity_id
+    );
+""".strip()
 
 
-def validate_migrations(migrations: tuple[Migration, ...] = MIGRATIONS) -> None:
-    versions = tuple(migration.version for migration in migrations)
-    if versions != tuple(range(1, len(migrations) + 1)):
-        raise ValueError("PostgreSQL migrations must be contiguous and start at 1")
-    if len({migration.name for migration in migrations}) != len(migrations):
-        raise ValueError("PostgreSQL migration names must be unique")
+SCHEMA_SQL = LEDGER_SQL + "\n\n" + EVIDENCE_STORE_SQL
+
+SCHEMA_SHA256 = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
-validate_migrations()
-
-
-__all__ = ["MIGRATIONS", "Migration", "validate_migrations"]
+__all__ = ["SCHEMA_SQL", "SCHEMA_SHA256", "LEDGER_SQL", "EVIDENCE_STORE_SQL"]

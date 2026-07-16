@@ -381,18 +381,18 @@ class WorkLease:
 
 @dataclass(frozen=True, slots=True)
 class SchemaStatus:
+    present: bool
     current: bool
-    expected_versions: tuple[int, ...]
-    applied_versions: tuple[int, ...]
-    pending_versions: tuple[int, ...]
+    schema_sha256: str
+    applied_sha256: str | None = None
     errors: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "present": self.present,
             "current": self.current,
-            "expected_versions": list(self.expected_versions),
-            "applied_versions": list(self.applied_versions),
-            "pending_versions": list(self.pending_versions),
+            "schema_sha256": self.schema_sha256,
+            "applied_sha256": self.applied_sha256,
             "errors": list(self.errors),
         }
 

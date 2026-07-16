@@ -28,7 +28,7 @@ from docarag.persistence import (
     resolve_database_url,
     safe_database_endpoint,
 )
-from docarag.persistence.migrations import INITIAL_LEDGER_SQL, MIGRATIONS
+from docarag.persistence.schema import SCHEMA_SHA256, SCHEMA_SQL
 from docarag.settings import RuntimeSettings, initialize_settings, load_settings
 
 
@@ -179,10 +179,9 @@ class PostgresSettingsTests(unittest.TestCase):
         self.assertNotIn("p%40ss", repr(ledger))
 
 
-class PostgresMigrationTests(unittest.TestCase):
-    def test_migration_is_explicit_ordered_and_contains_durable_primitives(self):
-        self.assertEqual((1,), tuple(migration.version for migration in MIGRATIONS))
-        self.assertEqual(64, len(MIGRATIONS[0].sha256))
+class PostgresSchemaTests(unittest.TestCase):
+    def test_schema_contains_ledger_and_evidence_primitives(self):
+        self.assertRegex(SCHEMA_SHA256, r"^[0-9a-f]{64}$")
         for table in (
             "tenants",
             "corpora",
@@ -192,69 +191,103 @@ class PostgresMigrationTests(unittest.TestCase):
             "index_revisions",
             "stage_events",
             "work_items",
+            "assets",
+            "canonical_blocks",
+            "block_representations",
+            "block_assets",
+            "tree_nodes",
+            "kg_entities",
+            "kg_relations",
+            "gt_links",
         ):
-            self.assertIn(f"CREATE TABLE docarag.{table}", INITIAL_LEDGER_SQL)
-        self.assertIn("artifact_receipts_are_immutable", INITIAL_LEDGER_SQL)
-        self.assertIn("stage_events_are_append_only", INITIAL_LEDGER_SQL)
-        self.assertNotIn("sqlite", INITIAL_LEDGER_SQL.lower())
+            self.assertIn(f"CREATE TABLE docarag.{table}", SCHEMA_SQL)
+        self.assertIn("artifact_receipts_are_immutable", SCHEMA_SQL)
+        self.assertIn("stage_events_are_append_only", SCHEMA_SQL)
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS ltree", SCHEMA_SQL)
+        self.assertNotIn("sqlite", SCHEMA_SQL.lower())
 
-    def test_migrate_is_locked_checksummed_and_idempotent(self):
-        applied: list[dict[str, object]] = []
+    def test_ensure_schema_is_locked_and_idempotent(self):
+        state: dict[str, object] = {"applied": None}
 
         def handler(query, params):
-            if "INSERT INTO docarag.schema_migrations" in query:
-                applied.append(
-                    {"version": params[0], "name": params[1], "checksum": params[2]}
-                )
-            if "to_regclass('docarag.schema_migrations')" in query:
-                return ({"relation": "docarag.schema_migrations"},)
-            if query.startswith("SELECT version, name, checksum"):
-                return tuple(applied)
+            if "INSERT INTO docarag.schema_meta" in query:
+                state["applied"] = params[0]
+                return ()
+            if "to_regclass('docarag.schema_meta')" in query:
+                return ({"relation": "docarag.schema_meta"},)
+            if "SELECT schema_sha256 FROM docarag.schema_meta" in query:
+                return ({"schema_sha256": state["applied"]},) if state["applied"] else ()
             return ()
 
         connection = _FakeConnection(handler)
         ledger = PostgresLedger(connection_factory=lambda: connection)
 
-        first = ledger.migrate()
-        second = ledger.migrate()
+        first = ledger.ensure_schema()
+        second = ledger.ensure_schema()
 
         self.assertTrue(first.current)
         self.assertTrue(second.current)
-        self.assertEqual(1, len(applied))
+        self.assertEqual(SCHEMA_SHA256, state["applied"])
         queries = [query for query, _ in connection.executions]
         self.assertTrue(any("pg_advisory_xact_lock" in query for query in queries))
-        self.assertTrue(any("CREATE TABLE docarag.tenants" in query for query in queries))
+        self.assertTrue(
+            any("CREATE TABLE docarag.canonical_blocks" in query for query in queries)
+        )
+        self.assertEqual(
+            1, sum(1 for q in queries if "INSERT INTO docarag.schema_meta" in q)
+        )
 
-    def test_migration_checksum_drift_is_a_hard_error(self):
+    def test_reset_schema_drops_and_recreates(self):
+        state: dict[str, object] = {"applied": "e" * 64}
+
+        def handler(query, params):
+            if "DROP SCHEMA IF EXISTS docarag CASCADE" in query:
+                state["applied"] = None
+                return ()
+            if "INSERT INTO docarag.schema_meta" in query:
+                state["applied"] = params[0]
+                return ()
+            if "to_regclass('docarag.schema_meta')" in query:
+                return ({"relation": "docarag.schema_meta"},)
+            if "SELECT schema_sha256 FROM docarag.schema_meta" in query:
+                return ({"schema_sha256": state["applied"]},) if state["applied"] else ()
+            return ()
+
+        connection = _FakeConnection(handler)
+        ledger = PostgresLedger(connection_factory=lambda: connection)
+        status = ledger.reset_schema()
+
+        self.assertTrue(status.current)
+        self.assertEqual(SCHEMA_SHA256, state["applied"])
+        queries = [query for query, _ in connection.executions]
+        self.assertTrue(
+            any("DROP SCHEMA IF EXISTS docarag CASCADE" in query for query in queries)
+        )
+
+    def test_fingerprint_mismatch_reports_not_current_without_raising(self):
         def handler(query, _params):
-            if query.startswith("SELECT version, name, checksum"):
-                return (
-                    {
-                        "version": 1,
-                        "name": MIGRATIONS[0].name,
-                        "checksum": "0" * 64,
-                    },
-                )
+            if "to_regclass('docarag.schema_meta')" in query:
+                return ({"relation": "docarag.schema_meta"},)
+            if "SELECT schema_sha256 FROM docarag.schema_meta" in query:
+                return ({"schema_sha256": "0" * 64},)
             return ()
 
         ledger = PostgresLedger(connection_factory=lambda: _FakeConnection(handler))
-        with self.assertRaises(SchemaDriftError):
-            ledger.migrate()
+        status = ledger.schema_status()
+
+        self.assertTrue(status.present)
+        self.assertFalse(status.current)
+        self.assertEqual("0" * 64, status.applied_sha256)
+        self.assertTrue(status.errors)
 
     def test_health_is_cli_safe_and_reports_schema(self):
         def handler(query, _params):
             if "current_setting('server_version_num')" in query:
                 return ({"server_version_num": 180001, "database_name": "docarag"},)
-            if "to_regclass('docarag.schema_migrations')" in query:
-                return ({"relation": "docarag.schema_migrations"},)
-            if query.startswith("SELECT version, name, checksum"):
-                return (
-                    {
-                        "version": 1,
-                        "name": MIGRATIONS[0].name,
-                        "checksum": MIGRATIONS[0].sha256,
-                    },
-                )
+            if "to_regclass('docarag.schema_meta')" in query:
+                return ({"relation": "docarag.schema_meta"},)
+            if "SELECT schema_sha256 FROM docarag.schema_meta" in query:
+                return ({"schema_sha256": SCHEMA_SHA256},)
             return ()
 
         ledger = PostgresLedger(
@@ -264,6 +297,7 @@ class PostgresMigrationTests(unittest.TestCase):
         health = ledger.health()
         rendered = json.dumps(health.to_dict(), sort_keys=True)
         self.assertTrue(health.ok)
+        self.assertTrue(health.schema.current)
         self.assertEqual(180001, health.server_version_num)
         self.assertNotIn("secret", rendered)
         self.assertNotIn("user", rendered)

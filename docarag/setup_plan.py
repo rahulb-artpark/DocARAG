@@ -265,9 +265,9 @@ def build_setup_plan(
             ),
         ),
         _command(
-            "migrate_default_database",
-            ("docarag", "storage", "migrate"),
-            purpose="Apply the packaged PostgreSQL schema migrations idempotently.",
+            "initialize_default_database",
+            ("docarag", "storage", "init"),
+            purpose="Create the PostgreSQL schema if it is not present.",
             state_behavior="persistent",
             network_behavior="configured-postgresql",
         ),
@@ -759,7 +759,7 @@ def build_setup_plan(
                 "GPU inventory and at least 6144 MiB request headroom",
             ],
             "live_doctor": [
-                "PostgreSQL connectivity and migration state",
+                "PostgreSQL connectivity and schema state",
                 "Qdrant health, collection access, and scoped readiness",
                 "configured model inventories",
                 "configured service endpoints",

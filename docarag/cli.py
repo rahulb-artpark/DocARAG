@@ -191,9 +191,10 @@ def _require_postgres(settings: RuntimeSettings):
             "`docarag storage up` or configure DOCARAG_DATABASE_URL"
         )
     if not health.schema.current:
-        raise CLIError(
-            "PostgreSQL schema is not current; run `docarag storage migrate`"
+        detail = health.schema.errors[0] if health.schema.errors else (
+            "run `docarag storage init`"
         )
+        raise CLIError(f"PostgreSQL schema is not current; {detail}")
     return ledger
 
 
@@ -211,14 +212,14 @@ def _compose_command(settings: RuntimeSettings, *arguments: str) -> int:
 def command_storage_up(args: argparse.Namespace) -> int:
     settings = _load(args)
     return_code = _compose_command(settings, "up", "--detach", "--wait")
-    if return_code != 0 or args.no_migrate:
+    if return_code != 0 or args.no_init:
         return return_code
     ledger = _postgres_ledger(settings)
     try:
-        status = ledger.migrate()
+        status = ledger.ensure_schema()
     except Exception as exc:
         raise CLIError(
-            f"PostgreSQL migration failed at {ledger.endpoint} "
+            f"PostgreSQL schema initialization failed at {ledger.endpoint} "
             f"({type(exc).__name__})"
         ) from exc
     qdrant = _qdrant_health()
@@ -233,8 +234,8 @@ def command_storage_up(args: argparse.Namespace) -> int:
             f"({qdrant.get('error_code', 'health_check_failed')})"
         )
     print(
-        "Default storage is running; PostgreSQL schema versions: "
-        + ", ".join(str(item) for item in status.applied_versions)
+        "Default storage is running; PostgreSQL schema is "
+        + ("ready" if status.current else "not current")
     )
     return 0 if status.current else 1
 
@@ -244,26 +245,51 @@ def command_storage_down(args: argparse.Namespace) -> int:
     return _compose_command(settings, "down")
 
 
-def command_storage_migrate(args: argparse.Namespace) -> int:
+def _print_schema_status(ledger, status) -> int:
+    print(
+        f"PostgreSQL schema at {ledger.endpoint}: "
+        + ("ready" if status.current else "not current")
+    )
+    if not status.current and status.errors:
+        print("  " + status.errors[0])
+    return 0 if status.current else 1
+
+
+def command_storage_init(args: argparse.Namespace) -> int:
     settings = _load(args)
     ledger = _postgres_ledger(settings)
     try:
-        status = ledger.migrate()
+        status = ledger.ensure_schema()
     except Exception as exc:
         raise CLIError(
-            f"PostgreSQL migration failed at {ledger.endpoint} "
+            f"PostgreSQL schema initialization failed at {ledger.endpoint} "
             f"({type(exc).__name__})"
         ) from exc
-    payload = {"endpoint": ledger.endpoint, **status.as_dict()}
     if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print(
-            f"PostgreSQL schema at {ledger.endpoint}: "
-            + ("current" if status.current else "not current")
+        print(json.dumps({"endpoint": ledger.endpoint, **status.as_dict()}, indent=2, sort_keys=True))
+        return 0 if status.current else 1
+    return _print_schema_status(ledger, status)
+
+
+def command_storage_reset(args: argparse.Namespace) -> int:
+    settings = _load(args)
+    if not args.yes:
+        raise CLIError(
+            "`storage reset` drops the entire docarag schema and all its data; "
+            "pass --yes to confirm"
         )
-        print("Applied migrations: " + ", ".join(map(str, status.applied_versions)))
-    return 0 if status.current else 1
+    ledger = _postgres_ledger(settings)
+    try:
+        status = ledger.reset_schema()
+    except Exception as exc:
+        raise CLIError(
+            f"PostgreSQL schema reset failed at {ledger.endpoint} "
+            f"({type(exc).__name__})"
+        ) from exc
+    if args.json:
+        print(json.dumps({"endpoint": ledger.endpoint, **status.as_dict()}, indent=2, sort_keys=True))
+        return 0 if status.current else 1
+    return _print_schema_status(ledger, status)
 
 
 def _qdrant_health() -> dict[str, object]:
@@ -328,10 +354,10 @@ def command_storage_status(args: argparse.Namespace) -> int:
         state = "ready" if health.ok else "not ready"
         print(f"PostgreSQL at {health.endpoint}: {state}")
         if health.reachable:
-            print(
-                "Schema migrations: "
-                + ", ".join(map(str, health.schema.applied_versions))
-            )
+            schema_state = "ready" if health.schema.current else "not current"
+            print(f"Schema: {schema_state}")
+            if not health.schema.current and health.schema.errors:
+                print("  " + health.schema.errors[0])
         elif health.error_code:
             print(f"Failure class: {health.error_code}")
         qdrant_state = "ready" if qdrant["ok"] else "not ready"
@@ -881,7 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     storage_parser = subparsers.add_parser(
         "storage",
-        help="Start, stop, migrate, or inspect PostgreSQL and Qdrant storage",
+        help="Start, stop, initialize, reset, or inspect PostgreSQL and Qdrant storage",
     )
     storage_subparsers = storage_parser.add_subparsers(
         dest="storage_command", required=True
@@ -890,22 +916,30 @@ def build_parser() -> argparse.ArgumentParser:
         "up", help="Start the loopback-only default PostgreSQL and Qdrant services"
     )
     storage_up.add_argument(
-        "--no-migrate",
+        "--no-init",
         action="store_true",
-        help="Start services without applying PostgreSQL migrations",
+        help="Start services without creating the PostgreSQL schema",
     )
     storage_up.set_defaults(handler=command_storage_up)
     storage_down = storage_subparsers.add_parser(
         "down", help="Stop default storage containers without deleting named volumes"
     )
     storage_down.set_defaults(handler=command_storage_down)
-    storage_migrate = storage_subparsers.add_parser(
-        "migrate", help="Apply checksummed PostgreSQL migrations"
+    storage_init = storage_subparsers.add_parser(
+        "init", help="Create the PostgreSQL schema if it is not present"
     )
-    storage_migrate.add_argument("--json", action="store_true")
-    storage_migrate.set_defaults(handler=command_storage_migrate)
+    storage_init.add_argument("--json", action="store_true")
+    storage_init.set_defaults(handler=command_storage_init)
+    storage_reset = storage_subparsers.add_parser(
+        "reset", help="Drop and recreate the PostgreSQL schema (destroys all data)"
+    )
+    storage_reset.add_argument("--json", action="store_true")
+    storage_reset.add_argument(
+        "--yes", action="store_true", help="Confirm dropping the entire schema"
+    )
+    storage_reset.set_defaults(handler=command_storage_reset)
     storage_status = storage_subparsers.add_parser(
-        "status", help="Check PostgreSQL reachability and migration state"
+        "status", help="Check PostgreSQL reachability and schema state"
     )
     storage_status.add_argument("--json", action="store_true")
     storage_status.set_defaults(handler=command_storage_status)
