@@ -326,6 +326,10 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
         dependencies["gbc_index"] = gbc_index
         dependencies["tree_vdb"] = tree_vdb
         asset_cas_root = os.environ.get("DOCARAG_ASSET_CAS_ROOT")
+        if asset_cas_root is None:
+            run_cas = Path(cfg.save_path).expanduser().resolve() / "asset_cas"
+            if run_cas.is_dir():
+                asset_cas_root = str(run_cas)
         if asset_cas_root is not None:
             if (
                 not asset_cas_root
