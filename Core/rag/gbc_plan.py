@@ -16,6 +16,27 @@ class PlanningBudgetExceeded(ValueError):
     """An untrusted query plan exceeded a configured synchronous budget."""
 
 
+MAX_PROMPT_SECTION_TITLES = 200
+MAX_PROMPT_SECTION_TITLE_CHARS = 120
+
+
+def bounded_section_titles(titles: object) -> tuple[str, ...]:
+    """Return the document's distinct section titles, bounded for one prompt."""
+
+    if not isinstance(titles, (list, tuple)):
+        return ()
+    seen: dict[str, None] = {}
+    for title in titles:
+        if not isinstance(title, str):
+            continue
+        cleaned = " ".join(title.split())[:MAX_PROMPT_SECTION_TITLE_CHARS]
+        if cleaned:
+            seen.setdefault(cleaned, None)
+        if len(seen) >= MAX_PROMPT_SECTION_TITLES:
+            break
+    return tuple(seen)
+
+
 def _validate_bounded_text(value: object, *, field: str, max_chars: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
@@ -363,16 +384,35 @@ Now, perform the decomposition for the following query.
 Complex Query: "{query}"
 """
 
-    def _get_global_prompt(self, query: str) -> str:
+    def _get_global_prompt(self, query: str, section_titles: tuple[str, ...]) -> str:
+        if section_titles:
+            section_block = "\n".join(f"- {title}" for title in section_titles)
+            section_rule = (
+                "Use ONLY when the query explicitly refers to one of the "
+                "sections listed under SECTIONS IN THIS DOCUMENT, and copy "
+                "that title exactly. A topic the query merely asks about is "
+                "NOT a section. If the query names no section from that list, "
+                "do NOT emit a section filter."
+            )
+        else:
+            section_block = "(this document has no detected sections)"
+            section_rule = (
+                "This document has no detected sections, so you MUST NOT emit "
+                "a section filter."
+            )
         return f"""
 You are a highly specialized AI assistant. Your ONLY function is to analyze a "Global Query" and return a single, valid JSON object that specifies **both** the filtering steps and the final aggregation operation. You MUST NOT output any other text or explanation.
+
+### SECTIONS IN THIS DOCUMENT ###
+
+{section_block}
 
 ### INSTRUCTIONS & DEFINITIONS ###
 
 1.  **Filters**: You MUST determine the list of `filters` to apply. Even if the filter is for the whole document (e.g., all tables), the `filters` list must be present.
     - `filter_type`: One of ["document", "section", "title", "image", "table", "equation", "page"].
         - `document`: Use for the whole document, such as a full-document summary. This does not mean a layout item count.
-        - `section`: Use for structural parts like chapters, sections, appendices, or references.
+        - `section`: {section_rule}
         - `title`: Use for all structural headings when counting or listing chapters/sections.
         - `image`: Use for visual elements like figures, images, pictures, or plots.
         - `table`: Use for tabular data.
@@ -392,9 +432,12 @@ Assistant: {{"filters": [{{"filter_type": "page", "filter_value": "3-10"}}, {{"f
 
 User: "Summarize the discussion about 'data augmentation' in the 'Methodology' section."
 Assistant: {{"filters": [{{"filter_type": "section", "filter_value": "Methodology"}}], "operation": "SUMMARIZE"}}
+(Only correct when "Methodology" is listed above. If it is not listed, emit
+{{"filters": [{{"filter_type": "document"}}], "operation": "SUMMARIZE"}} instead.)
 
-User: "List items in the 'Limitations' section."
-Assistant: {{"filters": [{{"filter_type": "section", "filter_value": "Limitations"}}], "operation": "LIST"}}
+User: "Analyze what drives the margin gap."
+Assistant: {{"filters": [{{"filter_type": "document"}}], "operation": "ANALYZE"}}
+(The query names a topic, not a section, so no section filter is emitted.)
 
 User: "How many chapter or section headings are in the document?"
 Assistant: {{"filters": [{{"filter_type": "title"}}], "operation": "COUNT"}}
@@ -420,13 +463,25 @@ Assistant:
         result = self.llm.get_json_completion(prompt, schema=ComplexResult)
         return result.sub_questions
 
-    def _process_global_query(self, query: str) -> GlobalResult:
-        prompt = self._get_global_prompt(query)
+    def _process_global_query(
+        self, query: str, section_titles: tuple[str, ...]
+    ) -> GlobalResult:
+        prompt = self._get_global_prompt(query, section_titles)
         result = self.llm.get_json_completion(prompt, schema=GlobalResult)
         return result
 
-    def analyze(self, query: str) -> PlanResult:
+    def analyze(
+        self, query: str, *, section_titles: object = ()
+    ) -> PlanResult:
+        """Plan one query against the sections the document actually has.
+
+        Without the real titles a global plan invents a plausible section name
+        from the query's topic, and a section filter that matches no heading
+        silently reduces the whole retrieval scope to nothing.
+        """
+
         self.validate_query(query)
+        known_sections = bounded_section_titles(section_titles)
         query_type = self._classify_query_type(query)
 
         if query_type == "simple":
@@ -439,7 +494,7 @@ Assistant:
             )
 
         elif query_type == "global":
-            global_result = self._process_global_query(query)
+            global_result = self._process_global_query(query, known_sections)
             plan = PlanResult(
                 query_type=query_type,
                 original_query=query,

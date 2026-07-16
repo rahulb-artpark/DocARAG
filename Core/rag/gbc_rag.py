@@ -1356,6 +1356,17 @@ class GBCRAG(BaseRAG):
                         ]
                         location["asset_materialization_attestations"] = matched
 
+    def _section_titles(self) -> List[str]:
+        """Return the heading titles the planner is allowed to filter on."""
+
+        return [
+            node.meta_info.content
+            for node in self.gbc_index.TreeIndex.get_nodes(hasRoot=False)
+            if node.type == NodeType.TITLE
+            and isinstance(node.meta_info.content, str)
+            and node.meta_info.content.strip()
+        ]
+
     def _process_retrieved_nodes(
         self, tree_data: List[Dict[str, Any]], iter_context: SubStep
     ) -> None:
@@ -1680,7 +1691,9 @@ class GBCRAG(BaseRAG):
                     original_query=query,
                 )
             else:
-                query_analysis: PlanResult = self.planner.analyze(query)
+                query_analysis: PlanResult = self.planner.analyze(
+                    query, section_titles=self._section_titles()
+                )
 
             context.plan = query_analysis
             self.process_analysis(context, query_analysis)

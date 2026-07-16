@@ -85,6 +85,65 @@ class PlannerFanoutBoundTests(unittest.TestCase):
         # returned for downstream retrieval/model fan-out.
         self.assertEqual(2, len(llm.calls))
 
+    def test_global_prompt_lists_the_document_sections(self):
+        # Without the real headings the planner invents a section name from the
+        # query's topic, and a section filter matching no heading reduces the
+        # retrieval scope to nothing.
+        llm = _SequencedLLM(
+            QueryTypeResult(query_type="global"),
+            GlobalResult(
+                filters=[Filter(filter_type="document")], operation="ANALYZE"
+            ),
+        )
+        planner = TaskPlanner(llm)
+
+        planner.analyze(
+            "What drives the margin gap?",
+            section_titles=["Why now", "Root cause", "Pricing"],
+        )
+
+        global_prompt = llm.calls[1][0]
+        self.assertIn("- Why now", global_prompt)
+        self.assertIn("- Root cause", global_prompt)
+        self.assertIn("- Pricing", global_prompt)
+        self.assertIn(
+            "A topic the query merely asks about is NOT a section",
+            global_prompt,
+        )
+
+    def test_global_prompt_forbids_section_filters_without_headings(self):
+        llm = _SequencedLLM(
+            QueryTypeResult(query_type="global"),
+            GlobalResult(
+                filters=[Filter(filter_type="document")], operation="SUMMARIZE"
+            ),
+        )
+        planner = TaskPlanner(llm)
+
+        planner.analyze("Summarize it", section_titles=[])
+
+        global_prompt = llm.calls[1][0]
+        self.assertIn("no detected sections", global_prompt)
+        self.assertIn("MUST NOT emit", global_prompt)
+
+    def test_section_titles_are_bounded_and_deduplicated(self):
+        llm = _SequencedLLM(
+            QueryTypeResult(query_type="global"),
+            GlobalResult(
+                filters=[Filter(filter_type="document")], operation="COUNT"
+            ),
+        )
+        planner = TaskPlanner(llm)
+
+        planner.analyze(
+            "Count the tables",
+            section_titles=["Repeated", "Repeated", "x" * 400, 7, None],
+        )
+
+        global_prompt = llm.calls[1][0]
+        self.assertEqual(1, global_prompt.count("- Repeated"))
+        self.assertNotIn("x" * 200, global_prompt)
+
     def test_oversized_global_filter_plan_is_rejected(self):
         filters = [Filter(filter_type="page", filter_value=str(index + 1)) for index in range(3)]
         llm = _SequencedLLM(
