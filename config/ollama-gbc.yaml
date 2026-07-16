@@ -34,6 +34,14 @@ mineru:
   server_url: http://localhost:30000   # unused with the pipeline backend
   lang: en
 
+figures:
+  # MinerU emits an image region as a crop with no interior text, so rendered
+  # tables and charts arrive with no evidence at all. These re-read the crop.
+  ocr: True                      # MinerU's own det/rec models, run over the crop
+  describe: True                 # vlm says what the figure shows, grounded on the OCR text
+  ocr_lang: en
+  min_confidence: 0.5
+
 tree:
   node_keywords: True
   node_summary: True

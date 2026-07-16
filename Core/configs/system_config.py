@@ -1,6 +1,7 @@
 import yaml
 from collections.abc import Mapping
 from Core.configs.mineru_config import MinerU
+from Core.configs.figure_config import FigureConfig
 from Core.configs.llm_config import LLMConfig
 from Core.configs.tree_config import TreeConfig
 from Core.configs.graph_config import GraphConfig
@@ -72,6 +73,7 @@ class SystemConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     vlm: VLMConfig = Field(default_factory=VLMConfig)
     mineru: MinerU = Field(default_factory=MinerU)
+    figures: FigureConfig = Field(default_factory=FigureConfig)
 
     # Index Configurations
     tree: TreeConfig = Field(default_factory=TreeConfig)

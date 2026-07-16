@@ -26,6 +26,8 @@ from docarag.bookrag_projection import (
     project_to_bookrag_pdf_list,
 )
 from docarag.crop_materialization import materialize_visual_crops
+from docarag.figure_describe import GroundedFigureDescriber
+from docarag.figure_enrichment import VISUAL_BLOCK_TYPES, enrich_visual_blocks
 from docarag.canonical_artifacts import (
     CANONICAL_EVIDENCE_FILE,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
@@ -441,6 +443,45 @@ def _make_parse_request(cfg: SystemConfig, pdf_list: list[dict]) -> ParseRequest
     )
 
 
+def _enrich_figures(
+    cfg: SystemConfig,
+    blocks: tuple[CanonicalBlock, ...],
+    crop_store: LocalContentAddressedArtifactStore,
+) -> tuple[CanonicalBlock, ...]:
+    """Recover the text and meaning MinerU leaves inside an image region."""
+
+    if not cfg.figures.ocr:
+        return blocks
+    if not any(block.block_type in VISUAL_BLOCK_TYPES for block in blocks):
+        return blocks
+
+    from docarag.adapters.mineru_figure_ocr import MinerUFigureOCR
+
+    vlm = VLM(cfg.vlm) if cfg.figures.describe else None
+    try:
+        enriched, stats = enrich_visual_blocks(
+            blocks,
+            resolver=crop_store.make_asset_resolver(),
+            ocr_engine=MinerUFigureOCR(lang=cfg.figures.ocr_lang),
+            describer=None if vlm is None else GroundedFigureDescriber(vlm),
+            min_confidence=cfg.figures.min_confidence,
+        )
+    finally:
+        if vlm is not None:
+            vlm.close()
+    log.info(
+        "figure enrichment: %d visual, %d with text (%d spans), %d described, "
+        "%d skipped, %d failed",
+        stats.visual_blocks,
+        stats.ocr_blocks,
+        stats.ocr_spans,
+        stats.described_blocks,
+        stats.skipped_blocks,
+        stats.failed_blocks,
+    )
+    return enriched
+
+
 def bind_canonical_evidence(
     cfg: SystemConfig,
     pdf_list: list[dict],
@@ -554,6 +595,7 @@ def bind_canonical_evidence(
     reconciled_blocks, cas_crop_assets = materialize_visual_crops(
         tuple(reconciled.canonical_blocks), crop_store, cfg.save_path
     )
+    reconciled_blocks = _enrich_figures(cfg, reconciled_blocks, crop_store)
 
     canonical_by_observation_id: dict[str, CanonicalBlock] = {}
     for canonical in reconciled_blocks:

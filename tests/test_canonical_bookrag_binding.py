@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 from Core.Index.Tree import DocumentTree
+from Core.configs.figure_config import FigureConfig
 from Core.pipelines.doc_tree_builder import (
     CANONICAL_EVIDENCE_FILE,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
@@ -41,6 +42,7 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
                 lang="en",
                 server_url="https://secret:credential@example.invalid/v1",
             ),
+            figures=FigureConfig(ocr=False, describe=False),
         )
 
     @staticmethod
