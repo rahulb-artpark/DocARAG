@@ -10,7 +10,7 @@ pdf_path: TODO
 save_path: TODO
 
 llm:
-  model_name: gpt-oss-bookrag        # installed Ollama model; serves text generation
+  model_name: qwen3.6:35b            # installed Ollama model; serves text generation
   api_key: ollama
   api_base: http://localhost:11434
   backend: ollama
@@ -19,14 +19,18 @@ llm:
   frequency_penalty: 0.0
   presence_penalty: 0.0
   max_workers: 4
+  # Stock models declare a 256k context. Ollama sizes the KV cache from it and
+  # spills to CPU, so cap it here rather than in a hand-built Modelfile.
+  num_ctx: 16384
 
 vlm:
-  model_name: qwen3-vl-bookrag        # vision-capable; used for figure/image descriptions
+  model_name: qwen3.6:35b            # vision-capable; figure descriptions + topology
   api_key: ollama
   api_base: http://localhost:11434
   temperature: 0.1
   max_tokens: 6000
   backend: ollama
+  num_ctx: 16384
 
 mineru:
   backend: pipeline              # native text layer + dedicated layout/table/formula/OCR models
@@ -39,6 +43,7 @@ figures:
   # tables and charts arrive with no evidence at all. These re-read the crop.
   ocr: True                      # MinerU's own det/rec models, run over the crop
   describe: True                 # vlm says what the figure shows, grounded on the OCR text
+  diagrams: True                 # vlm reads the node/edge topology a description flattens
   ocr_lang: en
   min_confidence: 0.5
 

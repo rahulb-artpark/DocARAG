@@ -27,6 +27,7 @@ from docarag.bookrag_projection import (
 )
 from docarag.crop_materialization import materialize_visual_crops
 from docarag.figure_describe import GroundedFigureDescriber
+from docarag.figure_diagram_vlm import VLMDiagramExtractor
 from docarag.figure_enrichment import VISUAL_BLOCK_TYPES, enrich_visual_blocks
 from docarag.canonical_artifacts import (
     CANONICAL_EVIDENCE_FILE,
@@ -457,13 +458,23 @@ def _enrich_figures(
 
     from docarag.adapters.mineru_figure_ocr import MinerUFigureOCR
 
-    vlm = VLM(cfg.vlm) if cfg.figures.describe else None
+    wants_vlm = cfg.figures.describe or cfg.figures.diagrams
+    vlm = VLM(cfg.vlm) if wants_vlm else None
     try:
         enriched, stats = enrich_visual_blocks(
             blocks,
             resolver=crop_store.make_asset_resolver(),
             ocr_engine=MinerUFigureOCR(lang=cfg.figures.ocr_lang),
-            describer=None if vlm is None else GroundedFigureDescriber(vlm),
+            describer=(
+                GroundedFigureDescriber(vlm)
+                if vlm is not None and cfg.figures.describe
+                else None
+            ),
+            diagram_extractor=(
+                VLMDiagramExtractor(vlm)
+                if vlm is not None and cfg.figures.diagrams
+                else None
+            ),
             min_confidence=cfg.figures.min_confidence,
         )
     finally:
@@ -471,11 +482,14 @@ def _enrich_figures(
             vlm.close()
     log.info(
         "figure enrichment: %d visual, %d with text (%d spans), %d described, "
-        "%d skipped, %d failed",
+        "%d graphs (%d nodes, %d edges), %d skipped, %d failed",
         stats.visual_blocks,
         stats.ocr_blocks,
         stats.ocr_spans,
         stats.described_blocks,
+        stats.graph_blocks,
+        stats.graph_nodes,
+        stats.graph_edges,
         stats.skipped_blocks,
         stats.failed_blocks,
     )

@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 import logging
 
 from docarag.asset_material import AssetMaterialResolver, AssetMaterializationError
+from docarag.domain.base import ContractValidationError
 from docarag.domain.evidence import (
     AssetKind,
     AssetRef,
@@ -22,7 +23,9 @@ from docarag.domain.evidence import (
     CanonicalBlock,
     Representation,
     RepresentationKind,
+    SemanticSubstructure,
 )
+from docarag.figure_diagram import DiagramExtractor, diagram_substructure
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +59,9 @@ class FigureEnrichmentStats:
     ocr_blocks: int = 0
     ocr_spans: int = 0
     described_blocks: int = 0
+    graph_blocks: int = 0
+    graph_nodes: int = 0
+    graph_edges: int = 0
     skipped_blocks: int = 0
     failed_blocks: int = 0
 
@@ -86,6 +92,29 @@ def _already_enriched(block: CanonicalBlock) -> bool:
     )
 
 
+def _extract_graph(
+    block: CanonicalBlock,
+    asset: AssetRef,
+    data: bytes,
+    text: str,
+    extractor: DiagramExtractor,
+) -> SemanticSubstructure | None:
+    try:
+        graph = extractor(data, text)
+        if graph is None:
+            return None
+        return diagram_substructure(
+            graph, asset=asset, source_observation_ids=block.source_observation_ids
+        )
+    except (ContractValidationError, OSError, ValueError, RuntimeError):
+        log.warning(
+            "figure graph extraction failed for block %s",
+            block.block_id,
+            exc_info=True,
+        )
+        return None
+
+
 def _reading_order(spans: Sequence[OCRSpan], height: int) -> list[OCRSpan]:
     band = max(height / 64.0, 1.0)
     return sorted(spans, key=lambda span: (int(span.bbox[1] / band), span.bbox[0]))
@@ -113,12 +142,14 @@ def enrich_visual_blocks(
     resolver: AssetMaterialResolver,
     ocr_engine: FigureOCREngine,
     describer: FigureDescriber | None = None,
+    diagram_extractor: DiagramExtractor | None = None,
     min_confidence: float = 0.5,
     min_chars: int = 2,
 ) -> tuple[tuple[CanonicalBlock, ...], FigureEnrichmentStats]:
-    """Return blocks whose figures carry recovered text and a description."""
+    """Return blocks whose figures carry recovered text, meaning and topology."""
 
     visual = ocr_done = spans_total = described = skipped = failed = 0
+    graphs = graph_nodes = graph_edges = 0
     enriched: list[CanonicalBlock] = []
     for block in blocks:
         if block.block_type not in VISUAL_BLOCK_TYPES:
@@ -197,7 +228,17 @@ def enrich_visual_blocks(
                 )
                 described += 1
 
-        if not added:
+        substructure = (
+            None
+            if diagram_extractor is None
+            else _extract_graph(block, asset, data, text, diagram_extractor)
+        )
+        if substructure is not None:
+            graphs += 1
+            graph_nodes += len(substructure.elements)
+            graph_edges += len(substructure.relations)
+
+        if not added and substructure is None:
             skipped += 1
             enriched.append(block)
             continue
@@ -205,6 +246,11 @@ def enrich_visual_blocks(
             replace(
                 block,
                 representations=tuple(block.representations) + tuple(added),
+                semantic_substructures=(
+                    tuple(block.semantic_substructures)
+                    if substructure is None
+                    else tuple(block.semantic_substructures) + (substructure,)
+                ),
             )
         )
 
@@ -213,6 +259,9 @@ def enrich_visual_blocks(
         ocr_blocks=ocr_done,
         ocr_spans=spans_total,
         described_blocks=described,
+        graph_blocks=graphs,
+        graph_nodes=graph_nodes,
+        graph_edges=graph_edges,
         skipped_blocks=skipped,
         failed_blocks=failed,
     )
