@@ -19,6 +19,7 @@ from Core.configs.llm_config import LLMConfig
 from Core.utils.bounded_executor import iter_bounded_ordered
 from Core.utils.utils import get_max_output_tokens
 from Core.provider.TokenTracker import TokenTracker
+from Core.provider.structured_output import parse_structured
 import time
 
 log = logging.getLogger(__name__)
@@ -491,7 +492,7 @@ class OllamaController(BaseLLMController):
                 completion_tokens=completion_tokens,
             )
 
-        return schema.model_validate_json(response["message"]["content"])
+        return parse_structured(response["message"]["content"], schema)
 
     def close(self) -> None:
         if getattr(self, "_closed", False):

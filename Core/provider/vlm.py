@@ -17,11 +17,12 @@ from abc import ABC, abstractmethod
 from PIL import Image
 import base64
 from io import BytesIO
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from Core.Common.Message import Message
 from Core.Common.Memory import Memory
 from Core.provider.TokenTracker import TokenTracker
+from Core.provider.structured_output import parse_structured
 
 from Core.configs.vlm_config import VLMConfig
 import logging
@@ -300,7 +301,7 @@ class QwenVLController(BaseVLMController):
             else:
                 raise ValueError("Last message content must be text or content parts")
         generated = self.generate(prepared_prompt, images)
-        return schema.model_validate_json(generated)
+        return parse_structured(generated, schema)
 
     def close(self) -> None:
         """Drop in-process model weights and return cached CUDA memory."""
@@ -517,24 +518,13 @@ class GPTVLMController(BaseVLMController):
                 f"Prompt tokens: {completion.usage.prompt_tokens}, Completion tokens: {completion.usage.completion_tokens}"
             )
 
-        return schema.model_validate_json(completion.choices[0].message.content)
+        return parse_structured(completion.choices[0].message.content, schema)
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
         self._closed = True
         _close_controller_client(self)
-
-
-def _parse_structured(payload: str, schema: BaseModel):
-    """Validate a structured reply, which some models serialize as YAML."""
-
-    try:
-        return schema.model_validate_json(payload)
-    except ValidationError:
-        import yaml
-
-        return schema.model_validate(yaml.safe_load(payload))
 
 
 class OllamaVLMController(BaseVLMController):
@@ -710,7 +700,7 @@ class OllamaVLMController(BaseVLMController):
                     completion_tokens=completion_tokens,
                 )
 
-            return _parse_structured(response["message"]["content"], schema)
+            return parse_structured(response["message"]["content"], schema)
         except Exception as e:
             raise RuntimeError(
                 f"Could not get a JSON response from Ollama model '{self.model_name}'"
