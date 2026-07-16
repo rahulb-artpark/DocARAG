@@ -53,15 +53,22 @@ def _resolve_local_asset(asset: dict, run: Path) -> Path | None:
         from urllib.parse import unquote, urlparse
 
         uri = unquote(urlparse(uri).path)
-    candidate = Path(uri)
-    if not candidate.is_absolute():
-        candidate = run / candidate
-    try:
-        resolved = candidate.resolve()
-        resolved.relative_to(run)
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return resolved if resolved.is_file() else None
+    candidates = []
+    path = Path(uri)
+    candidates.append(path if path.is_absolute() else run / path)
+    # Parser crops (e.g. interline equations) are often referenced by bare name
+    # relative to the parser image directory rather than the run root.
+    if not path.is_absolute() and len(path.parts) == 1:
+        candidates.append(run / "vlm" / "images" / path.name)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(run)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 def publish_asset_bytes(data: bytes, cas_root: Path) -> str:
