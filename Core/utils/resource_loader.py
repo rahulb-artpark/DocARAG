@@ -210,6 +210,13 @@ def _acquire_ready_bookrag_tree_vdb(
         raise
 
 
+def _gme_dtype(embed_cfg) -> dict:
+    """Pass an explicit load dtype only when the configuration states one."""
+
+    dtype = getattr(embed_cfg, "torch_dtype", None)
+    return {"torch_dtype": dtype} if dtype else {}
+
+
 def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
     """Open the exact attested TreeVDB used by the BookRAG tree stage.
 
@@ -247,6 +254,7 @@ def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
             embed_model = GmeEmbeddingProvider(
                 model_name=embed_cfg.model_name,
                 device=embed_cfg.device,
+                **_gme_dtype(embed_cfg),
             )
         else:
             from Core.provider.embedding import TextEmbeddingProvider
@@ -513,6 +521,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
                 embed_model = GmeEmbeddingProvider(
                     model_name=embed_cfg.model_name,
                     device=embed_cfg.device,
+                    **_gme_dtype(embed_cfg),
                 )
             else:
                 from Core.provider.embedding import TextEmbeddingProvider

@@ -46,6 +46,7 @@ class _GmeSharedRuntime:
         self,
         model_name: str,
         device_strategy: str,
+        torch_dtype: str = "bfloat16",
         *,
         max_active_calls: int = 1,
     ) -> None:
@@ -57,6 +58,7 @@ class _GmeSharedRuntime:
             raise ValueError("max_active_calls must be at least 1")
         self.model_name = model_name
         self.device_strategy = device_strategy
+        self.torch_dtype = torch_dtype
         self.max_active_calls = max_active_calls
         self.owner_count = 0
         self._active_calls = 0
@@ -86,12 +88,26 @@ class _GmeSharedRuntime:
         self.torch_functional = torch_functional
         self.model = AutoModel.from_pretrained(
             self.model_name,
-            torch_dtype="auto",
+            torch_dtype=self._resolved_dtype(torch),
             trust_remote_code=True,
             device_map=self.device_strategy,
             use_fast=True,
         )
         self.model.eval()
+
+    def _resolved_dtype(self, torch) -> Any:
+        """Resolve the load dtype, defaulting away from a float32 checkpoint.
+
+        gme-Qwen2-VL ships float32 weights, which cost twice the VRAM its
+        architecture needs and leave no room beside a large local LLM.
+        """
+
+        if self.torch_dtype in (None, "", "auto"):
+            return "auto"
+        dtype = getattr(torch, self.torch_dtype, None)
+        if dtype is None:
+            raise ValueError(f"unsupported torch dtype: {self.torch_dtype}")
+        return dtype
 
     def acquire_call(self, *, cancelled=None) -> None:
         """Admit one bounded inference call or reject a closing owner.
@@ -185,17 +201,21 @@ class GmeEmbeddingProvider(BaseEmbedder):
         self,
         model_name: str = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
         device: str = "auto",
+        torch_dtype: str = "bfloat16",
     ):
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("model_name must be a non-empty string")
         if not isinstance(device, str) or not device.strip():
             raise ValueError("device must be a non-empty string")
+        if not isinstance(torch_dtype, str) or not torch_dtype.strip():
+            raise ValueError("torch_dtype must be a non-empty string")
 
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         self.model_name = model_name.strip()
         self.device_strategy = device.strip().lower()
-        self._pool_key = (self.model_name, self.device_strategy)
+        self.torch_dtype = torch_dtype.strip()
+        self._pool_key = (self.model_name, self.device_strategy, self.torch_dtype)
         self._state_lock = Lock()
         self._closed_event = Event()
         self._runtime = None
@@ -217,6 +237,7 @@ class GmeEmbeddingProvider(BaseEmbedder):
                     runtime = _GmeSharedRuntime(
                         self.model_name,
                         self.device_strategy,
+                        self.torch_dtype,
                     )
                 except BaseException:
                     log.error(

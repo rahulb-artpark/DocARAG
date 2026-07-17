@@ -19,6 +19,9 @@ class EmbeddingConfig:
     # Ollama sizes an embedding model's KV cache from its declared context
     # unless a request caps it, which costs gigabytes for a small model.
     num_ctx: Optional[int] = None
+    # Local multimodal providers honour this instead of a checkpoint's own
+    # dtype, which may be float32 and cost twice the VRAM it needs.
+    torch_dtype: Optional[str] = None
     
     
     def __post_init__(self):

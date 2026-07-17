@@ -69,7 +69,7 @@ graph:
     # it never uses, and the query stack no longer fits beside the LLM.
     num_ctx: 4096
   reranker_config:
-    model_name: Qwen/Qwen3-Reranker-4B # loaded locally via transformers
+    model_name: Qwen/Qwen3-Reranker-0.6B # loaded locally via transformers
     max_length: 4096
     device: "cuda:0"
     backend: local
@@ -85,6 +85,8 @@ vdb:
   embedding_config:
     model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
     device: "cuda:0"
+    # The checkpoint ships float32 and costs 8.3GB; bfloat16 halves it.
+    torch_dtype: bfloat16
 
 rag_force_reprocess: True
 
@@ -96,7 +98,7 @@ rag:
   select_depth: 2
   max_retry: 2
   reranker_config:
-    model_name: Qwen/Qwen3-Reranker-4B
+    model_name: Qwen/Qwen3-Reranker-0.6B
     max_length: 4096
     device: "cuda:0"
     backend: local
@@ -104,3 +106,5 @@ rag:
   mm_reranker_config:
     model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
     device: "cuda:0"
+    # The checkpoint ships float32 and costs 8.3GB; bfloat16 halves it.
+    torch_dtype: bfloat16

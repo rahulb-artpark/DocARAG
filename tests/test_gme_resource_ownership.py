@@ -49,10 +49,28 @@ class GmeResourceOwnershipTests(unittest.TestCase):
                     raise AssertionError("GME runtime did not begin closing")
                 runtime._condition.wait(timeout=remaining)
 
+    def test_two_load_dtypes_never_share_one_set_of_weights(self):
+        cuda = Mock()
+        cuda.is_available.return_value = False
+
+        with patch.object(
+            _GmeSharedRuntime, "_load_model", new=self._fake_loader(cuda)
+        ):
+            half = GmeEmbeddingProvider(model_name="test/dtype-gme", device="cuda:0")
+            full = GmeEmbeddingProvider(
+                model_name="test/dtype-gme", device="cuda:0", torch_dtype="float32"
+            )
+            try:
+                self.assertEqual("bfloat16", half.torch_dtype)
+                self.assertIsNot(half._runtime, full._runtime)
+            finally:
+                half.close()
+                full.close()
+
     def test_compatible_handles_share_weights_without_sharing_close_state(self):
         cuda = Mock()
         cuda.is_available.return_value = True
-        key = ("test/shared-gme", "cuda:0")
+        key = ("test/shared-gme", "cuda:0", "bfloat16")
 
         with patch.object(
             _GmeSharedRuntime,
@@ -116,7 +134,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         entered = Event()
         release_call = Event()
         close_wait_started = Event()
-        key = ("test/inflight-gme", "cuda:0")
+        key = ("test/inflight-gme", "cuda:0", "bfloat16")
 
         with patch.object(
             _GmeSharedRuntime,
@@ -158,7 +176,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         first_entered = Event()
         release_first = Event()
         second_entered = Event()
-        key = ("test/serialized-gme", "cuda:0")
+        key = ("test/serialized-gme", "cuda:0", "bfloat16")
 
         with patch.object(
             _GmeSharedRuntime,
@@ -201,7 +219,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         cuda.is_available.return_value = False
         active_entered = Event()
         release_active = Event()
-        key = ("test/cancelled-waiter-gme", "cuda:0")
+        key = ("test/cancelled-waiter-gme", "cuda:0", "bfloat16")
 
         with patch.object(
             _GmeSharedRuntime,
@@ -246,7 +264,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
     def test_failed_runtime_load_is_cleaned_and_never_published(self):
         failed_cuda = Mock()
         failed_cuda.is_available.return_value = True
-        key = ("test/failing-gme", "cuda:0")
+        key = ("test/failing-gme", "cuda:0", "bfloat16")
 
         def fail_after_partial_allocation(runtime: _GmeSharedRuntime) -> None:
             runtime.torch = SimpleNamespace(cuda=failed_cuda)
@@ -302,7 +320,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
     def test_closing_one_mmr_owner_keeps_the_other_runtime_live(self):
         cuda = Mock()
         cuda.is_available.return_value = True
-        key = ("test/mmr-shared-gme", "cuda:0")
+        key = ("test/mmr-shared-gme", "cuda:0", "bfloat16")
         with tempfile.TemporaryDirectory() as directory, patch.object(
             _GmeSharedRuntime,
             "_load_model",
