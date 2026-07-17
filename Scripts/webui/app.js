@@ -45,6 +45,31 @@ const clip = (s, n) => {
 
 // Render a tree node's content: HTML tables as real tables, markdown as markdown,
 // otherwise plain text. Cells that look like formulas are shown in monospace.
+const TABLE_TAGS = new Set(["TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TD", "TH", "CAPTION"]);
+
+function renderTableBody(html) {
+  // Parser table markup is untrusted document content. Rebuild it from a fixed
+  // tag set so nothing else in it can reach the page.
+  const parsed = new DOMParser().parseFromString(String(html || ""), "text/html");
+  const source = parsed.body.querySelector("table");
+  if (!source) return null;
+  const build = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.nodeValue);
+    if (node.nodeType !== Node.ELEMENT_NODE || !TABLE_TAGS.has(node.tagName)) return null;
+    const el = document.createElement(node.tagName.toLowerCase());
+    for (const name of ["colspan", "rowspan"]) {
+      const value = node.getAttribute(name);
+      if (value && /^[1-9]\d{0,2}$/.test(value)) el.setAttribute(name, value);
+    }
+    for (const child of node.childNodes) {
+      const built = build(child);
+      if (built) el.appendChild(built);
+    }
+    return el;
+  };
+  return build(source);
+}
+
 function renderContent(n) {
   const c = (n && n.content) || "";
   if (!c.trim()) return "—";
@@ -974,7 +999,8 @@ function selectTreeNode(id) {
       <dt>Parent</dt><dd>${parent ? `<a class="linkish" data-tree="${parent.id}">#${parent.id} ${escapeHtml(clip(parent.content || parent.type, 40))}</a>` : "— (root)"}</dd>
       <dt>Children</dt><dd>${(n.children || []).length}</dd>
     </div>
-    <div class="section-h">Content</div>
+    ${n.tableBody ? `<div class="section-h">Table</div><div class="tableWrap" id="nodeTable"></div>` : ""}
+    <div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}</div>
     <div class="prose">${renderContent(n)}</div>
     ${n.summary ? `<div class="section-h">Summary (LLM-generated)</div><div class="prose">${escapeHtml(n.summary)}</div>` : ""}
     <div class="section-h">Entities extracted here (${ents.length})</div>
@@ -982,6 +1008,12 @@ function selectTreeNode(id) {
     <div class="section-h">Child nodes</div>
     ${kids}
     ${img}`;
+  if (n.tableBody) {
+    const table = renderTableBody(n.tableBody);
+    const host = $("nodeTable");
+    if (table && host) host.appendChild(table);
+    else if (host) host.innerHTML = `<p class="prose">The parser produced no readable grid for this table.</p>`;
+  }
   wireTreeJumpLinks($("treeDetail"));
   $("treeDetail").querySelectorAll("[data-entity]").forEach((a) =>
     a.onclick = () => { activateView("graph"); selectEntity(a.dataset.entity); });
