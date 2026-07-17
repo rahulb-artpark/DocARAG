@@ -49,6 +49,11 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
 STAGE_ORDER = ("tree", "graph", "vdb")
+_STAGE_TOKEN_KEYS = {
+    "tree": ("tree_index_construction", "tree_node_summary"),
+    "graph": ("kg_extraction", "kg_refinement"),
+    "vdb": (),
+}
 _GRAPH_VALIDATION_CACHE = {}
 _ROLE_CACHE = {}
 
@@ -109,16 +114,103 @@ def _read_json_if_present(path):
         return {}
 
 
-def run_progress(run_dir):
+_NODE_COUNT_CACHE = {}
+
+
+def _tree_node_count(run_dir):
+    """Count a run's tree nodes, cached against the published file's identity."""
+
+    path = run_dir / "tree.json"
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if key not in _NODE_COUNT_CACHE:
+        nodes = _read_json_if_present(path).get("nodes")
+        if not isinstance(nodes, list):
+            return None
+        _NODE_COUNT_CACHE.clear()
+        _NODE_COUNT_CACHE[key] = len(nodes)
+    return _NODE_COUNT_CACHE[key]
+
+
+def _stage_progress(run_dir, name):
+    """Return measured progress for a stage that publishes per-item results."""
+
+    if name != "graph":
+        return None
+    directory = run_dir / "kg_extractor_res"
+    if not directory.is_dir():
+        return None
+    try:
+        done = sum(1 for item in directory.iterdir() if item.suffix == ".json")
+    except OSError:
+        return None
+    total = _tree_node_count(run_dir)
+    if not total:
+        return None
+    return {"done": min(done, total), "total": total}
+
+
+def _stage_history(run_dirs):
+    """Median duration of each stage over runs that finished it."""
+
+    samples = {name: [] for name in STAGE_ORDER}
+    for run in run_dirs:
+        stages = (
+            _read_json_if_present(run / "index-state.json").get("stages") or {}
+        )
+        for name in STAGE_ORDER:
+            entry = stages.get(name) or {}
+            if entry.get("status") != "succeeded":
+                continue
+            seconds = _iso_seconds(entry.get("started_at"), entry.get("ended_at"))
+            if seconds:
+                samples[name].append(seconds)
+    history = {}
+    for name, values in samples.items():
+        if values:
+            values.sort()
+            history[name] = values[len(values) // 2]
+    return history
+
+
+def _elapsed_seconds(started):
+    if not started:
+        return None
+    try:
+        start = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    now = datetime.now(start.tzinfo) if start.tzinfo else datetime.now()
+    return max((now - start).total_seconds(), 0.0)
+
+
+def run_progress(run_dir, history=None):
     """Report one run's stages and metrics from its own published state."""
 
     state = _read_json_if_present(run_dir / "index-state.json")
     stats = _read_json_if_present(run_dir / "indexing_stats.json")
+    history = history or {}
     raw_stages = state.get("stages") or {}
     stages = []
     for name in STAGE_ORDER:
         entry = raw_stages.get(name) or {}
         status = entry.get("status") or "pending"
+        elapsed = _elapsed_seconds(entry.get("started_at")) if status == "running" else None
+        progress = _stage_progress(run_dir, name) if status == "running" else None
+        eta = eta_basis = None
+        if status == "running":
+            if progress and progress["done"] and elapsed:
+                rate = progress["done"] / elapsed
+                if rate > 0:
+                    eta = (progress["total"] - progress["done"]) / rate
+                    eta_basis = "measured"
+            if eta is None and history.get(name) and elapsed is not None:
+                remaining = history[name] - elapsed
+                if remaining > 0:
+                    eta, eta_basis = remaining, "past runs"
         stages.append(
             {
                 "name": name,
@@ -126,6 +218,17 @@ def run_progress(run_dir):
                 "startedAt": entry.get("started_at"),
                 "endedAt": entry.get("ended_at"),
                 "seconds": _iso_seconds(entry.get("started_at"), entry.get("ended_at")),
+                "elapsed": elapsed,
+                "progress": progress,
+                "etaSeconds": eta,
+                "etaBasis": eta_basis,
+                "typicalSeconds": history.get(name),
+                "tokens": {
+                    key: value.get("total_tokens")
+                    for key, value in (stats.get("token_stage_history") or {}).items()
+                    if isinstance(value, dict) and key in _STAGE_TOKEN_KEYS[name]
+                },
+                "exitCode": entry.get("exit_code"),
                 "error": entry.get("error"),
             }
         )
@@ -167,8 +270,8 @@ def run_completed(run_dir):
     )
 
 
-def run_summary(run_dir):
-    progress = run_progress(run_dir)
+def run_summary(run_dir, history=None):
+    progress = run_progress(run_dir, history)
     meta = _read_json_if_present(run_dir / "tree.json").get("meta_info") or {}
     source = _read_json_if_present(run_dir / "run-manifest.json").get("source") or {}
     source_name = source.get("display_name")
@@ -1013,10 +1116,13 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "runDir": str(self.state.run_dir)})
             return
         if parsed.path == "/api/library":
+            runs = find_run_dirs()
+            history = _stage_history(runs)
             self.send_json(
                 {
                     "current": str(self.state.run_dir),
-                    "runs": [run_summary(item) for item in find_run_dirs()],
+                    "stageHistory": history,
+                    "runs": [run_summary(item, history) for item in runs],
                 }
             )
             return
@@ -1061,7 +1167,7 @@ class Handler(SimpleHTTPRequestHandler):
         if run_dir is None:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown run")
             return
-        self.send_json(run_summary(run_dir))
+        self.send_json(run_summary(run_dir, _stage_history(find_run_dirs())))
 
     def send_tree_image(self, parsed):
         query = parse_qs(parsed.query)

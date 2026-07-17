@@ -257,20 +257,30 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .pill.failed { background: #fde8e8; color: #b91c1c; }
 .runMeta { margin-top: 4px; font-size: 12px; color: var(--muted); }
 
-.stages { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
-.stageStep { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fbfcfd; }
+.stages { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; align-items: start; }
+.stageStep { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd; }
+.stageStep > summary {
+  list-style: none; cursor: pointer; padding: 8px 10px; display: block;
+}
+.stageStep > summary::-webkit-details-marker { display: none; }
+.stageStep > summary:hover .nm { text-decoration: underline; }
 .stageStep .nm { font-size: 12px; font-weight: 700; text-transform: capitalize; }
-.stageStep .st { font-size: 11.5px; color: var(--muted); }
-.stageStep .bar { height: 3px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
+.stageStep .st { font-size: 11.5px; color: var(--muted); display: block; }
+.stageStep .bar { display: block; height: 3px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
 .stageStep .bar i { display: block; height: 100%; width: 0; background: var(--line); }
 .stageStep.succeeded .bar i { width: 100%; background: var(--accent); }
 .stageStep.succeeded .st { color: var(--accent); }
 .stageStep.running { border-color: #fcd34d; background: #fffbeb; }
-.stageStep.running .bar i { width: 45%; background: #f59e0b; animation: slide 1.2s ease-in-out infinite; }
+.stageStep.running .bar i { background: #f59e0b; }
+.stageStep.running .bar i:not([style]) { width: 45%; animation: slide 1.2s ease-in-out infinite; }
 .stageStep.running .st { color: #92400e; }
 .stageStep.failed { border-color: #f3c9c9; background: #fef4f4; }
 .stageStep.failed .bar i { width: 100%; background: #b91c1c; }
 .stageStep.failed .st { color: #b91c1c; }
+.stageBody { padding: 2px 10px 10px; border-top: 1px dashed var(--line); margin-top: 2px; }
+.stageFacts { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 8px 0 0; font-size: 11.5px; }
+.stageFacts dt { color: var(--muted); }
+.stageFacts dd { margin: 0; font-weight: 600; word-break: break-word; }
 @keyframes slide { 0% { margin-left: 0; } 50% { margin-left: 55%; } 100% { margin-left: 0; } }
 
 .runStats { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--line); }

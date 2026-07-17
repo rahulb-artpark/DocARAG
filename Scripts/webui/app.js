@@ -312,18 +312,61 @@ const fmtWhen = (iso) => {
   return isNaN(d) ? "—" : d.toLocaleString();
 };
 
+function stageHeadline(stage) {
+  if (stage.status === "running") {
+    const parts = [];
+    if (stage.progress) parts.push(`${stage.progress.done}/${stage.progress.total}`);
+    if (stage.etaSeconds != null) parts.push(`~${fmtDuration(stage.etaSeconds)} left`);
+    else if (stage.elapsed != null) parts.push(`${fmtDuration(stage.elapsed)} elapsed`);
+    return parts.join(" · ") || "running…";
+  }
+  if (stage.seconds != null) return fmtDuration(stage.seconds);
+  return stage.status;
+}
+
+function stageRows(stage) {
+  const rows = [];
+  const add = (k, v) => { if (v !== null && v !== undefined && v !== "") rows.push([k, v]); };
+  add("Status", stage.status);
+  add("Started", stage.startedAt ? fmtWhen(stage.startedAt) : null);
+  add("Ended", stage.endedAt ? fmtWhen(stage.endedAt) : null);
+  add("Duration", stage.seconds != null ? fmtDuration(stage.seconds) : null);
+  if (stage.status === "running") {
+    add("Elapsed", stage.elapsed != null ? fmtDuration(stage.elapsed) : null);
+    if (stage.progress) {
+      const pct = Math.round((stage.progress.done / stage.progress.total) * 100);
+      add("Progress", `${stage.progress.done} of ${stage.progress.total} nodes (${pct}%)`);
+    }
+    if (stage.etaSeconds != null)
+      add("Remaining", `~${fmtDuration(stage.etaSeconds)} (${stage.etaBasis})`);
+  }
+  if (stage.typicalSeconds != null) add("Typical", fmtDuration(stage.typicalSeconds));
+  for (const [key, total] of Object.entries(stage.tokens || {}))
+    add(key.replace(/_/g, " "), `${fmtTokens(total)} tokens`);
+  if (stage.exitCode !== null && stage.exitCode !== undefined && stage.exitCode !== 0)
+    add("Exit code", stage.exitCode);
+  return rows.length
+    ? `<dl class="stageFacts">${rows
+        .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`)
+        .join("")}</dl>`
+    : `<p class="prose">Nothing recorded for this stage yet.</p>`;
+}
+
 function stageStepHtml(stage) {
-  const detail =
-    stage.status === "running"
-      ? "running…"
-      : stage.seconds !== null && stage.seconds !== undefined
-        ? fmtDuration(stage.seconds)
-        : stage.status;
-  return `<div class="stageStep ${escapeHtml(stage.status)}">
-    <div class="nm">${escapeHtml(stage.name)}</div>
-    <div class="st">${escapeHtml(detail)}</div>
-    <div class="bar"><i></i></div>
-  </div>`;
+  const pct = stage.progress
+    ? Math.round((stage.progress.done / stage.progress.total) * 100)
+    : null;
+  return `<details class="stageStep ${escapeHtml(stage.status)}">
+    <summary>
+      <span class="nm">${escapeHtml(stage.name)}</span>
+      <span class="st">${escapeHtml(stageHeadline(stage))}</span>
+      <span class="bar"><i${pct != null ? ` style="width:${pct}%"` : ""}></i></span>
+    </summary>
+    <div class="stageBody">
+      ${stageRows(stage)}
+      ${stage.error ? `<div class="runError">${escapeHtml(String(stage.error))}</div>` : ""}
+    </div>
+  </details>`;
 }
 
 function runCardHtml(run) {
