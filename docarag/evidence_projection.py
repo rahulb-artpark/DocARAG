@@ -220,6 +220,7 @@ def build_document_evidence(
             )
 
     tree_nodes: list[TreeNodeRecord] = []
+    block_id_by_node: dict[int, str] = {}
     tree_path = run / "tree.json"
     if tree_path.is_file():
         tree = _load_json(tree_path)
@@ -230,8 +231,11 @@ def build_document_evidence(
             nid = node.get("index_id")
             if not isinstance(nid, int):
                 continue
-            meta = node.get("meta_info") or {}
-            block_id = meta.get("block_id") if isinstance(meta, dict) else None
+            meta = node.get("meta_info") if isinstance(node.get("meta_info"), dict) else {}
+            # The tree publishes its evidence binding as canonical_block_id;
+            # without it every tree row is an island that no query can join
+            # back to the block, its text, or its crop.
+            block_id = meta.get("canonical_block_id") or meta.get("block_id")
             summary = node.get("summary")
             tree_nodes.append(
                 TreeNodeRecord(
@@ -249,6 +253,8 @@ def build_document_evidence(
                     summary=summary if isinstance(summary, str) else None,
                 )
             )
+            if isinstance(block_id, str) and block_id:
+                block_id_by_node[nid] = block_id
 
     entities: list[EntityRecord] = []
     relations: list[RelationRecord] = []
@@ -320,7 +326,13 @@ def build_document_evidence(
                     if entity_id is None or (entity_id, node_id) in seen:
                         continue
                     seen.add((entity_id, node_id))
-                    gt_links.append(GTLinkRecord(entity_id=entity_id, node_id=node_id))
+                    gt_links.append(
+                        GTLinkRecord(
+                            entity_id=entity_id,
+                            node_id=node_id,
+                            block_id=block_id_by_node.get(node_id),
+                        )
+                    )
 
     return DocumentEvidence(
         index_revision_id=index_revision_id,
