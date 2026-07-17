@@ -87,6 +87,7 @@ class GBC:
                 device=config.graph.embedding_config.device,
                 api_base=config.graph.embedding_config.api_base,
                 api_key=getattr(config.graph.embedding_config, "api_key", None),
+                num_ctx=getattr(config.graph.embedding_config, "num_ctx", None),
             )
             self.entity_vdb = VectorStore(
                 qdrant_url=config.vdb.qdrant_url,

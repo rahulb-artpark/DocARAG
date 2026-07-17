@@ -738,6 +738,7 @@ class TextEmbeddingProvider(BaseEmbedder):
         max_length: int = 8192,
         api_base: str = None,
         api_key: Optional[str] = None,
+        num_ctx: Optional[int] = None,
         *,
         client: Optional[object] = None,
         owns_client: Optional[bool] = None,
@@ -765,6 +766,7 @@ class TextEmbeddingProvider(BaseEmbedder):
         self.model_name = model_name.strip()
         self.backend = backend.strip().lower()
         self.max_length = max_length
+        self.num_ctx = num_ctx
         self._torch = None
         self._torch_functional = None
 
@@ -948,6 +950,11 @@ class TextEmbeddingProvider(BaseEmbedder):
         norms = np.linalg.norm(values, ord=2, axis=1, keepdims=True)
         return values / np.maximum(norms, np.float32(1e-12))
 
+    def _embed_options(self) -> dict:
+        if self.num_ctx is None:
+            return {}
+        return {"options": {"num_ctx": self.num_ctx}}
+
     def embed_texts(self, texts: List[str]) -> np.ndarray:
         """
         为一批文本生成嵌入向量。
@@ -1014,7 +1021,9 @@ class TextEmbeddingProvider(BaseEmbedder):
             # ``EmbeddingConfig.api_base`` entirely.
             embed = getattr(self.client, "embed", None)
             if callable(embed):
-                response = embed(model=self.model_name, input=texts)
+                response = embed(
+                    model=self.model_name, input=texts, **self._embed_options()
+                )
                 if isinstance(response, dict):
                     all_embeddings = response.get("embeddings")
                 else:

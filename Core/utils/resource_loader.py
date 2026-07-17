@@ -258,6 +258,7 @@ def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
                 max_length=embed_cfg.max_length,
                 api_base=embed_cfg.api_base,
                 api_key=getattr(embed_cfg, "api_key", None),
+                num_ctx=getattr(embed_cfg, "num_ctx", None),
             )
 
         vdb = VectorStore(
@@ -384,6 +385,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
                 max_length=embed_cfg.max_length,
                 api_base=embed_cfg.api_base,
                 api_key=getattr(embed_cfg, "api_key", None),
+                num_ctx=getattr(embed_cfg, "num_ctx", None),
             )
             
             scope_filter = _runtime_scope(
@@ -440,6 +442,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
             max_length=embed_cfg.max_length,
             api_base=embed_cfg.api_base,
             api_key=getattr(embed_cfg, "api_key", None),
+            num_ctx=getattr(embed_cfg, "num_ctx", None),
         )
         
         tree_vdb = None
@@ -521,6 +524,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
                     max_length=embed_cfg.max_length,
                     api_base=embed_cfg.api_base,
                     api_key=getattr(embed_cfg, "api_key", None),
+                    num_ctx=getattr(embed_cfg, "num_ctx", None),
                 )
 
             vdb = VectorStore(

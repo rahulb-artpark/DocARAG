@@ -16,6 +16,9 @@ class EmbeddingConfig:
     max_length: int = 8192
     # Remote providers own placement; only local providers accept a device.
     device: Optional[str] = None
+    # Ollama sizes an embedding model's KV cache from its declared context
+    # unless a request caps it, which costs gigabytes for a small model.
+    num_ctx: Optional[int] = None
     
     
     def __post_init__(self):

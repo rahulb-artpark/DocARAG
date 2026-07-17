@@ -65,6 +65,9 @@ graph:
     backend: ollama
     max_length: 4096
     api_base: "http://localhost:11434"
+    # Without this a 0.6B model reserves 6.3GB of KV cache for a 32k context
+    # it never uses, and the query stack no longer fits beside the LLM.
+    num_ctx: 4096
   reranker_config:
     model_name: Qwen/Qwen3-Reranker-4B # loaded locally via transformers
     max_length: 4096
