@@ -259,7 +259,7 @@ class OpenAIController(BaseLLMController):
         prompt_or_memory: Union[str, Memory],
         schema: BaseModel,
         images: Optional[list] = None,
-        think_mode: bool = False,
+        think_mode: Optional[bool] = None,
     ) -> dict:
         """
         Get structured JSON response from OpenAI using Pydantic schema.
@@ -301,7 +301,7 @@ class OpenAIController(BaseLLMController):
             timeout=self.request_timeout_seconds,
             response_format=schema,
             extra_body={
-                "chat_template_kwargs": {"enable_thinking": think_mode},
+                "chat_template_kwargs": {"enable_thinking": bool(think_mode)},
             },
         )
 
@@ -374,6 +374,7 @@ class OllamaController(BaseLLMController):
         )
         self.keep_alive = llm_config.keep_alive if llm_config else "5m"
         self.num_ctx = getattr(llm_config, "num_ctx", None) if llm_config else None
+        self.think = getattr(llm_config, "think", None) if llm_config else None
         self.unload_on_close = bool(llm_config and llm_config.unload_on_close)
         self.request_timeout_seconds = (
             llm_config.request_timeout_seconds if llm_config else 300.0
@@ -405,6 +406,10 @@ class OllamaController(BaseLLMController):
             options["num_ctx"] = self.num_ctx
         return options
 
+    def _think_kwargs(self, requested: Optional[bool] = None) -> Dict[str, Any]:
+        mode = self.think if self.think is not None else requested
+        return {} if mode is None else {"think": mode}
+
     def _prepare_messages(
         self, prompt_or_memory: Union[str, Memory], add_system_prompt: bool = True
     ) -> List[Dict[str, Any]]:
@@ -429,7 +434,7 @@ class OllamaController(BaseLLMController):
             "messages": messages,
             "options": self._options(),
             "keep_alive": self.keep_alive,
-            "think": False,
+            **self._think_kwargs(False),
         }
         if json_response:
             parameters["format"] = "json"
@@ -449,7 +454,7 @@ class OllamaController(BaseLLMController):
         prompt_or_memory: Union[str, Memory],
         schema: BaseModel,
         images: Optional[list] = None,
-        think_mode: bool = False,
+        think_mode: Optional[bool] = None,
     ) -> dict:
         """
         Get structured JSON response from Ollama using Pydantic schema.
@@ -469,7 +474,7 @@ class OllamaController(BaseLLMController):
             format=schema.model_json_schema(),  # 关键：传递schema
             options=self._options(),
             keep_alive=self.keep_alive,
-            think=think_mode,
+            **self._think_kwargs(think_mode),
         )
 
         if response:
@@ -639,7 +644,7 @@ class LLM:
         prompt: Union[str, Memory],
         schema: BaseModel,
         images: Optional[list] = None,
-        think_mode: bool = False,
+        think_mode: Optional[bool] = None,
     ) -> dict:
         last_exception: Optional[Exception] = None
         for attempt in range(1, self.config.max_retries + 1):

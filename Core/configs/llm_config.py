@@ -74,6 +74,9 @@ class LLMConfig:
     # eviction affects every user of a shared Ollama server and is opt-in.
     unload_on_close: bool = False
     num_ctx: Optional[int] = None
+    # None leaves the model's own thinking default alone. Forcing it off makes
+    # some models abandon a requested schema and answer in prose instead.
+    think: Optional[bool] = None
 
     def __post_init__(self):
         if not isinstance(self.backend, str):

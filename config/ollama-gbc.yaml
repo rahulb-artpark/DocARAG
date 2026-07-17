@@ -22,6 +22,9 @@ llm:
   # Stock models declare a 256k context. Ollama sizes the KV cache from it and
   # spills to CPU, so cap it here rather than in a hand-built Modelfile.
   num_ctx: 16384
+  # qwen3.6 abandons a requested JSON schema and answers in prose when its
+  # thinking is forced off. Leave the model's own default alone.
+  think: null
 
 vlm:
   model_name: qwen3.6:35b            # vision-capable; figure descriptions + topology
