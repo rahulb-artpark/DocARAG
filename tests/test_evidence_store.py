@@ -197,6 +197,48 @@ class EvidenceProjectionTests(unittest.TestCase):
             self.assertEqual(digest, table.asset_links[0].asset_id)
             self.assertEqual("region_crop", table.asset_links[0].role)
 
+    def test_an_already_published_crop_is_registered_not_only_linked(self):
+        # Crops reach the canonical layer already published to a
+        # content-addressed store, so they arrive carrying a digest. Linking one
+        # without registering it violates the store's foreign key and fails the
+        # whole document's persistence.
+        digest = "d" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "run"
+            run.mkdir()
+            self._write_run(run)
+            cas = Path(directory) / "cas"
+            (cas / digest[:2]).mkdir(parents=True)
+            (cas / digest[:2] / digest).write_bytes(b"published crop bytes")
+
+            payload = json.loads((run / "canonical_blocks.json").read_text())
+            payload["canonical_blocks"][1]["assets"] = [
+                {
+                    "kind": "region_crop",
+                    "media_type": "image/jpeg",
+                    "sha256": digest,
+                    "uri": f"cas://sha256/{digest}",
+                }
+            ]
+            (run / "canonical_blocks.json").write_text(json.dumps(payload))
+
+            evidence = build_document_evidence(run, "rev1", asset_cas_root=cas)
+
+            registered = {asset.asset_id for asset in evidence.assets}
+            linked = {
+                link.asset_id
+                for block in evidence.blocks
+                for link in block.asset_links
+            }
+            self.assertTrue(
+                linked <= registered,
+                f"linked assets missing from the assets table: {linked - registered}",
+            )
+            record = next(a for a in evidence.assets if a.asset_id == digest)
+            self.assertEqual(f"cas://sha256/{digest}", record.cas_uri)
+            self.assertEqual("image/jpeg", record.mime_type)
+            self.assertEqual(len(b"published crop bytes"), record.byte_size)
+
     def test_projection_is_deterministic(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory) / "run"

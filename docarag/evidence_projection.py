@@ -71,6 +71,32 @@ def _resolve_local_asset(asset: dict, run: Path) -> Path | None:
     return None
 
 
+def _published_asset_record(asset: dict, digest: str, role: str, cas_root: Path | None):
+    """Describe an asset that already carries a verified content digest.
+
+    Crops reach the canonical layer already published to a content-addressed
+    store, so nothing re-reads them here. Their rows are still required: a
+    block link to an unregistered asset violates the store's foreign key and
+    fails the whole document's persistence.
+    """
+
+    byte_size = 0
+    if cas_root is not None:
+        candidate = cas_root / digest[:2] / digest
+        try:
+            byte_size = candidate.stat().st_size
+        except OSError:
+            byte_size = 0
+    uri = asset.get("uri")
+    return AssetRecord(
+        asset_id=digest,
+        mime_type=str(asset.get("media_type") or "application/octet-stream"),
+        byte_size=byte_size,
+        cas_uri=uri if isinstance(uri, str) and uri.startswith("cas://") else f"cas://sha256/{digest}",
+        metadata={"kind": role},
+    )
+
+
 def publish_asset_bytes(data: bytes, cas_root: Path) -> str:
     """Store bytes at <cas_root>/<digest[:2]>/<digest>; return the digest."""
 
@@ -146,7 +172,11 @@ def build_document_evidence(
                     continue
                 role = str(asset.get("kind") or asset.get("role") or "asset")
                 digest = asset.get("sha256")
-                if not (isinstance(digest, str) and len(digest) == 64):
+                if isinstance(digest, str) and len(digest) == 64:
+                    asset_by_id.setdefault(
+                        digest, _published_asset_record(asset, digest, role, cas_root)
+                    )
+                else:
                     resolved = _resolve_local_asset(asset, run)
                     if resolved is None or cas_root is None:
                         continue
