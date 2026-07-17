@@ -70,10 +70,30 @@ function renderTableBody(html) {
   return build(source);
 }
 
+function nodeLabel(n) {
+  // A table often carries no caption of its own; its header row names it far
+  // better than its node type does.
+  if (n.content && n.content.trim()) return n.content;
+  if (n.tableBody) {
+    const table = renderTableBody(n.tableBody);
+    const row = table && table.querySelector("tr");
+    if (row) {
+      const cells = [...row.children].map((c) => c.textContent.trim()).filter(Boolean);
+      if (cells.length) return cells.join(" · ");
+    }
+  }
+  return n.type;
+}
+
 function renderContent(n) {
   const c = (n && n.content) || "";
   if (!c.trim()) return "—";
-  if (/^\s*<table/i.test(c)) return `<div class="tablewrap">${c}</div>`;
+  if (/^\s*<table/i.test(c)) {
+    const table = renderTableBody(c);
+    return table
+      ? `<div class="tableWrap">${table.outerHTML}</div>`
+      : escapeHtml(c);
+  }
   const hasMath = /\$\$|\\\(|\\\[|\$[^$]+\$/.test(c);
   if (hasMath) {
     // keep $$...$$ intact on one line so MathJax finds the delimiters (no <br>)
@@ -866,7 +886,7 @@ function computeTreeLevels(nodes) {
 
 function toVisTreeNode(n, labelsOn) {
   const c = colorForType(n.type);
-  const short = clip(n.content || n.type, 40);
+  const short = clip(nodeLabel(n), 40);
   return {
     id: n.id,
     level: state.treeLevelById ? state.treeLevelById.get(n.id) : undefined,
@@ -881,7 +901,7 @@ function toVisTreeNode(n, labelsOn) {
 function rebuildTreeLabels() {
   const labelsOn = $("treeLabels").checked;
   state.treeNodes.update(state.tree.nodes.map((n) => ({
-    id: n.id, label: labelsOn ? `#${n.id} ${clip(n.content || n.type, 40)}` : `#${n.id}`,
+    id: n.id, label: labelsOn ? `#${n.id} ${clip(nodeLabel(n), 40)}` : `#${n.id}`,
   })));
 }
 
@@ -978,7 +998,7 @@ function selectTreeNode(id) {
   }
   const kids = (n.children || []).map((cid) => {
     const c = state.treeNodesById.get(cid);
-    return c ? `<div class="card"><div class="h"><a class="linkish" data-tree="${cid}">#${cid} ${escapeHtml(clip(c.content || c.type, 46))}</a></div>
+    return c ? `<div class="card"><div class="h"><a class="linkish" data-tree="${cid}">#${cid} ${escapeHtml(clip(nodeLabel(c), 46))}</a></div>
       <div class="b">${escapeHtml(c.type)}${c.page ? " · page " + c.page : ""}</div></div>` : "";
   }).join("") || `<p class="prose">No children (leaf node).</p>`;
 
@@ -992,16 +1012,18 @@ function selectTreeNode(id) {
     ? `<div class="section-h">Image</div><img class="nodeimg" src="/api/tree-image?id=${id}" alt="node image" />` : "";
 
   $("treeDetail").innerHTML = `
-    <h2>#${id} ${escapeHtml(clip(n.content || n.type, 90))}</h2>
+    <h2>#${id} ${escapeHtml(clip(nodeLabel(n), 90))}</h2>
     <div class="kv">
       <dt>Type</dt><dd><span class="tag" style="background:${colorForType(n.type)}">${escapeHtml(n.type)}</span></dd>
       ${n.page ? `<dt>Page</dt><dd>${n.page}</dd>` : ""}
-      <dt>Parent</dt><dd>${parent ? `<a class="linkish" data-tree="${parent.id}">#${parent.id} ${escapeHtml(clip(parent.content || parent.type, 40))}</a>` : "— (root)"}</dd>
+      <dt>Parent</dt><dd>${parent ? `<a class="linkish" data-tree="${parent.id}">#${parent.id} ${escapeHtml(clip(nodeLabel(parent), 40))}</a>` : "— (root)"}</dd>
       <dt>Children</dt><dd>${(n.children || []).length}</dd>
     </div>
     ${n.tableBody ? `<div class="section-h">Table</div><div class="tableWrap" id="nodeTable"></div>` : ""}
-    <div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}</div>
-    <div class="prose">${renderContent(n)}</div>
+    ${(n.content || "").trim() || !n.tableBody
+      ? `<div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}</div>
+         <div class="prose">${renderContent(n)}</div>`
+      : ""}
     ${n.summary ? `<div class="section-h">Summary (LLM-generated)</div><div class="prose">${escapeHtml(n.summary)}</div>` : ""}
     <div class="section-h">Entities extracted here (${ents.length})</div>
     <div class="prose">${entHtml}</div>

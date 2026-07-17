@@ -540,12 +540,18 @@ def write_private_json(path, payload):
 
 
 def node_content(node):
+    """Return a node's own text.
+
+    A table's markup is published separately as ``tableBody``; falling back to
+    it here would render the grid a second time and title the node with raw
+    HTML.
+    """
+
     meta = node.get("meta_info") or {}
     return (
         meta.get("content")
         or meta.get("text")
         or meta.get("caption")
-        or meta.get("table_body")
         or meta.get("title")
         or ""
     )
