@@ -104,6 +104,8 @@ def _project_blocks(
                 uid=uid,
                 kind=_text(raw.get("block_type")) or "unknown",
                 block_no=position,
+                revision_uid=_text(raw.get("revision_id")) or None,
+                page_uid=_text(raw.get("page_id")) or None,
                 page_no=_integer(raw.get("page_index")),
                 subtype=_text(raw.get("semantic_subtype")) or None,
                 reading_order=_number(raw.get("reading_order")),

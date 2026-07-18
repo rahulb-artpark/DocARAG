@@ -30,6 +30,8 @@ class NodeMeta:
     footnote: str = ""
     table_body: str = ""
     block_uid: str | None = None
+    block_revision_uid: str | None = None
+    page_uid: str | None = None
     geometry: Mapping[str, Any] | None = None
 
     def model_dump(self) -> dict[str, Any]:
@@ -41,6 +43,8 @@ class NodeMeta:
             "footnote": self.footnote,
             "table_body": self.table_body,
             "block_uid": self.block_uid,
+            "block_revision_uid": self.block_revision_uid,
+            "page_uid": self.page_uid,
             "geometry": self.geometry,
         }
 
@@ -275,6 +279,8 @@ def _view(row: Mapping[str, Any]) -> TreeNodeView:
             footnote=str(row.get("footnote") or ""),
             table_body=str(row.get("table_body") or ""),
             block_uid=row.get("block_uid"),
+            block_revision_uid=row.get("block_revision_uid"),
+            page_uid=row.get("page_uid"),
             geometry=row.get("geometry"),
         ),
     )
@@ -290,6 +296,8 @@ _NODE_COLUMNS = """
     parent.node_no AS parent_no,
     summary_blob.body AS summary,
     blk.block_uid,
+    blk.block_revision_uid,
+    blk.page_uid,
     blk.page_no,
     blk.geometry,
     (node.parent_key IS NULL OR node.node_kind ILIKE '%%title%%') AS is_outline,

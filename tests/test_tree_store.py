@@ -158,6 +158,8 @@ class TreeStoreReadTests(unittest.TestCase):
                 "footnote",
                 "table_body",
                 "block_uid",
+                "block_revision_uid",
+                "page_uid",
                 "geometry",
             },
             set(dumped),

@@ -592,6 +592,8 @@ class BlockRecord:
     uid: str
     kind: str
     block_no: int
+    revision_uid: str | None = None
+    page_uid: str | None = None
     page_no: int | None = None
     subtype: str | None = None
     reading_order: float | None = None

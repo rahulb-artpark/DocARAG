@@ -1364,15 +1364,17 @@ class PostgresLedger:
         for block in blocks:
             row = _mapping(
                 connection.execute(
-                    "INSERT INTO docarag.block (revision_key, block_uid, page_no, "
-                    "block_no, block_kind, subtype, reading_order, quality, "
+                    "INSERT INTO docarag.block (revision_key, block_uid, block_revision_uid, "
+                    "page_uid, page_no, block_no, block_kind, subtype, reading_order, quality, "
                     "reconciliation, content_sha256, geometry, "
                     "source_observation_ids, attrs) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, "
                     "%s::jsonb, %s::jsonb) RETURNING block_key",
                     (
                         revision_key,
                         block.uid,
+                        block.revision_uid,
+                        block.page_uid,
                         block.page_no,
                         block.block_no,
                         block.kind,

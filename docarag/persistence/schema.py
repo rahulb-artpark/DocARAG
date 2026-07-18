@@ -416,6 +416,8 @@ CREATE TABLE docarag.block (
         REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
     block_key bigint GENERATED ALWAYS AS IDENTITY,
     block_uid text NOT NULL,
+    block_revision_uid text,
+    page_uid text,
     page_no integer,
     block_no integer NOT NULL,
     block_kind text NOT NULL,

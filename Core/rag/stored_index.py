@@ -17,6 +17,7 @@ from typing import Any, Iterable, List, Sequence
 
 import networkx as nx
 
+from docarag.derived_identity import derived_evidence_id
 from docarag.document_store import DocumentStore
 from docarag.tree_store import TreeNodeView
 
@@ -306,17 +307,34 @@ def _node_payload(node: TreeNodeView, tree_meta: "StoredTreeMeta" = None) -> dic
     payload = {
         "document_version_id": tree_meta.document_version_id if tree_meta else "",
         "source_sha256": tree_meta.source_sha256 if tree_meta else "",
+        "source_uri": tree_meta.source_uri if tree_meta else "",
         "index_revision_id": tree_meta.index_revision_id if tree_meta else "",
         "index_id": node.index_id,
         "type": node.type,
         "content": meta.content,
         "page": meta.page_idx,
+        "page_id": meta.page_uid,
         "summary": node.summary,
         "parent_id": node.parent_id,
         "depth": node.depth,
         "block_uid": meta.block_uid,
         "geometry": meta.geometry,
     }
+    # A node either points at the canonical block it was built from, or names
+    # the derivation that produced it. Exactly one, never both.
+    revision_id = tree_meta.index_revision_id if tree_meta else ""
+    if meta.block_uid and meta.block_revision_uid:
+        payload["canonical_block_id"] = meta.block_uid
+        payload["canonical_revision_id"] = meta.block_revision_uid
+    else:
+        payload["derived_evidence_id"] = derived_evidence_id(
+            {
+                "index_id": node.index_id,
+                "index_revision_id": revision_id,
+                "type": node.type,
+                "depth": node.depth,
+            }
+        )
     if meta.img_path:
         payload["img_path"] = meta.img_path
     if meta.caption:
