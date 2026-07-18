@@ -287,7 +287,7 @@ class GmeEmbeddingProvider(BaseEmbedder):
         if functional is None:
             raise RuntimeError("GME embedding provider is closed")
         normalized_embeddings = functional.normalize(embeddings, p=2, dim=-1)
-        return normalized_embeddings.cpu().numpy()
+        return normalized_embeddings.detach().float().cpu().numpy()
 
     def embed_texts(
         self, texts: List[str], instruction: Optional[str] = None, batch_size=4
@@ -961,7 +961,7 @@ class TextEmbeddingProvider(BaseEmbedder):
             embeddings, p=2, dim=1
         )
         # 移动到CPU并转换为numpy数组
-        return normalized_embeddings.cpu().numpy()
+        return normalized_embeddings.detach().float().cpu().numpy()
 
     @staticmethod
     def _normalize_numpy(embeddings: np.ndarray) -> np.ndarray:
