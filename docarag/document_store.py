@@ -134,10 +134,14 @@ def _open_connection(database_url: str) -> Any:
         raise DocumentStoreError(
             "reading stored evidence requires psycopg 3"
         ) from exc
+    # Reads are single-statement slices over sealed evidence.  Autocommit
+    # keeps the connection out of "idle in transaction" between them, which
+    # would hold locks for the life of the viewer and block any DDL.
     return psycopg.connect(
         database_url,
         application_name="docarag-read",
         row_factory=dict_row,
+        autocommit=True,
     )
 
 
