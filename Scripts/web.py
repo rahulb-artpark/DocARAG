@@ -39,11 +39,16 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
+from docarag.cli import _load_project_environment
 from docarag.compat import inspect_run_readiness, run_provenance
 from docarag.provenance import query_readiness_stat_key
 from docarag.provenance import sha256_file
 from docarag.run_logging import RunLogInfo, RunLogScope
 from Core.provider.TokenTracker import TokenTracker
+
+# The store, Qdrant client and BookRAG subprocess must see the same local
+# storage endpoints the CLI uses, so the project .env is loaded the same way.
+_load_project_environment(REPO)
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
