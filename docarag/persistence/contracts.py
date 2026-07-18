@@ -193,7 +193,11 @@ class IndexRevisionSpec:
     # be invented because it is part of the index publication binding.
     qdrant_vector_name: str | None = None
     metadata: JsonObject = field(default_factory=dict)
-    revision_id: str = field(init=False)
+    # An indexer that already names its revision -- a fingerprint over its
+    # code, configuration and source -- keeps that name, because the run
+    # directory and every artifact in it are addressed by it.  Otherwise one
+    # is derived from the bindings above.
+    revision_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, DocumentScope):
@@ -205,6 +209,9 @@ class IndexRevisionSpec:
             _bounded_id(self.qdrant_vector_name, "qdrant_vector_name")
         metadata = _bounded_json(self.metadata, "metadata")
         object.__setattr__(self, "metadata", metadata)
+        if self.revision_id is not None:
+            require_non_empty(self.revision_id, "revision_id")
+            return
         object.__setattr__(
             self,
             "revision_id",

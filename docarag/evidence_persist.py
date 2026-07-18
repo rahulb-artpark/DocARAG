@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     from docarag.domain.evidence import DocumentRef
-    from docarag.persistence.contracts import CorpusScope
+    from docarag.persistence.contracts import CorpusScope, IndexRevisionSpec
     from docarag.persistence.postgres import PostgresLedger
 
     revision_id = str(manifest["revision_id"])
@@ -62,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
             CorpusScope(str(manifest["tenant_id"]), str(manifest["corpus_id"])),
             document,
         )
+        # Evidence is keyed by the revision, so the revision has to exist in
+        # the ledger before anything derived from it can be written.
+        _admit_revision(ledger, scope, manifest, run, IndexRevisionSpec)
         evidence = build_document_evidence(run, revision_id, asset_cas_root=cas_root)
         written = ledger.persist_document_evidence(scope, evidence)
     except Exception as exc:  # noqa: BLE001 - CLI boundary reports a clean message
@@ -73,6 +76,46 @@ def main(argv: list[str] | None = None) -> int:
         + ", ".join(f"{count} {name}" for name, count in sorted(written.items()) if count)
     )
     return 0
+
+
+def _admit_revision(ledger, scope, manifest, run, spec_type) -> None:
+    """Record the revision this run published, if it is not already known.
+
+    A revision is admitted once and never changed, so re-running persistence
+    for the same run finds it already present and proceeds.
+    """
+
+    import hashlib
+
+    try:
+        ledger.revision_key(scope, str(manifest["revision_id"]))
+        return
+    except Exception:
+        pass
+
+    config_sha = str((manifest.get("system_config") or {}).get("sha256") or "")
+    canonical = run / "canonical_blocks.json"
+    canonical_sha = (
+        hashlib.sha256(canonical.read_bytes()).hexdigest()
+        if canonical.is_file()
+        else "0" * 64
+    )
+    collection = "TreeVDB"
+    config_path = run / "run_config.yaml"
+    if config_path.is_file():
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("collection_name:"):
+                collection = line.split(":", 1)[1].strip().strip('"\'')
+                break
+    ledger.create_index_revision(
+        spec_type(
+            scope=scope,
+            configuration_sha256=config_sha if len(config_sha) == 64 else "0" * 64,
+            canonical_artifact_sha256=canonical_sha,
+            qdrant_collection=collection,
+            revision_id=str(manifest["revision_id"]),
+        )
+    )
 
 
 if __name__ == "__main__":
