@@ -697,6 +697,9 @@ CREATE TABLE docarag.statement_property (
 
 -- Why a statement is believed: the node, block or element that asserted it, and
 -- the span within it when the producer reported one.
+-- A locator may name a node, a block, an element, or a span within one, so the
+-- columns are optional and the uniqueness that dedupes them has to treat two
+-- absent locators as the same absence.
 CREATE TABLE docarag.statement_evidence (
     revision_key bigint NOT NULL,
     stmt_key bigint NOT NULL,
@@ -705,7 +708,10 @@ CREATE TABLE docarag.statement_evidence (
     element_key bigint,
     char_start integer,
     char_end integer,
-    PRIMARY KEY (revision_key, stmt_key, node_key, block_key, element_key),
+    CONSTRAINT statement_evidence_unique
+        UNIQUE NULLS NOT DISTINCT
+        (revision_key, stmt_key, node_key, block_key, element_key,
+         char_start, char_end),
     FOREIGN KEY (revision_key, stmt_key)
         REFERENCES docarag.statement(revision_key, stmt_key) ON DELETE CASCADE,
     CONSTRAINT statement_evidence_located CHECK (

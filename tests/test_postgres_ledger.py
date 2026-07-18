@@ -365,53 +365,60 @@ class PostgresSchemaTests(unittest.TestCase):
         self.assertNotIn("top-secret", rendered)
 
 
-class DeleteRevisionEvidenceTests(unittest.TestCase):
-    def _delete(self):
+class ClearRevisionEvidenceTests(unittest.TestCase):
+    """Removing a revision's evidence never touches the ledger or shared content."""
+
+    def _clear(self):
         connection = _FakeConnection()
         ledger = PostgresLedger(connection_factory=lambda: connection)
-        ledger.delete_revision_evidence(_scope(), "rev-a")
+        ledger.clear_revision_evidence(42)
         return connection
 
-    def test_every_evidence_table_is_scoped_to_one_revision(self):
-        connection = self._delete()
+    def test_every_evidence_table_is_cleared_by_one_surrogate(self):
+        connection = self._clear()
 
-        deletes = [q for q, _ in connection.executions if q.startswith("DELETE")]
-        self.assertEqual(7, len(deletes))
+        self.assertEqual(len(EVIDENCE_TABLES), len(connection.executions))
         for query, params in connection.executions:
-            self.assertIn("index_revision_id = %s", query)
-            self.assertEqual(
-                ("tenant-a", "corpus-a", "doc-a", "docv-a", "rev-a"), params
-            )
+            self.assertTrue(query.startswith("DELETE FROM docarag."))
+            self.assertIn("WHERE revision_key = %s", query)
+            self.assertEqual((42,), params)
+
+    def test_children_are_cleared_before_their_parents(self):
+        connection = self._clear()
+
+        order = [
+            query.split("docarag.", 1)[1].split(" ", 1)[0]
+            for query, _ in connection.executions
+        ]
+        self.assertLess(order.index("block_element"), order.index("block_structure"))
+        self.assertLess(order.index("block_structure"), order.index("block"))
+        self.assertLess(order.index("statement_role"), order.index("statement"))
+        self.assertLess(order.index("node_retrieval"), order.index("tree_node"))
 
     def test_the_append_only_ledger_is_never_touched(self):
-        # Document versions, index revisions, artifact receipts, and stage
-        # events are protected by database triggers because they record that a
-        # document was admitted and what ran over it.
-        connection = self._delete()
+        # These record that a document was admitted and what ran over it, and
+        # are protected from deletion by database triggers.
+        connection = self._clear()
 
         touched = " ".join(query for query, _ in connection.executions)
         for table in (
+            "documents",
             "document_versions",
             "index_revisions",
             "artifact_receipts",
             "stage_events",
-            "documents",
         ):
-            self.assertNotIn(f"docarag.{table}", touched)
+            self.assertNotIn(f"docarag.{table} ", touched)
 
-    def test_shared_content_addressed_assets_survive(self):
-        connection = self._delete()
+    def test_shared_content_survives_a_revision(self):
+        # Assets and text blobs are content addressed and shared by every
+        # revision that resolved to the same bytes.
+        connection = self._clear()
 
         touched = " ".join(query for query, _ in connection.executions)
-        self.assertNotIn("docarag.assets", touched)
-
-    def test_an_empty_revision_id_is_refused(self):
-        connection = _FakeConnection()
-        ledger = PostgresLedger(connection_factory=lambda: connection)
-
-        with self.assertRaises(Exception):
-            ledger.delete_revision_evidence(_scope(), "")
-        self.assertEqual([], connection.executions)
+        self.assertNotIn("docarag.asset ", touched)
+        self.assertNotIn("docarag.text_blob", touched)
+        self.assertNotIn("docarag.entity ", touched)
 
 
 class PostgresTruthRecordTests(unittest.TestCase):

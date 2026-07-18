@@ -440,130 +440,367 @@ def scope_for_document(
     )
 
 
+# ---------------------------------------------------------------- evidence --
+# What one revision's parsing and extraction produced.  These carry no database
+# keys: identity inside a revision is a local name the writer resolves to a
+# surrogate, so a projection never has to know what the database assigned.
+
+
+@dataclass(frozen=True, slots=True)
+class TextRecord:
+    """A piece of text stored once per digest and referenced by everything."""
+
+    body: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, str):
+            raise ValueError("text body must be a string")
+
+
 @dataclass(frozen=True, slots=True)
 class AssetRecord:
-    asset_id: str
-    mime_type: str
+    """Bytes that live in the content-addressed store."""
+
+    sha256: str
+    media_type: str
     byte_size: int
     cas_uri: str
     width: int | None = None
     height: int | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.sha256, "asset.sha256")
+        require_non_empty(self.media_type, "asset.media_type")
+        require_non_empty(self.cas_uri, "asset.cas_uri")
+        _require_non_negative(self.byte_size, "asset.byte_size")
+        for name in ("width", "height"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_non_negative(value, f"asset.{name}")
 
 
 @dataclass(frozen=True, slots=True)
 class RepresentationRecord:
+    """One text channel of a block: parsed text, OCR, a description, markup."""
+
     kind: str
-    content_sha256: str | None = None
-    content: str | None = None
-    cas_uri: str | None = None
+    text: str | None = None
+    asset_sha256: str | None = None
+    lang: str | None = None
     confidence: float | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    producer: str | None = None
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.kind, "representation.kind")
+        if self.text is None and self.asset_sha256 is None:
+            raise ValueError("representation must carry text or an asset")
+        if self.asset_sha256 is not None:
+            _require_sha256(self.asset_sha256, "representation.asset_sha256")
+        _require_probability(self.confidence, "representation.confidence")
 
 
 @dataclass(frozen=True, slots=True)
-class BlockAssetLink:
-    asset_id: str
-    role: str
-    metadata: Mapping[str, object] = field(default_factory=dict)
+class ElementRecord:
+    """A typed element inside a block: a cell, a symbol, a diagram node."""
+
+    local_key: str
+    kind: str
+    content: str | None = None
+    role: str | None = None
+    row_no: int | None = None
+    col_no: int | None = None
+    row_span: int | None = None
+    col_span: int | None = None
+    geometry: Mapping[str, object] | None = None
+    entity_ref: str | None = None
+    confidence: float | None = None
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.local_key, "element.local_key")
+        require_non_empty(self.kind, "element.kind")
+        for name in ("row_no", "col_no"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_non_negative(value, f"element.{name}")
+        _require_probability(self.confidence, "element.confidence")
+
+
+@dataclass(frozen=True, slots=True)
+class ElementEdgeRecord:
+    """A typed relation between two elements of one structure."""
+
+    src_local_key: str
+    dst_local_key: str
+    kind: str
+    label: str | None = None
+    ordinal: int = 0
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.src_local_key, "edge.src_local_key")
+        require_non_empty(self.dst_local_key, "edge.dst_local_key")
+        require_non_empty(self.kind, "edge.kind")
+        if self.src_local_key == self.dst_local_key:
+            raise ValueError("edge endpoints must differ")
+        _require_non_negative(self.ordinal, "edge.ordinal")
+
+
+@dataclass(frozen=True, slots=True)
+class StructureRecord:
+    """One graph inside one block: a table, a formula, a diagram, a chart."""
+
+    kind: str
+    producer: str
+    elements: tuple[ElementRecord, ...]
+    edges: tuple[ElementEdgeRecord, ...] = ()
+    availability: str = "complete"
+    confidence: float | None = None
+    source_uri: str | None = None
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.kind, "structure.kind")
+        require_non_empty(self.producer, "structure.producer")
+        if self.availability not in {"complete", "partial"}:
+            raise ValueError("structure.availability must be complete or partial")
+        if not self.elements:
+            raise ValueError("structure requires at least one element")
+        keys = [item.local_key for item in self.elements]
+        if len(keys) != len(set(keys)):
+            raise ValueError("structure contains duplicate element local keys")
+        known = set(keys)
+        for edge in self.edges:
+            if edge.src_local_key not in known or edge.dst_local_key not in known:
+                raise ValueError("edge endpoint is outside its structure")
+        _require_probability(self.confidence, "structure.confidence")
 
 
 @dataclass(frozen=True, slots=True)
 class BlockRecord:
-    block_id: str
-    revision_id: str
-    block_type: str
-    page_index: int
-    semantic_subtype: str | None = None
-    page_id: str | None = None
-    reading_order: int | None = None
-    parent_block_id: str | None = None
+    """A reconciled unit of a document, with its text, assets and structures."""
+
+    uid: str
+    kind: str
+    block_no: int
+    page_no: int | None = None
+    subtype: str | None = None
+    reading_order: float | None = None
+    quality: str | None = None
+    reconciliation: str | None = None
     content_sha256: str | None = None
-    quality_status: str | None = None
-    reconciliation_method: str | None = None
     geometry: Mapping[str, object] | None = None
     source_observation_ids: tuple[str, ...] = ()
-    metadata: Mapping[str, object] = field(default_factory=dict)
     representations: tuple[RepresentationRecord, ...] = ()
-    asset_links: tuple[BlockAssetLink, ...] = ()
+    asset_roles: tuple[tuple[str, str], ...] = ()
+    structures: tuple[StructureRecord, ...] = ()
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.uid, "block.uid")
+        require_non_empty(self.kind, "block.kind")
+        _require_non_negative(self.block_no, "block.block_no")
+        if self.page_no is not None:
+            _require_non_negative(self.page_no, "block.page_no")
+        for sha, _role in self.asset_roles:
+            _require_sha256(sha, "block.asset_roles[].sha256")
 
 
 @dataclass(frozen=True, slots=True)
 class TreeNodeRecord:
-    node_id: int
-    node_path: str
-    node_type: str
-    level: int
-    parent_id: int | None = None
-    reading_order: int | None = None
-    block_id: str | None = None
-    summary_sha256: str | None = None
+    """A node of the document tree, bound to the block it was built from."""
+
+    node_no: int
+    kind: str
+    parent_no: int | None = None
+    sibling_no: int = 0
+    block_uid: str | None = None
+    label: str | None = None
     summary: str | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require_non_negative(self.node_no, "tree_node.node_no")
+        require_non_empty(self.kind, "tree_node.kind")
+        if self.parent_no is not None:
+            _require_non_negative(self.parent_no, "tree_node.parent_no")
+            if self.parent_no == self.node_no:
+                raise ValueError("tree node cannot be its own parent")
+        _require_non_negative(self.sibling_no, "tree_node.sibling_no")
 
 
 @dataclass(frozen=True, slots=True)
 class EntityRecord:
-    entity_id: str
-    entity_name: str
-    entity_type: str
+    """A corpus-scoped entity, deduplicated across revisions by identity."""
+
+    ref: str
+    kind: str
+    canonical: str
     description: str | None = None
-    description_sha256: str | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.ref, "entity.ref")
+        require_non_empty(self.kind, "entity.kind")
+        require_non_empty(self.canonical, "entity.canonical")
 
 
 @dataclass(frozen=True, slots=True)
-class RelationRecord:
-    relation_id: str
-    src_entity_id: str
-    dst_entity_id: str
-    relation_type: str
+class MentionRecord:
+    """Where one revision saw an entity, and how it was written there."""
+
+    entity_ref: str
+    node_no: int | None = None
+    block_uid: str | None = None
+    surface: str | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    confidence: float | None = None
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.entity_ref, "mention.entity_ref")
+        if (self.char_start is None) != (self.char_end is None):
+            raise ValueError("mention offsets must be supplied together")
+        if self.char_start is not None:
+            _require_non_negative(self.char_start, "mention.char_start")
+            if self.char_end <= self.char_start:
+                raise ValueError("mention.char_end must exceed char_start")
+        _require_probability(self.confidence, "mention.confidence")
+
+
+@dataclass(frozen=True, slots=True)
+class StatementRoleRecord:
+    entity_ref: str
+    role: str
+    ordinal: int = 0
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.entity_ref, "role.entity_ref")
+        require_non_empty(self.role, "role.role")
+        _require_non_negative(self.ordinal, "role.ordinal")
+
+
+@dataclass(frozen=True, slots=True)
+class StatementEvidenceRecord:
+    node_no: int | None = None
+    block_uid: str | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.node_no is None and self.block_uid is None:
+            raise ValueError("statement evidence must locate a node or a block")
+
+
+@dataclass(frozen=True, slots=True)
+class StatementRecord:
+    """One asserted fact.  Two roles are a binary edge; more are a hyperedge."""
+
+    predicate: str
+    roles: tuple[StatementRoleRecord, ...]
     directed: bool = True
     weight: float | None = None
+    confidence: float | None = None
+    producer: str | None = None
     description: str | None = None
-    evidence: tuple[object, ...] = ()
-    metadata: Mapping[str, object] = field(default_factory=dict)
+    evidence: tuple[StatementEvidenceRecord, ...] = ()
+    properties: Mapping[str, object] = field(default_factory=dict)
+    attrs: Mapping[str, object] = field(default_factory=dict)
 
-
-@dataclass(frozen=True, slots=True)
-class GTLinkRecord:
-    entity_id: str
-    node_id: int
-    block_id: str | None = None
-    provenance: Mapping[str, object] = field(default_factory=dict)
+    def __post_init__(self) -> None:
+        require_non_empty(self.predicate, "statement.predicate")
+        if len(self.roles) < 2:
+            raise ValueError("statement requires at least two roles")
+        _require_probability(self.confidence, "statement.confidence")
 
 
 @dataclass(frozen=True, slots=True)
 class DocumentEvidence:
-    index_revision_id: str
+    """Everything one revision produced, ready to be written in one pass."""
+
+    revision_id: str
     assets: tuple[AssetRecord, ...] = ()
     blocks: tuple[BlockRecord, ...] = ()
     tree_nodes: tuple[TreeNodeRecord, ...] = ()
     entities: tuple[EntityRecord, ...] = ()
-    relations: tuple[RelationRecord, ...] = ()
-    gt_links: tuple[GTLinkRecord, ...] = ()
+    mentions: tuple[MentionRecord, ...] = ()
+    statements: tuple[StatementRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.revision_id, "evidence.revision_id")
+        uids = [block.uid for block in self.blocks]
+        if len(uids) != len(set(uids)):
+            raise ValueError("evidence contains duplicate block uids")
+        numbers = [node.node_no for node in self.tree_nodes]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError("evidence contains duplicate tree node numbers")
+        refs = [entity.ref for entity in self.entities]
+        if len(refs) != len(set(refs)):
+            raise ValueError("evidence contains duplicate entity refs")
+
+    def counts(self) -> dict[str, int]:
+        """Return what was written, for the caller to report."""
+
+        return {
+            "assets": len(self.assets),
+            "blocks": len(self.blocks),
+            "representations": sum(len(b.representations) for b in self.blocks),
+            "structures": sum(len(b.structures) for b in self.blocks),
+            "elements": sum(
+                len(s.elements) for b in self.blocks for s in b.structures
+            ),
+            "tree_nodes": len(self.tree_nodes),
+            "entities": len(self.entities),
+            "mentions": len(self.mentions),
+            "statements": len(self.statements),
+        }
+
+
+def _require_sha256(value: object, field_name: str) -> None:
+    require_sha256(value, field_name)
+
+
+def _require_non_negative(value: object, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+
+
+def _require_probability(value: object, field_name: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a number between 0 and 1")
+    if not 0.0 <= float(value) <= 1.0:
+        raise ValueError(f"{field_name} must be between 0 and 1")
 
 
 __all__ = [
     "ArtifactAvailability",
     "ArtifactReceiptRecord",
     "AssetRecord",
-    "BlockAssetLink",
     "BlockRecord",
     "CorpusScope",
     "DocumentEvidence",
     "DocumentScope",
+    "ElementEdgeRecord",
+    "ElementRecord",
     "EntityRecord",
-    "GTLinkRecord",
     "IndexPublication",
     "IndexRevisionSpec",
     "IndexRevisionState",
+    "MentionRecord",
     "PostgresHealth",
-    "RelationRecord",
     "RepresentationRecord",
     "SchemaStatus",
     "StageEvent",
     "StageEventStatus",
+    "StatementEvidenceRecord",
+    "StatementRecord",
+    "StatementRoleRecord",
+    "StructureRecord",
+    "TextRecord",
     "TreeNodeRecord",
     "WorkLease",
     "WorkSpec",

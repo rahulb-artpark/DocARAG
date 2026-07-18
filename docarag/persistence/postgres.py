@@ -8,6 +8,7 @@ pool or test transaction can be injected through ``connection_factory``.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
@@ -24,9 +25,16 @@ from docarag.domain.base import (
 from docarag.domain.evidence import DocumentRef
 from docarag.persistence.contracts import (
     ArtifactReceiptRecord,
+    AssetRecord,
+    BlockRecord,
     CorpusScope,
     DocumentEvidence,
     DocumentScope,
+    EntityRecord,
+    MentionRecord,
+    StatementRecord,
+    StructureRecord,
+    TreeNodeRecord,
     IndexPublication,
     IndexRevisionSpec,
     IndexRevisionState,
@@ -40,23 +48,12 @@ from docarag.persistence.contracts import (
     MAX_LEDGER_URI_CHARACTERS,
     scope_for_document,
 )
-from docarag.persistence.schema import SCHEMA_SHA256, SCHEMA_SQL
+from docarag.persistence.schema import EVIDENCE_TABLES, SCHEMA_SHA256, SCHEMA_SQL
 from docarag.settings import DEFAULT_DATABASE_URL, DEFAULT_DATABASE_URL_ENV
 
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5
 _SCHEMA_ADVISORY_LOCK = 7_640_227_241_925_119_841
-
-
-_REVISION_SCOPED_TABLES = (
-    "gt_links",
-    "kg_relations",
-    "kg_entities",
-    "tree_nodes",
-    "block_assets",
-    "block_representations",
-    "canonical_blocks",
-)
 
 
 
@@ -1229,294 +1226,526 @@ class PostgresLedger:
             raise LeaseLostError("work lease is stale, expired, or owned by another worker")
         return WorkState(str(row["state"]))
 
-    def delete_revision_evidence(
-        self, scope: DocumentScope, index_revision_id: str
-    ) -> dict[str, int]:
-        """Delete one revision's derived evidence rows.
+    # ------------------------------------------------------------ evidence --
 
-        The ledger itself is deliberately append-only: document versions,
-        index revisions, artifact receipts, and stage events are protected by
-        database triggers because they record that this document was admitted
-        and what ran over it. Only the derived evidence, which a reindex
-        rebuilds, is removable. Assets are content addressed and shared by
-        every revision resolving to the same bytes, so they stay too.
-        """
+    def revision_key(self, scope: DocumentScope, revision_id: str) -> int:
+        """Resolve the surrogate the evidence tables are keyed by."""
 
-        require_non_empty(index_revision_id, "index_revision_id")
-        base = (
-            scope.tenant_id,
-            scope.corpus_id,
-            scope.document_id,
-            scope.document_version_id,
-            index_revision_id,
-        )
-        removed: dict[str, int] = {}
+        require_non_empty(revision_id, "revision_id")
         with self._connection() as connection:
-            for table in _REVISION_SCOPED_TABLES:
-                cursor = connection.execute(
-                    f"DELETE FROM docarag.{table} WHERE tenant_id = %s AND "
-                    "corpus_id = %s AND document_id = %s AND "
-                    "document_version_id = %s AND index_revision_id = %s",
-                    base,
-                )
-                removed[table] = max(getattr(cursor, "rowcount", 0) or 0, 0)
-        return {name: count for name, count in removed.items() if count}
-
-    def persist_document_evidence(
-        self, scope: DocumentScope, evidence: DocumentEvidence
-    ) -> None:
-        """Replace all evidence rows for one index revision in a single transaction."""
-
-        base = (
-            scope.tenant_id,
-            scope.corpus_id,
-            scope.document_id,
-            scope.document_version_id,
-            evidence.index_revision_id,
-        )
-        with self._connection() as connection:
-            for table in _REVISION_SCOPED_TABLES:
+            row = _mapping(
                 connection.execute(
-                    f"DELETE FROM docarag.{table} WHERE tenant_id = %s AND "
-                    "corpus_id = %s AND document_id = %s AND "
-                    "document_version_id = %s AND index_revision_id = %s",
-                    base,
-                )
-            for asset in evidence.assets:
-                connection.execute(
-                    "INSERT INTO docarag.assets (tenant_id, corpus_id, asset_id, "
-                    "mime_type, byte_size, width, height, cas_uri, metadata) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
-                    "ON CONFLICT (tenant_id, corpus_id, asset_id) DO NOTHING",
+                    "SELECT revision_key FROM docarag.index_revisions "
+                    "WHERE tenant_id = %s AND corpus_id = %s AND document_id = %s "
+                    "AND document_version_id = %s AND revision_id = %s",
                     (
                         scope.tenant_id,
                         scope.corpus_id,
-                        asset.asset_id,
-                        asset.mime_type,
+                        scope.document_id,
+                        scope.document_version_id,
+                        revision_id,
+                    ),
+                ).fetchone(),
+                operation="revision lookup",
+            )
+        if row is None:
+            raise PostgresLedgerError(
+                f"index revision {revision_id} has not been admitted to the ledger"
+            )
+        return int(row["revision_key"])
+
+    def clear_revision_evidence(self, revision_key: int) -> dict[str, int]:
+        """Remove one revision's derived rows.
+
+        The ledger is untouched: it records that the document was admitted and
+        what ran over it, and is protected from deletion by database triggers.
+        Assets and text blobs are content addressed and shared, so they stay.
+        """
+
+        removed: dict[str, int] = {}
+        with self._connection() as connection:
+            for table in EVIDENCE_TABLES:
+                cursor = connection.execute(
+                    f"DELETE FROM docarag.{table} WHERE revision_key = %s",
+                    (revision_key,),
+                )
+                count = max(getattr(cursor, "rowcount", 0) or 0, 0)
+                if count:
+                    removed[table] = count
+        return removed
+
+    def persist_document_evidence(
+        self, scope: DocumentScope, evidence: DocumentEvidence
+    ) -> dict[str, int]:
+        """Replace one revision's evidence, then seal it for retrieval.
+
+        Local names in the evidence -- a block's uid, a tree node's number, an
+        entity's ref -- are resolved to surrogates here, so a projection never
+        has to know what the database assigned.
+        """
+
+        revision_key = self.revision_key(scope, evidence.revision_id)
+        with self._connection() as connection:
+            for table in EVIDENCE_TABLES:
+                connection.execute(
+                    f"DELETE FROM docarag.{table} WHERE revision_key = %s",
+                    (revision_key,),
+                )
+
+            asset_keys = self._intern_assets(connection, evidence.assets)
+            block_keys = self._write_blocks(
+                connection, revision_key, evidence.blocks, asset_keys
+            )
+            entity_keys = self._intern_entities(connection, scope, evidence.entities)
+            node_keys = self._write_tree(
+                connection, revision_key, evidence.tree_nodes, block_keys
+            )
+            self._write_mentions(
+                connection, revision_key, evidence.mentions, entity_keys, node_keys,
+                block_keys,
+            )
+            self._write_statements(
+                connection, revision_key, evidence.statements, entity_keys, node_keys,
+                block_keys,
+            )
+            self._seal_revision(connection, revision_key)
+        return evidence.counts()
+
+    # -- writers ------------------------------------------------------------
+
+    def _intern_text(self, connection: _Connection, body: str) -> int:
+        digest = hashlib.sha256(body.encode("utf-8")).digest()
+        row = _mapping(
+            connection.execute(
+                "INSERT INTO docarag.text_blob (sha256, byte_size, body) "
+                "VALUES (%s, %s, %s) ON CONFLICT (sha256) DO UPDATE "
+                "SET byte_size = EXCLUDED.byte_size RETURNING blob_key",
+                (digest, len(body.encode("utf-8")), body),
+            ).fetchone(),
+            operation="text interning",
+        )
+        return int(row["blob_key"])
+
+    def _intern_assets(
+        self, connection: _Connection, assets: Sequence[AssetRecord]
+    ) -> dict[str, int]:
+        keys: dict[str, int] = {}
+        for asset in assets:
+            row = _mapping(
+                connection.execute(
+                    "INSERT INTO docarag.asset "
+                    "(sha256, media_type, byte_size, width, height, cas_uri, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb) "
+                    "ON CONFLICT (sha256) DO UPDATE SET cas_uri = EXCLUDED.cas_uri "
+                    "RETURNING asset_key",
+                    (
+                        bytes.fromhex(asset.sha256),
+                        asset.media_type,
                         asset.byte_size,
                         asset.width,
                         asset.height,
                         asset.cas_uri,
-                        _json_text(asset.metadata),
+                        _json_text(asset.attrs),
                     ),
-                )
-            for block in evidence.blocks:
+                ).fetchone(),
+                operation="asset interning",
+            )
+            keys[asset.sha256] = int(row["asset_key"])
+        return keys
+
+    def _write_blocks(
+        self,
+        connection: _Connection,
+        revision_key: int,
+        blocks: Sequence[BlockRecord],
+        asset_keys: Mapping[str, int],
+    ) -> dict[str, int]:
+        block_keys: dict[str, int] = {}
+        for block in blocks:
+            row = _mapping(
                 connection.execute(
-                    "INSERT INTO docarag.canonical_blocks (tenant_id, corpus_id, "
-                    "document_id, document_version_id, index_revision_id, block_id, "
-                    "revision_id, block_type, semantic_subtype, page_id, page_index, "
-                    "reading_order, parent_block_id, content_sha256, quality_status, "
-                    "reconciliation_method, geometry, source_observation_ids, metadata) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s, %s, %s::jsonb, %s::jsonb, %s::jsonb)",
+                    "INSERT INTO docarag.block (revision_key, block_uid, page_no, "
+                    "block_no, block_kind, subtype, reading_order, quality, "
+                    "reconciliation, content_sha256, geometry, "
+                    "source_observation_ids, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, "
+                    "%s::jsonb, %s::jsonb) RETURNING block_key",
                     (
-                        *base,
-                        block.block_id,
-                        block.revision_id,
-                        block.block_type,
-                        block.semantic_subtype,
-                        block.page_id,
-                        block.page_index,
+                        revision_key,
+                        block.uid,
+                        block.page_no,
+                        block.block_no,
+                        block.kind,
+                        block.subtype,
                         block.reading_order,
-                        block.parent_block_id,
+                        block.quality,
+                        block.reconciliation,
                         block.content_sha256,
-                        block.quality_status,
-                        block.reconciliation_method,
-                        None if block.geometry is None else _json_text(block.geometry),
+                        _json_text(block.geometry) if block.geometry else None,
                         _json_array(block.source_observation_ids),
-                        _json_text(block.metadata),
+                        _json_text(block.attrs),
                     ),
-                )
-                for position, representation in enumerate(block.representations):
-                    connection.execute(
-                        "INSERT INTO docarag.block_representations (tenant_id, "
-                        "corpus_id, document_id, document_version_id, "
-                        "index_revision_id, block_id, representation_no, kind, "
-                        "content_sha256, content, cas_uri, confidence, metadata) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
-                        (
-                            *base,
-                            block.block_id,
-                            position,
-                            representation.kind,
-                            representation.content_sha256,
-                            representation.content,
-                            representation.cas_uri,
-                            representation.confidence,
-                            _json_text(representation.metadata),
-                        ),
-                    )
-                for link in block.asset_links:
-                    connection.execute(
-                        "INSERT INTO docarag.block_assets (tenant_id, corpus_id, "
-                        "document_id, document_version_id, index_revision_id, "
-                        "block_id, asset_id, role, metadata) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
-                        "ON CONFLICT DO NOTHING",
-                        (
-                            *base,
-                            block.block_id,
-                            link.asset_id,
-                            link.role,
-                            _json_text(link.metadata),
-                        ),
-                    )
-            for node in evidence.tree_nodes:
+                ).fetchone(),
+                operation="block write",
+            )
+            block_key = int(row["block_key"])
+            block_keys[block.uid] = block_key
+
+            for rep_no, rep in enumerate(block.representations):
                 connection.execute(
-                    "INSERT INTO docarag.tree_nodes (tenant_id, corpus_id, "
-                    "document_id, document_version_id, index_revision_id, node_id, "
-                    "parent_id, node_path, node_type, level, reading_order, block_id, "
-                    "summary_sha256, summary, metadata) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::ltree, %s, %s, %s, %s, "
-                    "%s, %s, %s::jsonb)",
+                    "INSERT INTO docarag.block_representation "
+                    "(revision_key, block_key, rep_no, rep_kind, blob_key, "
+                    "asset_key, lang, confidence, producer, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
                     (
-                        *base,
-                        node.node_id,
-                        node.parent_id,
-                        node.node_path,
-                        node.node_type,
-                        node.level,
-                        node.reading_order,
-                        node.block_id,
-                        node.summary_sha256,
-                        node.summary,
-                        _json_text(node.metadata),
+                        revision_key,
+                        block_key,
+                        rep_no,
+                        rep.kind,
+                        self._intern_text(connection, rep.text)
+                        if rep.text is not None
+                        else None,
+                        asset_keys.get(rep.asset_sha256) if rep.asset_sha256 else None,
+                        rep.lang,
+                        rep.confidence,
+                        rep.producer,
+                        _json_text(rep.attrs),
                     ),
                 )
-            for entity in evidence.entities:
+
+            for sha, role in block.asset_roles:
+                asset_key = asset_keys.get(sha)
+                if asset_key is None:
+                    continue
                 connection.execute(
-                    "INSERT INTO docarag.kg_entities (tenant_id, corpus_id, "
-                    "document_id, document_version_id, index_revision_id, entity_id, "
-                    "entity_name, entity_type, description, description_sha256, metadata) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
-                    (
-                        *base,
-                        entity.entity_id,
-                        entity.entity_name,
-                        entity.entity_type,
-                        entity.description,
-                        entity.description_sha256,
-                        _json_text(entity.metadata),
-                    ),
+                    "INSERT INTO docarag.block_asset "
+                    "(revision_key, block_key, asset_key, role) "
+                    "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (revision_key, block_key, asset_key, role),
                 )
-            for relation in evidence.relations:
+
+            for structure in block.structures:
+                self._write_structure(connection, revision_key, block_key, structure)
+        return block_keys
+
+    def _write_structure(
+        self,
+        connection: _Connection,
+        revision_key: int,
+        block_key: int,
+        structure: StructureRecord,
+    ) -> None:
+        row = _mapping(
+            connection.execute(
+                "INSERT INTO docarag.block_structure (revision_key, block_key, "
+                "structure_kind, producer, availability, confidence, source_uri, attrs) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb) RETURNING structure_key",
+                (
+                    revision_key,
+                    block_key,
+                    structure.kind,
+                    structure.producer,
+                    structure.availability,
+                    structure.confidence,
+                    structure.source_uri,
+                    _json_text(structure.attrs),
+                ),
+            ).fetchone(),
+            operation="structure write",
+        )
+        structure_key = int(row["structure_key"])
+        element_keys: dict[str, int] = {}
+        for element in structure.elements:
+            element_row = _mapping(
                 connection.execute(
-                    "INSERT INTO docarag.kg_relations (tenant_id, corpus_id, "
-                    "document_id, document_version_id, index_revision_id, relation_id, "
-                    "src_entity_id, dst_entity_id, relation_type, directed, weight, "
-                    "description, evidence, metadata) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s::jsonb, %s::jsonb)",
+                    "INSERT INTO docarag.block_element (revision_key, structure_key, "
+                    "local_key, element_kind, content, role, row_no, col_no, "
+                    "row_span, col_span, geometry, confidence, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, "
+                    "%s::jsonb) RETURNING element_key",
                     (
-                        *base,
-                        relation.relation_id,
-                        relation.src_entity_id,
-                        relation.dst_entity_id,
-                        relation.relation_type,
-                        relation.directed,
-                        relation.weight,
-                        relation.description,
-                        _json_array(relation.evidence),
-                        _json_text(relation.metadata),
+                        revision_key,
+                        structure_key,
+                        element.local_key,
+                        element.kind,
+                        element.content,
+                        element.role,
+                        element.row_no,
+                        element.col_no,
+                        element.row_span,
+                        element.col_span,
+                        _json_text(element.geometry) if element.geometry else None,
+                        element.confidence,
+                        _json_text(element.attrs),
                     ),
-                )
-            for link in evidence.gt_links:
+                ).fetchone(),
+                operation="element write",
+            )
+            element_keys[element.local_key] = int(element_row["element_key"])
+
+        for edge in structure.edges:
+            connection.execute(
+                "INSERT INTO docarag.block_element_edge (revision_key, structure_key, "
+                "src_key, dst_key, edge_kind, ordinal, label, attrs) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb) ON CONFLICT DO NOTHING",
+                (
+                    revision_key,
+                    structure_key,
+                    element_keys[edge.src_local_key],
+                    element_keys[edge.dst_local_key],
+                    edge.kind,
+                    edge.ordinal,
+                    edge.label,
+                    _json_text(edge.attrs),
+                ),
+            )
+
+    def _write_tree(
+        self,
+        connection: _Connection,
+        revision_key: int,
+        nodes: Sequence[TreeNodeRecord],
+        block_keys: Mapping[str, int],
+    ) -> dict[int, int]:
+        """Insert nodes, then bind parents once every node has a key."""
+
+        node_keys: dict[int, int] = {}
+        for node in nodes:
+            row = _mapping(
                 connection.execute(
-                    "INSERT INTO docarag.gt_links (tenant_id, corpus_id, "
-                    "document_id, document_version_id, index_revision_id, entity_id, "
-                    "node_id, block_id, provenance) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                    "INSERT INTO docarag.tree_node (revision_key, node_no, "
+                    "sibling_no, node_kind, block_key, label, summary_blob_key, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb) RETURNING node_key",
                     (
-                        *base,
-                        link.entity_id,
-                        link.node_id,
-                        link.block_id,
-                        _json_text(link.provenance),
+                        revision_key,
+                        node.node_no,
+                        node.sibling_no,
+                        node.kind,
+                        block_keys.get(node.block_uid) if node.block_uid else None,
+                        node.label,
+                        self._intern_text(connection, node.summary)
+                        if node.summary
+                        else None,
+                        _json_text(node.attrs),
+                    ),
+                ).fetchone(),
+                operation="tree node write",
+            )
+            node_keys[node.node_no] = int(row["node_key"])
+
+        for node in nodes:
+            if node.parent_no is None:
+                continue
+            parent_key = node_keys.get(node.parent_no)
+            if parent_key is None:
+                continue
+            connection.execute(
+                "UPDATE docarag.tree_node SET parent_key = %s "
+                "WHERE revision_key = %s AND node_key = %s",
+                (parent_key, revision_key, node_keys[node.node_no]),
+            )
+        return node_keys
+
+    def _intern_entities(
+        self,
+        connection: _Connection,
+        scope: DocumentScope,
+        entities: Sequence[EntityRecord],
+    ) -> dict[str, int]:
+        """Resolve corpus-scoped entities, reusing any this corpus already knows."""
+
+        keys: dict[str, int] = {}
+        for entity in entities:
+            row = _mapping(
+                connection.execute(
+                    "INSERT INTO docarag.entity (tenant_id, corpus_id, entity_kind, "
+                    "canonical, description_blob_key, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s::jsonb) "
+                    "ON CONFLICT (tenant_id, corpus_id, entity_kind, canonical) "
+                    "DO UPDATE SET attrs = docarag.entity.attrs || EXCLUDED.attrs "
+                    "RETURNING entity_key",
+                    (
+                        scope.tenant_id,
+                        scope.corpus_id,
+                        entity.kind,
+                        entity.canonical,
+                        self._intern_text(connection, entity.description)
+                        if entity.description
+                        else None,
+                        _json_text(entity.attrs),
+                    ),
+                ).fetchone(),
+                operation="entity interning",
+            )
+            keys[entity.ref] = int(row["entity_key"])
+        return keys
+
+    def _write_mentions(
+        self,
+        connection: _Connection,
+        revision_key: int,
+        mentions: Sequence[MentionRecord],
+        entity_keys: Mapping[str, int],
+        node_keys: Mapping[int, int],
+        block_keys: Mapping[str, int],
+    ) -> None:
+        for mention in mentions:
+            entity_key = entity_keys.get(mention.entity_ref)
+            if entity_key is None:
+                continue
+            connection.execute(
+                "INSERT INTO docarag.entity_mention (revision_key, entity_key, "
+                "surface, node_key, block_key, char_start, char_end, confidence) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    revision_key,
+                    entity_key,
+                    mention.surface,
+                    node_keys.get(mention.node_no) if mention.node_no is not None else None,
+                    block_keys.get(mention.block_uid) if mention.block_uid else None,
+                    mention.char_start,
+                    mention.char_end,
+                    mention.confidence,
+                ),
+            )
+
+    def _write_statements(
+        self,
+        connection: _Connection,
+        revision_key: int,
+        statements: Sequence[StatementRecord],
+        entity_keys: Mapping[str, int],
+        node_keys: Mapping[int, int],
+        block_keys: Mapping[str, int],
+    ) -> None:
+        for statement in statements:
+            roles = [
+                (role, entity_keys[role.entity_ref])
+                for role in statement.roles
+                if role.entity_ref in entity_keys
+            ]
+            if len(roles) < 2:
+                continue
+            row = _mapping(
+                connection.execute(
+                    "INSERT INTO docarag.statement (revision_key, predicate, directed, "
+                    "weight, confidence, producer, description_blob_key, attrs) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb) RETURNING stmt_key",
+                    (
+                        revision_key,
+                        statement.predicate,
+                        statement.directed,
+                        statement.weight,
+                        statement.confidence,
+                        statement.producer,
+                        self._intern_text(connection, statement.description)
+                        if statement.description
+                        else None,
+                        _json_text(statement.attrs),
+                    ),
+                ).fetchone(),
+                operation="statement write",
+            )
+            stmt_key = int(row["stmt_key"])
+            for role, entity_key in roles:
+                connection.execute(
+                    "INSERT INTO docarag.statement_role (revision_key, stmt_key, role, "
+                    "entity_key, ordinal) VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT DO NOTHING",
+                    (revision_key, stmt_key, role.role, entity_key, role.ordinal),
+                )
+            for name, value in (statement.properties or {}).items():
+                connection.execute(
+                    "INSERT INTO docarag.statement_property (revision_key, stmt_key, "
+                    "name, text_val, num_val) VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT DO NOTHING",
+                    (
+                        revision_key,
+                        stmt_key,
+                        str(name),
+                        None if isinstance(value, (int, float)) else str(value),
+                        value if isinstance(value, (int, float)) and not isinstance(value, bool) else None,
+                    ),
+                )
+            for item in statement.evidence:
+                connection.execute(
+                    "INSERT INTO docarag.statement_evidence (revision_key, stmt_key, "
+                    "node_key, block_key, element_key, char_start, char_end) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (
+                        revision_key,
+                        stmt_key,
+                        node_keys.get(item.node_no) if item.node_no is not None else None,
+                        block_keys.get(item.block_uid) if item.block_uid else None,
+                        None,
+                        item.char_start,
+                        item.char_end,
                     ),
                 )
 
-    def blocks_on_page(
-        self, scope: DocumentScope, index_revision_id: str, page_index: int
-    ) -> list[Mapping[str, Any]]:
-        return self._query_evidence(
-            "SELECT block_id, block_type, semantic_subtype, reading_order, "
-            "content_sha256, geometry FROM docarag.canonical_blocks "
-            "WHERE tenant_id = %s AND corpus_id = %s AND document_version_id = %s "
-            "AND index_revision_id = %s AND page_index = %s "
-            "ORDER BY reading_order NULLS LAST, block_id",
-            (
-                scope.tenant_id,
-                scope.corpus_id,
-                scope.document_version_id,
-                index_revision_id,
-                page_index,
-            ),
-        )
+    def _seal_revision(self, connection: _Connection, revision_key: int) -> None:
+        """Derive every tree path, then build the reranker's feed.
 
-    def node_subtree(
-        self, scope: DocumentScope, index_revision_id: str, node_path: str
-    ) -> list[Mapping[str, Any]]:
-        return self._query_evidence(
-            "SELECT node_id, parent_id, node_path::text AS node_path, node_type, "
-            "level, block_id FROM docarag.tree_nodes "
-            "WHERE tenant_id = %s AND corpus_id = %s AND document_version_id = %s "
-            "AND index_revision_id = %s AND node_path <@ %s::ltree "
-            "ORDER BY node_path",
-            (
-                scope.tenant_id,
-                scope.corpus_id,
-                scope.document_version_id,
-                index_revision_id,
-                node_path,
-            ),
-        )
+        A path depends on the final ordering of every ancestor, so it can only
+        be known once the last node is written.  A sealed revision is immutable,
+        so neither the path nor the feed ever has to be maintained.
+        """
 
-    def entity_relations(
-        self, scope: DocumentScope, index_revision_id: str, entity_id: str
-    ) -> list[Mapping[str, Any]]:
-        return self._query_evidence(
-            "SELECT relation_id, src_entity_id, dst_entity_id, relation_type, "
-            "directed, weight FROM docarag.kg_relations "
-            "WHERE tenant_id = %s AND corpus_id = %s AND document_version_id = %s "
-            "AND index_revision_id = %s AND (src_entity_id = %s OR dst_entity_id = %s) "
-            "ORDER BY relation_id",
-            (
-                scope.tenant_id,
-                scope.corpus_id,
-                scope.document_version_id,
-                index_revision_id,
-                entity_id,
-                entity_id,
-            ),
-        )
+        connection.execute(_SEAL_TREE_PATHS_SQL, (revision_key, revision_key))
+        connection.execute(_BUILD_NODE_RETRIEVAL_SQL, (revision_key,))
 
-    def gt_links_for_node(
-        self, scope: DocumentScope, index_revision_id: str, node_id: int
-    ) -> list[Mapping[str, Any]]:
-        return self._query_evidence(
-            "SELECT entity_id, node_id, block_id FROM docarag.gt_links "
-            "WHERE tenant_id = %s AND corpus_id = %s AND document_version_id = %s "
-            "AND index_revision_id = %s AND node_id = %s ORDER BY entity_id",
-            (
-                scope.tenant_id,
-                scope.corpus_id,
-                scope.document_version_id,
-                index_revision_id,
-                node_id,
-            ),
-        )
 
-    def _query_evidence(
-        self, query: str, params: tuple[object, ...]
-    ) -> list[Mapping[str, Any]]:
-        with self._connection() as connection:
-            rows = connection.execute(query, params).fetchall()
-        results: list[Mapping[str, Any]] = []
-        for raw in rows:
-            row = _mapping(raw, operation="evidence query")
-            if row is not None:
-                results.append(row)
-        return results
+_SEAL_TREE_PATHS_SQL = """
+WITH RECURSIVE walk AS (
+    SELECT node_key, node_no::text::public.ltree AS path, 0 AS depth
+    FROM docarag.tree_node
+    WHERE revision_key = %s AND parent_key IS NULL
+    UNION ALL
+    SELECT child.node_key,
+           parent.path || child.node_no::text::public.ltree,
+           parent.depth + 1
+    FROM docarag.tree_node child
+    JOIN walk parent ON child.parent_key = parent.node_key
+)
+UPDATE docarag.tree_node AS target
+SET path = walk.path, depth = walk.depth
+FROM walk
+WHERE target.revision_key = %s AND target.node_key = walk.node_key
+"""
+
+# One row per node holding the single string a reranker scores, chosen by a
+# fixed precedence so the same node always presents the same text.
+_BUILD_NODE_RETRIEVAL_SQL = """
+INSERT INTO docarag.node_retrieval
+    (revision_key, node_key, node_kind, page_no, text_len, retrieval_text)
+SELECT node.revision_key, node.node_key, node.node_kind, blk.page_no,
+       char_length(chosen.body), chosen.body
+FROM docarag.tree_node node
+LEFT JOIN docarag.block blk
+    ON blk.revision_key = node.revision_key AND blk.block_key = node.block_key
+CROSS JOIN LATERAL (
+    SELECT coalesce(
+        (
+            SELECT txt.body
+            FROM docarag.block_representation rep
+            JOIN docarag.text_blob txt ON txt.blob_key = rep.blob_key
+            WHERE rep.revision_key = node.revision_key
+              AND rep.block_key = node.block_key
+            ORDER BY array_position(
+                ARRAY['text', 'html', 'ocr_text', 'visual_description',
+                      'caption', 'latex', 'markdown'],
+                rep.rep_kind
+            ) NULLS LAST, rep.rep_no
+            LIMIT 1
+        ),
+        node.label,
+        ''
+    ) AS body
+) AS chosen
+WHERE node.revision_key = %s AND chosen.body <> ''
+ON CONFLICT (revision_key, node_key) DO UPDATE
+SET retrieval_text = EXCLUDED.retrieval_text, text_len = EXCLUDED.text_len
+"""
 
 
 __all__ = [
