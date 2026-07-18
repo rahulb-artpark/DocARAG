@@ -325,7 +325,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
         try:
             # The tree and graph are read from the store a slice at a time, so
             # a query's memory follows the question rather than the document.
-            gbc_index = StoredIndex.open(cfg.save_path)
+            gbc_index = StoredIndex.open(cfg.save_path, config=cfg)
             tree_vdb = _open_ready_bookrag_tree_vdb(cfg, cfg.vdb)
         except BaseException:
             _close_partial_resources(("partial GBC index", gbc_index))
@@ -359,7 +359,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
     elif strategy_name == "graph":
         from Core.rag.stored_index import StoredIndex
 
-        gbc_index = StoredIndex.open(cfg.save_path)
+        gbc_index = StoredIndex.open(cfg.save_path, config=cfg)
         log.info(f"Successfully opened the stored index at {cfg.save_path}")
         dependencies["gbc_index"] = gbc_index
 

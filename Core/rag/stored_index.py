@@ -157,23 +157,61 @@ class StoredGraphIndex:
 class StoredIndex:
     """What a query holds open for one document."""
 
-    __slots__ = ("GraphIndex", "TreeIndex", "_store")
+    __slots__ = ("GraphIndex", "TreeIndex", "_store", "embedder", "entity_vdb")
 
-    def __init__(self, store: DocumentStore) -> None:
+    def __init__(self, store: DocumentStore, config=None) -> None:
         self._store = store
         self.TreeIndex = StoredTreeIndex(store.tree)
         self.GraphIndex = StoredGraphIndex(store.tree)
+        self.embedder = None
+        self.entity_vdb = None
+        if config is not None:
+            self._open_entity_search(config)
+
+    def _open_entity_search(self, config) -> None:
+        # Retrieval scores query entities against graph node names and searches
+        # the entity vectors, so both are opened with the index they serve.
+        from Core.provider.embedding import TextEmbeddingProvider
+        from Core.provider.vdb import VectorStore
+
+        embedding_config = config.graph.embedding_config
+        try:
+            self.embedder = TextEmbeddingProvider(
+                model_name=embedding_config.model_name,
+                backend=embedding_config.backend,
+                max_length=embedding_config.max_length,
+                device=embedding_config.device,
+                api_base=embedding_config.api_base,
+                api_key=getattr(embedding_config, "api_key", None),
+                num_ctx=getattr(embedding_config, "num_ctx", None),
+            )
+            self.entity_vdb = VectorStore(
+                qdrant_url=config.vdb.qdrant_url,
+                embedding_model=self.embedder,
+                collection_name=config.graph.entity_collection_name,
+                api_key_env=config.vdb.api_key_env,
+            )
+        except BaseException:
+            self.close()
+            raise
 
     @classmethod
-    def open(cls, run_dir, **kwargs) -> "StoredIndex":
-        return cls(DocumentStore.open(run_dir, **kwargs))
+    def open(cls, run_dir, config=None, **kwargs) -> "StoredIndex":
+        return cls(DocumentStore.open(run_dir, **kwargs), config=config)
 
     @property
     def store(self) -> DocumentStore:
         return self._store
 
     def close(self) -> None:
-        self._store.close()
+        for resource in (self.entity_vdb, self.embedder, self._store):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+        self.entity_vdb = None
+        self.embedder = None
 
     def __enter__(self) -> "StoredIndex":
         return self

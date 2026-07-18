@@ -1328,6 +1328,47 @@ PY
   echo "[driver] $(date) ALL DONE"
 }
 
+finalize_run() {
+  # Persistence is the last thing standing between a run whose stages all
+  # succeeded and a queryable index. Reaching it only from the tail of a full
+  # run means a run interrupted after its stages can never be completed, so it
+  # is reachable on its own. The run_succeeded transition does the judging: it
+  # refuses unless every stage succeeded and the artifact manifest matches this
+  # revision and attempt.
+  local run_dir="${1:-}"
+  if [[ -z "$run_dir" || ! -d "$run_dir" ]]; then
+    echo "[finalize] usage: --finalize-run <run-dir>" >&2
+    return 2
+  fi
+  local state_file="$run_dir/index-state.json"
+  if [[ ! -s "$state_file" ]]; then
+    echo "[finalize] no index state at $state_file" >&2
+    return 1
+  fi
+
+  local revision_id attempt_id
+  revision_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("revision_id") or "")' "$state_file")"
+  attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("attempt_id") or "")' "$state_file")"
+  if [[ -z "$revision_id" ]]; then
+    echo "[finalize] index state has no revision identity" >&2
+    return 1
+  fi
+  export DRIVER_ATTEMPT_ID="$attempt_id"
+
+  if ! python3 -m docarag.evidence_persist --run "$run_dir"; then
+    echo "[finalize] evidence persistence failed; the index cannot be queried" >&2
+    return 1
+  fi
+  update_index_state "$state_file" "$revision_id" "$$" run_succeeded "" 0
+  echo "[finalize] $revision_id is queryable"
+}
+
+if [[ "${1:-}" == "--finalize-run" ]]; then
+  shift
+  finalize_run "$@"
+  exit $?
+fi
+
 if [[ "${1:-}" == "--verify-revision-inputs" ]]; then
   shift
   verify_revision_inputs "$@"

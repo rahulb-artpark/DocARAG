@@ -510,7 +510,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         self.assertEqual(
             {"gbc_index": gbc, "tree_vdb": tree_vdb}, dependencies
         )
-        load_gbc.assert_called_once_with(cfg.save_path)
+        load_gbc.assert_called_once_with(cfg.save_path, config=cfg)
         open_tree.assert_called_once_with(cfg, cfg.vdb)
 
     def test_gbc_loader_closes_graph_resources_when_tree_vdb_open_fails(self):
