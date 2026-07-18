@@ -57,6 +57,7 @@ class TreeNodeView:
     type: str
     depth: int
     meta_info: NodeMeta
+    evidence: Mapping[str, Any] | None = None
     parent_id: int | None = None
     summary: str = ""
     outline_node: bool = False
@@ -270,6 +271,7 @@ def _view(row: Mapping[str, Any]) -> TreeNodeView:
         depth=int(row["depth"] or 0),
         parent_id=int(row["parent_no"]) if row.get("parent_no") is not None else None,
         summary=str(row.get("summary") or ""),
+        evidence=(row.get("attrs") or {}).get("evidence"),
         outline_node=bool(row.get("is_outline")),
         meta_info=NodeMeta(
             content=str(row.get("content") or row.get("label") or ""),
@@ -293,6 +295,7 @@ _NODE_COLUMNS = """
     node.node_kind,
     node.depth,
     node.label,
+    node.attrs,
     parent.node_no AS parent_no,
     summary_blob.body AS summary,
     blk.block_uid,

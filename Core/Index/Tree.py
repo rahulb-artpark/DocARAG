@@ -593,7 +593,7 @@ class DocumentTree:
                 {
                     "index_id": node.index_id,
                     "parent_id": node.parent.index_id if node.parent else None,
-                    "type": str(node.type) if node.type else None,
+                    "type": (node.type.value if isinstance(node.type, NodeType) else str(node.type)) if node.type else None,
                     "meta_info": (
                         node.meta_info.model_dump() if node.meta_info else None
                     ),

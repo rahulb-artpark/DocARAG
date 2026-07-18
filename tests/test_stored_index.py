@@ -138,14 +138,14 @@ class StoredTreeIndexTests(unittest.TestCase):
         self.assertEqual(2, payload["index_id"])
         self.assertEqual("Speaker", payload["content"])
         self.assertEqual(4, payload["page"])
-        self.assertTrue(payload["img_path"].startswith("cas://"))
+        self.assertTrue(payload["crop_uri"].startswith("cas://"))
 
     def test_empty_channels_are_omitted_rather_than_sent_blank(self):
         index, _tree = self.index()
 
         payload = index.get_nodes_data([1])[0]
 
-        self.assertNotIn("img_path", payload)
+        self.assertNotIn("crop_uri", payload)
         self.assertNotIn("caption", payload)
         self.assertNotIn("table_body", payload)
 

@@ -12,6 +12,8 @@ compared without one.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import hashlib
 import json
 from pathlib import Path
@@ -259,6 +261,72 @@ def _structures(payload: object) -> tuple[StructureRecord, ...]:
 # -- tree ---------------------------------------------------------------------
 
 
+_EVIDENCE_TRACE_FIELDS = (
+    "page_id",
+    "document_version_id",
+    "canonical_block_id",
+    "canonical_revision_id",
+    "observation_id",
+    "derived_evidence_id",
+    "source_canonical_block_ids",
+    "source_canonical_revision_ids",
+    "source_observation_ids",
+    "source_evidence_refs",
+    "canonical_representation_ids",
+    "canonical_asset_ids",
+    "selected_representation_ids",
+    "selected_asset_ids",
+    "canonical_relations",
+    "semantic_substructures",
+    "transformations",
+    "semantic_subtype",
+    "parser_provenance",
+    "quality_status",
+    "reconciliation_method",
+    "source_uri",
+    "source_sha256",
+    "snapshot_path",
+)
+
+
+def _node_evidence(kind: str, meta: Mapping[str, object]) -> dict[str, object] | None:
+    """The retrieval payload this node's evidence lineage is validated by.
+
+    Mirrors the shape the tree publishes: the hydrator compares these fields
+    against the canonical artifact, so they are stored verbatim, not rebuilt.
+    """
+
+    if not meta:
+        return None
+    payload: dict[str, object] = {
+        "type": kind,
+        "content": meta.get("content"),
+        "page": meta.get("page_idx"),
+    }
+    for name in _EVIDENCE_TRACE_FIELDS:
+        value = meta.get(name)
+        if value is not None:
+            payload[name] = value
+    geometry = meta.get("source_geometry")
+    if geometry is not None:
+        payload["geometry"] = geometry
+    if kind in ("image", "table", "equation"):
+        payload["img_path"] = meta.get("img_path")
+    if kind == "table":
+        payload["table_body"] = meta.get("table_body")
+        payload["caption"] = meta.get("caption")
+        payload["footnote"] = meta.get("footnote")
+    return payload
+
+
+def _node_kind(value: object) -> str:
+    kind = _text(value)
+    # Trees serialized before the NodeType fix spelled the enum member name.
+    if kind.startswith("NodeType."):
+        kind = kind.removeprefix("NodeType.").lower()
+    return kind or "node"
+
+
 def _project_tree(payload: object) -> tuple[TreeNodeRecord, ...]:
     raw_nodes = _sequence(payload, "nodes")
     siblings: dict[int | None, int] = {}
@@ -277,10 +345,12 @@ def _project_tree(payload: object) -> tuple[TreeNodeRecord, ...]:
         summary = raw.get("summary")
         sibling_no = siblings.get(parent_no, 0)
         siblings[parent_no] = sibling_no + 1
+        kind = _node_kind(raw.get("type"))
+        evidence = _node_evidence(kind, meta)
         nodes.append(
             TreeNodeRecord(
                 node_no=node_no,
-                kind=_text(raw.get("type")) or "node",
+                kind=kind,
                 parent_no=parent_no,
                 sibling_no=sibling_no,
                 # The tree publishes its evidence binding under this name; it
@@ -288,6 +358,7 @@ def _project_tree(payload: object) -> tuple[TreeNodeRecord, ...]:
                 block_uid=_text(meta.get("canonical_block_id")) or None,
                 label=_clip(_text(meta.get("content"))) or None,
                 summary=summary if isinstance(summary, str) and summary.strip() else None,
+                attrs={"evidence": evidence} if evidence else {},
             )
         )
     return tuple(nodes)
