@@ -75,16 +75,16 @@ def safe_pdf_name(raw):
 def find_run_dirs():
     """Return every run directory, including ones still being indexed.
 
-    ``find_runs`` only sees a published ``tree.json``, so a run whose first
-    stage is still building would be missing from the library exactly while its
-    progress matters most.
+    ``find_runs`` only sees admitted runs, so a run whose admission is still
+    being written would be missing from the library exactly while its progress
+    matters most.
     """
 
     root = runs_root()
     if not root.is_dir():
         return []
     runs = set()
-    for marker in ("**/tree.json", "**/index-state.json"):
+    for marker in ("**/run-manifest.json", "**/index-state.json"):
         for path in root.glob(marker):
             run_dir = path.parent.resolve()
             try:
@@ -236,7 +236,6 @@ def run_progress(run_dir, history=None):
     for stage_name, usage in (stats.get("token_stage_history") or {}).items():
         if isinstance(usage, dict):
             tokens[stage_name] = usage.get("total_tokens")
-    tree_path = run_dir / "tree.json"
     return {
         "runDir": str(run_dir),
         "phase": state.get("phase"),
@@ -247,7 +246,7 @@ def run_progress(run_dir, history=None):
         "endedAt": state.get("ended_at"),
         "error": state.get("error"),
         "stages": stages,
-        "viewable": tree_path.is_file(),
+        "viewable": run_completed(run_dir),
         "metrics": {
             "buildTreeSeconds": stats.get("build_tree_time"),
             "tokensByStage": tokens,
@@ -257,13 +256,11 @@ def run_progress(run_dir, history=None):
 
 
 def run_completed(run_dir):
-    """True when every stage of this run finished and left a viewable tree."""
+    """True when the driver finished every stage and sealed the run."""
 
     state = _read_json_if_present(run_dir / "index-state.json")
-    if not (run_dir / "tree.json").is_file():
-        return False
     if not state:
-        return True
+        return False
     stages = state.get("stages") or {}
     return state.get("overall_status") == "succeeded" and all(
         (stages.get(name) or {}).get("status") == "succeeded" for name in STAGE_ORDER
@@ -272,12 +269,11 @@ def run_completed(run_dir):
 
 def run_summary(run_dir, history=None):
     progress = run_progress(run_dir, history)
-    meta = _read_json_if_present(run_dir / "tree.json").get("meta_info") or {}
     source = _read_json_if_present(run_dir / "run-manifest.json").get("source") or {}
     source_name = source.get("display_name")
     if not source_name and source.get("path"):
         source_name = Path(str(source["path"])).name
-    name = meta.get("file_name") or source_name or run_dir.name
+    name = source_name or run_dir.name
     progress["name"] = name
     progress["mtime"] = run_dir.stat().st_mtime
     return progress
@@ -591,8 +587,8 @@ def find_runs():
     root = runs_root()
     if not root.is_dir():
         return []
-    for tree_path in root.glob("**/tree.json"):
-        run_dir = tree_path.parent.resolve()
+    for manifest_path in root.glob("**/run-manifest.json"):
+        run_dir = manifest_path.parent.resolve()
         try:
             relative = run_dir.relative_to(root)
         except ValueError:
@@ -620,7 +616,7 @@ def pick_run(path_arg):
         return path
     runs = find_runs()
     if not runs:
-        raise SystemExit(f"No indexed runs found under {runs_root()} with tree.json")
+        raise SystemExit(f"No indexed runs found under {runs_root()}")
     return runs[0].resolve()
 
 
@@ -685,12 +681,20 @@ class AppState:
         self.chat_lock = threading.Lock()
         self.rag_agent = None
         self._rag_identity_key = None
-        self._tree_cache_key = None
+        self._store = None
         self._tree_cache = None
-        self._graph_cache_key = None
         self._graph_cache = None
         self._readiness_cache_key = None
         self._readiness_cache = None
+
+    def store(self):
+        """The document store for this run; evidence is immutable per revision."""
+
+        if self._store is None:
+            from docarag.document_store import DocumentStore
+
+            self._store = DocumentStore.open(self.run_dir)
+        return self._store
 
     def switch_run(self, run_dir):
         """Rebind every cache and release the agent held for the old run."""
@@ -704,9 +708,10 @@ class AppState:
                     close()
             self.rag_agent = None
             self._rag_identity_key = None
-            self._tree_cache_key = None
+            if self._store is not None:
+                self._store.close()
+            self._store = None
             self._tree_cache = None
-            self._graph_cache_key = None
             self._graph_cache = None
             self._readiness_cache_key = None
             self._readiness_cache = None
@@ -725,151 +730,114 @@ class AppState:
 
     @property
     def doc_name(self):
-        try:
-            meta = read_json(self.run_dir / "tree.json").get("meta_info") or {}
-            return meta.get("file_name") or self.run_dir.name
-        except Exception:
-            return self.run_dir.name
+        return Handler._safe_doc_name(self.run_dir)
 
     def tree_payload(self):
-        tree_path = self.run_dir / "tree.json"
-        tree_stat = tree_path.stat()
-        cache_key = (tree_stat.st_mtime_ns, tree_stat.st_size)
-        if self._tree_cache_key == cache_key and self._tree_cache is not None:
+        if self._tree_cache is not None:
             return self._tree_cache
 
-        data = read_json(tree_path)
-        nodes = data.get("nodes") or []
+        views = self.store().tree.nodes()
         children = {}
-        by_id = {}
-        for node in nodes:
-            nid = node.get("index_id")
-            by_id[nid] = node
-            children.setdefault(nid, [])
-        for node in nodes:
-            parent = node.get("parent_id")
-            if parent is not None:
-                children.setdefault(parent, []).append(node.get("index_id"))
+        for view in views:
+            if view.parent_id is not None:
+                children.setdefault(view.parent_id, []).append(view.index_id)
 
         flat = []
-        for node in nodes:
-            meta = node.get("meta_info") or {}
-            nid = node.get("index_id")
+        root_id = None
+        for view in views:
+            evidence = dict(view.evidence or {})
+            meta = view.meta_info
+            if view.parent_id is None:
+                root_id = view.index_id
+            page = evidence.get("page")
+            if meta.img_path:
+                evidence.setdefault("crop_uri", meta.img_path)
             flat.append(
                 {
-                    "id": nid,
-                    "parentId": node.get("parent_id"),
-                    "type": normalize_type(node.get("type")),
-                    "page": (
-                        meta.get("page_idx") + 1
-                        if isinstance(meta.get("page_idx"), int)
-                        else None
-                    ),
-                    "titleLevel": meta.get("title_level"),
-                    "content": node_content(node),
-                    "tableBody": meta.get("table_body") or "",
-                    "caption": meta.get("caption") or "",
-                    "footnote": meta.get("footnote") or "",
-                    "summary": node.get("summary") or "",
-                    "meta": meta,
-                    "children": children.get(nid, []),
-                }
-            )
-
-        root_id = next((n["id"] for n in flat if n["parentId"] is None), None)
-        document_meta = data.get("meta_info") or {}
-        payload = {
-            "docName": document_meta.get("file_name") or self.run_dir.name,
-            "runDir": str(self.run_dir),
-            "rootId": root_id,
-            "nodes": flat,
-        }
-        self._tree_cache_key = cache_key
-        self._tree_cache = payload
-        return payload
-
-    def graph_payload(self):
-        path = find_graph_artifact(self.run_dir)
-        if path is None:
-            return {
-                "docName": self.doc_name,
-                "runDir": str(self.run_dir),
-                "graphArtifact": None,
-                "nodes": [],
-                "links": [],
-            }
-        graph_stat = path.stat()
-        cache_key = (str(path), graph_stat.st_mtime_ns, graph_stat.st_size)
-        if self._graph_cache_key == cache_key and self._graph_cache is not None:
-            return self._graph_cache
-        data = read_json(path)
-        graph = data.get("graph") or data
-        raw_nodes = graph.get("nodes") or []
-        raw_links = graph.get("links") or graph.get("edges") or []
-        tree_nodes = {
-            node["id"]: node
-            for node in self.tree_payload().get("nodes", [])
-        }
-
-        degree = {}
-        for link in raw_links:
-            for key in ("source", "target"):
-                val = link.get(key)
-                if val is not None:
-                    degree[val] = degree.get(val, 0) + 1
-
-        nodes = []
-        for idx, node in enumerate(raw_nodes):
-            node_id = node.get("id") or f"entity-{idx}"
-            label = node.get("entity_name") or node_id
-            source_ids = node.get("source_ids") or []
-            source_snippets = [
-                tree_nodes[source_id].get("content")
-                or tree_nodes[source_id].get("summary")
-                or ""
-                for source_id in source_ids
-                if source_id in tree_nodes
-            ]
-            nodes.append(
-                {
-                    "id": node_id,
-                    "label": label,
-                    "type": node.get("entity_type") or "UNKNOWN",
-                    "description": node.get("description") or "",
-                    "sourceIds": source_ids,
-                    "sourceSnippets": source_snippets,
-                    "degree": degree.get(node_id, 0),
-                    "raw": node,
-                }
-            )
-
-        links = []
-        for idx, link in enumerate(raw_links):
-            links.append(
-                {
-                    "id": f"rel-{idx}",
-                    "source": link.get("source"),
-                    "target": link.get("target"),
-                    "sourceName": link.get("src_entity_name") or "",
-                    "targetName": link.get("tgt_entity_name") or "",
-                    "name": link.get("relation_name") or "",
-                    "description": link.get("description") or "",
-                    "weight": link.get("weight"),
-                    "sourceIds": link.get("source_ids") or [],
-                    "raw": link,
+                    "id": view.index_id,
+                    "parentId": view.parent_id,
+                    "type": view.type if view.type == "root" else view.type.upper(),
+                    "page": page + 1 if isinstance(page, int) else None,
+                    "titleLevel": evidence.get("title_level"),
+                    "content": meta.content or evidence.get("content") or "",
+                    "tableBody": meta.table_body or "",
+                    "caption": meta.caption or "",
+                    "footnote": meta.footnote or "",
+                    "summary": view.summary or "",
+                    "meta": evidence,
+                    "children": children.get(view.index_id, []),
                 }
             )
 
         payload = {
             "docName": self.doc_name,
             "runDir": str(self.run_dir),
-            "variant": data.get("variant"),
-            "graphArtifact": str(path),
-            "graphArtifactName": path.name,
+            "rootId": root_id,
+            "nodes": flat,
+        }
+        self._tree_cache = payload
+        return payload
+
+    def graph_payload(self):
+        if self._graph_cache is not None:
+            return self._graph_cache
+
+        store = self.store()
+        entities = store.tree.graph_entities()
+        statements = store.tree.graph_statements()
+        tree_nodes = {
+            node["id"]: node for node in self.tree_payload().get("nodes", [])
+        }
+
+        degree = {}
+        for statement in statements:
+            for key in ("source", "target"):
+                name = statement[key]
+                degree[name] = degree.get(name, 0) + 1
+
+        nodes = []
+        for entity in entities:
+            source_ids = entity["node_ids"]
+            nodes.append(
+                {
+                    "id": entity["canonical"],
+                    "label": entity["canonical"],
+                    "type": entity["entity_kind"] or "UNKNOWN",
+                    "description": entity["description"],
+                    "sourceIds": source_ids,
+                    "sourceSnippets": [
+                        tree_nodes[source_id].get("content")
+                        or tree_nodes[source_id].get("summary")
+                        or ""
+                        for source_id in source_ids
+                        if source_id in tree_nodes
+                    ],
+                    "degree": degree.get(entity["canonical"], 0),
+                }
+            )
+
+        links = []
+        for idx, statement in enumerate(statements):
+            links.append(
+                {
+                    "id": f"rel-{idx}",
+                    "source": statement["source"],
+                    "target": statement["target"],
+                    "sourceName": statement["source"],
+                    "targetName": statement["target"],
+                    "name": statement["predicate"],
+                    "description": statement["description"],
+                    "weight": statement["weight"],
+                    "sourceIds": statement["node_ids"],
+                }
+            )
+
+        payload = {
+            "docName": self.doc_name,
+            "runDir": str(self.run_dir),
             "nodes": nodes,
             "links": links,
         }
-        self._graph_cache_key = cache_key
         self._graph_cache = payload
         return payload
 
@@ -1089,25 +1057,21 @@ class Handler(SimpleHTTPRequestHandler):
             for run in find_runs():
                 if not run_completed(run) and run.resolve() != current:
                     continue
-                graph_artifact = find_graph_artifact(run)
                 runs.append(
                     {
                         "path": str(run),
                         "name": self._safe_doc_name(run),
-                        "hasGraph": graph_artifact is not None,
-                        "graphArtifact": (
-                            str(graph_artifact) if graph_artifact is not None else None
-                        ),
+                        "hasGraph": True,
                         "mtime": run.stat().st_mtime,
                     }
                 )
             self.send_json({"current": str(self.state.run_dir), "runs": runs})
             return
         if parsed.path == "/api/tree":
-            self.send_json(self.state.tree_payload())
+            self.send_view_payload(self.state.tree_payload)
             return
         if parsed.path == "/api/graph":
-            self.send_json(self.state.graph_payload())
+            self.send_view_payload(self.state.graph_payload)
             return
         if parsed.path == "/api/tree-image":
             self.send_tree_image(parsed)
@@ -1156,6 +1120,16 @@ class Handler(SimpleHTTPRequestHandler):
         if relative == Path(".") or not run_dir.is_dir():
             return None
         return run_dir
+
+    def send_view_payload(self, build):
+        try:
+            self.send_json(build())
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.CONFLICT,
+                "Run has no persisted evidence to view",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
 
     def send_progress(self, parsed):
         requested = (parse_qs(parsed.query).get("run") or [""])[0]
@@ -1332,9 +1306,9 @@ class Handler(SimpleHTTPRequestHandler):
                     "directory",
                 )
                 return
-            if not (run_dir / "tree.json").is_file():
+            if not (run_dir / "run-manifest.json").is_file():
                 self.send_error_json(
-                    HTTPStatus.CONFLICT, "Run has no published tree yet"
+                    HTTPStatus.CONFLICT, "Run has not been admitted yet"
                 )
                 return
             self.state.switch_run(run_dir)
@@ -1404,8 +1378,8 @@ def main():
         raise SystemExit("Web port must be between 1 and 65535")
 
     run_dir = pick_run(args.run_dir)
-    if not (run_dir / "tree.json").exists():
-        raise SystemExit(f"Missing tree.json in run directory: {run_dir}")
+    if not (run_dir / "run-manifest.json").exists():
+        raise SystemExit(f"Missing run-manifest.json in run directory: {run_dir}")
 
     Handler.state = AppState(run_dir)
     server, actual_port = bind_server(args.host, args.port, Handler)

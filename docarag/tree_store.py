@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 MAX_NODES_PER_READ = 4096
 MAX_SUBGRAPH_EDGES = 8192
+MAX_GRAPH_ENTITIES = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +198,43 @@ class TreeStore:
                 weight=row["weight"],
                 description=str(row["description"] or ""),
             )
+            for row in rows
+        ]
+
+    def graph_entities(self, limit: int = MAX_GRAPH_ENTITIES) -> list[dict[str, Any]]:
+        """Return every entity this revision mentions, with its evidence nodes."""
+
+        with self._session() as connection:
+            rows = connection.execute(
+                _GRAPH_ENTITIES_SQL,
+                (self._revision_key, self._revision_key, self._revision_key, limit),
+            ).fetchall()
+        return [
+            {
+                "canonical": str(row["canonical"]),
+                "entity_kind": str(row["entity_kind"]),
+                "description": str(row["description"] or ""),
+                "node_ids": sorted(int(n) for n in (row["node_nos"] or ())),
+            }
+            for row in rows
+        ]
+
+    def graph_statements(self, limit: int = MAX_SUBGRAPH_EDGES) -> list[dict[str, Any]]:
+        """Return every statement of this revision as a binary edge with evidence."""
+
+        with self._session() as connection:
+            rows = connection.execute(
+                _GRAPH_STATEMENTS_SQL, (self._revision_key, limit)
+            ).fetchall()
+        return [
+            {
+                "source": str(row["src"]),
+                "target": str(row["dst"]),
+                "predicate": str(row["predicate"]),
+                "weight": row["weight"],
+                "description": str(row["description"] or ""),
+                "node_ids": sorted(int(n) for n in (row["node_nos"] or ())),
+            }
             for row in rows
         ]
 
@@ -387,6 +425,65 @@ _SUBTREE_SQL = _sql(
     ") ORDER BY node.node_no"
 )
 
+_GRAPH_ENTITIES_SQL = """
+WITH revision_entities AS (
+    SELECT entity_key FROM docarag.entity_mention WHERE revision_key = %s
+    UNION
+    SELECT entity_key FROM docarag.statement_role WHERE revision_key = %s
+)
+SELECT
+    ent.canonical,
+    ent.entity_kind,
+    blob.body AS description,
+    mentioned.node_nos
+FROM revision_entities re
+JOIN docarag.entity ent ON ent.entity_key = re.entity_key
+LEFT JOIN docarag.text_blob blob ON blob.blob_key = ent.description_blob_key
+LEFT JOIN LATERAL (
+    SELECT array_agg(DISTINCT node.node_no) AS node_nos
+    FROM docarag.entity_mention mention
+    JOIN docarag.tree_node node
+        ON node.revision_key = mention.revision_key
+       AND node.node_key = mention.node_key
+    WHERE mention.revision_key = %s AND mention.entity_key = ent.entity_key
+) mentioned ON true
+ORDER BY ent.canonical
+LIMIT %s
+"""
+
+_GRAPH_STATEMENTS_SQL = """
+SELECT
+    subject.canonical AS src,
+    object.canonical AS dst,
+    stmt.predicate,
+    stmt.weight,
+    blob.body AS description,
+    evidence.node_nos
+FROM docarag.statement stmt
+JOIN docarag.statement_role subject_role
+    ON subject_role.revision_key = stmt.revision_key
+   AND subject_role.stmt_key = stmt.stmt_key
+   AND subject_role.role = 'subject'
+JOIN docarag.statement_role object_role
+    ON object_role.revision_key = stmt.revision_key
+   AND object_role.stmt_key = stmt.stmt_key
+   AND object_role.role = 'object'
+JOIN docarag.entity subject ON subject.entity_key = subject_role.entity_key
+JOIN docarag.entity object ON object.entity_key = object_role.entity_key
+LEFT JOIN docarag.text_blob blob ON blob.blob_key = stmt.description_blob_key
+LEFT JOIN LATERAL (
+    SELECT array_agg(DISTINCT node.node_no) AS node_nos
+    FROM docarag.statement_evidence ev
+    JOIN docarag.tree_node node
+        ON node.revision_key = ev.revision_key AND node.node_key = ev.node_key
+    WHERE ev.revision_key = stmt.revision_key AND ev.stmt_key = stmt.stmt_key
+) evidence ON true
+WHERE stmt.revision_key = %s
+ORDER BY stmt.stmt_key
+LIMIT %s
+"""
+
+
 _NODES_FOR_ENTITY_SQL = """
 SELECT DISTINCT node.node_no
 FROM docarag.entity ent
@@ -427,4 +524,4 @@ LIMIT %s
 """
 
 
-__all__ = ["GraphEdge", "NodeMeta", "TreeNodeView", "TreeStore"]
+__all__ = ["GraphEdge", "MAX_GRAPH_ENTITIES", "NodeMeta", "TreeNodeView", "TreeStore"]

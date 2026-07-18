@@ -61,7 +61,7 @@ class WebDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             runs = Path(temp) / "external-runs"
             indexed = runs / "group" / "run-a"
-            write_json(indexed / "tree.json", {"nodes": []})
+            write_json(indexed / "run-manifest.json", {"revision_id": "r1"})
             with patch.dict(os.environ, {"DOCARAG_RUNS_DIR": str(runs)}):
                 self.assertEqual(self.web.runs_root(), runs.resolve())
                 self.assertEqual(self.web.find_runs(), [indexed])
@@ -299,20 +299,62 @@ class WebDiscoveryTests(unittest.TestCase):
                 self.web.find_retrieval_artifact_dir(run), retrieval.resolve()
             )
 
-    def test_graph_payload_exposes_selected_artifact(self):
+    def test_graph_payload_is_built_from_the_store(self):
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp)
             write_json(
-                run / "tree.json",
-                {"meta_info": {"file_name": "sample.pdf"}, "nodes": []},
+                run / "run-manifest.json",
+                {"source": {"path": "/data/sample.pdf"}},
             )
-            artifact = run / "graph_data_visual.json"
-            write_json(artifact, graph_payload("visual", node_count=2))
-            payload = self.web.AppState(run).graph_payload()
-            self.assertEqual(payload["graphArtifact"], str(artifact))
-            self.assertEqual(payload["graphArtifactName"], artifact.name)
-            self.assertEqual(payload["variant"], "visual")
-            self.assertEqual(len(payload["nodes"]), 2)
+            state = self.web.AppState(run)
+            state._tree_cache = {
+                "docName": "sample.pdf",
+                "runDir": str(run),
+                "rootId": 0,
+                "nodes": [
+                    {"id": 2, "content": "Speaker text", "summary": ""},
+                ],
+            }
+            tree = SimpleNamespace(
+                graph_entities=lambda: [
+                    {
+                        "canonical": "speaker",
+                        "entity_kind": "DEVICE",
+                        "description": "outputs sound",
+                        "node_ids": [2],
+                    },
+                    {
+                        "canonical": "sound",
+                        "entity_kind": "CONCEPT",
+                        "description": "",
+                        "node_ids": [],
+                    },
+                ],
+                graph_statements=lambda: [
+                    {
+                        "source": "speaker",
+                        "target": "sound",
+                        "predicate": "produces",
+                        "weight": 2.0,
+                        "description": "a speaker produces sound",
+                        "node_ids": [2],
+                    }
+                ],
+            )
+            state._store = SimpleNamespace(tree=tree, close=lambda: None)
+
+            payload = state.graph_payload()
+
+            self.assertEqual(2, len(payload["nodes"]))
+            speaker = payload["nodes"][0]
+            self.assertEqual("speaker", speaker["id"])
+            self.assertEqual("DEVICE", speaker["type"])
+            self.assertEqual(1, speaker["degree"])
+            self.assertEqual(["Speaker text"], speaker["sourceSnippets"])
+            link = payload["links"][0]
+            self.assertEqual("produces", link["name"])
+            self.assertEqual([2], link["sourceIds"])
+            self.assertEqual("sample.pdf", payload["docName"])
 
 
 class ProgressScriptTests(unittest.TestCase):

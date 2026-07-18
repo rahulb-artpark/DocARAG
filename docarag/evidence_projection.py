@@ -280,6 +280,7 @@ _EVIDENCE_TRACE_FIELDS = (
     "semantic_substructures",
     "transformations",
     "semantic_subtype",
+    "title_level",
     "parser_provenance",
     "quality_status",
     "reconciliation_method",
