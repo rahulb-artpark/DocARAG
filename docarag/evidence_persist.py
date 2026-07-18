@@ -63,22 +63,14 @@ def main(argv: list[str] | None = None) -> int:
             document,
         )
         evidence = build_document_evidence(run, revision_id, asset_cas_root=cas_root)
-        ledger.persist_document_evidence(scope, evidence)
+        written = ledger.persist_document_evidence(scope, evidence)
     except Exception as exc:  # noqa: BLE001 - CLI boundary reports a clean message
         print(f"evidence persistence error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
     print(
-        "Persisted evidence for revision {rev}: {b} blocks, {t} tree nodes, "
-        "{e} entities, {r} relations, {g} gt-links, {a} assets".format(
-            rev=revision_id,
-            b=len(evidence.blocks),
-            t=len(evidence.tree_nodes),
-            e=len(evidence.entities),
-            r=len(evidence.relations),
-            g=len(evidence.gt_links),
-            a=len(evidence.assets),
-        )
+        f"Persisted revision {revision_id}: "
+        + ", ".join(f"{count} {name}" for name, count in sorted(written.items()) if count)
     )
     return 0
 

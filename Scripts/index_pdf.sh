@@ -1308,10 +1308,18 @@ PY
     DRIVER_FINALIZED=1
     return "$status"
   fi
+  # Retrieval reads the tree and the graph from the store, so a run that does
+  # not persist its evidence has not produced a usable index.
   if "${python_runner[@]}" -m docarag.evidence_persist --run "$run_dir"; then
-    echo "[driver] $(date) canonical evidence persisted to PostgreSQL and asset CAS"
+    echo "[driver] $(date) evidence persisted to PostgreSQL"
   else
-    echo "[driver] $(date) evidence persistence did not complete; index remains usable" >&2
+    status=$?
+    error="evidence persistence failed; the index cannot be queried"
+    echo "[driver] $(date) $error" >&2
+    update_index_state "$state_file" "$revision_id" "$$" run_failed "" "$status" "$error"
+    archive_attempt_state "$state_file" "$DRIVER_ATTEMPT_DIR" || true
+    DRIVER_FINALIZED=1
+    return "$status"
   fi
   update_index_state "$state_file" "$revision_id" "$$" run_succeeded "" 0
   archive_attempt_state "$state_file" "$DRIVER_ATTEMPT_DIR" || true

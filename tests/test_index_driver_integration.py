@@ -37,6 +37,11 @@ import pickle
 from types import SimpleNamespace
 
 args = sys.argv[1:]
+if args[:2] == ["-m", "docarag.evidence_persist"]:
+    # The driver requires evidence to be persisted before a run counts as
+    # usable; these tests exercise stage orchestration, not the store.
+    print("stub: evidence persisted")
+    raise SystemExit(0)
 if args and args[0].endswith("docarag/runtime_probe.py"):
     output = Path(args[args.index("--output") + 1])
     revision_id = args[args.index("--revision-id") + 1]

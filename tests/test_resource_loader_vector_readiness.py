@@ -496,7 +496,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         )
         with (
             patch(
-                "Core.Index.GBCIndex.GBC.load_gbc_index",
+                "Core.rag.stored_index.StoredIndex.open",
                 return_value=gbc,
             ) as load_gbc,
             patch.object(
@@ -510,7 +510,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         self.assertEqual(
             {"gbc_index": gbc, "tree_vdb": tree_vdb}, dependencies
         )
-        load_gbc.assert_called_once_with(cfg)
+        load_gbc.assert_called_once_with(cfg.save_path)
         open_tree.assert_called_once_with(cfg, cfg.vdb)
 
     def test_gbc_loader_closes_graph_resources_when_tree_vdb_open_fails(self):
@@ -524,7 +524,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         )
         with (
             patch(
-                "Core.Index.GBCIndex.GBC.load_gbc_index",
+                "Core.rag.stored_index.StoredIndex.open",
                 return_value=gbc,
             ),
             patch.object(
