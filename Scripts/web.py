@@ -46,10 +46,6 @@ from docarag.provenance import sha256_file
 from docarag.run_logging import RunLogInfo, RunLogScope
 from Core.provider.TokenTracker import TokenTracker
 
-# The store, Qdrant client and BookRAG subprocess must see the same local
-# storage endpoints the CLI uses, so the project .env is loaded the same way.
-_load_project_environment(REPO)
-
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
@@ -787,6 +783,8 @@ class AppState:
         if self._graph_cache is not None:
             return self._graph_cache
 
+        from Core.rag.stored_index import entity_node_name
+
         store = self.store()
         entities = store.tree.graph_entities()
         statements = store.tree.graph_statements()
@@ -796,16 +794,17 @@ class AppState:
 
         degree = {}
         for statement in statements:
-            for key in ("source", "target"):
-                name = statement[key]
-                degree[name] = degree.get(name, 0) + 1
+            for name_key, kind_key in (("source", "source_kind"), ("target", "target_kind")):
+                node_id = entity_node_name(statement[name_key], statement[kind_key])
+                degree[node_id] = degree.get(node_id, 0) + 1
 
         nodes = []
         for entity in entities:
             source_ids = entity["node_ids"]
+            node_id = entity_node_name(entity["canonical"], entity["entity_kind"])
             nodes.append(
                 {
-                    "id": entity["canonical"],
+                    "id": node_id,
                     "label": entity["canonical"],
                     "type": entity["entity_kind"] or "UNKNOWN",
                     "description": entity["description"],
@@ -817,7 +816,7 @@ class AppState:
                         for source_id in source_ids
                         if source_id in tree_nodes
                     ],
-                    "degree": degree.get(entity["canonical"], 0),
+                    "degree": degree.get(node_id, 0),
                 }
             )
 
@@ -826,8 +825,12 @@ class AppState:
             links.append(
                 {
                     "id": f"rel-{idx}",
-                    "source": statement["source"],
-                    "target": statement["target"],
+                    "source": entity_node_name(
+                        statement["source"], statement["source_kind"]
+                    ),
+                    "target": entity_node_name(
+                        statement["target"], statement["target_kind"]
+                    ),
                     "sourceName": statement["source"],
                     "targetName": statement["target"],
                     "name": statement["predicate"],
@@ -1362,6 +1365,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
+    # The store, Qdrant client and BookRAG subprocess must see the same local
+    # storage endpoints the CLI uses, so the project .env is loaded the same
+    # way -- here and not at import, which would leak it into any importer.
+    _load_project_environment(REPO)
     # This executable is the composition root and may configure its own
     # console. Importing it for tests or embedding must not mutate the host
     # process's root logging configuration.

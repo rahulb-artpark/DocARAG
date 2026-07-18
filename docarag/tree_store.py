@@ -229,7 +229,9 @@ class TreeStore:
         return [
             {
                 "source": str(row["src"]),
+                "source_kind": str(row["src_kind"]),
                 "target": str(row["dst"]),
+                "target_kind": str(row["dst_kind"]),
                 "predicate": str(row["predicate"]),
                 "weight": row["weight"],
                 "description": str(row["description"] or ""),
@@ -454,7 +456,9 @@ LIMIT %s
 _GRAPH_STATEMENTS_SQL = """
 SELECT
     subject.canonical AS src,
+    subject.entity_kind AS src_kind,
     object.canonical AS dst,
+    object.entity_kind AS dst_kind,
     stmt.predicate,
     stmt.weight,
     blob.body AS description,

@@ -333,7 +333,9 @@ class WebDiscoveryTests(unittest.TestCase):
                 graph_statements=lambda: [
                     {
                         "source": "speaker",
+                        "source_kind": "DEVICE",
                         "target": "sound",
+                        "target_kind": "CONCEPT",
                         "predicate": "produces",
                         "weight": 2.0,
                         "description": "a speaker produces sound",
@@ -347,7 +349,7 @@ class WebDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(2, len(payload["nodes"]))
             speaker = payload["nodes"][0]
-            self.assertEqual("speaker", speaker["id"])
+            self.assertEqual("Name: speaker\nType: DEVICE", speaker["id"])
             self.assertEqual("DEVICE", speaker["type"])
             self.assertEqual(1, speaker["degree"])
             self.assertEqual(["Speaker text"], speaker["sourceSnippets"])
