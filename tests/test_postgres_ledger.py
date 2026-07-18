@@ -28,7 +28,7 @@ from docarag.persistence import (
     resolve_database_url,
     safe_database_endpoint,
 )
-from docarag.persistence.schema import SCHEMA_SHA256, SCHEMA_SQL
+from docarag.persistence.schema import EVIDENCE_TABLES, SCHEMA_SHA256, SCHEMA_SQL
 from docarag.settings import RuntimeSettings, initialize_settings, load_settings
 
 
@@ -180,9 +180,10 @@ class PostgresSettingsTests(unittest.TestCase):
 
 
 class PostgresSchemaTests(unittest.TestCase):
-    def test_schema_contains_ledger_and_evidence_primitives(self):
+    def test_schema_contains_the_ledger_and_the_evidence_store(self):
         self.assertRegex(SCHEMA_SHA256, r"^[0-9a-f]{64}$")
         for table in (
+            # ledger: append-only record of admission and execution
             "tenants",
             "corpora",
             "documents",
@@ -191,20 +192,68 @@ class PostgresSchemaTests(unittest.TestCase):
             "index_revisions",
             "stage_events",
             "work_items",
-            "assets",
-            "canonical_blocks",
-            "block_representations",
-            "block_assets",
-            "tree_nodes",
-            "kg_entities",
-            "kg_relations",
-            "gt_links",
+            # evidence: derived, rebuildable, revision-scoped
+            "text_blob",
+            "asset",
+            "block",
+            "block_representation",
+            "block_asset",
+            "block_structure",
+            "block_element",
+            "block_element_edge",
+            "tree_node",
+            "entity",
+            "entity_mention",
+            "statement",
+            "statement_role",
+            "statement_property",
+            "statement_evidence",
+            "node_retrieval",
         ):
-            self.assertIn(f"CREATE TABLE docarag.{table}", SCHEMA_SQL)
+            self.assertIn(f"CREATE TABLE docarag.{table} (", SCHEMA_SQL)
         self.assertIn("artifact_receipts_are_immutable", SCHEMA_SQL)
         self.assertIn("stage_events_are_append_only", SCHEMA_SQL)
         self.assertIn("CREATE EXTENSION IF NOT EXISTS ltree", SCHEMA_SQL)
         self.assertNotIn("sqlite", SCHEMA_SQL.lower())
+
+    def test_evidence_is_keyed_by_an_interned_revision(self):
+        # The ledger identifies a revision by five text columns; evidence
+        # carries one surrogate instead, so the tuple is stored once.
+        self.assertIn(
+            "revision_key bigint GENERATED ALWAYS AS IDENTITY UNIQUE", SCHEMA_SQL
+        )
+        for table in EVIDENCE_TABLES:
+            body = SCHEMA_SQL.split(f"CREATE TABLE docarag.{table} (", 1)[1]
+            body = body.split(");", 1)[0]
+            self.assertIn(
+                "revision_key bigint NOT NULL",
+                body,
+                f"{table} must be scoped by revision_key",
+            )
+
+    def test_the_tree_is_addressable_by_path_and_by_parent(self):
+        # Subtree reads use the ltree path; ingestion writes adjacency before
+        # any path can exist, so both have to be indexed.
+        self.assertIn("path public.ltree", SCHEMA_SQL)
+        self.assertIn("USING gist (path)", SCHEMA_SQL)
+        self.assertIn(
+            "tree_node_children_idx\n    ON docarag.tree_node "
+            "(revision_key, parent_key, sibling_no)",
+            SCHEMA_SQL,
+        )
+
+    def test_the_hot_retrieval_reads_are_covered_by_indexes(self):
+        for covering in (
+            # query entity -> the nodes mentioning it
+            "entity_mention_lookup_idx",
+            # a subtree's nodes -> the statements they support
+            "statement_evidence_node_idx",
+            # hundreds of candidates -> one string each, for the reranker
+            "node_retrieval_feed_idx",
+        ):
+            self.assertIn(covering, SCHEMA_SQL)
+            clause = SCHEMA_SQL.split(covering, 1)[1].split(";", 1)[0]
+            self.assertIn("INCLUDE", clause, f"{covering} should be covering")
 
     def test_ensure_schema_is_locked_and_idempotent(self):
         state: dict[str, object] = {"applied": None}
@@ -231,7 +280,7 @@ class PostgresSchemaTests(unittest.TestCase):
         queries = [query for query, _ in connection.executions]
         self.assertTrue(any("pg_advisory_xact_lock" in query for query in queries))
         self.assertTrue(
-            any("CREATE TABLE docarag.canonical_blocks" in query for query in queries)
+            any("CREATE TABLE docarag.block (" in query for query in queries)
         )
         self.assertEqual(
             1, sum(1 for q in queries if "INSERT INTO docarag.schema_meta" in q)
