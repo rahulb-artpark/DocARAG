@@ -1,362 +1,461 @@
-"""Project a completed run's canonical/tree/graph JSON into the evidence store.
+"""Turn one run's published artifacts into the records the store writes.
 
-Dependency-light: reads only the run's JSON artifacts (no BookRAG interpreter),
-publishes figure/table/diagram bytes into a content-addressed asset store, and
-returns a DocumentEvidence bundle for one index revision.
+A run publishes three artifacts: the canonical blocks a parser produced, the
+tree built over them, and the knowledge graph extracted from that tree.  This
+reads all three and emits a single :class:`DocumentEvidence`, addressing
+everything by the names the artifacts use -- a block's id, a node's index, an
+entity's key -- and leaving the writer to resolve those to database surrogates.
+
+Nothing here talks to a database, so a projection can be built, inspected and
+compared without one.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 from docarag.persistence.contracts import (
     AssetRecord,
-    BlockAssetLink,
     BlockRecord,
     DocumentEvidence,
+    ElementEdgeRecord,
+    ElementRecord,
     EntityRecord,
-    GTLinkRecord,
-    RelationRecord,
+    MentionRecord,
     RepresentationRecord,
+    StatementEvidenceRecord,
+    StatementRecord,
+    StatementRoleRecord,
+    StructureRecord,
     TreeNodeRecord,
 )
 
-_IMAGE_MIME = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
+CANONICAL_BLOCKS = "canonical_blocks.json"
+TREE = "tree.json"
+GRAPH = "graph_data.json"
+
+MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+
+# A statement's participants when the source only knows a source and a target.
+SUBJECT_ROLE = "subject"
+OBJECT_ROLE = "object"
 
 
-def _load_json(path: Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _entity_id(node_key: str) -> str:
-    return "ent_" + hashlib.sha256(node_key.encode("utf-8")).hexdigest()[:24]
-
-
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _resolve_local_asset(asset: dict, run: Path) -> Path | None:
-    uri = asset.get("uri")
-    if not isinstance(uri, str) or not uri:
-        return None
-    if uri.startswith("file://"):
-        from urllib.parse import unquote, urlparse
-
-        uri = unquote(urlparse(uri).path)
-    candidates = []
-    path = Path(uri)
-    candidates.append(path if path.is_absolute() else run / path)
-    # Parser crops (e.g. interline equations) are often referenced by bare name
-    # relative to the parser image directory rather than the run root.
-    if not path.is_absolute() and len(path.parts) == 1:
-        candidates.append(run / "vlm" / "images" / path.name)
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-            resolved.relative_to(run)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if resolved.is_file():
-            return resolved
-    return None
-
-
-def _published_asset_record(asset: dict, digest: str, role: str, cas_root: Path | None):
-    """Describe an asset that already carries a verified content digest.
-
-    Crops reach the canonical layer already published to a content-addressed
-    store, so nothing re-reads them here. Their rows are still required: a
-    block link to an unregistered asset violates the store's foreign key and
-    fails the whole document's persistence.
-    """
-
-    byte_size = 0
-    if cas_root is not None:
-        candidate = cas_root / digest[:2] / digest
-        try:
-            byte_size = candidate.stat().st_size
-        except OSError:
-            byte_size = 0
-    uri = asset.get("uri")
-    return AssetRecord(
-        asset_id=digest,
-        mime_type=str(asset.get("media_type") or "application/octet-stream"),
-        byte_size=byte_size,
-        cas_uri=uri if isinstance(uri, str) and uri.startswith("cas://") else f"cas://sha256/{digest}",
-        metadata={"kind": role},
-    )
-
-
-def publish_asset_bytes(data: bytes, cas_root: Path) -> str:
-    """Store bytes at <cas_root>/<digest[:2]>/<digest>; return the digest."""
-
-    digest = _sha256_bytes(data)
-    target = cas_root / digest[:2] / digest
-    if not target.exists():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
-    return digest
-
-
-def _blocks(payload: object) -> list[dict]:
-    if isinstance(payload, dict):
-        blocks = payload.get("canonical_blocks")
-        if isinstance(blocks, list):
-            return [b for b in blocks if isinstance(b, dict)]
-    return []
-
-
-def _node_paths(nodes: list[dict]) -> dict[int, str]:
-    parent = {}
-    for node in nodes:
-        nid = node.get("index_id")
-        if isinstance(nid, int):
-            parent[nid] = node.get("parent_id")
-    paths: dict[int, str] = {}
-
-    def path_for(nid: int) -> str:
-        if nid in paths:
-            return paths[nid]
-        pid = parent.get(nid)
-        if pid is None or pid == nid or pid not in parent:
-            paths[nid] = str(nid)
-        else:
-            paths[nid] = path_for(pid) + "." + str(nid)
-        return paths[nid]
-
-    for nid in parent:
-        path_for(nid)
-    return paths
+class ProjectionError(RuntimeError):
+    """A run's artifacts could not be read as evidence."""
 
 
 def build_document_evidence(
-    run_dir: str | os.PathLike[str],
-    index_revision_id: str,
+    run_dir: str | Path,
+    revision_id: str,
     *,
-    asset_cas_root: str | os.PathLike[str] | None = None,
+    asset_cas_root: str | Path | None = None,
 ) -> DocumentEvidence:
+    """Project one run directory into the evidence for one index revision."""
+
     run = Path(run_dir).expanduser().resolve()
     cas_root = Path(asset_cas_root).expanduser().resolve() if asset_cas_root else None
 
-    asset_by_id: dict[str, AssetRecord] = {}
-    blocks: list[BlockRecord] = []
-    canonical_path = run / "canonical_blocks.json"
-    if canonical_path.is_file():
-        for block in _blocks(_load_json(canonical_path)):
-            representations = tuple(
-                RepresentationRecord(
-                    kind=str(rep.get("kind") or "text"),
-                    content_sha256=rep.get("content_sha256"),
-                    content=rep.get("content"),
-                    confidence=rep.get("confidence"),
-                    metadata=rep.get("metadata") or {},
-                )
-                for rep in block.get("representations") or []
-                if isinstance(rep, dict)
-            )
-            asset_links: list[BlockAssetLink] = []
-            for asset in block.get("assets") or []:
-                if not isinstance(asset, dict):
-                    continue
-                role = str(asset.get("kind") or asset.get("role") or "asset")
-                digest = asset.get("sha256")
-                if isinstance(digest, str) and len(digest) == 64:
-                    asset_by_id.setdefault(
-                        digest, _published_asset_record(asset, digest, role, cas_root)
-                    )
-                else:
-                    resolved = _resolve_local_asset(asset, run)
-                    if resolved is None or cas_root is None:
-                        continue
-                    data = resolved.read_bytes()
-                    digest = publish_asset_bytes(data, cas_root)
-                    asset_by_id.setdefault(
-                        digest,
-                        AssetRecord(
-                            asset_id=digest,
-                            mime_type=str(
-                                asset.get("media_type")
-                                or _IMAGE_MIME.get(resolved.suffix.lower(), "application/octet-stream")
-                            ),
-                            byte_size=len(data),
-                            cas_uri=f"cas://sha256/{digest}",
-                            metadata={"kind": role},
-                        ),
-                    )
-                asset_links.append(BlockAssetLink(asset_id=digest, role=role))
-            blocks.append(
-                BlockRecord(
-                    block_id=str(block["block_id"]),
-                    revision_id=str(block.get("revision_id") or block.get("revision") or ""),
-                    block_type=str(block.get("block_type") or "text"),
-                    page_index=int(block.get("page_index") or 0),
-                    semantic_subtype=block.get("semantic_subtype"),
-                    page_id=block.get("page_id"),
-                    reading_order=block.get("reading_order"),
-                    parent_block_id=block.get("parent_block_id"),
-                    content_sha256=block.get("content_sha256"),
-                    quality_status=block.get("quality_status"),
-                    reconciliation_method=block.get("reconciliation_method"),
-                    geometry=block.get("geometry"),
-                    source_observation_ids=tuple(
-                        str(x) for x in block.get("source_observation_ids") or []
-                    ),
-                    metadata=block.get("metadata") or {},
-                    representations=representations,
-                    asset_links=tuple(asset_links),
-                )
-            )
-
-    tree_nodes: list[TreeNodeRecord] = []
-    block_id_by_node: dict[int, str] = {}
-    tree_path = run / "tree.json"
-    if tree_path.is_file():
-        tree = _load_json(tree_path)
-        nodes = tree.get("nodes") if isinstance(tree, dict) else None
-        nodes = [n for n in nodes or [] if isinstance(n, dict)]
-        paths = _node_paths(nodes)
-        for node in nodes:
-            nid = node.get("index_id")
-            if not isinstance(nid, int):
-                continue
-            meta = node.get("meta_info") if isinstance(node.get("meta_info"), dict) else {}
-            # The tree publishes its evidence binding as canonical_block_id;
-            # without it every tree row is an island that no query can join
-            # back to the block, its text, or its crop.
-            block_id = meta.get("canonical_block_id") or meta.get("block_id")
-            summary = node.get("summary")
-            tree_nodes.append(
-                TreeNodeRecord(
-                    node_id=nid,
-                    node_path=paths.get(nid, str(nid)),
-                    node_type=str(node.get("type") or "node"),
-                    level=paths.get(nid, str(nid)).count(".") ,
-                    parent_id=node.get("parent_id"),
-                    block_id=block_id if isinstance(block_id, str) else None,
-                    summary_sha256=(
-                        _sha256_bytes(summary.encode("utf-8"))
-                        if isinstance(summary, str) and summary
-                        else None
-                    ),
-                    summary=summary if isinstance(summary, str) else None,
-                )
-            )
-            if isinstance(block_id, str) and block_id:
-                block_id_by_node[nid] = block_id
-
-    entities: list[EntityRecord] = []
-    relations: list[RelationRecord] = []
-    gt_links: list[GTLinkRecord] = []
-    graph_path = run / "graph_data.json"
-    if graph_path.is_file():
-        graph_doc = _load_json(graph_path)
-        graph = graph_doc.get("graph") if isinstance(graph_doc, dict) else None
-        id_map: dict[str, str] = {}
-        if isinstance(graph, dict):
-            for node in graph.get("nodes") or []:
-                if not isinstance(node, dict):
-                    continue
-                key = str(node.get("id") or node.get("entity_name") or "")
-                if not key:
-                    continue
-                entity_id = _entity_id(key)
-                id_map[key] = entity_id
-                description = node.get("description")
-                entities.append(
-                    EntityRecord(
-                        entity_id=entity_id,
-                        entity_name=str(node.get("entity_name") or ""),
-                        entity_type=str(node.get("entity_type") or "UNKNOWN"),
-                        description=description if isinstance(description, str) else None,
-                        description_sha256=(
-                            _sha256_bytes(description.encode("utf-8"))
-                            if isinstance(description, str) and description
-                            else None
-                        ),
-                    )
-                )
-            for position, link in enumerate(graph.get("links") or []):
-                if not isinstance(link, dict):
-                    continue
-                src = id_map.get(str(link.get("source")))
-                dst = id_map.get(str(link.get("target")))
-                if src is None or dst is None:
-                    continue
-                weight = link.get("weight")
-                relations.append(
-                    RelationRecord(
-                        relation_id="rel_"
-                        + hashlib.sha256(
-                            f"{src}|{dst}|{link.get('relation_name')}|{position}".encode()
-                        ).hexdigest()[:24],
-                        src_entity_id=src,
-                        dst_entity_id=dst,
-                        relation_type=str(link.get("relation_name") or "related"),
-                        directed=True,
-                        weight=float(weight) if _is_number(weight) else None,
-                        description=(
-                            link.get("description")
-                            if isinstance(link.get("description"), str)
-                            else None
-                        ),
-                    )
-                )
-        tree2kg = graph_doc.get("tree2kg") if isinstance(graph_doc, dict) else None
-        if isinstance(tree2kg, dict):
-            seen: set[tuple[str, int]] = set()
-            for node_key, entity_keys in tree2kg.items():
-                try:
-                    node_id = int(node_key)
-                except (TypeError, ValueError):
-                    continue
-                for entity_key in entity_keys or []:
-                    entity_id = id_map.get(str(entity_key))
-                    if entity_id is None or (entity_id, node_id) in seen:
-                        continue
-                    seen.add((entity_id, node_id))
-                    gt_links.append(
-                        GTLinkRecord(
-                            entity_id=entity_id,
-                            node_id=node_id,
-                            block_id=block_id_by_node.get(node_id),
-                        )
-                    )
+    blocks, assets = _project_blocks(_read(run / CANONICAL_BLOCKS), cas_root)
+    nodes = _project_tree(_read(run / TREE))
+    entities, mentions, statements = _project_graph(_read(run / GRAPH), nodes)
 
     return DocumentEvidence(
-        index_revision_id=index_revision_id,
-        assets=tuple(asset_by_id.values()),
-        blocks=tuple(blocks),
-        tree_nodes=tuple(tree_nodes),
-        entities=tuple(entities),
-        relations=tuple(relations),
-        gt_links=tuple(gt_links),
+        revision_id=revision_id,
+        assets=assets,
+        blocks=blocks,
+        tree_nodes=nodes,
+        entities=entities,
+        mentions=mentions,
+        statements=statements,
     )
 
 
-def _is_number(value: object) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, (int, float)):
-        return True
-    if isinstance(value, str):
+# -- blocks -------------------------------------------------------------------
+
+
+def _project_blocks(
+    payload: object, cas_root: Path | None
+) -> tuple[tuple[BlockRecord, ...], tuple[AssetRecord, ...]]:
+    raw_blocks = _sequence(payload, "canonical_blocks")
+    assets: dict[str, AssetRecord] = {}
+    blocks: list[BlockRecord] = []
+
+    for position, raw in enumerate(raw_blocks):
+        if not isinstance(raw, dict):
+            continue
+        uid = _text(raw.get("block_id"))
+        if not uid:
+            continue
+
+        asset_roles: list[tuple[str, str]] = []
+        for asset in _sequence(raw.get("assets"), None):
+            record = _asset_record(asset, cas_root)
+            if record is None:
+                continue
+            assets.setdefault(record.sha256, record)
+            role = _text(asset.get("kind")) or "asset"
+            asset_roles.append((record.sha256, role))
+
+        blocks.append(
+            BlockRecord(
+                uid=uid,
+                kind=_text(raw.get("block_type")) or "unknown",
+                block_no=position,
+                page_no=_integer(raw.get("page_index")),
+                subtype=_text(raw.get("semantic_subtype")) or None,
+                reading_order=_number(raw.get("reading_order")),
+                quality=_text(raw.get("quality_status")) or None,
+                reconciliation=_text(raw.get("reconciliation_method")) or None,
+                content_sha256=_text(raw.get("content_sha256")) or None,
+                geometry=raw.get("geometry") if isinstance(raw.get("geometry"), dict) else None,
+                source_observation_ids=tuple(
+                    _text(item) for item in _sequence(raw.get("source_observation_ids"), None)
+                ),
+                representations=_representations(raw.get("representations")),
+                asset_roles=tuple(asset_roles),
+                structures=_structures(raw.get("semantic_substructures")),
+                attrs=raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {},
+            )
+        )
+    return tuple(blocks), tuple(assets.values())
+
+
+def _asset_record(asset: object, cas_root: Path | None) -> AssetRecord | None:
+    """Describe an asset already published to the content-addressed store.
+
+    Crops reach the canonical layer already published, so nothing is re-read
+    here; only their size is recovered, and only when the store is reachable.
+    """
+
+    if not isinstance(asset, dict):
+        return None
+    digest = _text(asset.get("sha256"))
+    if len(digest) != 64:
+        return None
+    byte_size = 0
+    if cas_root is not None:
         try:
-            float(value)
-            return True
-        except ValueError:
-            return False
-    return False
+            byte_size = (cas_root / digest[:2] / digest).stat().st_size
+        except OSError:
+            byte_size = 0
+    uri = _text(asset.get("uri"))
+    return AssetRecord(
+        sha256=digest,
+        media_type=_text(asset.get("media_type")) or "application/octet-stream",
+        byte_size=byte_size,
+        cas_uri=uri if uri.startswith("cas://") else f"cas://sha256/{digest}",
+        attrs=asset.get("metadata") if isinstance(asset.get("metadata"), dict) else {},
+    )
 
 
-__all__ = ["build_document_evidence", "publish_asset_bytes"]
+def _representations(payload: object) -> tuple[RepresentationRecord, ...]:
+    records: list[RepresentationRecord] = []
+    for raw in _sequence(payload, None):
+        if not isinstance(raw, dict):
+            continue
+        kind = _text(raw.get("kind"))
+        if not kind:
+            continue
+        content = raw.get("content")
+        text = content if isinstance(content, str) else _render(content)
+        if not text:
+            continue
+        producer = None
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict):
+            producer = _text(metadata.get("producer")) or None
+        records.append(
+            RepresentationRecord(
+                kind=kind,
+                text=text,
+                lang=_text(raw.get("language")) or None,
+                confidence=_probability(raw.get("confidence")),
+                producer=producer,
+                attrs=metadata if isinstance(metadata, dict) else {},
+            )
+        )
+    return tuple(records)
+
+
+def _structures(payload: object) -> tuple[StructureRecord, ...]:
+    """Carry a block's semantic graphs: table cells, formula symbols, diagrams."""
+
+    structures: list[StructureRecord] = []
+    for raw in _sequence(payload, None):
+        if not isinstance(raw, dict):
+            continue
+        elements: list[ElementRecord] = []
+        by_id: dict[str, str] = {}
+        for item in _sequence(raw.get("elements"), None):
+            if not isinstance(item, dict):
+                continue
+            local_key = _text(item.get("local_key"))
+            if not local_key:
+                continue
+            by_id[_text(item.get("element_id"))] = local_key
+            content = item.get("content")
+            elements.append(
+                ElementRecord(
+                    local_key=local_key,
+                    kind=_text(item.get("kind")) or "element",
+                    content=content if isinstance(content, str) else _render(content),
+                    role=_text(item.get("role")) or None,
+                    row_no=_integer(item.get("row_index")),
+                    col_no=_integer(item.get("column_index")),
+                    row_span=_integer(item.get("row_span")),
+                    col_span=_integer(item.get("column_span")),
+                    geometry=item.get("geometry") if isinstance(item.get("geometry"), dict) else None,
+                    confidence=_probability(item.get("confidence")),
+                    attrs=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+                )
+            )
+        if not elements:
+            continue
+
+        edges: list[ElementEdgeRecord] = []
+        seen: set[tuple[str, str, str, int]] = set()
+        for item in _sequence(raw.get("relations"), None):
+            if not isinstance(item, dict):
+                continue
+            src = by_id.get(_text(item.get("source_element_id")))
+            dst = by_id.get(_text(item.get("target_element_id")))
+            kind = _text(item.get("kind"))
+            if not src or not dst or src == dst or not kind:
+                continue
+            identity = (src, dst, kind, 0)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            edges.append(
+                ElementEdgeRecord(
+                    src_local_key=src,
+                    dst_local_key=dst,
+                    kind=kind,
+                    label=_text(item.get("label")) or None,
+                    attrs=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+                )
+            )
+
+        source_paths = _sequence(raw.get("source_field_paths"), None)
+        structures.append(
+            StructureRecord(
+                kind=_text(raw.get("kind")) or "layout",
+                producer=_text(raw.get("producer_kind")) or "parser_native",
+                elements=tuple(elements),
+                edges=tuple(edges),
+                availability=_text(raw.get("availability")) or "complete",
+                source_uri=_text(source_paths[0]) if source_paths else None,
+                attrs=raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {},
+            )
+        )
+    return tuple(structures)
+
+
+# -- tree ---------------------------------------------------------------------
+
+
+def _project_tree(payload: object) -> tuple[TreeNodeRecord, ...]:
+    raw_nodes = _sequence(payload, "nodes")
+    siblings: dict[int | None, int] = {}
+    nodes: list[TreeNodeRecord] = []
+
+    for raw in raw_nodes:
+        if not isinstance(raw, dict):
+            continue
+        node_no = _integer(raw.get("index_id"))
+        if node_no is None:
+            continue
+        parent_no = _integer(raw.get("parent_id"))
+        if parent_no == node_no:
+            parent_no = None
+        meta = raw.get("meta_info") if isinstance(raw.get("meta_info"), dict) else {}
+        summary = raw.get("summary")
+        sibling_no = siblings.get(parent_no, 0)
+        siblings[parent_no] = sibling_no + 1
+        nodes.append(
+            TreeNodeRecord(
+                node_no=node_no,
+                kind=_text(raw.get("type")) or "node",
+                parent_no=parent_no,
+                sibling_no=sibling_no,
+                # The tree publishes its evidence binding under this name; it
+                # is what joins a node to the block it was built from.
+                block_uid=_text(meta.get("canonical_block_id")) or None,
+                label=_clip(_text(meta.get("content"))) or None,
+                summary=summary if isinstance(summary, str) and summary.strip() else None,
+            )
+        )
+    return tuple(nodes)
+
+
+# -- graph --------------------------------------------------------------------
+
+
+def _project_graph(
+    payload: object, nodes: tuple[TreeNodeRecord, ...]
+) -> tuple[
+    tuple[EntityRecord, ...], tuple[MentionRecord, ...], tuple[StatementRecord, ...]
+]:
+    if not isinstance(payload, dict):
+        return (), (), ()
+    graph = payload.get("graph") if isinstance(payload.get("graph"), dict) else {}
+
+    entities: dict[str, EntityRecord] = {}
+    ref_by_name: dict[str, str] = {}
+    for raw in _sequence(graph.get("nodes"), None):
+        if not isinstance(raw, dict):
+            continue
+        canonical = _text(raw.get("entity_name"))
+        if not canonical:
+            continue
+        kind = _text(raw.get("entity_type")) or "UNKNOWN"
+        ref = _entity_ref(kind, canonical)
+        entities.setdefault(
+            ref,
+            EntityRecord(
+                ref=ref,
+                kind=kind,
+                canonical=canonical,
+                description=_text(raw.get("description")) or None,
+            ),
+        )
+        ref_by_name[canonical] = ref
+        node_id = _text(raw.get("id"))
+        if node_id:
+            ref_by_name[node_id] = ref
+
+    known_nodes = {node.node_no for node in nodes}
+    mentions: list[MentionRecord] = []
+    seen_mentions: set[tuple[str, int]] = set()
+    for node_key, entity_keys in (payload.get("tree2kg") or {}).items():
+        node_no = _integer(node_key)
+        if node_no is None or node_no not in known_nodes:
+            continue
+        for entity_key in _sequence(entity_keys, None):
+            ref = ref_by_name.get(_text(entity_key))
+            if ref is None or (ref, node_no) in seen_mentions:
+                continue
+            seen_mentions.add((ref, node_no))
+            mentions.append(MentionRecord(entity_ref=ref, node_no=node_no))
+
+    statements: list[StatementRecord] = []
+    for raw in _sequence(graph.get("links"), None):
+        if not isinstance(raw, dict):
+            continue
+        source = ref_by_name.get(_text(raw.get("src_entity_name")))
+        target = ref_by_name.get(_text(raw.get("tgt_entity_name")))
+        if source is None or target is None or source == target:
+            continue
+        predicate = _text(raw.get("relation_name")) or "related_to"
+        statements.append(
+            StatementRecord(
+                predicate=predicate,
+                roles=(
+                    StatementRoleRecord(entity_ref=source, role=SUBJECT_ROLE),
+                    StatementRoleRecord(entity_ref=target, role=OBJECT_ROLE, ordinal=1),
+                ),
+                weight=_number(raw.get("weight")),
+                description=_text(raw.get("description")) or None,
+                producer="kg_extraction",
+                evidence=tuple(
+                    StatementEvidenceRecord(node_no=node_no)
+                    for node_no in _source_nodes(raw.get("source_ids"), known_nodes)
+                ),
+            )
+        )
+    return tuple(entities.values()), tuple(mentions), tuple(statements)
+
+
+def _entity_ref(kind: str, canonical: str) -> str:
+    """A stable local name for an entity within one projection."""
+
+    digest = hashlib.sha256(f"{kind}\x00{canonical}".encode("utf-8")).hexdigest()
+    return f"ent_{digest[:24]}"
+
+
+def _source_nodes(payload: object, known: set[int]) -> tuple[int, ...]:
+    found = []
+    for item in _sequence(payload, None):
+        node_no = _integer(item)
+        if node_no is not None and node_no in known:
+            found.append(node_no)
+    return tuple(dict.fromkeys(found))
+
+
+# -- reading ------------------------------------------------------------------
+
+
+def _read(path: Path) -> object:
+    if not path.is_file():
+        return None
+    if path.stat().st_size > MAX_ARTIFACT_BYTES:
+        raise ProjectionError(f"{path.name} exceeds the artifact size limit")
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ProjectionError(f"{path.name} is not readable JSON") from exc
+
+
+def _sequence(payload: object, key: str | None) -> list[object]:
+    if key is not None:
+        payload = payload.get(key) if isinstance(payload, dict) else None
+    return [item for item in payload] if isinstance(payload, list) else []
+
+
+def _text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _clip(value: str, limit: int = 512) -> str:
+    collapsed = " ".join(value.split())
+    return collapsed[:limit]
+
+
+def _integer(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value)
+    return None
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _probability(value: object) -> float | None:
+    number = _number(value)
+    if number is None or not 0.0 <= number <= 1.0:
+        return None
+    return number
+
+
+def _render(value: object) -> str:
+    """Flatten a structured representation, such as a table grid, into text."""
+
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        rows = []
+        for row in value:
+            if isinstance(row, list):
+                rows.append(" | ".join(_render(cell) for cell in row))
+            else:
+                rows.append(_render(row))
+        return "\n".join(part for part in rows if part)
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+__all__ = ["ProjectionError", "build_document_evidence"]
