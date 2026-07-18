@@ -64,16 +64,20 @@ def scope_for_run(run_dir: str | Path) -> tuple[DocumentScope, str]:
 class DocumentStore:
     """A store bound to one run, holding the connection its reads share."""
 
-    __slots__ = ("_connection", "_closed", "revision_key", "scope", "tree")
+    __slots__ = ("_connection", "_closed", "revision_key", "revision_id", "run_dir", "scope", "tree")
 
     def __init__(
         self,
         scope: DocumentScope,
         revision_key: int,
         connection: Any,
+        revision_id: str = "",
+        run_dir: Path | None = None,
     ) -> None:
         self.scope = scope
         self.revision_key = revision_key
+        self.revision_id = revision_id
+        self.run_dir = run_dir
         self._connection = connection
         self._closed = False
         self.tree = TreeStore(self._borrow, revision_key)
@@ -91,7 +95,13 @@ class DocumentStore:
         scope, revision_id = scope_for_run(run_dir)
         url = resolve_database_url(database_url)
         revision_key = (ledger or PostgresLedger(url)).revision_key(scope, revision_id)
-        return cls(scope, revision_key, _open_connection(url))
+        return cls(
+            scope,
+            revision_key,
+            _open_connection(url),
+            revision_id=revision_id,
+            run_dir=Path(run_dir).expanduser().resolve(),
+        )
 
     def _borrow(self) -> Any:
         if self._closed:

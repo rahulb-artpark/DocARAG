@@ -9,6 +9,10 @@ size of the document.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
 from typing import Any, Iterable, List, Sequence
 
 import networkx as nx
@@ -38,10 +42,11 @@ def split_node_name(node_name: str) -> tuple[str, str | None]:
 class StoredTreeIndex:
     """The document tree, read a slice at a time."""
 
-    __slots__ = ("_tree",)
+    __slots__ = ("_tree", "meta_info")
 
-    def __init__(self, tree) -> None:
+    def __init__(self, tree, meta_info=None) -> None:
         self._tree = tree
+        self.meta_info = meta_info
 
     @property
     def root_node(self) -> TreeNodeView | None:
@@ -80,7 +85,10 @@ class StoredTreeIndex:
     def get_nodes_data(self, node_ids: Sequence[int] | None = None) -> List[dict]:
         """Return the evidence behind the nodes an answer will cite."""
 
-        return [_node_payload(node) for node in self._tree.nodes(node_ids)]
+        return [
+            _node_payload(node, self.meta_info)
+            for node in self._tree.nodes(node_ids)
+        ]
 
     def retrieval_texts(self, node_ids: Sequence[int]) -> dict[int, str]:
         return self._tree.retrieval_texts(node_ids)
@@ -154,6 +162,72 @@ class StoredGraphIndex:
         }
 
 
+@dataclass(frozen=True)
+class StoredTreeMeta:
+    """The identity retrieval binds a tree's vectors and evidence against.
+
+    Field names mirror Core.Index.Tree.MetaInfo, which retrieval reads by name.
+    """
+
+    tenant_id: str = ""
+    corpus_id: str = ""
+    document_version_id: str = ""
+    index_revision_id: str = ""
+    source_sha256: str = ""
+    source_uri: str = ""
+    file_name: str = ""
+    file_path: str = ""
+    snapshot_path: str = ""
+    canonical_artifact_path: str = ""
+    canonical_artifact_sha256: str = ""
+    canonical_artifact_size_bytes: int = 0
+
+    @property
+    def source_sha(self) -> str:
+        return self.source_sha256
+
+    @property
+    def canonical_artifact_sha(self) -> str:
+        return self.canonical_artifact_sha256
+
+    @classmethod
+    def from_store(cls, store: DocumentStore) -> "StoredTreeMeta":
+        run_dir = getattr(store, "run_dir", None)
+        manifest: dict = {}
+        if run_dir is not None:
+            try:
+                manifest = json.loads(
+                    (run_dir / "run-manifest.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                manifest = {}
+        source = manifest.get("source") or {}
+        canonical = run_dir / "canonical_blocks.json" if run_dir else None
+        canonical_sha = ""
+        canonical_size = 0
+        if canonical is not None and canonical.is_file():
+            payload = canonical.read_bytes()
+            canonical_sha = hashlib.sha256(payload).hexdigest()
+            canonical_size = len(payload)
+        source_path = str(source.get("path") or "")
+        scope = getattr(store, "scope", None)
+        return cls(
+            tenant_id=getattr(scope, "tenant_id", "") or "",
+            corpus_id=getattr(scope, "corpus_id", "") or "",
+            document_version_id=getattr(scope, "document_version_id", "") or "",
+            index_revision_id=getattr(store, "revision_id", "") or "",
+            source_sha256=str(source.get("sha256") or ""),
+            source_uri=str(source.get("uri") or "")
+            or (Path(source_path).as_uri() if source_path else ""),
+            file_name=Path(source_path or "document.pdf").name,
+            file_path=source_path,
+            snapshot_path=str(manifest.get("source_snapshot") or ""),
+            canonical_artifact_path=str(canonical) if canonical_sha else "",
+            canonical_artifact_sha256=canonical_sha,
+            canonical_artifact_size_bytes=canonical_size,
+        )
+
+
 class StoredIndex:
     """What a query holds open for one document."""
 
@@ -161,7 +235,7 @@ class StoredIndex:
 
     def __init__(self, store: DocumentStore, config=None) -> None:
         self._store = store
-        self.TreeIndex = StoredTreeIndex(store.tree)
+        self.TreeIndex = StoredTreeIndex(store.tree, StoredTreeMeta.from_store(store))
         self.GraphIndex = StoredGraphIndex(store.tree)
         self.embedder = None
         self.entity_vdb = None
@@ -221,11 +295,18 @@ class StoredIndex:
         return False
 
 
-def _node_payload(node: TreeNodeView) -> dict:
-    """The retrieval payload for one node, with its evidence bindings."""
+def _node_payload(node: TreeNodeView, tree_meta: "StoredTreeMeta" = None) -> dict:
+    """The retrieval payload for one node, with its evidence bindings.
+
+    Every node carries the revision identity it was read under, so a retrieved
+    node can be checked against the canonical artifact that produced it.
+    """
 
     meta = node.meta_info
     payload = {
+        "document_version_id": tree_meta.document_version_id if tree_meta else "",
+        "source_sha256": tree_meta.source_sha256 if tree_meta else "",
+        "index_revision_id": tree_meta.index_revision_id if tree_meta else "",
         "index_id": node.index_id,
         "type": node.type,
         "content": meta.content,
