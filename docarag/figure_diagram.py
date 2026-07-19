@@ -54,6 +54,7 @@ class DiagramNode:
     key: str
     label: str
     role: str | None = None
+    inside: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +120,29 @@ def diagram_substructure(
 
     relations: list[SemanticRelation] = []
     seen: set[tuple[str, str, str]] = set()
+    # Containment is drawn as a box inside a box, not as an arrow, so it
+    # arrives on the node and leaves as a spatial_contains relation.
+    for node in graph.nodes[:MAX_DIAGRAM_NODES]:
+        child = elements.get(_clean(node.key))
+        parent = elements.get(_clean(node.inside))
+        if child is None or parent is None or child is parent:
+            continue
+        identity = (
+            parent.element_id,
+            child.element_id,
+            SemanticRelationKind.DIAGRAM_CONTAINS.value,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        relations.append(
+            SemanticRelation(
+                kind=SemanticRelationKind.DIAGRAM_CONTAINS,
+                source_element_id=parent.element_id,
+                target_element_id=child.element_id,
+                source_selector_ids=(selector.selector_id,),
+            )
+        )
     for edge in graph.edges[:MAX_DIAGRAM_EDGES]:
         source = elements.get(_clean(edge.source))
         target = elements.get(_clean(edge.target))

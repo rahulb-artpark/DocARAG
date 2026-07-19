@@ -1099,11 +1099,25 @@ const ROLE_COLORS = {
 };
 
 function structureParts(s) {
-  const connected = new Set();
-  (s.edges || []).forEach((e) => { connected.add(e.source); connected.add(e.target); });
-  const inFlow = (s.elements || []).filter((el) => connected.has(el.content));
-  const standalone = (s.elements || []).filter((el) => !connected.has(el.content));
-  return { inFlow, standalone };
+  const contained = new Map();
+  const flowConnected = new Set();
+  (s.edges || []).forEach((e) => {
+    if (e.kind === "diagram_contains") {
+      if (!contained.has(e.source)) contained.set(e.source, []);
+      contained.get(e.source).push(e.target);
+    } else {
+      flowConnected.add(e.source);
+      flowConnected.add(e.target);
+    }
+  });
+  const nested = new Set([].concat(...contained.values()));
+  const inFlow = (s.elements || []).filter(
+    (el) => flowConnected.has(el.content) && !nested.has(el.content)
+  );
+  const standalone = (s.elements || []).filter(
+    (el) => !flowConnected.has(el.content) && !nested.has(el.content) && !contained.has(el.content)
+  );
+  return { inFlow, standalone, contained };
 }
 
 function renderStructures(structures) {
@@ -1126,17 +1140,24 @@ function drawStructures(host, structures) {
     const s = structures[Number(canvas.dataset.struct)];
     if (!s || typeof vis === "undefined") return;
     const ids = new Map();
-    const nodes = structureParts(s).inFlow.map((el, i) => {
+    const { inFlow, contained } = structureParts(s);
+    const nodes = inFlow.map((el, i) => {
       ids.set(el.content, i);
       const c = ROLE_COLORS[el.role] || { background: "#ffffff", border: "#64748b" };
+      const inner = contained.get(el.content) || [];
+      const label = inner.length
+        ? `${el.content}\n${inner.map((name) => `\u2022 ${name}`).join("\n")}`
+        : el.content;
       return {
         id: i,
-        label: el.content,
+        label,
         title: el.role || undefined,
         shape: el.role === "decision" ? "diamond" : "box",
         color: { ...c, highlight: c },
-        font: { size: 13, face: "system-ui", color: "#1c2430" },
-        margin: 8,
+        font: { size: 13, face: "system-ui", color: "#1c2430",
+          multi: false, align: inner.length ? "left" : "center" },
+        margin: inner.length ? 10 : 8,
+        borderWidth: inner.length ? 2 : 1,
       };
     });
     // A pair of opposite edges reads as one double-headed arrow, the way the
@@ -1144,6 +1165,7 @@ function drawStructures(host, structures) {
     const seen = new Map();
     const edges = [];
     (s.edges || []).forEach((e) => {
+      if (e.kind === "diagram_contains") return;
       const a = ids.get(e.source), b = ids.get(e.target);
       if (a === undefined || b === undefined) return;
       const back = seen.get(`${b}|${a}`);

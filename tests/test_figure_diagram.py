@@ -52,6 +52,45 @@ class DiagramSubstructureTest(unittest.TestCase):
             graph, asset=self.asset, source_observation_ids=OBSERVATIONS
         )
 
+    def test_a_node_drawn_inside_another_becomes_a_containment_relation(self) -> None:
+        graph = DiagramGraph(
+            kind=SemanticStructureKind.FLOWCHART,
+            nodes=(
+                DiagramNode(key="n1", label="Central Processing Unit", role="process"),
+                DiagramNode(key="n2", label="Control Unit", role="process", inside="n1"),
+                DiagramNode(key="n3", label="Input Device", role="input"),
+            ),
+            edges=(DiagramEdge(source="n3", target="n1"),),
+        )
+
+        structure = self.build(graph)
+
+        kinds = {r.kind for r in structure.relations}
+        self.assertIn(SemanticRelationKind.DIAGRAM_CONTAINS, kinds)
+        contains = [
+            r for r in structure.relations
+            if r.kind is SemanticRelationKind.DIAGRAM_CONTAINS
+        ][0]
+        by_id = {e.element_id: e.content for e in structure.elements}
+        self.assertEqual("Central Processing Unit", by_id[contains.source_element_id])
+        self.assertEqual("Control Unit", by_id[contains.target_element_id])
+
+    def test_containment_naming_an_unknown_or_self_parent_is_dropped(self) -> None:
+        graph = DiagramGraph(
+            kind=SemanticStructureKind.FLOWCHART,
+            nodes=(
+                DiagramNode(key="n1", label="CPU", role="process", inside="n1"),
+                DiagramNode(key="n2", label="Ghost", role="process", inside="n9"),
+                DiagramNode(key="n3", label="Input", role="input"),
+            ),
+            edges=(DiagramEdge(source="n3", target="n1"),),
+        )
+
+        structure = self.build(graph)
+
+        kinds = {r.kind for r in structure.relations}
+        self.assertNotIn(SemanticRelationKind.DIAGRAM_CONTAINS, kinds)
+
     def test_flowchart_branches_map_to_typed_relations(self) -> None:
         graph = flowchart(
             (

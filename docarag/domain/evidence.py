@@ -192,6 +192,7 @@ class SemanticRelationKind(StrEnum):
     FORMULA_SUBSCRIPT_OF = "formula_subscript_of"
     FORMULA_NEXT = "formula_next"
     DIAGRAM_CONNECTS_TO = "diagram_connects_to"
+    DIAGRAM_CONTAINS = "diagram_contains"
     FLOW_NEXT = "flow_next"
     FLOW_BRANCH_TRUE = "flow_branch_true"
     FLOW_BRANCH_FALSE = "flow_branch_false"
@@ -1315,7 +1316,10 @@ _STRUCTURE_RELATION_KINDS: Mapping[
     )
     | _SPATIAL_RELATION_KINDS,
     SemanticStructureKind.DIAGRAM: frozenset(
-        {SemanticRelationKind.DIAGRAM_CONNECTS_TO}
+        {
+            SemanticRelationKind.DIAGRAM_CONNECTS_TO,
+            SemanticRelationKind.DIAGRAM_CONTAINS,
+        }
     )
     | _SPATIAL_RELATION_KINDS,
     SemanticStructureKind.FLOWCHART: frozenset(
@@ -1323,6 +1327,7 @@ _STRUCTURE_RELATION_KINDS: Mapping[
             SemanticRelationKind.FLOW_NEXT,
             SemanticRelationKind.FLOW_BRANCH_TRUE,
             SemanticRelationKind.FLOW_BRANCH_FALSE,
+            SemanticRelationKind.DIAGRAM_CONTAINS,
         }
     )
     | _SPATIAL_RELATION_KINDS,

@@ -33,7 +33,8 @@ PROMPT = """Return this figure as a graph.
 kind: "flowchart" if boxes are joined by arrows in an order, "diagram" if \
 labelled parts are joined by lines, "none" otherwise.
 nodes: one per labelled box. key is a short id like "n1". label is its text, \
-copied. role is its shape: start, end, process, decision, input, output, data.
+copied. role is its shape: start, end, process, decision, input, output, data. \
+inside is the key of the box it is drawn inside, if any.
 edges: one per arrow, source key to target key. label is the arrow's text. \
 branch is "true" or "false" for a decision's two paths.
 
@@ -50,6 +51,7 @@ class _Node(BaseModel):
     key: str = Field(max_length=MAX_LABEL_CHARS)
     label: str = Field(max_length=MAX_LABEL_CHARS)
     role: Optional[str] = Field(default=None, max_length=MAX_LABEL_CHARS)
+    inside: Optional[str] = Field(default=None, max_length=MAX_LABEL_CHARS)
 
 
 class _Edge(BaseModel):
@@ -100,7 +102,12 @@ class VLMDiagramExtractor:
         return DiagramGraph(
             kind=kind,
             nodes=tuple(
-                DiagramNode(key=item.key, label=item.label, role=item.role)
+                DiagramNode(
+                    key=item.key,
+                    label=item.label,
+                    role=item.role,
+                    inside=item.inside,
+                )
                 for item in result.nodes
             ),
             edges=tuple(
