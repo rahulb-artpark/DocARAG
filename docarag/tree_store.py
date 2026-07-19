@@ -201,6 +201,57 @@ class TreeStore:
             for row in rows
         ]
 
+    def structures_for_nodes(
+        self, node_ids: Sequence[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Return each node's extracted structures: elements and directed edges."""
+
+        wanted = _bounded_ids(node_ids)
+        if not wanted:
+            return {}
+        with self._session() as connection:
+            element_rows = connection.execute(
+                _STRUCTURE_ELEMENTS_SQL, (self._revision_key, wanted)
+            ).fetchall()
+            edge_rows = connection.execute(
+                _STRUCTURE_EDGES_SQL, (self._revision_key, wanted)
+            ).fetchall()
+
+        structures: dict[int, dict[str, Any]] = {}
+        order: dict[int, list[int]] = {}
+        for row in element_rows:
+            key = int(row["structure_key"])
+            entry = structures.get(key)
+            if entry is None:
+                entry = structures[key] = {
+                    "kind": str(row["structure_kind"]),
+                    "elements": [],
+                    "edges": [],
+                }
+                order.setdefault(int(row["node_no"]), []).append(key)
+            entry["elements"].append(
+                {
+                    "content": str(row["content"] or ""),
+                    "role": str(row["role"] or ""),
+                    "kind": str(row["element_kind"]),
+                }
+            )
+        for row in edge_rows:
+            entry = structures.get(int(row["structure_key"]))
+            if entry is not None:
+                entry["edges"].append(
+                    {
+                        "source": str(row["src_content"] or ""),
+                        "target": str(row["dst_content"] or ""),
+                        "kind": str(row["edge_kind"]),
+                        "label": str(row["label"] or ""),
+                    }
+                )
+        return {
+            node_no: [structures[key] for key in keys]
+            for node_no, keys in order.items()
+        }
+
     def graph_entities(self, limit: int = MAX_GRAPH_ENTITIES) -> list[dict[str, Any]]:
         """Return every entity this revision mentions, with its evidence nodes."""
 
@@ -426,6 +477,44 @@ _SUBTREE_SQL = _sql(
     "    AND node.path <@ section.path"
     ") ORDER BY node.node_no"
 )
+
+_STRUCTURE_ELEMENTS_SQL = """
+SELECT
+    node.node_no,
+    s.structure_key,
+    s.structure_kind,
+    el.element_kind,
+    el.content,
+    el.role
+FROM docarag.tree_node node
+JOIN docarag.block_structure s
+    ON s.revision_key = node.revision_key AND s.block_key = node.block_key
+JOIN docarag.block_element el
+    ON el.revision_key = s.revision_key AND el.structure_key = s.structure_key
+WHERE node.revision_key = %s AND node.node_no = ANY(%s)
+ORDER BY s.structure_key, el.element_key
+"""
+
+_STRUCTURE_EDGES_SQL = """
+SELECT
+    s.structure_key,
+    edge.edge_kind,
+    edge.label,
+    src.content AS src_content,
+    dst.content AS dst_content
+FROM docarag.tree_node node
+JOIN docarag.block_structure s
+    ON s.revision_key = node.revision_key AND s.block_key = node.block_key
+JOIN docarag.block_element_edge edge
+    ON edge.revision_key = s.revision_key AND edge.structure_key = s.structure_key
+JOIN docarag.block_element src
+    ON src.revision_key = edge.revision_key AND src.element_key = edge.src_key
+JOIN docarag.block_element dst
+    ON dst.revision_key = edge.revision_key AND dst.element_key = edge.dst_key
+WHERE node.revision_key = %s AND node.node_no = ANY(%s)
+ORDER BY s.structure_key, edge.ordinal, edge.src_key
+"""
+
 
 _GRAPH_ENTITIES_SQL = """
 WITH revision_entities AS (

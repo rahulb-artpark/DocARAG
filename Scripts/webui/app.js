@@ -1067,6 +1067,7 @@ function selectTreeNode(id) {
       ? `<div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}</div>
          <div class="prose">${renderContent(n)}</div>`
       : ""}
+    ${(n.structures || []).length ? `<div class="section-h">Extracted structure</div>${renderStructures(n.structures)}` : ""}
     ${n.summary ? `<div class="section-h">Summary (LLM-generated)</div><div class="prose">${escapeHtml(n.summary)}</div>` : ""}
     <div class="section-h">Entities extracted here (${ents.length})</div>
     <div class="prose">${entHtml}</div>
@@ -1086,6 +1087,18 @@ function selectTreeNode(id) {
   typesetMath($("treeDetail"));
   const im = $("treeDetail").querySelector(".nodeimg");
   if (im) im.onclick = () => openLightbox(im.src);
+}
+
+function renderStructures(structures) {
+  return structures.map((s) => {
+    const edges = (s.edges || []).map((e) =>
+      `<div class="flowEdge">${escapeHtml(e.source)} <span class="arrow">\u2192</span> ${escapeHtml(e.target)}${e.label ? ` <span class="edgeLabel">(${escapeHtml(e.label)})</span>` : ""}</div>`
+    ).join("");
+    const parts = (s.elements || []).map((el) =>
+      `<span class="tag">${escapeHtml(el.content)}${el.role ? ` \u00b7 ${escapeHtml(el.role)}` : ""}</span>`
+    ).join(" ");
+    return `<div class="structBlock"><div class="structKind">${escapeHtml(s.kind)}</div>${edges}<div class="structEls">${parts}</div></div>`;
+  }).join("");
 }
 
 /* =============================== CHAT =================================== */

@@ -737,7 +737,11 @@ class AppState:
         if self._tree_cache is not None:
             return self._tree_cache
 
-        views = self.store().tree.nodes()
+        store = self.store()
+        views = store.tree.nodes()
+        structures = store.tree.structures_for_nodes(
+            [view.index_id for view in views]
+        )
         children = {}
         for view in views:
             if view.parent_id is not None:
@@ -774,6 +778,7 @@ class AppState:
                     "footnote": meta.footnote or "",
                     "summary": view.summary or "",
                     "meta": evidence,
+                    "structures": structures.get(view.index_id, []),
                     "children": children.get(view.index_id, []),
                 }
             )
