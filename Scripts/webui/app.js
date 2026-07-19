@@ -1099,23 +1099,28 @@ const ROLE_COLORS = {
 };
 
 function structureParts(s) {
-  const contained = new Map();
   const flowConnected = new Set();
   (s.edges || []).forEach((e) => {
-    if (e.kind === "diagram_contains") {
-      if (!contained.has(e.source)) contained.set(e.source, []);
-      contained.get(e.source).push(e.target);
-    } else {
+    if (e.kind !== "diagram_contains") {
       flowConnected.add(e.source);
       flowConnected.add(e.target);
     }
+  });
+  // A node with flow arrows through it is part of the flow whatever any
+  // containment claim says; only arrow-less parts fold into their parent.
+  const contained = new Map();
+  (s.edges || []).forEach((e) => {
+    if (e.kind !== "diagram_contains") return;
+    if (flowConnected.has(e.target)) return;
+    if (!contained.has(e.source)) contained.set(e.source, []);
+    contained.get(e.source).push(e.target);
   });
   const nested = new Set([].concat(...contained.values()));
   const inFlow = (s.elements || []).filter(
     (el) => flowConnected.has(el.content) && !nested.has(el.content)
   );
   const standalone = (s.elements || []).filter(
-    (el) => !flowConnected.has(el.content) && !nested.has(el.content) && !contained.has(el.content)
+    (el) => !flowConnected.has(el.content) && !nested.has(el.content)
   );
   return { inFlow, standalone, contained };
 }

@@ -121,11 +121,22 @@ def diagram_substructure(
     relations: list[SemanticRelation] = []
     seen: set[tuple[str, str, str]] = set()
     # Containment is drawn as a box inside a box, not as an arrow, so it
-    # arrives on the node and leaves as a spatial_contains relation.
+    # arrives on the node and leaves as a diagram_contains relation.  Mutual
+    # or self containment is impossible to draw, so such claims are dropped.
+    inside_of = {}
     for node in graph.nodes[:MAX_DIAGRAM_NODES]:
-        child = elements.get(_clean(node.key))
-        parent = elements.get(_clean(node.inside))
+        child_key = _clean(node.key)
+        parent_key = _clean(node.inside)
+        if child_key and parent_key and child_key != parent_key:
+            inside_of[child_key] = parent_key
+    for node in graph.nodes[:MAX_DIAGRAM_NODES]:
+        child_key = _clean(node.key)
+        parent_key = _clean(node.inside)
+        child = elements.get(child_key)
+        parent = elements.get(parent_key)
         if child is None or parent is None or child is parent:
+            continue
+        if inside_of.get(parent_key) == child_key:
             continue
         identity = (
             parent.element_id,

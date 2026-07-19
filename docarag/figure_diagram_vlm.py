@@ -34,7 +34,7 @@ kind: "flowchart" if boxes are joined by arrows in an order, "diagram" if \
 labelled parts are joined by lines, "none" otherwise.
 nodes: one per labelled box. key is a short id like "n1". label is its text, \
 copied. role is its shape: start, end, process, decision, input, output, data. \
-inside is the key of the box it is drawn inside, if any.
+inside is the key of the bigger box this box is drawn inside, if any.
 edges: one per arrow, source key to target key. label is the arrow's text. \
 branch is "true" or "false" for a decision's two paths.
 
