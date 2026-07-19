@@ -43,7 +43,9 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
                 lang="en",
                 server_url="https://secret:credential@example.invalid/v1",
             ),
-            figures=FigureConfig(ocr=False, describe=False),
+            figures=FigureConfig(
+                ocr=False, describe=False, transcribe_formulas=False
+            ),
         )
 
     @staticmethod
@@ -123,6 +125,29 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             self.assertEqual(
                 list(projected["image_footnote"]), blocks[0]["image_footnote"]
             )
+
+    def test_equation_row_text_follows_the_projection_selection(self):
+        # When a vision transcription is preferred over the recognizer output,
+        # a tree built from the recognizer text would fail hydration.
+        blocks = [
+            {
+                "type": "equation",
+                "text": "$$\nv _ { 2 }\n$$",
+                "text_format": "latex",
+                "page_idx": 0,
+                "middle_json": {
+                    "type": "interline_equation",
+                    "bbox": [10, 10, 200, 60],
+                    "index": 1,
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+            projected = project_canonical_blocks(request.document, canonical)[0]
+            self.assertEqual(projected["text"], blocks[0]["text"])
+            self.assertEqual(projected["text_format"], blocks[0]["text_format"])
 
     def test_canonical_artifacts_tree_node_and_retrieval_share_source_binding(self):
         with tempfile.TemporaryDirectory() as tmp:

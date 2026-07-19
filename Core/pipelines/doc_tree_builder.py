@@ -772,6 +772,12 @@ def bind_canonical_evidence(
             attachment["image_footnote"] = list(
                 projected.get("image_footnote", [])
             )
+        # An equation row's text must follow the projection's selection: when
+        # the vision transcription is preferred over the recognizer output,
+        # a tree built from the recognizer text would fail hydration.
+        if projected.get("type") == "equation":
+            attachment["text"] = projected.get("text", "")
+            attachment["text_format"] = projected.get("text_format", "")
 
     canonical_payload = {
         "artifact_schema_version": CANONICAL_EVIDENCE_SCHEMA_VERSION,
