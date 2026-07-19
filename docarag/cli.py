@@ -499,6 +499,13 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_stage(args: argparse.Namespace) -> int:
+    _load(args)
+    from docarag.pipeline import main as pipeline_main
+
+    return pipeline_main([args.stage_name, "--run", args.run])
+
+
 def command_index(args: argparse.Namespace) -> int:
     settings = _load(args)
     pdf = Path(args.document).expanduser().resolve()
@@ -1025,6 +1032,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     index_parser.set_defaults(handler=command_index)
+
+    stage_parser = subparsers.add_parser(
+        "stage",
+        help="Run or inspect one pipeline stage for an existing run",
+        description=(
+            "A stage is a store transformation and can be re-run alone -- "
+            "after an edit, a model change or a failure -- without running "
+            "the pipeline around it. `status` reads stage state from "
+            "PostgreSQL."
+        ),
+    )
+    stage_parser.add_argument(
+        "stage_name", choices=("tree", "graph", "vdb", "persist", "status")
+    )
+    stage_parser.add_argument("--run", required=True)
+    stage_parser.set_defaults(handler=command_stage)
 
     status_parser = subparsers.add_parser("status", help="Show indexing status")
     status_parser.add_argument("run", nargs="?")

@@ -411,6 +411,23 @@ CREATE TABLE docarag.asset (
 -- Every evidence table leads with revision_key, so one document's rows stay
 -- together, are removed together, and never scan another document's heap.
 
+CREATE TABLE docarag.stage_state (
+    revision_key bigint NOT NULL
+        REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
+    stage text NOT NULL,
+    status text NOT NULL,
+    started_at timestamptz,
+    ended_at timestamptz,
+    error text,
+    PRIMARY KEY (revision_key, stage),
+    CONSTRAINT stage_state_stage CHECK (
+        stage IN ('parse', 'tree', 'graph', 'vdb', 'persist')
+    ),
+    CONSTRAINT stage_state_status CHECK (
+        status IN ('pending', 'running', 'succeeded', 'failed', 'stale')
+    )
+);
+
 CREATE TABLE docarag.revision_document (
     revision_key bigint NOT NULL PRIMARY KEY
         REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
