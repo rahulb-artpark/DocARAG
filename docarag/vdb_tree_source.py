@@ -128,6 +128,20 @@ class StoreTreeSource:
                 return node
         return None
 
+    def get_path_from_root(self, node_id: int) -> list:
+        node = self.get_node_by_index_id(node_id)
+        path: list = []
+        while node is not None:
+            path.append(node)
+            node = node.parent
+        return list(reversed(path))
+
+    def get_sibling_nodes(self, node_id: int) -> list:
+        node = self.get_node_by_index_id(node_id)
+        if node is None or node.parent is None:
+            return []
+        return [child for child in node.parent.children if child is not node]
+
     @classmethod
     def open(cls, run_dir: str) -> "StoreTreeSource":
         store = DocumentStore.open(run_dir)

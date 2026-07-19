@@ -103,11 +103,16 @@ def _construct_GBC_index(
     # This dictionary will hold all stats for the CURRENT run
     current_run_stats = {}
 
-    # --- Measure Tree Building ---
+    # --- Tree: built by the tree stage, read from the store by every other ---
     tree_start_time = time.time()
-    tree_index = build_tree_from_pdf(cfg, parsing_provider=parsing_provider)
+    if tree_only:
+        tree_index = build_tree_from_pdf(cfg, parsing_provider=parsing_provider)
+    else:
+        from docarag.vdb_tree_source import StoreTreeSource
+
+        tree_index = StoreTreeSource.open(cfg.save_path)
     tree_duration = time.time() - tree_start_time
-    log.info(f"Document tree constructed in {tree_duration:.2f} seconds.")
+    log.info(f"Document tree ready in {tree_duration:.2f} seconds.")
     current_run_stats["build_tree_time"] = round(tree_duration, 2)
 
     if tree_only:

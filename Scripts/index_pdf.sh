@@ -1249,6 +1249,18 @@ PY
       return "$status"
     fi
     update_index_state "$state_file" "$revision_id" "$$" stage_succeeded "$stage" 0
+    # A stage's output belongs to the store the moment the stage ends; the
+    # vector stage reads the tree from PostgreSQL, not from a file.
+    if [[ "$stage" == "tree" || "$stage" == "graph" ]]; then
+      if ! "${python_runner[@]}" -m docarag.evidence_persist         --run "$run_dir" --part "$stage"; then
+        status=$?
+        error="$stage evidence persistence failed"
+        update_index_state "$state_file" "$revision_id" "$$" stage_failed "$stage" "$status" "$error"
+        archive_attempt_state "$state_file" "$DRIVER_ATTEMPT_DIR" || true
+        DRIVER_FINALIZED=1
+        return "$status"
+      fi
+    fi
     echo "[driver] $(date) $stage done (exit 0)"
   done
 

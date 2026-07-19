@@ -159,7 +159,9 @@ class ConstructIndexStageTests(unittest.TestCase):
         stage_calls = []
 
         with (
-            patch.object(construct_index, "build_tree_from_pdf", return_value=tree),
+            patch(
+                "docarag.vdb_tree_source.StoreTreeSource.open", return_value=tree
+            ),
             patch.object(
                 construct_index, "build_knowledge_graph", return_value=graph
             ),
