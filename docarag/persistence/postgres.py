@@ -1292,6 +1292,15 @@ class PostgresLedger:
                     (revision_key,),
                 )
 
+            if evidence.canonical_document is not None:
+                connection.execute(
+                    "INSERT INTO docarag.revision_document "
+                    "(revision_key, canonical_document) VALUES (%s, %s::jsonb)",
+                    (
+                        revision_key,
+                        json.dumps(evidence.canonical_document, ensure_ascii=False),
+                    ),
+                )
             asset_keys = self._intern_assets(connection, evidence.assets)
             block_keys = self._write_blocks(
                 connection, revision_key, evidence.blocks, asset_keys
@@ -1364,15 +1373,23 @@ class PostgresLedger:
         for block in blocks:
             row = _mapping(
                 connection.execute(
-                    "INSERT INTO docarag.block (revision_key, block_uid, block_revision_uid, "
+                    "INSERT INTO docarag.block (revision_key, block_uid, canonical_blob_key, block_revision_uid, "
                     "page_uid, page_no, block_no, block_kind, subtype, reading_order, quality, "
                     "reconciliation, content_sha256, geometry, "
                     "source_observation_ids, attrs) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, "
                     "%s::jsonb, %s::jsonb) RETURNING block_key",
                     (
                         revision_key,
                         block.uid,
+                        self._intern_text(
+                            connection,
+                            json.dumps(
+                                block.canonical, ensure_ascii=False, sort_keys=True
+                            ),
+                        )
+                        if block.canonical is not None
+                        else None,
                         block.revision_uid,
                         block.page_uid,
                         block.page_no,

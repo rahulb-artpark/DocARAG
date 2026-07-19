@@ -184,7 +184,7 @@ class GBCRAG(BaseRAG):
         evidence_hydrator = None
         tree_index = self.gbc_index.TreeIndex
         retrieval_binding = self._hybrid_retrieval_binding(tree_index, tree_vdb)
-        if tree_index is not None and tree_index.meta_info.canonical_artifact_path:
+        if tree_index is not None:
             tree_meta = tree_index.meta_info
             for field_name in (
                 "document_version_id",
@@ -197,8 +197,8 @@ class GBCRAG(BaseRAG):
                         "canonical BookRAG tree is missing source identity: "
                         f"{field_name}"
                     )
-            evidence_hydrator = CanonicalEvidenceHydrator.from_artifact(
-                tree_meta.canonical_artifact_path,
+            evidence_hydrator = CanonicalEvidenceHydrator(
+                self.gbc_index.store.evidence_catalog(),
                 node_resolver=lambda node_ids, tree=tree_index: tree.get_nodes_data(
                     list(node_ids)
                 ),

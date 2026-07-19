@@ -103,6 +103,49 @@ class DocumentStore:
             run_dir=Path(run_dir).expanduser().resolve(),
         )
 
+    def evidence_catalog(self):
+        """Build the canonical evidence catalog from the store's own rows."""
+
+        from pathlib import PurePosixPath
+
+        from docarag.evidence_hydration import (
+            CanonicalEvidenceCatalog,
+            EvidenceHydrationError,
+        )
+        from docarag.domain.evidence import CanonicalBlock, DocumentRef
+
+        connection = self._borrow()
+        header = connection.execute(
+            "SELECT canonical_document FROM docarag.revision_document "
+            "WHERE revision_key = %s",
+            (self.revision_key,),
+        ).fetchone()
+        document_payload = (header or {}).get("canonical_document")
+        if not isinstance(document_payload, dict):
+            raise EvidenceHydrationError(
+                "this revision has no canonical document header; re-run "
+                "evidence persistence"
+            )
+        rows = connection.execute(
+            "SELECT blob.body FROM docarag.block blk "
+            "JOIN docarag.text_blob blob ON blob.blob_key = blk.canonical_blob_key "
+            "WHERE blk.revision_key = %s ORDER BY blk.block_no",
+            (self.revision_key,),
+        ).fetchall()
+        blocks = tuple(
+            CanonicalBlock.from_dict(json.loads(row["body"])) for row in rows
+        )
+        if not blocks:
+            raise EvidenceHydrationError(
+                "this revision has no canonical blocks in the store; re-run "
+                "evidence persistence"
+            )
+        return CanonicalEvidenceCatalog(
+            artifact_path=PurePosixPath(f"postgres://revision/{self.revision_id}"),
+            document=DocumentRef.from_dict(document_payload),
+            blocks=blocks,
+        )
+
     def _borrow(self) -> Any:
         if self._closed:
             raise DocumentStoreError("document store is closed")

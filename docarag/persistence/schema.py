@@ -411,11 +411,18 @@ CREATE TABLE docarag.asset (
 -- Every evidence table leads with revision_key, so one document's rows stay
 -- together, are removed together, and never scan another document's heap.
 
+CREATE TABLE docarag.revision_document (
+    revision_key bigint NOT NULL PRIMARY KEY
+        REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
+    canonical_document jsonb NOT NULL
+);
+
 CREATE TABLE docarag.block (
     revision_key bigint NOT NULL
         REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
     block_key bigint GENERATED ALWAYS AS IDENTITY,
     block_uid text NOT NULL,
+    canonical_blob_key bigint REFERENCES docarag.text_blob(blob_key),
     block_revision_uid text,
     page_uid text,
     page_no integer,
@@ -770,6 +777,7 @@ EVIDENCE_TABLES = (
     "block_representation",
     "tree_node",
     "block",
+    "revision_document",
 )
 
 

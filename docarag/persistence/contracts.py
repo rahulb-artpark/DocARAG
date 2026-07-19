@@ -593,6 +593,7 @@ class BlockRecord:
     kind: str
     block_no: int
     revision_uid: str | None = None
+    canonical: Mapping[str, object] | None = None
     page_uid: str | None = None
     page_no: int | None = None
     subtype: str | None = None
@@ -730,6 +731,7 @@ class DocumentEvidence:
     """Everything one revision produced, ready to be written in one pass."""
 
     revision_id: str
+    canonical_document: Mapping[str, object] | None = None
     assets: tuple[AssetRecord, ...] = ()
     blocks: tuple[BlockRecord, ...] = ()
     tree_nodes: tuple[TreeNodeRecord, ...] = ()

@@ -60,12 +60,15 @@ def build_document_evidence(
     run = Path(run_dir).expanduser().resolve()
     cas_root = Path(asset_cas_root).expanduser().resolve() if asset_cas_root else None
 
-    blocks, assets = _project_blocks(_read(run / CANONICAL_BLOCKS), cas_root)
+    artifact = _read(run / CANONICAL_BLOCKS)
+    blocks, assets = _project_blocks(artifact, cas_root)
     nodes = _project_tree(_read(run / TREE))
     entities, mentions, statements = _project_graph(_read(run / GRAPH), nodes)
 
+    document = artifact.get("document") if isinstance(artifact, dict) else None
     return DocumentEvidence(
         revision_id=revision_id,
+        canonical_document=document if isinstance(document, dict) else None,
         assets=assets,
         blocks=blocks,
         tree_nodes=nodes,
@@ -107,6 +110,7 @@ def _project_blocks(
                 kind=_text(raw.get("block_type")) or "unknown",
                 block_no=position,
                 revision_uid=_text(raw.get("revision_id")) or None,
+                canonical=raw,
                 page_uid=_text(raw.get("page_id")) or None,
                 page_no=_integer(raw.get("page_index")),
                 subtype=_text(raw.get("semantic_subtype")) or None,
