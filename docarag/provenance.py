@@ -293,7 +293,10 @@ def publish_artifact_manifest(
         raise ValueError("index state and publication revision IDs differ")
     if state_payload.get("attempt_id") != attempt_id:
         raise ValueError("index state and publication attempt IDs differ")
-    if state_payload.get("overall_status") != "running":
+    if state_payload.get("overall_status") not in {"running", "succeeded"}:
+        # A running attempt publishes as it finishes; a sealed run republishes
+        # when one of its stages is legitimately re-run.  A failed run has no
+        # coherent artifact set to describe.
         raise ValueError("artifacts may only be published by the active attempt")
     if state_payload.get("current_stage") not in {None, ""}:
         raise ValueError("cannot publish while an index stage is still active")

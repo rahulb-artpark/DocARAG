@@ -94,9 +94,16 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             side_effect=self._remote_state,
         )
         self.state_patch.start()
+        # The store seal is the binding truth; unit fixtures share one seal so
+        # publication and readiness agree without a live PostgreSQL.
+        self.seal_patch = patch.object(
+            vdb_index, "_store_revision_seal", return_value="a" * 64
+        )
+        self.seal_patch.start()
 
     def tearDown(self):
         self.state_patch.stop()
+        self.seal_patch.stop()
 
     def _remote_state(self, config, scope):
         key = (config.collection_name, tuple(sorted(scope.items())))
@@ -165,7 +172,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                 ) as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
-                    "missing, incomplete",
+                    "sealed store revision",
                 ),
             ):
                 resource_loader.prepare_rag_dependencies(config)
@@ -259,7 +266,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                 patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
-                    "source SHA-256",
+                    "sealed store revision",
                 ),
             ):
                 resource_loader.prepare_rag_dependencies(config)
@@ -274,7 +281,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                 patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
-                    "another tree/source/embedding configuration",
+                    "sealed store revision",
                 ),
             ):
                 resource_loader.prepare_rag_dependencies(changed_collection)
@@ -286,7 +293,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                 patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
-                    "another tree/source/embedding configuration",
+                    "sealed store revision",
                 ),
             ):
                 resource_loader.prepare_rag_dependencies(changed_model)
@@ -351,19 +358,24 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             self._assert_exclusive_lock_available(str(Path(directory) / "vectors"))
 
-    def test_changed_saved_tree_invalidates_query_attestation(self):
+    def test_changed_store_rows_invalidate_query_attestation(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = _tree(directory)
             config = _config(directory)
             self._publish_index(tree, config)
-            tree.nodes[1].meta_info.content = "tree changed after vector build"
-            tree.save_to_file()
+            # The store's rows changed after the vectors were built: the live
+            # seal no longer matches the one the attestation recorded.
+            self.seal_patch.stop()
+            self.seal_patch = patch.object(
+                vdb_index, "_store_revision_seal", return_value="b" * 64
+            )
+            self.seal_patch.start()
 
             with (
                 patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
-                    "another tree/source/embedding configuration",
+                    "sealed store revision",
                 ),
             ):
                 resource_loader.prepare_rag_dependencies(config)

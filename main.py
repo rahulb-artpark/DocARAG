@@ -51,8 +51,22 @@ def redact_config(value):
     return value
 
 
-def write_config_snapshot(path: Path, config: SystemConfig) -> None:
+def write_config_snapshot(
+    path: Path, config: SystemConfig, source_path: Path | None = None
+) -> None:
     """Atomically write, or safely reuse, an owner-only config snapshot."""
+
+    if source_path is not None and path.exists():
+        try:
+            same = path.resolve() == source_path.resolve()
+        except OSError:
+            same = False
+        if same:
+            # Re-running a stage from the frozen snapshot itself: the file is
+            # the truth being executed, so re-dumping it -- which would fold
+            # in any config fields added since -- must not touch it.
+            path.chmod(0o400)
+            return
 
     payload = yaml.safe_dump(config.model_dump(), allow_unicode=True)
     if path.exists():
@@ -474,7 +488,9 @@ def process_document(
         data_df = group.reset_index(drop=True)
         if args.command == "index":
             config_snapshot_path = output_full_path / "run_config.yaml"
-            write_config_snapshot(config_snapshot_path, current_config)
+            write_config_snapshot(
+                config_snapshot_path, current_config, source_path=Path(args.config)
+            )
             log.info(f"  - Saved index config snapshot to: {config_snapshot_path}")
             with routed_parsing_provider(args.stage) as parsing_provider:
                 build_index(

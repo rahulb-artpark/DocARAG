@@ -152,13 +152,17 @@ def _acquire_ready_bookrag_tree_vdb(
     vdb_cfg,
     attestation_path: str,
 ) -> Any:
-    """Return a shared lease only after source-bound TreeVDB attestation."""
+    """Return a shared lease only after store-bound TreeVDB attestation.
 
-    from Core.Index.Tree import DocumentTree
+    The attestation binds the vectors to the sealed store rows, so readiness
+    is one identity comparison plus one seal read -- no serialized tree is
+    opened on the query path.
+    """
+
+    from types import SimpleNamespace
+
     from Core.pipelines.vdb_index import (
         VectorIndexBindingError,
-        bookrag_tree_artifact_sha256,
-        tree_vector_scope,
         tree_vector_index_attestation_is_ready,
     )
     from Core.utils.vector_index_manifest import VectorIndexAttestationReadLease
@@ -168,41 +172,23 @@ def _acquire_ready_bookrag_tree_vdb(
         raise VectorIndexBindingError(
             "BookRAG tree retrieval requires cfg.source.sha256 to validate TreeVDB"
         )
+    expected = _runtime_scope(cfg, vdb_cfg, index_kind="tree")
+    identity = SimpleNamespace(
+        meta_info=SimpleNamespace(
+            source_sha256=source.sha256,
+            document_version_id=expected["document_version_id"],
+        ),
+        nodes=(),
+        save_dir=cfg.save_path,
+    )
     lease = VectorIndexAttestationReadLease(attestation_path)
     try:
-        tree_path = DocumentTree.get_save_path(cfg.save_path)
-        digest_before = bookrag_tree_artifact_sha256(tree_path)
-        tree = DocumentTree.load_from_file(tree_path)
-        digest_after = bookrag_tree_artifact_sha256(tree_path)
-        if digest_before != digest_after:
-            raise VectorIndexBindingError(
-                "BookRAG tree artifact changed while it was being loaded"
-            )
-        if tree.meta_info.source_sha256 != source.sha256:
-            raise VectorIndexBindingError(
-                "TreeVDB tree source SHA-256 differs from cfg.source"
-            )
-        if tree.meta_info.source_uri != source.original_uri:
-            raise VectorIndexBindingError(
-                "TreeVDB tree source URI differs from cfg.source"
-            )
-        if tree_vector_scope(tree, vdb_cfg) != _runtime_scope(
-            cfg, vdb_cfg, index_kind="tree"
-        ):
-            raise VectorIndexBindingError(
-                "TreeVDB scope differs from the selected document revision"
-            )
-
         runtime_vdb_cfg = copy(vdb_cfg)
         runtime_vdb_cfg.manifest_dir_name = attestation_path
-        if not tree_vector_index_attestation_is_ready(
-            tree,
-            runtime_vdb_cfg,
-            tree_artifact_sha256=digest_after,
-        ):
+        if not tree_vector_index_attestation_is_ready(identity, runtime_vdb_cfg):
             raise VectorIndexBindingError(
-                "TreeVDB is missing, incomplete, or belongs to another "
-                "tree/source/embedding configuration; rebuild the vdb stage"
+                "TreeVDB attestation does not match the sealed store revision; "
+                "rebuild the vdb stage"
             )
         return lease
     except BaseException:

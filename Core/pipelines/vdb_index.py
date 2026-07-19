@@ -79,7 +79,30 @@ _VECTOR_ATTESTATION_IDENTITY_FIELDS = (
     "qdrant_endpoint_sha256",
     "vector_config_sha256",
     "embedding_identity_sha256",
+    "store_seal_sha256",
 )
+
+
+def _store_revision_seal(revision_id: str) -> str | None:
+    """Read the sealed tree digest for a revision from the store."""
+
+    import psycopg
+
+    url = os.environ.get("DOCARAG_DATABASE_URL")
+    if not url:
+        return None
+    try:
+        with psycopg.connect(url, connect_timeout=5) as connection:
+            row = connection.execute(
+                "SELECT seal.tree_sha256 FROM docarag.revision_seal seal "
+                "JOIN docarag.index_revisions rev "
+                "  ON rev.revision_key = seal.revision_key "
+                "WHERE rev.revision_id = %s",
+                (revision_id,),
+            ).fetchone()
+    except psycopg.Error:
+        return None
+    return str(row[0]) if row else None
 
 
 class VectorIndexBindingError(RuntimeError):
@@ -530,6 +553,10 @@ def expected_tree_vector_index_attestation(
         "qdrant_endpoint_sha256": vector_config["qdrant_endpoint_sha256"],
         "vector_config_sha256": _sha256_json(vector_config),
         "embedding_identity_sha256": _sha256_json(embedding_identity),
+        "store_seal_sha256": _store_revision_seal(
+            scope_filter["index_revision_id"]
+        )
+        or "0" * 64,
     }
     return {
         **identity,
@@ -542,7 +569,7 @@ def tree_vector_index_attestation_is_ready(
     tree: DocumentTree,
     vdb_cfg: VDBConfig,
     *,
-    tree_artifact_sha256: str,
+    tree_artifact_sha256: str | None = None,
 ) -> bool:
     """Validate a build attestation without rehashing every indexed asset.
 
@@ -552,7 +579,9 @@ def tree_vector_index_attestation_is_ready(
     attestation self-hash, and live scoped Qdrant point count are checked here.
     """
 
-    if not _is_lower_sha256(tree_artifact_sha256):
+    if tree_artifact_sha256 is not None and not _is_lower_sha256(
+        tree_artifact_sha256
+    ):
         raise VectorIndexBindingError("tree artifact SHA-256 is invalid")
     source_sha256 = tree.meta_info.source_sha256
     document_version_id = tree.meta_info.document_version_id
@@ -608,8 +637,6 @@ def tree_vector_index_attestation_is_ready(
         "source_sha256": source_sha256,
         "document_version_id": document_version_id,
         "index_revision_id": scope_filter["index_revision_id"],
-        "tree_artifact_sha256": tree_artifact_sha256,
-        "node_count": len(tree.nodes),
         "collection_name": vector_config["collection_name"],
         "scope_filter": scope_filter,
         "qdrant_endpoint_sha256": vector_config["qdrant_endpoint_sha256"],
@@ -617,6 +644,17 @@ def tree_vector_index_attestation_is_ready(
         "embedding_identity_sha256": _sha256_json(embedding_identity),
     }
     if any(attestation.get(key) != value for key, value in expected_scalars.items()):
+        return False
+    # The binding truth: the vectors attest to the sealed store rows.  When
+    # the caller still holds the serialized tree, its artifact hash and node
+    # count are checked as well; a store-backed caller has neither.
+    if tree_artifact_sha256 is not None:
+        if attestation.get("tree_artifact_sha256") != tree_artifact_sha256:
+            return False
+        if attestation.get("node_count") != len(tree.nodes):
+            return False
+    live_seal = _store_revision_seal(scope_filter["index_revision_id"])
+    if live_seal is None or attestation.get("store_seal_sha256") != live_seal:
         return False
     node_count = attestation.get("node_count")
     if isinstance(node_count, bool) or not isinstance(node_count, int):

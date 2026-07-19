@@ -82,8 +82,11 @@ def run_stage(run: Path, stage: str) -> int:
     else:
         config = run / "run_config.yaml"
         if not config.is_file():
-            raise RuntimeError(f"run has no configuration snapshot: {config}")
-        dataset = os.environ.get("DOCARAG_DATASET_CONFIG", "config/dataset.yaml")
+            raise RuntimeError(f"run has no frozen configuration: {config}")
+        datasets = sorted((run / "inputs").glob("dataset-*.yaml"))
+        if not datasets:
+            raise RuntimeError(f"run has no dataset snapshot under {run}/inputs")
+        dataset = str(datasets[0])
         command = [
             sys.executable, "main.py",
             "-c", str(config), "-d", dataset,
@@ -91,10 +94,25 @@ def run_stage(run: Path, stage: str) -> int:
             "index", "--stage", stage,
         ]
 
+    manifest = json.loads((run / "run-manifest.json").read_text(encoding="utf-8"))
+    env = dict(os.environ)
+    env.update(
+        {
+            "DOCARAG_TENANT_ID": str(manifest["tenant_id"]),
+            "DOCARAG_CORPUS_ID": str(manifest["corpus_id"]),
+            "DOCARAG_DOCUMENT_ID": str(manifest["document_id"]),
+            "DOCARAG_DOCUMENT_VERSION_ID": str(manifest["document_version_id"]),
+            "DOCARAG_INDEX_REVISION_ID": str(manifest["revision_id"]),
+            "DOCARAG_SYSTEM_CONFIG_SHA256": str(
+                (manifest.get("system_config") or {}).get("sha256") or ""
+            ),
+            "DOCARAG_RUNS_DIR": str(run.parent.parent),
+        }
+    )
     with _connect() as connection:
         key = _revision_key(connection, run)
         _record(connection, key, stage, "running")
-    completed = subprocess.run(command, cwd=str(repo))
+    completed = subprocess.run(command, cwd=str(repo), env=env)
     status = "succeeded" if completed.returncode == 0 else "failed"
     error = None if completed.returncode == 0 else f"exit {completed.returncode}"
     with _connect() as connection:
@@ -103,6 +121,15 @@ def run_stage(run: Path, stage: str) -> int:
             # New tree rows: graph bindings and vectors no longer describe them.
             _record(connection, key, "graph", "stale")
             _record(connection, key, "vdb", "stale")
+    if status == "succeeded" and stage in ("tree", "graph", "vdb"):
+        # A re-run stage rewrote published artifacts; the manifest and the
+        # sealed run state must describe what is now on disk.
+        republish = _republish(run, repo, env)
+        if republish != 0:
+            with _connect() as connection:
+                _record(connection, key, stage, "failed", "artifact republication failed")
+            print(f"[stage] {stage}: failed (republication)")
+            return republish
     if status == "succeeded" and stage in ("tree", "graph"):
         # A stage's output belongs to the store the moment the stage ends.
         part = subprocess.run(
@@ -122,6 +149,33 @@ def run_stage(run: Path, stage: str) -> int:
             status = "failed"
     print(f"[stage] {stage}: {status}")
     return completed.returncode
+
+
+def _republish(run: Path, repo: Path, env: dict) -> int:
+    """Refresh the artifact manifest and reseal run state after a stage re-run."""
+
+    manifest = json.loads((run / "artifact-manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((run / "index-state.json").read_text(encoding="utf-8"))
+    roles = manifest.get("roles") or {}
+    retrieval = run / str(roles["retrieval_attestation"])
+    command = [
+        sys.executable, "-m", "docarag.provenance", "publish",
+        "--run", str(run),
+        "--revision-id", str(manifest["revision_id"]),
+        "--attempt-id", str(state.get("attempt_id") or manifest["attempt_id"]),
+        "--retrieval-attestation", str(retrieval),
+        "--graph-artifact", str(run / str(roles["graph"])),
+        "--entity-attestation", str(run / str(roles["entity_attestation"])),
+    ]
+    published = subprocess.run(command, cwd=str(repo), env=env)
+    if published.returncode != 0:
+        return published.returncode
+    finalized = subprocess.run(
+        ["bash", str(repo / "Scripts" / "index_pdf.sh"), "--finalize-run", str(run)],
+        cwd=str(repo),
+        env=env,
+    )
+    return finalized.returncode
 
 
 def main(argv: list[str] | None = None) -> int:
