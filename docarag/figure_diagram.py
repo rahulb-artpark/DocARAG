@@ -102,19 +102,29 @@ def diagram_substructure(
         raise ValueError(f"unsupported diagram structure kind: {graph.kind!r}")
     selector = SemanticSourceSelector(asset_id=asset.asset_id)
     element_kind = _ELEMENT_KIND[graph.kind]
+    # A drawing can spend two boxes on one thing -- an outer boundary and an
+    # inner label box with the same text.  Same-label nodes fold into one
+    # element, and every key that named one of them resolves to it.
     elements: dict[str, SemanticElement] = {}
+    by_label: dict[str, SemanticElement] = {}
     for node in graph.nodes[:MAX_DIAGRAM_NODES]:
         key = _clean(node.key)
         label = _clean(node.label)
         if not key or key in elements or not label:
             continue
-        elements[key] = SemanticElement(
+        existing = by_label.get(label)
+        if existing is not None:
+            elements[key] = existing
+            continue
+        element = SemanticElement(
             local_key=key,
             kind=element_kind,
             source_selectors=(selector,),
             content=label,
             role=_clean(node.role) or None,
         )
+        elements[key] = element
+        by_label[label] = element
     if not elements:
         return None
 
@@ -188,7 +198,7 @@ def diagram_substructure(
 
     unbound = SemanticSubstructure(
         kind=graph.kind,
-        elements=tuple(elements.values()),
+        elements=tuple(by_label.values()),
         relations=tuple(relations),
         producer_kind=SemanticProducerKind.MODEL_DERIVED,
         source_field_paths=(asset.uri,),

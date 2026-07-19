@@ -1174,7 +1174,12 @@ function drawStructures(host, structures) {
       const a = ids.get(e.source), b = ids.get(e.target);
       if (a === undefined || b === undefined) return;
       const back = seen.get(`${b}|${a}`);
-      if (back !== undefined) { edges[back].arrows = "to, from"; return; }
+      if (back !== undefined) {
+        edges[back].arrows = { to: { enabled: true }, from: { enabled: true } };
+        edges[back].smooth = false;
+        edges[back].width = 2;
+        return;
+      }
       seen.set(`${a}|${b}`, edges.length);
       edges.push({ from: a, to: b, arrows: "to", label: e.label || undefined,
         color: { color: "#64748b", highlight: "#0f766e" }, width: 1.5,

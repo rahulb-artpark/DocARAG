@@ -52,6 +52,33 @@ class DiagramSubstructureTest(unittest.TestCase):
             graph, asset=self.asset, source_observation_ids=OBSERVATIONS
         )
 
+    def test_same_label_boxes_fold_into_one_element(self) -> None:
+        # A boundary box and its inner label box are one thing drawn twice.
+        graph = DiagramGraph(
+            kind=SemanticStructureKind.FLOWCHART,
+            nodes=(
+                DiagramNode(key="n1", label="CPU", role="process"),
+                DiagramNode(key="n2", label="CPU", role="process", inside="n1"),
+                DiagramNode(key="n3", label="Control Unit", role="process", inside="n2"),
+                DiagramNode(key="n4", label="Input", role="input"),
+            ),
+            edges=(DiagramEdge(source="n4", target="n1"),),
+        )
+
+        structure = self.build(graph)
+
+        contents = [e.content for e in structure.elements]
+        self.assertEqual(1, contents.count("CPU"))
+        contains = [
+            r for r in structure.relations
+            if r.kind is SemanticRelationKind.DIAGRAM_CONTAINS
+        ]
+        by_id = {e.element_id: e.content for e in structure.elements}
+        self.assertEqual(
+            [("CPU", "Control Unit")],
+            [(by_id[r.source_element_id], by_id[r.target_element_id]) for r in contains],
+        )
+
     def test_a_node_drawn_inside_another_becomes_a_containment_relation(self) -> None:
         graph = DiagramGraph(
             kind=SemanticStructureKind.FLOWCHART,
