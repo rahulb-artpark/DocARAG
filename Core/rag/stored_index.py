@@ -202,14 +202,20 @@ class StoredTreeMeta:
             except (OSError, ValueError):
                 manifest = {}
         source = manifest.get("source") or {}
-        canonical = run_dir / "canonical_blocks.json" if run_dir else None
+        # The canonical identity was recorded at admission; the ledger is the
+        # source of truth, and no artifact file is opened at query time.
         canonical_sha = ""
-        canonical_size = 0
-        if canonical is not None and canonical.is_file():
-            payload = canonical.read_bytes()
-            canonical_sha = hashlib.sha256(payload).hexdigest()
-            canonical_size = len(payload)
+        try:
+            row = store._borrow().execute(
+                "SELECT canonical_artifact_sha256 FROM docarag.index_revisions "
+                "WHERE revision_key = %s",
+                (store.revision_key,),
+            ).fetchone()
+            canonical_sha = str((row or {}).get("canonical_artifact_sha256") or "")
+        except Exception:
+            canonical_sha = ""
         source_path = str(source.get("path") or "")
+
         scope = getattr(store, "scope", None)
         return cls(
             tenant_id=getattr(scope, "tenant_id", "") or "",
@@ -222,9 +228,9 @@ class StoredTreeMeta:
             file_name=Path(source_path or "document.pdf").name,
             file_path=source_path,
             snapshot_path=str(manifest.get("source_snapshot") or ""),
-            canonical_artifact_path=str(canonical) if canonical_sha else "",
+            canonical_artifact_path="",
             canonical_artifact_sha256=canonical_sha,
-            canonical_artifact_size_bytes=canonical_size,
+            canonical_artifact_size_bytes=0,
         )
 
 
