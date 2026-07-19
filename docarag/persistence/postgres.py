@@ -1835,23 +1835,54 @@ FROM docarag.tree_node node
 LEFT JOIN docarag.block blk
     ON blk.revision_key = node.revision_key AND blk.block_key = node.block_key
 CROSS JOIN LATERAL (
-    SELECT coalesce(
-        (
-            SELECT txt.body
-            FROM docarag.block_representation rep
-            JOIN docarag.text_blob txt ON txt.blob_key = rep.blob_key
-            WHERE rep.revision_key = node.revision_key
-              AND rep.block_key = node.block_key
-            ORDER BY array_position(
-                ARRAY['text', 'html', 'ocr_text', 'visual_description',
-                      'caption', 'vlm_latex', 'latex', 'markdown'],
-                rep.rep_kind
-            ) NULLS LAST, rep.rep_no
-            LIMIT 1
-        ),
+    -- What a node offers for retrieval depends on what it is.  A figure is
+    -- its description plus the exact strings read from it; a table is its
+    -- caption and grid; an equation is its best transcription; prose is its
+    -- text.  A global first-match order silenced every channel after the
+    -- first, which for figures meant the description never reached search.
+    SELECT left(coalesce(
+        CASE
+            WHEN node.node_kind = 'image' THEN nullif((
+                SELECT string_agg(txt.body, E'\n' ORDER BY array_position(
+                    ARRAY['visual_description', 'caption', 'footnote',
+                          'ocr_text'],
+                    rep.rep_kind
+                ), rep.rep_no)
+                FROM docarag.block_representation rep
+                JOIN docarag.text_blob txt ON txt.blob_key = rep.blob_key
+                WHERE rep.revision_key = node.revision_key
+                  AND rep.block_key = node.block_key
+                  AND rep.rep_kind = ANY(ARRAY['visual_description',
+                                               'caption', 'footnote',
+                                               'ocr_text'])
+            ), '')
+            WHEN node.node_kind = 'table' THEN nullif((
+                SELECT string_agg(txt.body, E'\n' ORDER BY array_position(
+                    ARRAY['caption', 'footnote', 'html'], rep.rep_kind
+                ), rep.rep_no)
+                FROM docarag.block_representation rep
+                JOIN docarag.text_blob txt ON txt.blob_key = rep.blob_key
+                WHERE rep.revision_key = node.revision_key
+                  AND rep.block_key = node.block_key
+                  AND rep.rep_kind = ANY(ARRAY['caption', 'footnote', 'html'])
+            ), '')
+            ELSE (
+                SELECT txt.body
+                FROM docarag.block_representation rep
+                JOIN docarag.text_blob txt ON txt.blob_key = rep.blob_key
+                WHERE rep.revision_key = node.revision_key
+                  AND rep.block_key = node.block_key
+                ORDER BY array_position(
+                    ARRAY['text', 'vlm_latex', 'latex', 'html', 'ocr_text',
+                          'visual_description', 'caption', 'markdown'],
+                    rep.rep_kind
+                ) NULLS LAST, rep.rep_no
+                LIMIT 1
+            )
+        END,
         node.label,
         ''
-    ) AS body
+    ), 16000) AS body
 ) AS chosen
 WHERE node.revision_key = %s AND chosen.body <> ''
 ON CONFLICT (revision_key, node_key) DO UPDATE

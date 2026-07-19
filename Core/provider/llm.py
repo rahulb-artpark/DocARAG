@@ -327,6 +327,30 @@ class OpenAIController(BaseLLMController):
         _close_controller_client(self)
 
 
+
+def _grammar_safe_schema(schema: dict) -> dict:
+    """Drop schema constraints Ollama's grammar compiler cannot build.
+
+    A string maxLength expands into a grammar the runner rejects with
+    "failed to load model vocabulary required for format".  The full schema
+    still validates the parsed reply, so the constraint is enforced on the
+    way out, just not during decoding.
+    """
+
+    def scrub(value):
+        if isinstance(value, dict):
+            return {
+                key: scrub(item)
+                for key, item in value.items()
+                if key != "maxLength"
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(schema)
+
+
 class OllamaController(BaseLLMController):
     def __init__(
         self,
@@ -471,7 +495,7 @@ class OllamaController(BaseLLMController):
         response = self.client.chat(
             model=self.model,
             messages=messages,
-            format=schema.model_json_schema(),  # 关键：传递schema
+            format=_grammar_safe_schema(schema.model_json_schema()),
             options=self._options(),
             keep_alive=self.keep_alive,
             **self._think_kwargs(think_mode),
