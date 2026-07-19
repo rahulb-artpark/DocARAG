@@ -79,11 +79,66 @@ def main(argv: list[str] | None = None) -> int:
         print(f"evidence persistence error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
+    _mirror_stage_state(ledger, scope, revision_id, run)
     print(
         f"Persisted revision {revision_id}: "
         + ", ".join(f"{count} {name}" for name, count in sorted(written.items()) if count)
     )
     return 0
+
+
+def _mirror_stage_state(ledger, scope, revision_id: str, run: Path) -> None:
+    """Mirror the driver's stage outcomes into the store.
+
+    A fresh run is driven from the run directory's state file; persistence is
+    the first store write it performs, so this is where the pipeline's history
+    becomes queryable alongside its evidence.  Failures here must not undo a
+    completed persist.
+    """
+
+    try:
+        state = json.loads((run / "index-state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    stages = state.get("stages")
+    if not isinstance(stages, dict):
+        return
+    try:
+        revision_key = ledger.revision_key(scope, revision_id)
+        with ledger._connection() as connection:
+            for name, entry in stages.items():
+                if name not in ("tree", "graph", "vdb"):
+                    continue
+                status = (entry or {}).get("status")
+                if status not in ("succeeded", "failed", "running"):
+                    continue
+                connection.execute(
+                    "INSERT INTO docarag.stage_state "
+                    "(revision_key, stage, status, started_at, ended_at, error) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (revision_key, stage) DO UPDATE SET "
+                    " status = EXCLUDED.status, "
+                    " started_at = EXCLUDED.started_at, "
+                    " ended_at = EXCLUDED.ended_at, "
+                    " error = EXCLUDED.error",
+                    (
+                        revision_key,
+                        name,
+                        status,
+                        (entry or {}).get("started_at"),
+                        (entry or {}).get("ended_at"),
+                        (entry or {}).get("error"),
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO docarag.stage_state (revision_key, stage, status) "
+                "VALUES (%s, 'persist', 'succeeded') "
+                "ON CONFLICT (revision_key, stage) DO UPDATE SET "
+                " status = 'succeeded', ended_at = clock_timestamp(), error = NULL",
+                (revision_key,),
+            )
+    except Exception:  # noqa: BLE001 - history mirroring is best effort
+        return
 
 
 def _admit_revision(ledger, scope, manifest, run, spec_type) -> None:
