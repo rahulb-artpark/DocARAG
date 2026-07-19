@@ -99,11 +99,27 @@ def run_stage(run: Path, stage: str) -> int:
     error = None if completed.returncode == 0 else f"exit {completed.returncode}"
     with _connect() as connection:
         _record(connection, key, stage, status, error)
-        if status == "succeeded" and stage in ("tree", "graph"):
-            # Whatever this stage rewrote is no longer what the store holds.
-            _record(connection, key, "persist", "stale")
         if status == "succeeded" and stage == "tree":
+            # New tree rows: graph bindings and vectors no longer describe them.
+            _record(connection, key, "graph", "stale")
             _record(connection, key, "vdb", "stale")
+    if status == "succeeded" and stage in ("tree", "graph"):
+        # A stage's output belongs to the store the moment the stage ends.
+        part = subprocess.run(
+            [
+                sys.executable, "-m", "docarag.evidence_persist",
+                "--run", str(run), "--part", stage,
+            ],
+            cwd=str(repo),
+        )
+        with _connect() as connection:
+            _record(
+                connection, key, "persist",
+                "succeeded" if part.returncode == 0 else "failed",
+                None if part.returncode == 0 else f"exit {part.returncode}",
+            )
+        if part.returncode != 0:
+            status = "failed"
     print(f"[stage] {stage}: {status}")
     return completed.returncode
 

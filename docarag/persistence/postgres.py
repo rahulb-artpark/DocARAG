@@ -48,7 +48,13 @@ from docarag.persistence.contracts import (
     MAX_LEDGER_URI_CHARACTERS,
     scope_for_document,
 )
-from docarag.persistence.schema import EVIDENCE_TABLES, SCHEMA_SHA256, SCHEMA_SQL
+from docarag.persistence.schema import (
+    EVIDENCE_TABLES,
+    GRAPH_EVIDENCE_TABLES,
+    SCHEMA_SHA256,
+    SCHEMA_SQL,
+    TREE_EVIDENCE_TABLES,
+)
 from docarag.settings import DEFAULT_DATABASE_URL, DEFAULT_DATABASE_URL_ENV
 
 
@@ -1275,7 +1281,10 @@ class PostgresLedger:
         return removed
 
     def persist_document_evidence(
-        self, scope: DocumentScope, evidence: DocumentEvidence
+        self,
+        scope: DocumentScope,
+        evidence: DocumentEvidence,
+        parts: frozenset[str] = frozenset({"tree", "graph"}),
     ) -> dict[str, int]:
         """Replace one revision's evidence, then seal it for retrieval.
 
@@ -1285,14 +1294,19 @@ class PostgresLedger:
         """
 
         revision_key = self.revision_key(scope, evidence.revision_id)
+        wipe = []
+        if "graph" in parts:
+            wipe += list(GRAPH_EVIDENCE_TABLES)
+        if "tree" in parts:
+            wipe += list(TREE_EVIDENCE_TABLES)
         with self._connection() as connection:
-            for table in EVIDENCE_TABLES:
+            for table in wipe:
                 connection.execute(
                     f"DELETE FROM docarag.{table} WHERE revision_key = %s",
                     (revision_key,),
                 )
 
-            if evidence.canonical_document is not None:
+            if "tree" in parts and evidence.canonical_document is not None:
                 connection.execute(
                     "INSERT INTO docarag.revision_document "
                     "(revision_key, canonical_document) VALUES (%s, %s::jsonb)",
@@ -1301,23 +1315,44 @@ class PostgresLedger:
                         json.dumps(evidence.canonical_document, ensure_ascii=False),
                     ),
                 )
-            asset_keys = self._intern_assets(connection, evidence.assets)
-            block_keys = self._write_blocks(
-                connection, revision_key, evidence.blocks, asset_keys
-            )
-            entity_keys = self._intern_entities(connection, scope, evidence.entities)
-            node_keys = self._write_tree(
-                connection, revision_key, evidence.tree_nodes, block_keys
-            )
-            self._write_mentions(
-                connection, revision_key, evidence.mentions, entity_keys, node_keys,
-                block_keys,
-            )
-            self._write_statements(
-                connection, revision_key, evidence.statements, entity_keys, node_keys,
-                block_keys,
-            )
-            self._seal_revision(connection, revision_key)
+            if "tree" in parts:
+                asset_keys = self._intern_assets(connection, evidence.assets)
+                block_keys = self._write_blocks(
+                    connection, revision_key, evidence.blocks, asset_keys
+                )
+                node_keys = self._write_tree(
+                    connection, revision_key, evidence.tree_nodes, block_keys
+                )
+                self._seal_revision(connection, revision_key)
+            else:
+                block_keys = {
+                    str(row["block_uid"]): int(row["block_key"])
+                    for row in connection.execute(
+                        "SELECT block_uid, block_key FROM docarag.block "
+                        "WHERE revision_key = %s",
+                        (revision_key,),
+                    )
+                }
+                node_keys = {
+                    int(row["node_no"]): int(row["node_key"])
+                    for row in connection.execute(
+                        "SELECT node_no, node_key FROM docarag.tree_node "
+                        "WHERE revision_key = %s",
+                        (revision_key,),
+                    )
+                }
+            if "graph" in parts:
+                entity_keys = self._intern_entities(
+                    connection, scope, evidence.entities
+                )
+                self._write_mentions(
+                    connection, revision_key, evidence.mentions, entity_keys,
+                    node_keys, block_keys,
+                )
+                self._write_statements(
+                    connection, revision_key, evidence.statements, entity_keys,
+                    node_keys, block_keys,
+                )
         return evidence.counts()
 
     # -- writers ------------------------------------------------------------

@@ -54,24 +54,40 @@ def build_document_evidence(
     revision_id: str,
     *,
     asset_cas_root: str | Path | None = None,
+    parts: frozenset[str] = frozenset({"tree", "graph"}),
 ) -> DocumentEvidence:
-    """Project one run directory into the evidence for one index revision."""
+    """Project one run's stage outputs into evidence, one part at a time.
+
+    Each stage persists only what it produced, so a part never loads the
+    other parts' artifacts: the memory a projection needs follows the stage,
+    not the document.
+    """
 
     run = Path(run_dir).expanduser().resolve()
     cas_root = Path(asset_cas_root).expanduser().resolve() if asset_cas_root else None
 
-    artifact = _read(run / CANONICAL_BLOCKS)
-    blocks, assets = _project_blocks(artifact, cas_root)
     nodes = _project_tree(_read(run / TREE))
-    entities, mentions, statements = _project_graph(_read(run / GRAPH), nodes)
+    blocks: tuple = ()
+    assets: tuple = ()
+    document = None
+    if "tree" in parts:
+        artifact = _read(run / CANONICAL_BLOCKS)
+        blocks, assets = _project_blocks(artifact, cas_root)
+        raw = artifact.get("document") if isinstance(artifact, dict) else None
+        document = raw if isinstance(raw, dict) else None
 
-    document = artifact.get("document") if isinstance(artifact, dict) else None
+    entities: tuple = ()
+    mentions: tuple = ()
+    statements: tuple = ()
+    if "graph" in parts:
+        entities, mentions, statements = _project_graph(_read(run / GRAPH), nodes)
+
     return DocumentEvidence(
         revision_id=revision_id,
-        canonical_document=document if isinstance(document, dict) else None,
+        canonical_document=document,
         assets=assets,
         blocks=blocks,
-        tree_nodes=nodes,
+        tree_nodes=nodes if "tree" in parts else (),
         entities=entities,
         mentions=mentions,
         statements=statements,

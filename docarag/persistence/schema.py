@@ -780,13 +780,16 @@ SCHEMA_SHA256 = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 # Children before parents, so a caller may remove a revision's evidence
 # explicitly rather than relying on cascade ordering.
-EVIDENCE_TABLES = (
-    "node_retrieval",
+GRAPH_EVIDENCE_TABLES = (
     "statement_evidence",
     "statement_property",
     "statement_role",
     "statement",
     "entity_mention",
+)
+
+TREE_EVIDENCE_TABLES = (
+    "node_retrieval",
     "block_element_edge",
     "block_element",
     "block_structure",
@@ -797,8 +800,18 @@ EVIDENCE_TABLES = (
     "revision_document",
 )
 
+# Full wipe order: graph rows reference tree rows, so graph goes first, with
+# node_retrieval ahead of both as before.
+EVIDENCE_TABLES = (
+    "node_retrieval",
+    *GRAPH_EVIDENCE_TABLES,
+    *TREE_EVIDENCE_TABLES[1:],
+)
+
 
 __all__ = [
+    "GRAPH_EVIDENCE_TABLES",
+    "TREE_EVIDENCE_TABLES",
     "EVIDENCE_SQL",
     "EVIDENCE_TABLES",
     "LEDGER_SQL",

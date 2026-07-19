@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--database-url")
     parser.add_argument("--asset-cas-root", type=Path)
+    parser.add_argument("--part", choices=("tree", "graph", "all"), default="all")
     args = parser.parse_args(argv)
 
     run = args.run.expanduser().resolve()
@@ -65,8 +66,15 @@ def main(argv: list[str] | None = None) -> int:
         # Evidence is keyed by the revision, so the revision has to exist in
         # the ledger before anything derived from it can be written.
         _admit_revision(ledger, scope, manifest, run, IndexRevisionSpec)
-        evidence = build_document_evidence(run, revision_id, asset_cas_root=cas_root)
-        written = ledger.persist_document_evidence(scope, evidence)
+        parts = (
+            frozenset({"tree", "graph"})
+            if args.part == "all"
+            else frozenset({args.part})
+        )
+        evidence = build_document_evidence(
+            run, revision_id, asset_cas_root=cas_root, parts=parts
+        )
+        written = ledger.persist_document_evidence(scope, evidence, parts=parts)
     except Exception as exc:  # noqa: BLE001 - CLI boundary reports a clean message
         print(f"evidence persistence error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
