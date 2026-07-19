@@ -760,7 +760,15 @@ class AppState:
                     "type": view.type if view.type == "root" else view.type.upper(),
                     "page": page + 1 if isinstance(page, int) else None,
                     "titleLevel": evidence.get("title_level"),
-                    "content": meta.content or evidence.get("content") or "",
+                    # A node's display text is its evidence content -- caption
+                    # and footnotes for a table, the description for an image.
+                    # The retrieval feed prefers html/ocr channels and is for
+                    # the reranker, not the reader.
+                    "content": (
+                        (evidence.get("content") or "")
+                        if view.evidence
+                        else meta.content or ""
+                    ),
                     "tableBody": meta.table_body or "",
                     "caption": meta.caption or "",
                     "footnote": meta.footnote or "",
