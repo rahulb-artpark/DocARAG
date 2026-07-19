@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -925,65 +926,129 @@ class CLITests(unittest.TestCase):
                 question="question",
             )
 
-    def test_web_uses_snapshot_and_receives_configured_runs_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runs = root / "runs"
-            run = make_run(runs)
-            settings = RuntimeSettings(
-                project_root=root,
-                runs_dir=runs,
-                system_config=root / "current.yaml",
-                python_executable="/configured/python",
-            ).resolved()
+    def test_web_start_forwards_port_and_run_to_the_service(self):
+        with (
+            patch("docarag.cli._load"),
+            patch("docarag.web_service.main", return_value=0) as service,
+        ):
+            code = cli.main(["web", "start", "--port", "65535", "--run", "runs/x"])
 
-            with (
-                patch("docarag.cli._load", return_value=settings),
-                patch("docarag.cli._run", return_value=0) as runner,
-            ):
-                code = cli.main(["web", "--run", str(run)])
+        self.assertEqual(0, code)
+        self.assertEqual(
+            ["start", "--port", "65535", "--run", "runs/x"],
+            service.call_args.args[0],
+        )
 
-            self.assertEqual(0, code)
-            environment = runner.call_args.kwargs["env"]
-            self.assertEqual(str(runs.resolve()), environment["DOCARAG_RUNS_DIR"])
-            self.assertEqual(
-                str((run / "run_config.yaml").resolve()),
-                environment["BOOKRAG_CONFIG"],
-            )
-
-    def test_web_rejects_non_loopback_host_before_loading_settings(self):
+    def test_web_requires_an_action(self):
         with (
             patch("docarag.cli._load") as loader,
             contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises((SystemExit, argparse.ArgumentError)),
         ):
-            code = cli.main(["web", "--host", "0.0.0.0"])
+            cli.main(["web"])
 
-        self.assertEqual(2, code)
         loader.assert_not_called()
 
-    def test_web_accepts_highest_valid_tcp_port(self):
+    def test_web_stop_and_status_reach_the_service(self):
+        for action in ("stop", "status"):
+            with (
+                patch("docarag.cli._load"),
+                patch("docarag.web_service.main", return_value=0) as service,
+            ):
+                code = cli.main(["web", action])
+
+            self.assertEqual(0, code)
+            self.assertEqual(action, service.call_args.args[0][0])
+
+    def test_ask_legacy_fallback_authority_is_delegated_explicitly(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runs = root / "runs"
-            run = make_run(runs)
+            run = make_run(runs, snapshot=False)
+            fallback = root / "current.yaml"
+            fallback.write_text("index_type: gbc\n", encoding="utf-8")
             settings = RuntimeSettings(
                 project_root=root,
                 runs_dir=runs,
-                system_config=root / "current.yaml",
-                python_executable="/configured/python",
+                system_config=fallback,
+                python_executable=sys.executable,
             ).resolved()
 
             with (
                 patch("docarag.cli._load", return_value=settings),
                 patch("docarag.cli._run", return_value=0) as runner,
             ):
-                code = cli.main(
-                    ["web", "--run", str(run), "--port", "65535"]
+                delegated_without_fallback = cli.main(
+                    ["ask", "question", "--run", str(run)]
+                )
+                delegated_with_fallback = cli.main(
+                    [
+                        "ask",
+                        "question",
+                        "--run",
+                        str(run),
+                        "--allow-legacy-config",
+                    ]
+                )
+
+            self.assertEqual(0, delegated_without_fallback)
+            self.assertEqual(0, delegated_with_fallback)
+            self.assertEqual(2, runner.call_count)
+            first_command = runner.call_args_list[0].args[0]
+            second_command = runner.call_args_list[1].args[0]
+            self.assertNotIn("--allow-legacy-config", first_command)
+            self.assertIn("--allow-legacy-config", second_command)
+            self.assertEqual(
+                str(fallback.resolve()),
+                second_command[second_command.index("--fallback-system-config") + 1],
+            )
+
+    def test_internal_ask_bridge_selects_run_snapshot_after_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "runs" / "run"
+            run.mkdir(parents=True)
+            snapshot = run / "run_config.yaml"
+            snapshot.write_text("index_type: gbc\n", encoding="utf-8")
+            fallback = root / "fallback.yaml"
+            fallback.write_text("index_type: other\n", encoding="utf-8")
+            output = io.StringIO()
+
+            with (
+                patch("docarag.compat.resolve_run", return_value=run) as resolver,
+                patch(
+                    "docarag.compat.resolve_run_config", return_value=snapshot
+                ) as config_resolver,
+                patch("docarag.compat.ask", return_value={"answer": "ok"}) as asker,
+                contextlib.redirect_stdout(output),
+            ):
+                code = compat._main(
+                    [
+                        "ask",
+                        "--run",
+                        str(run),
+                        "--runs-dir",
+                        str(root / "runs"),
+                        "--fallback-system-config",
+                        str(fallback),
+                        "--json",
+                        "question",
+                    ]
                 )
 
             self.assertEqual(0, code)
-            command = runner.call_args.args[0]
-            self.assertEqual("65535", command[command.index("--port") + 1])
+            resolver.assert_called_once_with(root / "runs", str(run), purpose="ask")
+            config_resolver.assert_called_once_with(
+                run,
+                fallback,
+                allow_legacy_fallback=False,
+            )
+            asker.assert_called_once_with(
+                run_dir=run,
+                system_config=snapshot,
+                question="question",
+            )
+
 
 
 if __name__ == "__main__":

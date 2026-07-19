@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Launch the local BookRAG web UI.
-#   bash Scripts/web.sh
-#   bash Scripts/web.sh <run_dir>
+# Manage the DocARAG web UI service.
+#   bash Scripts/web.sh              start (or report already running)
+#   bash Scripts/web.sh stop         stop it
+#   bash Scripts/web.sh status       is it up, and what is it serving
+#   bash Scripts/web.sh restart      stop then start
+#   bash Scripts/web.sh start --port 8888 --run <run_dir>
 cd "$(dirname "$0")/.."
-exec conda run --no-capture-output -n gbc-rag python Scripts/web.py "$@"
+action="${1:-start}"
+shift 2>/dev/null || true
+exec conda run --no-capture-output -n gbc-rag docarag web "$action" "$@"

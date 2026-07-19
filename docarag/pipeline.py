@@ -178,6 +178,92 @@ def _republish(run: Path, repo: Path, env: dict) -> int:
     return finalized.returncode
 
 
+_OVERVIEW_SQL = """
+SELECT
+    doc.display_name,
+    rev.revision_id,
+    seal.tree_sha256 IS NOT NULL AS sealed,
+    stage.stage,
+    stage.status,
+    stage.started_at
+FROM docarag.index_revisions rev
+JOIN docarag.documents doc
+    ON doc.tenant_id = rev.tenant_id
+   AND doc.corpus_id = rev.corpus_id
+   AND doc.document_id = rev.document_id
+LEFT JOIN docarag.revision_seal seal ON seal.revision_key = rev.revision_key
+LEFT JOIN docarag.stage_state stage ON stage.revision_key = rev.revision_key
+ORDER BY doc.display_name, rev.created_at, stage.stage
+"""
+
+
+def overview() -> int:
+    """One line per revision: what every document's pipeline looks like now."""
+
+    import datetime
+
+    with _connect() as connection:
+        rows = connection.execute(_OVERVIEW_SQL).fetchall()
+    if not rows:
+        print("no revisions in the store")
+        return 0
+    revisions: dict[str, dict] = {}
+    for row in rows:
+        entry = revisions.setdefault(
+            row["revision_id"],
+            {
+                "name": row["display_name"] or "?",
+                "sealed": bool(row["sealed"]),
+                "stages": {},
+            },
+        )
+        if row["stage"]:
+            entry["stages"][row["stage"]] = row
+    for revision_id, entry in revisions.items():
+        cells = []
+        running = False
+        for name in STAGES:
+            stage = entry["stages"].get(name)
+            status = (stage or {}).get("status", "-")
+            if status == "running" and stage and stage.get("started_at"):
+                elapsed = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    - stage["started_at"]
+                ).total_seconds()
+                status = f"running {int(elapsed)}s"
+                running = True
+            elif status == "stale":
+                status = "STALE"
+            cells.append(f"{name}:{status}")
+        seal = "sealed" if entry["sealed"] else "unsealed"
+        marker = ">" if running else " "
+        print(
+            f"{marker} {entry['name'][:32]:32} {revision_id[:12]}  "
+            f"{seal:8}  " + "  ".join(cells)
+        )
+    return 0
+
+
+def watch(interval: float = 5.0) -> int:
+    """Refresh the overview until nothing is running."""
+
+    import time
+
+    while True:
+        print("\033[2J\033[H", end="")
+        print(f"pipeline overview  ({time.strftime('%H:%M:%S')})\n")
+        overview()
+        with _connect() as connection:
+            active = connection.execute(
+                "SELECT count(*) AS n FROM docarag.stage_state "
+                "WHERE status = 'running'"
+            ).fetchone()["n"]
+        if not active:
+            print("\nnothing running")
+            return 0
+        time.sleep(interval)
+
+
 def run_all(run: Path) -> int:
     """Re-derive the whole pipeline in order, stopping at the first failure."""
 
@@ -190,9 +276,15 @@ def run_all(run: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one pipeline stage from the store's state")
-    parser.add_argument("stage", choices=STAGES + ("status", "all"))
-    parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("stage", choices=STAGES + ("status", "all", "overview", "watch"))
+    parser.add_argument("--run", type=Path)
     args = parser.parse_args(argv)
+    if args.stage == "overview":
+        return overview()
+    if args.stage == "watch":
+        return watch()
+    if args.run is None:
+        parser.error(f"--run is required for '{args.stage}'")
     if args.stage == "status":
         for row in stage_status(args.run):
             line = f"{row['stage']:8} {row['status']}"

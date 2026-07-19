@@ -515,6 +515,24 @@ def command_stage(args: argparse.Namespace) -> int:
     return pipeline_main([args.stage_name, "--run", args.run])
 
 
+def command_pipeline(args: argparse.Namespace) -> int:
+    _load(args)
+    from docarag.pipeline import main as pipeline_main
+
+    action = "overview" if args.pipeline_action == "status" else "watch"
+    return pipeline_main([action])
+
+
+def command_web(args: argparse.Namespace) -> int:
+    _load(args)
+    from docarag.web_service import main as web_main
+
+    argv = [args.web_action, "--port", str(args.port)]
+    if args.run:
+        argv += ["--run", args.run]
+    return web_main(argv)
+
+
 def command_index(args: argparse.Namespace) -> int:
     settings = _load(args)
     pdf = Path(args.document).expanduser().resolve()
@@ -756,43 +774,6 @@ def command_ask(args: argparse.Namespace) -> int:
         command.append("--json")
     command.append(args.question)
     return _run(command, cwd=settings.project_root)
-
-
-def command_web(args: argparse.Namespace) -> int:
-    if not _is_loopback_host(args.host):
-        raise CLIError(
-            "The compatibility Web UI is loopback-only; use 127.0.0.1 or localhost"
-        )
-    if not 1 <= args.port <= 65535:
-        raise CLIError("Web port must be between 1 and 65535")
-    try:
-        from docarag.compat import resolve_run, resolve_run_config
-    except ImportError as exc:
-        raise CLIError(
-            "Compatibility Web UI support is unavailable; use a complete "
-            "BookRAG runtime"
-        ) from exc
-    settings = _load(args)
-    run = resolve_run(settings.runs_dir, args.run, purpose="web")
-    run_config = resolve_run_config(
-        run,
-        settings.system_config,
-        allow_legacy_fallback=args.allow_legacy_config,
-    )
-    script = settings.project_root / "Scripts" / "web.py"
-    command = [
-        *settings.python_command(),
-        str(script),
-        str(run),
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-    ]
-    env = os.environ.copy()
-    env["BOOKRAG_CONFIG"] = str(run_config)
-    env["DOCARAG_RUNS_DIR"] = str(settings.runs_dir)
-    return _run(command, cwd=settings.project_root, env=env)
 
 
 def _load_parser_worker_profile(path: str):
@@ -1059,6 +1040,23 @@ def build_parser() -> argparse.ArgumentParser:
     stage_parser.add_argument("--run", required=True)
     stage_parser.set_defaults(handler=command_stage)
 
+    pipeline_parser = subparsers.add_parser(
+        "pipeline",
+        help="Monitor every document's pipeline from the store",
+    )
+    pipeline_parser.add_argument("pipeline_action", choices=("status", "watch"))
+    pipeline_parser.set_defaults(handler=command_pipeline)
+
+    webui_parser = subparsers.add_parser(
+        "web", help="Start, stop or inspect the web UI service"
+    )
+    webui_parser.add_argument(
+        "web_action", choices=("start", "stop", "status", "restart")
+    )
+    webui_parser.add_argument("--port", type=int, default=8765)
+    webui_parser.add_argument("--run", help="run directory to serve initially")
+    webui_parser.set_defaults(handler=command_web)
+
     edit_parser = subparsers.add_parser(
         "edit",
         help="Edit stored content; downstream staleness is recorded",
@@ -1110,26 +1108,6 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("--json", action="store_true")
     ask_parser.set_defaults(handler=command_ask)
 
-    web_parser = subparsers.add_parser("web", help="Run the Web UI in the foreground")
-    web_parser.add_argument(
-        "--run",
-        help=(
-            "Run name or directory beneath configured runs_dir; defaults to "
-            "the latest viewable run"
-        ),
-    )
-    web_parser.add_argument(
-        "--allow-legacy-config",
-        "--legacy-config-fallback",
-        action="store_true",
-        help=(
-            "For an old run without run_config.yaml, explicitly use the current "
-            "configured system_config (not reproducible)"
-        ),
-    )
-    web_parser.add_argument("--host", default="127.0.0.1")
-    web_parser.add_argument("--port", type=int, default=8765)
-    web_parser.set_defaults(handler=command_web)
     return parser
 
 
