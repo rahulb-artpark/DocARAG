@@ -82,6 +82,7 @@ class RepresentationKind(StrEnum):
     FOOTNOTE = "footnote"
     TABLE_GRID = "table_grid"
     VISUAL_DESCRIPTION = "visual_description"
+    VLM_LATEX = "vlm_latex"
     DIAGRAM_GRAPH = "diagram_graph"
     STRUCTURED_DATA = "structured_data"
 

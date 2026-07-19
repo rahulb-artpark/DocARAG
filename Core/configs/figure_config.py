@@ -10,11 +10,14 @@ class FigureConfig:
     ships; ``describe`` asks the configured vision model what the figure shows,
     grounded on the recovered text; ``diagrams`` asks that model for the
     node/edge topology a description flattens away.
+    ``transcribe_formulas`` has that model re-read each equation crop, because
+    the dedicated formula recognizer drops lines it cannot segment.
     """
 
     ocr: bool = True
     describe: bool = True
     diagrams: bool = True
+    transcribe_formulas: bool = True
     ocr_lang: str = "en"
     min_confidence: float = 0.5
 

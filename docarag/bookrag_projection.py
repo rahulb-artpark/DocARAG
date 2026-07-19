@@ -1363,6 +1363,7 @@ def _project_equation(
     selected = _select_textual_representation(
         block,
         (
+            RepresentationKind.VLM_LATEX,
             RepresentationKind.LATEX,
             RepresentationKind.MATHML,
             RepresentationKind.TEXT,

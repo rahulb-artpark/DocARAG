@@ -35,6 +35,7 @@ from docarag.canonical_artifacts import (
     ROUTED_PARSING_AUDIT_SCHEMA_VERSION,
 )
 from docarag.domain import (
+    BlockType,
     CanonicalBlock,
     DocumentRef,
     IssueSeverity,
@@ -451,48 +452,76 @@ def _enrich_figures(
 ) -> tuple[CanonicalBlock, ...]:
     """Recover the text and meaning MinerU leaves inside an image region."""
 
-    if not cfg.figures.ocr:
-        return blocks
-    if not any(block.block_type in VISUAL_BLOCK_TYPES for block in blocks):
+    from docarag.formula_transcription import (
+        VLMFormulaTranscriber,
+        transcribe_equation_blocks,
+    )
+
+    has_visual = any(block.block_type in VISUAL_BLOCK_TYPES for block in blocks)
+    has_equations = any(
+        block.block_type is BlockType.EQUATION for block in blocks
+    )
+    run_figures = cfg.figures.ocr and has_visual
+    run_formulas = cfg.figures.transcribe_formulas and has_equations
+    if not run_figures and not run_formulas:
         return blocks
 
-    from docarag.adapters.mineru_figure_ocr import MinerUFigureOCR
-
-    wants_vlm = cfg.figures.describe or cfg.figures.diagrams
+    wants_vlm = run_formulas or (
+        run_figures and (cfg.figures.describe or cfg.figures.diagrams)
+    )
     vlm = VLM(cfg.vlm) if wants_vlm else None
+    enriched = tuple(blocks)
     try:
-        enriched, stats = enrich_visual_blocks(
-            blocks,
-            resolver=crop_store.make_asset_resolver(),
-            ocr_engine=MinerUFigureOCR(lang=cfg.figures.ocr_lang),
-            describer=(
-                GroundedFigureDescriber(vlm)
-                if vlm is not None and cfg.figures.describe
-                else None
-            ),
-            diagram_extractor=(
-                VLMDiagramExtractor(vlm)
-                if vlm is not None and cfg.figures.diagrams
-                else None
-            ),
-            min_confidence=cfg.figures.min_confidence,
-        )
+        if run_figures:
+            from docarag.adapters.mineru_figure_ocr import MinerUFigureOCR
+
+            enriched, stats = enrich_visual_blocks(
+                enriched,
+                resolver=crop_store.make_asset_resolver(),
+                ocr_engine=MinerUFigureOCR(lang=cfg.figures.ocr_lang),
+                describer=(
+                    GroundedFigureDescriber(vlm)
+                    if vlm is not None and cfg.figures.describe
+                    else None
+                ),
+                diagram_extractor=(
+                    VLMDiagramExtractor(vlm)
+                    if vlm is not None and cfg.figures.diagrams
+                    else None
+                ),
+                min_confidence=cfg.figures.min_confidence,
+            )
+        if run_formulas:
+            enriched, formula_stats = transcribe_equation_blocks(
+                enriched,
+                resolver=crop_store.make_asset_resolver(),
+                transcriber=VLMFormulaTranscriber(vlm),
+            )
+            log.info(
+                "formula transcription: %d equations, %d transcribed, "
+                "%d skipped, %d failed",
+                formula_stats.equation_blocks,
+                formula_stats.transcribed_blocks,
+                formula_stats.skipped_blocks,
+                formula_stats.failed_blocks,
+            )
     finally:
         if vlm is not None:
             vlm.close()
-    log.info(
-        "figure enrichment: %d visual, %d with text (%d spans), %d described, "
-        "%d graphs (%d nodes, %d edges), %d skipped, %d failed",
-        stats.visual_blocks,
-        stats.ocr_blocks,
-        stats.ocr_spans,
-        stats.described_blocks,
-        stats.graph_blocks,
-        stats.graph_nodes,
-        stats.graph_edges,
-        stats.skipped_blocks,
-        stats.failed_blocks,
-    )
+    if run_figures:
+        log.info(
+            "figure enrichment: %d visual, %d with text (%d spans), %d described, "
+            "%d graphs (%d nodes, %d edges), %d skipped, %d failed",
+            stats.visual_blocks,
+            stats.ocr_blocks,
+            stats.ocr_spans,
+            stats.described_blocks,
+            stats.graph_blocks,
+            stats.graph_nodes,
+            stats.graph_edges,
+            stats.skipped_blocks,
+            stats.failed_blocks,
+        )
     return enriched
 
 

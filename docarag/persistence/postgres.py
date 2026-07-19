@@ -1735,7 +1735,7 @@ CROSS JOIN LATERAL (
               AND rep.block_key = node.block_key
             ORDER BY array_position(
                 ARRAY['text', 'html', 'ocr_text', 'visual_description',
-                      'caption', 'latex', 'markdown'],
+                      'caption', 'vlm_latex', 'latex', 'markdown'],
                 rep.rep_kind
             ) NULLS LAST, rep.rep_no
             LIMIT 1
