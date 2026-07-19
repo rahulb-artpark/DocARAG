@@ -1053,7 +1053,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     stage_parser.add_argument(
-        "stage_name", choices=("tree", "graph", "vdb", "persist", "status")
+        "stage_name",
+        choices=("tree", "graph", "vdb", "persist", "status", "all"),
     )
     stage_parser.add_argument("--run", required=True)
     stage_parser.set_defaults(handler=command_stage)

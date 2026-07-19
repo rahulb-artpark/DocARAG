@@ -178,9 +178,19 @@ def _republish(run: Path, repo: Path, env: dict) -> int:
     return finalized.returncode
 
 
+def run_all(run: Path) -> int:
+    """Re-derive the whole pipeline in order, stopping at the first failure."""
+
+    for stage in ("tree", "graph", "vdb"):
+        code = run_stage(run, stage)
+        if code != 0:
+            return code
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one pipeline stage from the store's state")
-    parser.add_argument("stage", choices=STAGES + ("status",))
+    parser.add_argument("stage", choices=STAGES + ("status", "all"))
     parser.add_argument("--run", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.stage == "status":
@@ -190,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
                 line += f"  ({row['error']})"
             print(line)
         return 0
+    if args.stage == "all":
+        return run_all(args.run)
     return run_stage(args.run, args.stage)
 
 
