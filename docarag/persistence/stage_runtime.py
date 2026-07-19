@@ -10,6 +10,8 @@ events, retries, checkpoints, and immutable artifact receipts.
 
 from __future__ import annotations
 
+import json
+
 from collections.abc import Mapping
 import hashlib
 import mimetypes
@@ -448,7 +450,13 @@ class DurableStage:
                 runtime.scope.document_version_id,
                 runtime.index_revision_id,
                 stage_name,
+                # The same stage against different inputs is different work: a
+                # replay of identical work stays idempotent, and a legitimate
+                # rebuild -- new seal, new configuration -- is admitted rather
+                # than colliding with history.
+                json.dumps(dict(payload or {}), sort_keys=True, default=str),
             ),
+
             payload={
                 "index_revision_id": runtime.index_revision_id,
                 "stage_name": stage_name,

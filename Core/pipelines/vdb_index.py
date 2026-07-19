@@ -436,6 +436,10 @@ def _tree_serialized_state_sha256(tree: DocumentTree) -> str:
 def _validated_tree_artifact_sha256(tree: DocumentTree) -> str | None:
     """Bind an in-memory build input to the exact saved compatibility tree."""
 
+    if getattr(tree, "store_backed", False):
+        # The build input was read from the sealed store rows; the seal is the
+        # saved-artifact identity, and there is no pickle to bind to.
+        return getattr(tree, "store_seal", None)
     tree_artifact_path = DocumentTree.get_save_path(tree.save_dir)
     artifact_sha256 = bookrag_tree_artifact_sha256(
         tree_artifact_path,

@@ -308,12 +308,16 @@ def _construct_vdb(
     current_run_stats = {}
 
     tree_start_time = time.time()
-    tree_index = build_tree_from_pdf(cfg, parsing_provider=parsing_provider)
-    tree_duration = time.time() - tree_start_time
-    log.info(f"Document tree constructed in {tree_duration:.2f} seconds.")
-    current_run_stats["build_tree_time"] = round(tree_duration, 2)
+    from docarag.vdb_tree_source import StoreTreeSource
 
-    log.info("Document tree constructed successfully for vector database.")
+    tree_index = StoreTreeSource.open(cfg.save_path)
+    tree_duration = time.time() - tree_start_time
+    log.info(
+        "Tree read from the store in %.2f seconds (%d nodes).",
+        tree_duration,
+        len(tree_index.nodes),
+    )
+    current_run_stats["build_tree_time"] = round(tree_duration, 2)
 
     current_run_stats["token_stage_history"] = token_tracker.stage_history
 
@@ -330,6 +334,9 @@ def _construct_vdb(
         payload={
             "collection": vdb_cfg.collection_name,
             "index_type": cfg.index_type,
+            # A rebuild against different sealed content is a different work
+            # item; receipts stay append-only and history is kept.
+            "store_seal": getattr(tree_index, "store_seal", None),
         },
         source_sha256=_tree_source_sha256(tree_index),
     ) as vector_stage:

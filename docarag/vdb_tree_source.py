@@ -40,6 +40,14 @@ class _NodeMeta:
         self.source_evidence_refs = evidence.get("source_evidence_refs")
         self._evidence = evidence
 
+    def __getattr__(self, name: str):
+        # Every remaining meta field the stage may read lives in the evidence
+        # payload; absence is None, exactly as the serialized meta behaved.
+        try:
+            return self.__dict__["_evidence"].get(name)
+        except KeyError:
+            raise AttributeError(name) from None
+
     def model_dump(self, mode: str = "python") -> dict:
         return dict(self._evidence)
 
@@ -80,6 +88,20 @@ class StoreTreeSource:
                     parent.children.append(node)
         self.nodes = [by_id[view.index_id] for view in views]
         self.save_dir = str(store.run_dir)
+        self.store_backed = True
+        row = store._borrow().execute(
+            "SELECT tree_sha256 FROM docarag.revision_seal WHERE revision_key = %s",
+            (store.revision_key,),
+        ).fetchone()
+        self.store_seal = str((row or {}).get("tree_sha256") or "") or None
+        ledger_row = store._borrow().execute(
+            "SELECT canonical_artifact_sha256 FROM docarag.index_revisions "
+            "WHERE revision_key = %s",
+            (store.revision_key,),
+        ).fetchone()
+        canonical_sha = str(
+            (ledger_row or {}).get("canonical_artifact_sha256") or ""
+        ) or None
         scope = store.scope
         source = self.nodes and self.nodes[0].meta_info or None
         self.meta_info = SimpleNamespace(
@@ -92,7 +114,19 @@ class StoreTreeSource:
                 None,
             ),
             document_version_id=scope.document_version_id,
+            canonical_artifact_sha256=canonical_sha,
         )
+
+    def get_nodes(self, hasRoot: bool = False) -> list:
+        if hasRoot:
+            return list(self.nodes)
+        return [node for node in self.nodes if node is not self.root_node]
+
+    def get_node_by_index_id(self, node_id: int):
+        for node in self.nodes:
+            if node.index_id == node_id:
+                return node
+        return None
 
     @classmethod
     def open(cls, run_dir: str) -> "StoreTreeSource":

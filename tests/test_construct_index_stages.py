@@ -235,7 +235,10 @@ class ConstructIndexStageTests(unittest.TestCase):
 
             with (
                 patch.object(construct_index.TokenTracker, "get_instance", return_value=tracker),
-                patch.object(construct_index, "build_tree_from_pdf", return_value=object()),
+                patch(
+                    "docarag.vdb_tree_source.StoreTreeSource.open",
+                    return_value=SimpleNamespace(nodes=[], store_seal=None, meta_info=None),
+                ),
                 patch.object(construct_index, "build_vdb_index") as build_vdb,
                 patch.object(construct_index, "save_indexing_stats"),
                 patch.object(
