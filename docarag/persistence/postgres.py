@@ -1747,6 +1747,63 @@ class PostgresLedger:
 
         connection.execute(_SEAL_TREE_PATHS_SQL, (revision_key, revision_key))
         connection.execute(_BUILD_NODE_RETRIEVAL_SQL, (revision_key,))
+        # One digest over the sealed rows, streamed in node order: what the
+        # vector index attests to and what query readiness compares against,
+        # with no artifact file in the loop.
+        digest = hashlib.sha256()
+        with connection.cursor(name=f"seal_{revision_key}") as cursor:
+            cursor.itersize = 500
+            cursor.execute(_SEAL_DIGEST_ROWS_SQL, (revision_key,))
+            for row in cursor:
+                digest.update(
+                    json.dumps(
+                        [str(item) for item in row],
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                )
+        connection.execute(
+            "INSERT INTO docarag.revision_seal (revision_key, tree_sha256) "
+            "VALUES (%s, %s) ON CONFLICT (revision_key) DO UPDATE SET "
+            "tree_sha256 = EXCLUDED.tree_sha256, sealed_at = clock_timestamp()",
+            (revision_key, digest.hexdigest()),
+        )
+
+    def revision_seal(self, scope: DocumentScope, revision_id: str) -> str | None:
+        """Return the sealed tree digest for one revision, or None if unsealed."""
+
+        revision_key = self.revision_key(scope, revision_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT tree_sha256 FROM docarag.revision_seal "
+                "WHERE revision_key = %s",
+                (revision_key,),
+            ).fetchone()
+        return str(row["tree_sha256"]) if row else None
+
+
+_SEAL_DIGEST_ROWS_SQL = """
+SELECT
+    node.node_no,
+    parent.node_no,
+    node.node_kind,
+    node.depth,
+    node.sibling_no,
+    encode(summary_blob.sha256, 'hex'),
+    md5(node.attrs::text),
+    md5(COALESCE(feed.retrieval_text, '')),
+    blk.block_uid,
+    blk.content_sha256
+FROM docarag.tree_node node
+LEFT JOIN docarag.tree_node parent
+    ON parent.revision_key = node.revision_key AND parent.node_key = node.parent_key
+LEFT JOIN docarag.text_blob summary_blob ON summary_blob.blob_key = node.summary_blob_key
+LEFT JOIN docarag.node_retrieval feed
+    ON feed.revision_key = node.revision_key AND feed.node_key = node.node_key
+LEFT JOIN docarag.block blk
+    ON blk.revision_key = node.revision_key AND blk.block_key = node.block_key
+WHERE node.revision_key = %s
+ORDER BY node.node_no
+"""
 
 
 _SEAL_TREE_PATHS_SQL = """

@@ -428,6 +428,13 @@ CREATE TABLE docarag.stage_state (
     )
 );
 
+CREATE TABLE docarag.revision_seal (
+    revision_key bigint NOT NULL PRIMARY KEY
+        REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
+    tree_sha256 char(64) NOT NULL,
+    sealed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 CREATE TABLE docarag.revision_document (
     revision_key bigint NOT NULL PRIMARY KEY
         REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
@@ -789,6 +796,7 @@ GRAPH_EVIDENCE_TABLES = (
 )
 
 TREE_EVIDENCE_TABLES = (
+    "revision_seal",
     "node_retrieval",
     "block_element_edge",
     "block_element",
