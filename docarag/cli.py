@@ -499,6 +499,15 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_edit(args: argparse.Namespace) -> int:
+    _load(args)
+    from docarag.edit import main as edit_main
+
+    return edit_main(
+        [args.edit_what, "--run", args.run, "--node", str(args.node), "--text", args.text]
+    )
+
+
 def command_stage(args: argparse.Namespace) -> int:
     _load(args)
     from docarag.pipeline import main as pipeline_main
@@ -1048,6 +1057,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stage_parser.add_argument("--run", required=True)
     stage_parser.set_defaults(handler=command_stage)
+
+    edit_parser = subparsers.add_parser(
+        "edit",
+        help="Edit stored content; downstream staleness is recorded",
+    )
+    edit_parser.add_argument("edit_what", choices=("summary",))
+    edit_parser.add_argument("--run", required=True)
+    edit_parser.add_argument("--node", type=int, required=True)
+    edit_parser.add_argument("--text", required=True)
+    edit_parser.set_defaults(handler=command_edit)
 
     status_parser = subparsers.add_parser("status", help="Show indexing status")
     status_parser.add_argument("run", nargs="?")
