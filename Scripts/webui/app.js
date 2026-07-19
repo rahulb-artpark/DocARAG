@@ -1098,15 +1098,26 @@ const ROLE_COLORS = {
   decision:{ background: "#fef3c7", border: "#b45309" },
 };
 
+function structureParts(s) {
+  const connected = new Set();
+  (s.edges || []).forEach((e) => { connected.add(e.source); connected.add(e.target); });
+  const inFlow = (s.elements || []).filter((el) => connected.has(el.content));
+  const standalone = (s.elements || []).filter((el) => !connected.has(el.content));
+  return { inFlow, standalone };
+}
+
 function renderStructures(structures) {
   return structures.map((s, i) => {
+    const { standalone } = structureParts(s);
     const hasFlow = (s.edges || []).length > 0;
-    const body = hasFlow
-      ? `<div class="flowCanvas" data-struct="${i}"></div>`
-      : `<div class="structEls">${(s.elements || []).map((el) =>
-          `<span class="tag">${escapeHtml(el.content)}${el.role ? ` \u00b7 ${escapeHtml(el.role)}` : ""}</span>`
-        ).join(" ")}</div>`;
-    return `<div class="structBlock"><div class="structKind">${escapeHtml(s.kind)}</div>${body}</div>`;
+    const chips = standalone.map((el) =>
+      `<span class="tag">${escapeHtml(el.content)}${el.role ? ` \u00b7 ${escapeHtml(el.role)}` : ""}</span>`
+    ).join(" ");
+    const canvas = hasFlow ? `<div class="flowCanvas" data-struct="${i}"></div>` : "";
+    const chipBlock = chips
+      ? `<div class="structEls">${hasFlow ? `<span class="structNote">also shown, without flow arrows:</span> ` : ""}${chips}</div>`
+      : "";
+    return `<div class="structBlock"><div class="structKind">${escapeHtml(s.kind)}</div>${canvas}${chipBlock}</div>`;
   }).join("");
 }
 
@@ -1115,7 +1126,7 @@ function drawStructures(host, structures) {
     const s = structures[Number(canvas.dataset.struct)];
     if (!s || typeof vis === "undefined") return;
     const ids = new Map();
-    const nodes = (s.elements || []).map((el, i) => {
+    const nodes = structureParts(s).inFlow.map((el, i) => {
       ids.set(el.content, i);
       const c = ROLE_COLORS[el.role] || { background: "#ffffff", border: "#64748b" };
       return {
