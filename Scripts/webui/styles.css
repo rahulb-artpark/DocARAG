@@ -302,7 +302,5 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 
 .structBlock { margin: 6px 0 10px; }
 .structKind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .65; margin-bottom: 4px; }
-.flowEdge { font-family: var(--mono, monospace); font-size: 13px; padding: 2px 0; }
-.flowEdge .arrow { opacity: .6; padding: 0 4px; }
-.flowEdge .edgeLabel { opacity: .7; }
+.flowCanvas { height: 260px; border: 1px solid var(--line, #e2e8f0); border-radius: 8px; background: #fbfdff; }
 .structEls { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }

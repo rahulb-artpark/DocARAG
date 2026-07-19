@@ -1083,22 +1083,77 @@ function selectTreeNode(id) {
   wireTreeJumpLinks($("treeDetail"));
   $("treeDetail").querySelectorAll("[data-entity]").forEach((a) =>
     a.onclick = () => { activateView("graph"); selectEntity(a.dataset.entity); });
+  if ((n.structures || []).length) drawStructures($("treeDetail"), n.structures);
   enhanceContent($("treeDetail"));
   typesetMath($("treeDetail"));
   const im = $("treeDetail").querySelector(".nodeimg");
   if (im) im.onclick = () => openLightbox(im.src);
 }
 
+const ROLE_COLORS = {
+  input:   { background: "#e0f2fe", border: "#0369a1" },
+  output:  { background: "#dcfce7", border: "#15803d" },
+  process: { background: "#fce7f3", border: "#be185d" },
+  data:    { background: "#fef9c3", border: "#a16207" },
+  decision:{ background: "#fef3c7", border: "#b45309" },
+};
+
 function renderStructures(structures) {
-  return structures.map((s) => {
-    const edges = (s.edges || []).map((e) =>
-      `<div class="flowEdge">${escapeHtml(e.source)} <span class="arrow">\u2192</span> ${escapeHtml(e.target)}${e.label ? ` <span class="edgeLabel">(${escapeHtml(e.label)})</span>` : ""}</div>`
-    ).join("");
-    const parts = (s.elements || []).map((el) =>
-      `<span class="tag">${escapeHtml(el.content)}${el.role ? ` \u00b7 ${escapeHtml(el.role)}` : ""}</span>`
-    ).join(" ");
-    return `<div class="structBlock"><div class="structKind">${escapeHtml(s.kind)}</div>${edges}<div class="structEls">${parts}</div></div>`;
+  return structures.map((s, i) => {
+    const hasFlow = (s.edges || []).length > 0;
+    const body = hasFlow
+      ? `<div class="flowCanvas" data-struct="${i}"></div>`
+      : `<div class="structEls">${(s.elements || []).map((el) =>
+          `<span class="tag">${escapeHtml(el.content)}${el.role ? ` \u00b7 ${escapeHtml(el.role)}` : ""}</span>`
+        ).join(" ")}</div>`;
+    return `<div class="structBlock"><div class="structKind">${escapeHtml(s.kind)}</div>${body}</div>`;
   }).join("");
+}
+
+function drawStructures(host, structures) {
+  host.querySelectorAll(".flowCanvas").forEach((canvas) => {
+    const s = structures[Number(canvas.dataset.struct)];
+    if (!s || typeof vis === "undefined") return;
+    const ids = new Map();
+    const nodes = (s.elements || []).map((el, i) => {
+      ids.set(el.content, i);
+      const c = ROLE_COLORS[el.role] || { background: "#ffffff", border: "#64748b" };
+      return {
+        id: i,
+        label: el.content,
+        title: el.role || undefined,
+        shape: el.role === "decision" ? "diamond" : "box",
+        color: { ...c, highlight: c },
+        font: { size: 13, face: "system-ui", color: "#1c2430" },
+        margin: 8,
+      };
+    });
+    // A pair of opposite edges reads as one double-headed arrow, the way the
+    // source diagram draws bidirectional flow.
+    const seen = new Map();
+    const edges = [];
+    (s.edges || []).forEach((e) => {
+      const a = ids.get(e.source), b = ids.get(e.target);
+      if (a === undefined || b === undefined) return;
+      const back = seen.get(`${b}|${a}`);
+      if (back !== undefined) { edges[back].arrows = "to, from"; return; }
+      seen.set(`${a}|${b}`, edges.length);
+      edges.push({ from: a, to: b, arrows: "to", label: e.label || undefined,
+        color: { color: "#64748b", highlight: "#0f766e" }, width: 1.5,
+        font: { size: 11, align: "top" } });
+    });
+    const net = new vis.Network(canvas, {
+      nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges),
+    }, {
+      layout: { hierarchical: { enabled: true, direction: "LR",
+        sortMethod: "directed", levelSeparation: 150, nodeSpacing: 70 } },
+      physics: false,
+      interaction: { dragNodes: true, zoomView: true, dragView: true },
+      edges: { smooth: { enabled: true, type: "cubicBezier",
+        forceDirection: "horizontal", roundness: 0.4 } },
+    });
+    net.once("afterDrawing", () => net.fit({ animation: false }));
+  });
 }
 
 /* =============================== CHAT =================================== */
