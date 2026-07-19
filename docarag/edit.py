@@ -41,7 +41,7 @@ def edit_node_summary(run: Path, node_no: int, text: str) -> None:
                 "SELECT tree_sha256 FROM docarag.revision_seal "
                 "WHERE revision_key = %s",
                 (revision_key,),
-            ).fetchone()[0]
+            ).fetchone()["tree_sha256"]
         )
     print(f"node {node_no} summary updated; revision resealed {seal[:16]}…")
     print("vdb is stale: run `docarag stage vdb --run <run>` to re-derive vectors")

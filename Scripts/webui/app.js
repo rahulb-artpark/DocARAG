@@ -1068,7 +1068,7 @@ function selectTreeNode(id) {
          <div class="prose">${renderContent(n)}</div>`
       : ""}
     ${(n.structures || []).length ? `<div class="section-h">Extracted structure</div>${renderStructures(n.structures)}` : ""}
-    ${n.summary ? `<div class="section-h">Summary (LLM-generated)</div><div class="prose">${escapeHtml(n.summary)}</div>` : ""}
+    ${n.summary ? `<div class="section-h">Summary (LLM-generated) <button class="miniBtn" id="editSummary">edit</button></div><div class="prose" id="summaryText">${escapeHtml(n.summary)}</div>` : ""}
     <div class="section-h">Entities extracted here (${ents.length})</div>
     <div class="prose">${entHtml}</div>
     <div class="section-h">Child nodes</div>
@@ -1086,6 +1086,8 @@ function selectTreeNode(id) {
   if ((n.structures || []).length) drawStructures($("treeDetail"), n.structures);
   enhanceContent($("treeDetail"));
   typesetMath($("treeDetail"));
+  const editBtn = $("treeDetail").querySelector("#editSummary");
+  if (editBtn) editBtn.onclick = () => beginSummaryEdit(id, n.summary);
   const im = $("treeDetail").querySelector(".nodeimg");
   if (im) im.onclick = () => openLightbox(im.src);
 }
@@ -1197,6 +1199,29 @@ function drawStructures(host, structures) {
     });
     net.once("afterDrawing", () => net.fit({ animation: false }));
   });
+}
+
+function beginSummaryEdit(nodeId, current) {
+  const host = $("summaryText");
+  if (!host) return;
+  host.innerHTML = `<textarea id="summaryDraft" rows="5" style="width:100%">${escapeHtml(current)}</textarea>
+    <div style="margin-top:6px"><button class="miniBtn" id="saveSummary">save</button>
+    <span class="structNote">saving reseals the revision and marks vectors stale</span></div>`;
+  host.querySelector("#saveSummary").onclick = async () => {
+    const text = host.querySelector("#summaryDraft").value.trim();
+    if (!text) return;
+    try {
+      await api("/api/edit-summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nodeId, text }),
+      });
+      await loadData();
+      selectTreeNode(nodeId);
+    } catch (err) {
+      alert("Edit failed: " + err.message);
+    }
+  };
 }
 
 /* =============================== CHAT =================================== */

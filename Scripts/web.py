@@ -1207,6 +1207,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/upload":
             self.upload_document()
             return
+        if parsed.path == "/api/edit-summary":
+            self.edit_summary()
+            return
         if parsed.path != "/api/chat":
             self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint")
             return
@@ -1315,6 +1318,31 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(
             {"ok": True, "name": name, "path": str(target), "runDir": run_dir}
         )
+
+    def edit_summary(self):
+        try:
+            payload = self.read_json_body()
+            node_id = payload.get("nodeId")
+            text = payload.get("text")
+            if not isinstance(node_id, int) or not isinstance(text, str) or not text.strip():
+                self.send_error_json(
+                    HTTPStatus.BAD_REQUEST, "nodeId and non-empty text are required"
+                )
+                return
+            from docarag.edit import edit_node_summary
+
+            edit_node_summary(self.state.run_dir, node_id, text.strip())
+            # The tree changed under the viewer; its cache must not outlive it.
+            self.state._tree_cache = None
+            self.send_json({"ok": True, "nodeId": node_id, "vdb": "stale"})
+        except SystemExit as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "Edit failed",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
 
     def set_run(self):
         try:
