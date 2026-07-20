@@ -635,11 +635,24 @@ class DocumentTree:
 
         import json
 
-        # save json file for visualization
+        summary = self.to_json_summary()
+
+        # Evidence persistence reads this one. It is a plain data dump of the
+        # in-memory tree at the moment save_to_file runs -- never hand-edit
+        # it; a correction belongs in the code that built the tree, then a
+        # rebuild, so this file and the pickle it was written alongside never
+        # disagree with each other or with what gets projected into Postgres.
+        structure_path = os.path.join(self.save_dir, "tree_structure.json")
+        with open(structure_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        log.info(f"Document tree structure saved to {structure_path}")
+
+        # tree.json is a debug/visualization dump only. Nothing in the
+        # pipeline reads it back; it is not evidence and never authoritative.
         json_path = os.path.join(self.save_dir, "tree.json")
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_json_summary(), f, ensure_ascii=False, indent=2)
-        log.info(f"Document tree summary saved to {json_path}")
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        log.info(f"Document tree summary (debug/visualization only) saved to {json_path}")
 
     @staticmethod
     def get_save_path(input_dir: str) -> str:

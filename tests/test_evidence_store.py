@@ -295,7 +295,7 @@ class ProjectionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (run / "tree.json").write_text(
+        (run / "tree_structure.json").write_text(
             json.dumps(
                 {
                     "nodes": [

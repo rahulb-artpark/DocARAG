@@ -35,7 +35,10 @@ from docarag.persistence.contracts import (
 )
 
 CANONICAL_BLOCKS = "canonical_blocks.json"
-TREE = "tree.json"
+# tree.json is a debug/visualization dump the tree stage also writes; it is
+# never read back by anything. tree_structure.json is the same shape, written
+# once, at the same moment, and is the only one evidence projection may read.
+TREE = "tree_structure.json"
 GRAPH = "graph_data.json"
 
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
