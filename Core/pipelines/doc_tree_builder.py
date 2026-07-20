@@ -487,7 +487,9 @@ def _enrich_figures(
 
     from docarag.formula_transcription import (
         VLMFormulaTranscriber,
+        has_inline_formula_candidates,
         transcribe_equation_blocks,
+        transcribe_inline_equations,
     )
 
     has_visual = any(block.block_type in VISUAL_BLOCK_TYPES for block in blocks)
@@ -496,10 +498,17 @@ def _enrich_figures(
     )
     run_figures = cfg.figures.ocr and has_visual
     run_formulas = cfg.figures.transcribe_formulas and has_equations
-    if not run_figures and not run_formulas:
+    # MinerU crops individual equation spans even inside blocks it never
+    # types as EQUATION (a formula written inline in a paragraph, say) --
+    # transcribe_equation_blocks only ever looks at BlockType.EQUATION, so
+    # this is a second, separate pass over the blocks it skips.
+    run_inline_formulas = cfg.figures.transcribe_formulas and (
+        has_inline_formula_candidates(blocks)
+    )
+    if not run_figures and not run_formulas and not run_inline_formulas:
         return blocks
 
-    wants_vlm = run_formulas or (
+    wants_vlm = run_formulas or run_inline_formulas or (
         run_figures and (cfg.figures.describe or cfg.figures.diagrams)
     )
     vlm = VLM(cfg.vlm) if wants_vlm else None
@@ -537,6 +546,20 @@ def _enrich_figures(
                 formula_stats.transcribed_blocks,
                 formula_stats.skipped_blocks,
                 formula_stats.failed_blocks,
+            )
+        if run_inline_formulas:
+            enriched, inline_stats = transcribe_inline_equations(
+                enriched,
+                resolver=crop_store.make_asset_resolver(),
+                transcriber=VLMFormulaTranscriber(vlm),
+            )
+            log.info(
+                "inline formula correction: %d candidates, %d corrected, "
+                "%d skipped, %d failed",
+                inline_stats.candidate_blocks,
+                inline_stats.corrected_blocks,
+                inline_stats.skipped_blocks,
+                inline_stats.failed_blocks,
             )
     finally:
         if vlm is not None:

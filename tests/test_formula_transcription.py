@@ -16,8 +16,11 @@ from docarag.domain.evidence import (
 )
 from docarag.formula_transcription import (
     VLMFormulaTranscriber,
+    _find_unambiguous_equation_span,
     clean_latex,
+    has_inline_formula_candidates,
     transcribe_equation_blocks,
+    transcribe_inline_equations,
 )
 
 CROP_SHA = "a" * 64
@@ -78,6 +81,33 @@ def equation_block(*, with_crop=True, representations=()):
                 media_type="application/x-latex",
             ),
             *representations,
+        ),
+        assets=assets,
+    )
+
+
+def inline_block(
+    *, text, block_type=BlockType.PARAGRAPH, with_crop=True, confidence=0.9325
+):
+    assets = ()
+    if with_crop:
+        assets = (
+            AssetRef(
+                kind=AssetKind.REGION_CROP,
+                uri=f"cas://sha256/{CROP_SHA}",
+                media_type="image/jpeg",
+                sha256=CROP_SHA,
+            ),
+        )
+    return make_block(
+        block_type=block_type,
+        representations=(
+            Representation(
+                kind=RepresentationKind.TEXT,
+                content=text,
+                media_type="text/plain",
+                confidence=confidence,
+            ),
         ),
         assets=assets,
     )
@@ -240,6 +270,163 @@ class TranscribeBlocksTests(unittest.TestCase):
 
         self.assertIs(other, blocks[0])
         self.assertEqual(1, stats.equation_blocks)
+
+
+class FindUnambiguousEquationSpanTests(unittest.TestCase):
+    def test_no_dollar_spans_is_none(self):
+        self.assertIsNone(_find_unambiguous_equation_span("plain text, no math"))
+
+    def test_a_single_span_is_used_even_without_an_operator(self):
+        match = _find_unambiguous_equation_span(r"see $\alpha$ above")
+        self.assertEqual(r"\alpha", match.group(1))
+
+    def test_two_spans_one_with_an_operator_picks_that_one(self):
+        # The real reported case: a garbled equation next to an unrelated
+        # units expression that also happens to be wrapped in "$...$".
+        text = r"p = mv, in units of $\mathrm{kg}\,\mathrm{m}\,\mathrm{s}^{-1}$, namely $\rho = \pi \nu$."
+        match = _find_unambiguous_equation_span(text)
+        self.assertEqual(r"\rho = \pi \nu", match.group(1))
+
+    def test_two_operator_bearing_spans_is_ambiguous(self):
+        text = r"$a = b$ and also $c = d$"
+        self.assertIsNone(_find_unambiguous_equation_span(text))
+
+    def test_two_spans_neither_with_an_operator_is_ambiguous(self):
+        text = r"$\alpha$ and $\beta$"
+        self.assertIsNone(_find_unambiguous_equation_span(text))
+
+
+class HasInlineFormulaCandidatesTests(unittest.TestCase):
+    def test_true_for_an_eligible_block_containing_a_dollar_span(self):
+        self.assertTrue(
+            has_inline_formula_candidates([inline_block(text="p = $mv$")])
+        )
+
+    def test_false_with_no_dollar_sign_anywhere(self):
+        self.assertFalse(
+            has_inline_formula_candidates([inline_block(text="no math here")])
+        )
+
+    def test_false_for_an_equation_typed_block(self):
+        # transcribe_equation_blocks already owns EQUATION blocks whole.
+        block = inline_block(text="$p = mv$", block_type=BlockType.EQUATION)
+        self.assertFalse(has_inline_formula_candidates([block]))
+
+
+class TranscribeInlineEquationsTests(unittest.TestCase):
+    def transcriber(self, latex="p = mv"):
+        class VLM:
+            def generate(self, prompt, images=None):
+                return latex
+
+        return VLMFormulaTranscriber(VLM())
+
+    def test_the_real_reported_case_is_corrected_and_units_span_is_untouched(self):
+        text = (
+            "The product of mass m of a body and its velocity v is called "
+            r"its linear momentum p. Mathematically $\rho = \pi \nu$ where "
+            r"units are $\mathrm{kg}\,\mathrm{m}\,\mathrm{s}^{-1}$."
+        )
+        block = inline_block(text=text)
+
+        blocks, stats = transcribe_inline_equations(
+            [block], resolver=_Resolver(), transcriber=self.transcriber()
+        )
+
+        expected = text.replace(r"$\rho = \pi \nu$", "$p = mv$")
+        corrected = blocks[0].representations[-1]
+        self.assertEqual(expected, corrected.content)
+        self.assertIn(r"$\mathrm{kg}\,\mathrm{m}\,\mathrm{s}^{-1}$", corrected.content)
+        self.assertEqual(1, stats.corrected_blocks)
+        self.assertEqual(0, stats.skipped_blocks)
+        self.assertEqual(0, stats.failed_blocks)
+
+    def test_corrected_representation_added_beside_the_original_with_higher_confidence(self):
+        block = inline_block(text="p = $mv$", confidence=0.9325)
+
+        blocks, _ = transcribe_inline_equations(
+            [block], resolver=_Resolver(), transcriber=self.transcriber()
+        )
+
+        original, corrected = blocks[0].representations
+        self.assertEqual("p = $mv$", original.content)
+        self.assertEqual(RepresentationKind.TEXT, corrected.kind)
+        self.assertGreater(corrected.confidence, original.confidence)
+        self.assertEqual(
+            "vlm.inline_formula_correction", corrected.metadata["producer"]
+        )
+        self.assertEqual(CROP_SHA, corrected.metadata["asset_sha256"])
+
+    def test_equation_typed_blocks_are_left_to_transcribe_equation_blocks(self):
+        block = inline_block(text="$p = mv$", block_type=BlockType.EQUATION)
+
+        blocks, stats = transcribe_inline_equations(
+            [block], resolver=_Resolver(), transcriber=self.transcriber()
+        )
+
+        self.assertEqual(block.representations, blocks[0].representations)
+        self.assertEqual(0, stats.candidate_blocks)
+
+    def test_no_crop_is_never_counted_as_a_candidate(self):
+        block = inline_block(text="p = $mv$", with_crop=False)
+
+        blocks, stats = transcribe_inline_equations(
+            [block], resolver=_Resolver(), transcriber=self.transcriber()
+        )
+
+        self.assertEqual(block.representations, blocks[0].representations)
+        self.assertEqual(0, stats.candidate_blocks)
+
+    def test_ambiguous_multi_operator_spans_are_skipped_not_guessed(self):
+        block = inline_block(text=r"$a = b$ and also $c = d$")
+
+        blocks, stats = transcribe_inline_equations(
+            [block], resolver=_Resolver(), transcriber=self.transcriber()
+        )
+
+        self.assertEqual(block.representations, blocks[0].representations)
+        self.assertEqual(0, stats.candidate_blocks)
+
+    def test_a_vlm_reply_matching_the_original_span_is_skipped_not_corrected(self):
+        block = inline_block(text="p = $mv$")
+
+        blocks, stats = transcribe_inline_equations(
+            [block],
+            resolver=_Resolver(),
+            transcriber=self.transcriber(latex="mv"),
+        )
+
+        self.assertEqual(block.representations, blocks[0].representations)
+        self.assertEqual(1, stats.candidate_blocks)
+        self.assertEqual(1, stats.skipped_blocks)
+        self.assertEqual(0, stats.corrected_blocks)
+
+    def test_crop_resolution_failure_is_recorded_and_block_left_unchanged(self):
+        class Boom:
+            def resolve(self, asset, include_bytes=False):
+                raise OSError("no cas")
+
+        block = inline_block(text="p = $mv$")
+
+        blocks, stats = transcribe_inline_equations(
+            [block], resolver=Boom(), transcriber=self.transcriber()
+        )
+
+        self.assertEqual(block.representations, blocks[0].representations)
+        self.assertEqual(1, stats.failed_blocks)
+
+    def test_non_eligible_block_types_pass_through_untouched(self):
+        # e.g. a table cell using "$" for currency, not LaTeX.
+        block = inline_block(
+            text="cost is $5", block_type=BlockType.TABLE
+        )
+
+        blocks, stats = transcribe_inline_equations(
+            [block], resolver=_Resolver(), transcriber=self.transcriber()
+        )
+
+        self.assertEqual(block.representations, blocks[0].representations)
+        self.assertEqual(0, stats.candidate_blocks)
 
 
 if __name__ == "__main__":
