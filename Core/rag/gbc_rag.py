@@ -224,6 +224,8 @@ class GBCRAG(BaseRAG):
             topk_ent=self.cfg.topk_ent,
             x_percentile=self.cfg.x_percentile,
             topk=self.cfg.topk,
+            topk_relative_floor=self.cfg.topk_relative_floor,
+            topk_min=self.cfg.topk_min,
             candidate_pool_size=self.cfg.candidate_pool_size,
             tree_vdb=self.tree_vdb,
             retrieval_binding=retrieval_binding,

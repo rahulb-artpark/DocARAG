@@ -81,12 +81,22 @@ class Retriever:
         topk_ent: int = 20,
         x_percentile: float = 0.85,
         topk: int = 10,
+        topk_relative_floor: float = 0.5,
+        topk_min: int = 3,
         candidate_pool_size: int = 512,
         tree_vdb: Any | None = None,
         retrieval_binding: HybridRetrievalBinding | None = None,
     ):
         if isinstance(topk, bool) or not isinstance(topk, int) or topk < 1:
             raise ValueError("topk must be a positive integer")
+        if (
+            isinstance(topk_relative_floor, bool)
+            or not isinstance(topk_relative_floor, (int, float))
+            or not 0.0 < topk_relative_floor <= 1.0
+        ):
+            raise ValueError("topk_relative_floor must be a number in (0, 1]")
+        if isinstance(topk_min, bool) or not isinstance(topk_min, int) or topk_min < 1:
+            raise ValueError("topk_min must be a positive integer")
         if (
             isinstance(candidate_pool_size, bool)
             or not isinstance(candidate_pool_size, int)
@@ -104,6 +114,8 @@ class Retriever:
         self.topk_ent: int = topk_ent
         self.x_percentile: float = x_percentile
         self.topk: int = topk
+        self.topk_relative_floor: float = float(topk_relative_floor)
+        self.topk_min: int = topk_min
         self.candidate_pool_size: int = candidate_pool_size
         self.tree_vdb = tree_vdb
         self.retrieval_binding = retrieval_binding
@@ -822,6 +834,38 @@ class Retriever:
             for position in sorted(selected_positions)[:limit]
         ]
 
+    def _confidence_filtered(
+        self,
+        ranked: List[Tuple[int, float]],
+        *,
+        limit: int | None = None,
+        min_k: int | None = None,
+    ) -> List[Tuple[int, float]]:
+        """Keep the highest-scoring candidates, but stop at a real drop-off.
+
+        ``limit`` (default ``self.topk``) is an upper bound, not a quota:
+        reranker scores are calibrated relevance probabilities, so padding
+        out to the limit with whatever scored next sends the answer model
+        noise it has to spend tokens (and sometimes trust) discounting.
+        Candidates scoring below ``topk_relative_floor`` of the best match
+        are dropped, down to a floor of ``min_k`` (default ``self.topk_min``)
+        so a query with uniformly modest scores still returns an answer.
+        This only ever shrinks the selection -- it can never add a candidate
+        the limit alone would have excluded.
+        """
+
+        limit = self.topk if limit is None else limit
+        min_k = self.topk_min if min_k is None else min_k
+        bounded = ranked[:limit]
+        if len(bounded) <= min_k:
+            return bounded
+        top_score = bounded[0][1]
+        floor = top_score * self.topk_relative_floor
+        kept = [item for item in bounded if item[1] >= floor]
+        if len(kept) < min_k:
+            kept = bounded[:min_k]
+        return kept
+
     def text_reranker(
         self, subtree_nodes: List[TreeNode], query: str
     ) -> List[Tuple[int, float]]:
@@ -1015,7 +1059,9 @@ class Retriever:
             log.info("Variant 'wo_graph' selected: Skipping graph reranker.")
             # Only use text reranker
             text_rerank_res = self.text_reranker(subtree_nodes, sub_query)
-            tree_node_ids = [node_id for node_id, _ in text_rerank_res[: self.topk]]
+            tree_node_ids = [
+                node_id for node_id, _ in self._confidence_filtered(text_rerank_res)
+            ]
 
             # use start_ent_map as the returned entities
             res_entities = []
@@ -1067,13 +1113,41 @@ class Retriever:
                 f"Activating fallback to meet minimum of {self.topk}."
             )
 
-            tree_node_ids = self._fill_to_limit(
+            filled = self._fill_to_limit(
                 tree_node_ids,
                 graph_rerank_res,
                 text_rerank_res,
                 limit=self.topk,
             )
-            log.info("Fallback selected %s unique nodes.", len(tree_node_ids))
+            # Skyline members are the algorithm's actual multi-criteria pick
+            # and are never trimmed; only the padding added purely to reach
+            # the numeric quota is subject to the relevance floor.
+            skyline_ids = set(tree_node_ids)
+            padding_ids = [node_id for node_id in filled if node_id not in skyline_ids]
+            text_score_by_id = dict(text_rerank_res)
+            padding_scored = sorted(
+                ((node_id, text_score_by_id.get(node_id, 0.0)) for node_id in padding_ids),
+                key=lambda item: (-item[1], item[0]),
+            )
+            kept_padding = {
+                node_id
+                for node_id, _ in self._confidence_filtered(
+                    padding_scored,
+                    limit=len(padding_scored),
+                    min_k=max(0, self.topk_min - len(skyline_ids)),
+                )
+            }
+            tree_node_ids = [
+                node_id
+                for node_id in filled
+                if node_id in skyline_ids or node_id in kept_padding
+            ]
+            log.info(
+                "Fallback selected %s unique nodes (%s padding entries dropped "
+                "below the confidence floor).",
+                len(tree_node_ids),
+                len(filled) - len(tree_node_ids),
+            )
 
         return tree_node_ids[: self.topk], res_entities
 

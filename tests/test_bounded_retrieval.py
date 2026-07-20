@@ -143,6 +143,115 @@ class SkylineBoundTests(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4], first_ids)
         self.assertEqual(first_ids, second_ids)
 
+    def test_confidence_filter_drops_a_real_score_cliff(self):
+        retriever = Retriever(
+            variant="standard",
+            reranker=_RecordingReranker(),
+            embedder=_Embedder(),
+            topk=10,
+        )
+
+        ranked = [(1, 0.95), (2, 0.9), (3, 0.88), (4, 0.1), (5, 0.05)]
+
+        self.assertEqual(
+            [1, 2, 3],
+            [node_id for node_id, _ in retriever._confidence_filtered(ranked)],
+        )
+
+    def test_confidence_filter_keeps_a_closely_scored_cluster_up_to_topk(self):
+        retriever = Retriever(
+            variant="standard",
+            reranker=_RecordingReranker(),
+            embedder=_Embedder(),
+            topk=10,
+        )
+
+        ranked = [(i, 0.9 - i * 0.01) for i in range(10)]
+
+        self.assertEqual(10, len(retriever._confidence_filtered(ranked)))
+
+    def test_confidence_filter_never_drops_below_topk_min(self):
+        retriever = Retriever(
+            variant="standard",
+            reranker=_RecordingReranker(),
+            embedder=_Embedder(),
+            topk=10,
+            topk_min=3,
+        )
+
+        ranked = [(1, 0.5), (2, 0.05), (3, 0.04), (4, 0.03)]
+
+        self.assertEqual(
+            [1, 2, 3],
+            [node_id for node_id, _ in retriever._confidence_filtered(ranked)],
+        )
+
+    def test_confidence_filter_never_exceeds_the_unfiltered_selection(self):
+        # An adaptive floor must only ever shrink what a fixed cutoff would
+        # have returned -- it can never surface a candidate topk excluded.
+        retriever = Retriever(
+            variant="standard",
+            reranker=_RecordingReranker(),
+            embedder=_Embedder(),
+            topk=3,
+        )
+
+        ranked = [(i, 1.0) for i in range(10)]  # every score identical
+
+        kept = [node_id for node_id, _ in retriever._confidence_filtered(ranked)]
+        self.assertEqual([0, 1, 2], kept)
+
+    def test_wo_graph_variant_applies_the_confidence_floor(self):
+        retriever = Retriever(
+            variant="wo_graph",
+            reranker=_RecordingReranker(),
+            embedder=_Embedder(),
+            topk=5,
+            topk_min=2,
+        )
+        retriever.text_reranker = lambda *_args: [
+            (1, 0.9),
+            (2, 0.85),
+            (3, 0.1),
+            (4, 0.05),
+        ]
+
+        tree_node_ids, _ = retriever.skyline_filter(
+            "query", [_text_node(1)], nx.Graph(), {}
+        )
+
+        self.assertEqual([1, 2], tree_node_ids)
+
+    def test_fallback_padding_below_the_floor_is_dropped_even_under_topk(self):
+        # The skyline alone is one dominant node; the rest is quota padding.
+        # A genuinely irrelevant padding candidate must not ride along just
+        # to hit topk -- topk is a ceiling, not a promise of that many nodes.
+        retriever = Retriever(
+            variant="standard",
+            reranker=_RecordingReranker(),
+            embedder=_Embedder(),
+            topk=4,
+            topk_min=1,
+            candidate_pool_size=4,
+        )
+        retriever.graph_reranker = lambda *_args: (
+            [(1, 0.9), (2, 0.5), (3, 0.4), (4, 0.3)],
+            [],
+        )
+        retriever.text_reranker = lambda *_args: [
+            (1, 0.95),
+            (2, 0.5),
+            (3, 0.4),
+            (4, 0.02),
+        ]
+
+        tree_node_ids, _ = retriever.skyline_filter(
+            "query", [_text_node(1)], nx.Graph(), {}
+        )
+
+        self.assertIn(1, tree_node_ids)
+        self.assertNotIn(4, tree_node_ids)
+
 
 class CandidatePoolTests(unittest.TestCase):
     def test_hybrid_candidate_contract_fuses_visual_dense_and_bm25(self):

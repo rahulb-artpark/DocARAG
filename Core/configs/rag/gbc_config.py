@@ -31,6 +31,25 @@ class GBCRAGConfig(BaseRAGStrategyConfig):
         ge=1,
         description="The number of top results to return from the graph-based retrieval.",
     )
+    topk_relative_floor: float = Field(
+        default=0.5,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "After reranking, drop candidates scoring below this fraction of "
+            "the top match rather than padding topk with low-relevance nodes. "
+            "topk stays the ceiling; this only ever shrinks the selection."
+        ),
+    )
+    topk_min: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Always keep at least this many top-ranked candidates even if "
+            "topk_relative_floor would cut deeper, so a query with uniformly "
+            "modest scores still gets an answer."
+        ),
+    )
     candidate_pool_size: int = Field(
         default=512,
         ge=1,
