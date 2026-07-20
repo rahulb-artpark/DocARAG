@@ -9,6 +9,8 @@ without running the pipeline around it.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,43 @@ import subprocess
 import sys
 
 STAGES = ("tree", "graph", "vdb", "persist")
+
+
+class StageLockedError(RuntimeError):
+    """Another process already holds this revision's stage lock."""
+
+
+def _lock_key(revision_key: int, stage: str) -> tuple[int, int]:
+    """Two signed int4 keys for pg_advisory_lock, deterministic per stage."""
+
+    digest = hashlib.sha256(f"docarag-stage:{revision_key}:{stage}".encode()).digest()
+    key1 = int.from_bytes(digest[:4], "big", signed=True)
+    key2 = int.from_bytes(digest[4:8], "big", signed=True)
+    return key1, key2
+
+
+@contextmanager
+def _stage_lock(connection, revision_key: int, stage: str):
+    """Hold a session-scoped advisory lock for one stage of one revision.
+
+    Two stages can run concurrently; the same stage of the same revision
+    cannot. Session-scoped means the lock releases if the connection dies,
+    so a killed process can never strand a run permanently locked.
+    """
+
+    key1, key2 = _lock_key(revision_key, stage)
+    acquired = connection.execute(
+        "SELECT pg_try_advisory_lock(%s, %s)", (key1, key2)
+    ).fetchone()["pg_try_advisory_lock"]
+    if not acquired:
+        raise StageLockedError(
+            f"stage '{stage}' is already running for this revision -- "
+            "another docarag stage invocation holds it"
+        )
+    try:
+        yield
+    finally:
+        connection.execute("SELECT pg_advisory_unlock(%s, %s)", (key1, key2))
 
 
 def _connect():
@@ -111,42 +150,45 @@ def run_stage(run: Path, stage: str) -> int:
     )
     with _connect() as connection:
         key = _revision_key(connection, run)
-        _record(connection, key, stage, "running")
-    completed = subprocess.run(command, cwd=str(repo), env=env)
-    status = "succeeded" if completed.returncode == 0 else "failed"
-    error = None if completed.returncode == 0 else f"exit {completed.returncode}"
-    with _connect() as connection:
-        _record(connection, key, stage, status, error)
-        if status == "succeeded" and stage == "tree":
-            # New tree rows: graph bindings and vectors no longer describe them.
-            _record(connection, key, "graph", "stale")
-            _record(connection, key, "vdb", "stale")
-    if status == "succeeded" and stage in ("tree", "graph", "vdb"):
-        # A re-run stage rewrote published artifacts; the manifest and the
-        # sealed run state must describe what is now on disk.
-        republish = _republish(run, repo, env)
-        if republish != 0:
-            with _connect() as connection:
-                _record(connection, key, stage, "failed", "artifact republication failed")
-            print(f"[stage] {stage}: failed (republication)")
-            return republish
-    if status == "succeeded" and stage in ("tree", "graph"):
-        # A stage's output belongs to the store the moment the stage ends.
-        part = subprocess.run(
-            [
-                sys.executable, "-m", "docarag.evidence_persist",
-                "--run", str(run), "--part", stage,
-            ],
-            cwd=str(repo),
-        )
-        with _connect() as connection:
-            _record(
-                connection, key, "persist",
-                "succeeded" if part.returncode == 0 else "failed",
-                None if part.returncode == 0 else f"exit {part.returncode}",
-            )
-        if part.returncode != 0:
-            status = "failed"
+        with _stage_lock(connection, key, stage):
+            _record(connection, key, stage, "running")
+            completed = subprocess.run(command, cwd=str(repo), env=env)
+            status = "succeeded" if completed.returncode == 0 else "failed"
+            error = None if completed.returncode == 0 else f"exit {completed.returncode}"
+            _record(connection, key, stage, status, error)
+            if status == "succeeded" and stage == "tree":
+                # New tree rows: graph bindings and vectors no longer
+                # describe them.
+                _record(connection, key, "graph", "stale")
+                _record(connection, key, "vdb", "stale")
+            if status == "succeeded" and stage in ("tree", "graph", "vdb"):
+                # A re-run stage rewrote published artifacts; the manifest
+                # and the sealed run state must describe what is now on disk.
+                republish = _republish(run, repo, env)
+                if republish != 0:
+                    _record(
+                        connection, key, stage,
+                        "failed", "artifact republication failed",
+                    )
+                    print(f"[stage] {stage}: failed (republication)")
+                    return republish
+            if status == "succeeded" and stage in ("tree", "graph"):
+                # A stage's output belongs to the store the moment the
+                # stage ends.
+                part = subprocess.run(
+                    [
+                        sys.executable, "-m", "docarag.evidence_persist",
+                        "--run", str(run), "--part", stage,
+                    ],
+                    cwd=str(repo),
+                )
+                _record(
+                    connection, key, "persist",
+                    "succeeded" if part.returncode == 0 else "failed",
+                    None if part.returncode == 0 else f"exit {part.returncode}",
+                )
+                if part.returncode != 0:
+                    status = "failed"
     print(f"[stage] {stage}: {status}")
     return completed.returncode
 
@@ -292,9 +334,13 @@ def main(argv: list[str] | None = None) -> int:
                 line += f"  ({row['error']})"
             print(line)
         return 0
-    if args.stage == "all":
-        return run_all(args.run)
-    return run_stage(args.run, args.stage)
+    try:
+        if args.stage == "all":
+            return run_all(args.run)
+        return run_stage(args.run, args.stage)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
