@@ -89,10 +89,19 @@ def get_json_content(any_list: list[Optional[str]], selected_columns: list[str])
     return json_list_str
 
 
-def enumerate_pdf_list(pdf_list: list[Optional[str]]) -> list[Optional[str]]:
-    """Enumerate the PDF content list."""
+def enumerate_pdf_list(
+    pdf_list: list[Optional[str]], start: int = 1
+) -> list[Optional[str]]:
+    """Enumerate the PDF content list.
+
+    ``start`` lets a sharded caller continue numbering where the previous
+    shard left off, so pdf_id stays a globally unique, order-preserving
+    identifier across the whole document instead of resetting to 1 -- and
+    colliding -- at every shard boundary.
+    """
+
     enumerated_list = []
-    i = 1  # pdf_id starts from 1
+    i = start
     for content in pdf_list:
         if content is not None and content.get("invalid", False) == False:
             content["pdf_id"] = i

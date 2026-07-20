@@ -39,6 +39,8 @@ def do_parse(
     p_formula_enable=True,  # Enable formula parsing
     p_table_enable=True,  # Enable table parsing
     server_url=None,  # Server URL for vlm-sglang-client backend
+    start_page_id: int = 0,  # First page to parse (0-indexed, inclusive)
+    end_page_id: int | None = None,  # Last page to parse, inclusive; None = last page
 ):
     from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
     from mineru.data.data_reader_writer import FileBasedDataWriter
@@ -46,7 +48,12 @@ def do_parse(
     from mineru.utils.enum_class import MakeMode
 
     local_image_dir, local_md_dir = prepare_result_dir(output_dir, parse_method)
-    new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes)
+    # Page selection happens here, before analysis: pdfium extracts just this
+    # range into a new, small in-memory PDF, so OCR/layout/rendering below
+    # only ever sees and holds this shard, never the whole document.
+    new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(
+        pdf_bytes, start_page_id=start_page_id, end_page_id=end_page_id
+    )
     image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(
         local_md_dir
     )
@@ -133,7 +140,10 @@ def do_parse(
         json.dumps(middle_json, ensure_ascii=False, indent=4),
     )
 
-    draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
+    # pdf_info's page indices are relative to the sliced shard (new_pdf_bytes),
+    # not the original document -- drawing against the original pdf_bytes
+    # would misalign every page once a shard doesn't start at page 0.
+    draw_layout_bbox(pdf_info, new_pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
 
     log.info(f"PDF parsing completed. Output saved to {local_md_dir}")
     return middle_json, content_list
@@ -146,6 +156,8 @@ def parse_doc(
     backend="pipeline",
     method="auto",
     server_url=None,
+    start_page_id: int = 0,
+    end_page_id: int | None = None,
 ):
     """
     Parameter description:
@@ -167,6 +179,11 @@ def parse_doc(
         Without method specified, 'auto' will be used by default.
         Adapted only for the case where the backend is set to "pipeline".
     server_url: When the backend is `sglang-client`, you need to specify the server_url, for example:`http://127.0.0.1:30000`
+    start_page_id: First page to parse, 0-indexed, inclusive. Default 0 (the
+        first page) -- parses the whole document exactly as before.
+    end_page_id: Last page to parse, inclusive. Default None (the last page).
+        Passing a bounded range parses only that shard: rendering, OCR and
+        layout analysis never see or hold pages outside it.
     """
     try:
         from mineru.cli.common import read_fn
@@ -181,6 +198,8 @@ def parse_doc(
             backend=backend,
             parse_method=method,
             server_url=server_url,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
         )
     except Exception as e:
         log.error(f"Error parsing {pdf_path}: {e}")

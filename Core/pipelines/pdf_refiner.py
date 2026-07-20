@@ -1273,21 +1273,26 @@ def truncate_ocr_error_refiner(
     return pdf_list
 
 
-def pdf_info_refiner(pdf_list: list[Optional[str]], llm: LLM) -> list[Optional[str]]:
+def pdf_info_refiner(
+    pdf_list: list[Optional[str]], llm: LLM, *, start_pdf_id: int = 1
+) -> list[Optional[str]]:
     # Heuristic refiner for "-" error in OCR
     pdf_list = dash_line_refiner(pdf_list)
     # Heuristic refiner for OCR Error
     pdf_list = truncate_ocr_error_refiner(pdf_list)
 
     # we first enumerate the pdf_list to ensure each content has a unique index
-    pdf_list = enumerate_pdf_list(pdf_list)
+    pdf_list = enumerate_pdf_list(pdf_list, start=start_pdf_id)
 
     # Then we refine the PDF information by merging incomplete paragraphs and tables
     pdf_list = text_merger(pdf_list, llm)
     pdf_list = table_merger(pdf_list, llm)
 
-    # After merging, we need to re-enumerate the pdf_list
-    pdf_list = enumerate_pdf_list(pdf_list)
+    # After merging, we need to re-enumerate the pdf_list. A sharded caller
+    # passes the same start_pdf_id here as above: merging only ever removes
+    # items (two continuation pieces become one), never adds them, so the
+    # id sequence re-numbers within the same range, still globally unique.
+    pdf_list = enumerate_pdf_list(pdf_list, start=start_pdf_id)
     log.info("PDF information refinement completed.")
     # Return the refined pdf_list
     return pdf_list
