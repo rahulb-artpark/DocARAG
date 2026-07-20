@@ -545,6 +545,7 @@ def bind_canonical_evidence(
     merged_content_path: str | os.PathLike[str],
     document_page_count: int | None = None,
     debug_artifact_suffix: str = "",
+    canonical_artifact_filename: str = CANONICAL_EVIDENCE_FILE,
 ) -> tuple[ParseRequest, tuple[CanonicalBlock, ...]]:
     """Translate MinerU blocks and attach immutable evidence IDs one-to-one.
 
@@ -561,6 +562,16 @@ def bind_canonical_evidence(
     don't silently overwrite each other under the same document-derived
     name -- the same bug class already found and fixed for ``do_parse``'s
     own dumps when the parse stage was sharded.
+
+    ``canonical_artifact_filename`` overrides where this call's canonical
+    blocks are written. Left at its default, behavior is unchanged: one
+    call publishes the complete, final ``canonical_blocks.json``. A
+    per-shard caller instead points this at a small per-shard fragment
+    filename and calls ``merge_canonical_evidence_shards`` once, after every
+    shard is bound, to produce the one complete artifact every existing
+    reader (``evidence_projection.py``, ``evidence_persist.py``,
+    ``docarag.provenance``) still expects -- this function's own writing
+    logic doesn't need to know which mode it's in beyond the filename.
     """
 
     request = _make_parse_request(
@@ -823,7 +834,7 @@ def bind_canonical_evidence(
         "block_count": len(canonical_blocks),
         "canonical_blocks": [item.to_dict() for item in canonical_blocks],
     }
-    canonical_path = Path(cfg.save_path) / CANONICAL_EVIDENCE_FILE
+    canonical_path = Path(cfg.save_path) / canonical_artifact_filename
     _atomic_write_json(canonical_path, canonical_payload)
     for block, attachment in zip(pdf_list, attachments, strict=True):
         block.update(attachment)
@@ -833,6 +844,118 @@ def bind_canonical_evidence(
         canonical_path,
     )
     return request, tuple(canonical_blocks)
+
+
+def merge_canonical_evidence_shards(
+    cfg: SystemConfig,
+    *,
+    shard_fragment_filenames: list[str],
+) -> Path:
+    """Publish the one complete canonical-evidence artifact every existing
+    reader expects, from per-shard fragments written by repeated
+    ``bind_canonical_evidence`` calls.
+
+    Every reader of ``canonical_blocks.json``
+    (``evidence_projection.py``, ``evidence_persist.py``,
+    ``docarag.provenance``, ``docarag.evidence_hydration``) expects exactly
+    one file with this same shape -- this does not change that shape or add
+    a field; it only changes how the file is produced. Each fragment is read
+    (bounded to one shard's blocks), its blocks streamed straight into the
+    output file, and discarded before the next fragment is opened -- peak
+    memory is one shard's blocks, not the whole document's.
+
+    Every fragment's ``document`` is identical (shard-invariant since the
+    per-shard ``document_page_count`` fix). ``parse_request_id``/
+    ``parse_result_sha256``/``parser_manifest`` are genuinely per-shard-call
+    values (each shard has its own ``ParseRequest``/``ParseResult``), but
+    nothing downstream depends on which shard's values end up in the merged
+    artifact (confirmed: ``evidence_hydration.py`` only checks these fields
+    are present in its known-fields allowlist, never their content) -- so
+    this takes them from whichever fragment is opened first, requiring
+    nothing extra from the caller beyond the list of fragment filenames.
+    """
+
+    if not shard_fragment_filenames:
+        raise CanonicalEvidenceBindingError(
+            "cannot merge canonical evidence from zero shards"
+        )
+    canonical_path = Path(cfg.save_path) / CANONICAL_EVIDENCE_FILE
+    canonical_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _encode(value: object) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    block_count = 0
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{canonical_path.name}.",
+            suffix=".tmp",
+            dir=canonical_path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            # Hand-assembled, not one json.dumps(whole_payload) call, so
+            # canonical_blocks never has to exist as one in-memory list --
+            # each fragment's blocks are read, written, and dropped before
+            # the next fragment is opened. Every reader parses this as JSON
+            # by key, not by relying on a particular key order, so writing
+            # header fields before canonical_blocks (matching the field
+            # order bind_canonical_evidence itself already writes) is a
+            # readability choice, not a correctness requirement.
+            temporary.write("{")
+            header_written = False
+            first_block = True
+            for filename in shard_fragment_filenames:
+                fragment_path = Path(cfg.save_path) / filename
+                with open(fragment_path, "r", encoding="utf-8") as fragment_file:
+                    fragment = json.load(fragment_file)
+                if not header_written:
+                    for key in (
+                        "artifact_schema_version",
+                        "contract_schema_version",
+                        "document",
+                        "parse_request_id",
+                        "parse_result_sha256",
+                        "parser_manifest",
+                    ):
+                        temporary.write(f"{_encode(key)}:{_encode(fragment[key])},")
+                    temporary.write(f'{_encode("canonical_blocks")}:[')
+                    header_written = True
+                for block in fragment["canonical_blocks"]:
+                    if not first_block:
+                        temporary.write(",")
+                    temporary.write(_encode(block))
+                    first_block = False
+                    block_count += 1
+                del fragment
+            temporary.write(f'],{_encode("block_count")}:{block_count}}}')
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, canonical_path)
+        directory_fd = os.open(canonical_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    log.info(
+        "Merged %d canonical blocks from %d shard(s) into %s",
+        block_count,
+        len(shard_fragment_filenames),
+        canonical_path,
+    )
+    return canonical_path
 
 
 def _normalize_canonical_ingestion(value: object) -> CanonicalIngestionResult:

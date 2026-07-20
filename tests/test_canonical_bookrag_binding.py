@@ -16,10 +16,12 @@ from Core.pipelines.doc_tree_builder import (
     PARSER_OBSERVATION_SCHEMA_VERSION,
     CanonicalEvidenceBindingError,
     bind_canonical_evidence,
+    merge_canonical_evidence_shards,
 )
 from Core.pipelines.tree_node_builder import create_node_by_type
 from docarag.bookrag_projection import project_canonical_blocks
 from docarag.domain import CanonicalBlock, DocumentRef, ParseResult, RelationType
+from docarag.evidence_hydration import CanonicalEvidenceCatalog
 
 
 class CanonicalBookRAGBindingTests(unittest.TestCase):
@@ -362,6 +364,65 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
                 (Path(cfg.save_path) / "auto" / "source_parser_observations.json")
                 .is_file()
             )
+
+    def test_merging_shard_fragments_matches_a_whole_document_call(self):
+        # Two separate bind_canonical_evidence calls, one per block, each
+        # writing to its own fragment filename instead of the shared
+        # canonical_blocks.json -- simulating two shards of the same
+        # document. Merging them must produce exactly what one
+        # whole-document call would have.
+        blocks = self.blocks()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self.make_cfg(root)
+            merged_path = Path(cfg.save_path) / "auto" / "source_merged_content.json"
+            merged_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_path.write_text(json.dumps(blocks), encoding="utf-8")
+
+            whole_request, whole_canonical = bind_canonical_evidence(
+                cfg,
+                deepcopy(blocks),
+                merged_content_path=merged_path,
+                canonical_artifact_filename="whole_document_reference.json",
+            )
+
+            fragment_names = []
+            for index, block in enumerate(deepcopy(blocks)):
+                fragment_name = f"canonical_blocks_shard{index:03d}.json"
+                bind_canonical_evidence(
+                    cfg,
+                    [block],
+                    merged_content_path=merged_path,
+                    debug_artifact_suffix=f"_shard{index:03d}",
+                    canonical_artifact_filename=fragment_name,
+                )
+                fragment_names.append(fragment_name)
+
+            canonical_path = merge_canonical_evidence_shards(
+                cfg, shard_fragment_filenames=fragment_names
+            )
+            self.assertEqual(Path(cfg.save_path) / CANONICAL_EVIDENCE_FILE, canonical_path)
+
+            catalog = CanonicalEvidenceCatalog.load(canonical_path)
+            self.assertEqual(whole_request.document, catalog.document)
+            self.assertEqual(
+                sorted(item.block_id for item in whole_canonical),
+                sorted(block.block_id for block in catalog.blocks),
+            )
+            self.assertEqual(
+                sorted(item.revision_id for item in whole_canonical),
+                sorted(block.revision_id for block in catalog.blocks),
+            )
+
+            payload = json.loads(canonical_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(blocks), payload["block_count"])
+            self.assertEqual(len(blocks), len(payload["canonical_blocks"]))
+
+    def test_merge_rejects_an_empty_shard_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_cfg(Path(tmp))
+            with self.assertRaises(CanonicalEvidenceBindingError):
+                merge_canonical_evidence_shards(cfg, shard_fragment_filenames=[])
 
     def test_artifacts_are_byte_deterministic_for_the_same_parser_output(self):
         with tempfile.TemporaryDirectory() as tmp:
