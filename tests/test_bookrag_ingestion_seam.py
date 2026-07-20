@@ -13,11 +13,13 @@ from unittest import mock
 from Core.Index.Tree import DocumentTree, NodeType, TreeNode
 from Core.pipelines import doc_tree_builder
 from Core.pipelines.doc_tree_builder import (
+    CANONICAL_EVIDENCE_SCHEMA_VERSION,
     CanonicalIngestionBindingError,
     CanonicalIngestionPolicy,
     CanonicalIngestionResult,
     build_tree_from_pdf,
 )
+from docarag.domain.base import CONTRACT_SCHEMA_VERSION
 from docarag.bookrag_projection import project_to_bookrag_pdf_list
 from docarag.domain import (
     BlockType,
@@ -93,6 +95,7 @@ class BookRAGIngestionSeamTests(unittest.TestCase):
                 method="auto",
                 server_url=None,
                 lang="en",
+                shard_pages=10,
             ),
         )
 
@@ -411,14 +414,31 @@ class BookRAGIngestionSeamTests(unittest.TestCase):
             captured: dict[str, object] = {}
             patches = self.pipeline_patches(captured)
 
-            def bind(_cfg, pdf_list, *, merged_content_path):
+            def bind(
+                _cfg,
+                pdf_list,
+                *,
+                merged_content_path,
+                document_page_count=None,
+                debug_artifact_suffix="",
+                canonical_artifact_filename="canonical_blocks.json",
+            ):
                 self.assertEqual(str(merged_path), merged_content_path)
                 pdf_list[0]["canonical_block_id"] = canonical.block_id
                 pdf_list[0]["canonical_revision_id"] = canonical.revision_id
-                canonical_path = Path(cfg.save_path) / "canonical_blocks.json"
+                canonical_path = Path(cfg.save_path) / canonical_artifact_filename
                 canonical_path.write_text(
                     json.dumps(
-                        {"canonical_blocks": [canonical.to_dict()]},
+                        {
+                            "artifact_schema_version": CANONICAL_EVIDENCE_SCHEMA_VERSION,
+                            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+                            "document": document.to_dict(),
+                            "parse_request_id": request.request_id,
+                            "parse_result_sha256": "0" * 64,
+                            "parser_manifest": {},
+                            "block_count": 1,
+                            "canonical_blocks": [canonical.to_dict()],
+                        },
                         sort_keys=True,
                     ),
                     encoding="utf-8",

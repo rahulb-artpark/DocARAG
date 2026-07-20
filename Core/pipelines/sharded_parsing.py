@@ -77,6 +77,60 @@ def shard_ranges(page_count: int, shard_size: int) -> Iterator[tuple[int, int]]:
         yield start, min(start + shard_size, page_count) - 1
 
 
+def page_count_from_blocks(blocks: list[dict[str, Any]]) -> int:
+    """Return a document's page count from its own already-parsed blocks.
+
+    Used where the document's real PDF file either isn't safe to reopen (a
+    cache-hit path that intentionally never touches it again) or simply
+    doesn't need to be: every block already carries the page it came from,
+    and ``blocks`` here is the whole document's, not one shard's, so the
+    highest ``page_idx`` plus one is the same total ``pdf_page_count`` would
+    have opened the file to compute.
+    """
+
+    highest = -1
+    for block in blocks:
+        page_idx = block.get("page_idx") if isinstance(block, dict) else None
+        if isinstance(page_idx, int) and not isinstance(page_idx, bool):
+            highest = max(highest, page_idx)
+    if highest < 0:
+        raise ValueError("no block carries a valid page_idx")
+    return highest + 1
+
+
+def partition_blocks_by_shard(
+    blocks: list[dict[str, Any]], ranges: list[tuple[int, int]]
+) -> list[list[dict[str, Any]]]:
+    """Group already-assembled blocks back into their original page shards.
+
+    For a stage that needs the whole document's blocks in page order before
+    it can run (recovering the native text layer, for instance) but whose
+    *own* output can still be produced shard by shard (canonical evidence
+    binding), this re-derives the same page groups the parse loop used,
+    from each block's own ``page_idx`` -- no separate bookkeeping needed.
+
+    Every block lands in exactly one group, in its original relative order.
+    A block without a valid integer ``page_idx`` (not expected in practice
+    -- every stage that produces blocks upstream sets one -- but not
+    something this function should silently drop if it ever happens) goes
+    to the last shard rather than being lost.
+    """
+
+    if not ranges:
+        raise ValueError("ranges must not be empty")
+    groups: list[list[dict[str, Any]]] = [[] for _ in ranges]
+    for block in blocks:
+        page_idx = block.get("page_idx") if isinstance(block, dict) else None
+        shard_index = len(ranges) - 1
+        if isinstance(page_idx, int) and not isinstance(page_idx, bool):
+            for index, (start, end) in enumerate(ranges):
+                if start <= page_idx <= end:
+                    shard_index = index
+                    break
+        groups[shard_index].append(block)
+    return groups
+
+
 def offset_page_indices(
     middle_json: dict[str, Any], content_list: list[dict[str, Any]], offset: int
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -212,6 +266,8 @@ __all__ = [
     "CARRY_PAGES",
     "ParsedShard",
     "offset_page_indices",
+    "page_count_from_blocks",
+    "partition_blocks_by_shard",
     "parse_sharded",
     "pdf_page_count",
     "shard_ranges",

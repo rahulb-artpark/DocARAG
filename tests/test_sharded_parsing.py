@@ -15,6 +15,8 @@ from Core.pipelines.sharded_parsing import (
     CARRY_PAGES,
     ParsedShard,
     offset_page_indices,
+    page_count_from_blocks,
+    partition_blocks_by_shard,
     parse_sharded,
     pdf_page_count,
     shard_ranges,
@@ -44,6 +46,85 @@ class PdfPageCountTests(unittest.TestCase):
 
     def test_single_page_document(self):
         self.assertEqual(1, pdf_page_count(self._make_pdf(1)))
+
+
+class PageCountFromBlocksTests(unittest.TestCase):
+    def test_returns_highest_page_idx_plus_one(self):
+        blocks = [{"page_idx": 0}, {"page_idx": 4}, {"page_idx": 2}]
+        self.assertEqual(5, page_count_from_blocks(blocks))
+
+    def test_ignores_blocks_without_a_valid_page_idx(self):
+        blocks = [
+            {"page_idx": 2},
+            {"id": "no page_idx"},
+            {"page_idx": None},
+            {"page_idx": "3"},
+            {"page_idx": True},
+        ]
+        self.assertEqual(3, page_count_from_blocks(blocks))
+
+    def test_raises_when_no_block_has_a_valid_page_idx(self):
+        with self.assertRaises(ValueError):
+            page_count_from_blocks([{"id": "no pages here"}])
+
+
+class PartitionBlocksByShardTests(unittest.TestCase):
+    def test_every_block_lands_in_the_shard_containing_its_page(self):
+        ranges = [(0, 1), (2, 3)]
+        blocks = [
+            {"page_idx": 0, "id": "a"},
+            {"page_idx": 3, "id": "b"},
+            {"page_idx": 1, "id": "c"},
+            {"page_idx": 2, "id": "d"},
+        ]
+        groups = partition_blocks_by_shard(blocks, ranges)
+        self.assertEqual(
+            [["a", "c"], ["b", "d"]],
+            [[block["id"] for block in group] for group in groups],
+        )
+
+    def test_relative_order_within_a_shard_is_preserved(self):
+        ranges = [(0, 5)]
+        blocks = [{"page_idx": 0, "id": i} for i in range(5)]
+        groups = partition_blocks_by_shard(blocks, ranges)
+        self.assertEqual([0, 1, 2, 3, 4], [block["id"] for block in groups[0]])
+
+    def test_every_input_block_appears_exactly_once_across_all_groups(self):
+        ranges = [(0, 2), (3, 5), (6, 8)]
+        blocks = [{"page_idx": page} for page in [8, 0, 4, 1, 7, 3, 2, 6, 5]]
+        groups = partition_blocks_by_shard(blocks, ranges)
+        flattened = [block for group in groups for block in group]
+        self.assertEqual(len(blocks), len(flattened))
+        for block in blocks:
+            self.assertIn(block, flattened)
+
+    def test_a_block_without_a_valid_page_idx_goes_to_the_last_shard_not_lost(self):
+        ranges = [(0, 1), (2, 3)]
+        blocks = [
+            {"page_idx": 0, "id": "a"},
+            {"id": "no page_idx at all"},
+            {"page_idx": None, "id": "explicit none"},
+            {"page_idx": "1", "id": "string, not int"},
+            {"page_idx": True, "id": "bool, not a real page index"},
+        ]
+        groups = partition_blocks_by_shard(blocks, ranges)
+        self.assertEqual(["a"], [b["id"] for b in groups[0]])
+        self.assertEqual(
+            [
+                "no page_idx at all",
+                "explicit none",
+                "string, not int",
+                "bool, not a real page index",
+            ],
+            [b["id"] for b in groups[1]],
+        )
+
+    def test_rejects_empty_ranges(self):
+        with self.assertRaises(ValueError):
+            partition_blocks_by_shard([{"page_idx": 0}], [])
+
+    def test_empty_blocks_produces_one_empty_group_per_range(self):
+        self.assertEqual([[], []], partition_blocks_by_shard([], [(0, 1), (2, 3)]))
 
 
 class ShardRangesTests(unittest.TestCase):

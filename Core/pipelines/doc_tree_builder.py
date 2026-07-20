@@ -13,7 +13,13 @@ from Core.Index.Tree import DocumentTree
 from Core.configs.system_config import SystemConfig
 from Core.pipelines.outline_extractor import extract_pdf_outline_in_chunks
 from Core.pipelines.pdf_refiner import pdf_info_refiner
-from Core.pipelines.sharded_parsing import offset_page_indices, pdf_page_count, shard_ranges
+from Core.pipelines.sharded_parsing import (
+    offset_page_indices,
+    page_count_from_blocks,
+    partition_blocks_by_shard,
+    pdf_page_count,
+    shard_ranges,
+)
 from Core.pipelines.tree_node_builder import create_node_by_type
 from Core.pipelines.tree_node_summary import generate_tree_node_summary
 from Core.provider.TokenTracker import TokenTracker
@@ -1558,10 +1564,46 @@ def build_tree_from_pdf(
                     recovered_blocks,
                     dropped_blocks,
                 )
-            parse_request, _canonical_blocks = bind_canonical_evidence(
-                cfg,
-                pdf_list,
-                merged_content_path=tmp_save_path,
+
+            # Canonical evidence binding -- translation, reconciliation, crop
+            # materialization, VLM figure enrichment -- is the second-largest
+            # memory cost after MinerU's own rendering (bounded above). Bind
+            # it in the same page-range shards parsing already used: one
+            # shard's blocks, crops and VLM calls in memory at a time,
+            # instead of the whole document's. recover_and_prune_empty_text_blocks
+            # still needs pdf_list whole (it's a lightweight text match, not
+            # a memory concern) so blocks are regrouped by page_idx back into
+            # the same shard boundaries afterward.
+            #
+            # The page count comes from pdf_list itself (every block already
+            # carries its page_idx, and pdf_list is the whole document's
+            # here, whether freshly parsed or loaded from the merged-content
+            # cache), not from reopening cfg.pdf_path -- the cache-hit branch
+            # above intentionally never touches the source file again once
+            # parsing has completed once.
+            canonical_page_count = page_count_from_blocks(pdf_list)
+            canonical_shard_ranges = list(
+                shard_ranges(canonical_page_count, cfg.mineru.shard_pages)
+            )
+            canonical_shard_fragments: list[str] = []
+            parse_request = None
+            for shard_index, shard_blocks in enumerate(
+                partition_blocks_by_shard(pdf_list, canonical_shard_ranges)
+            ):
+                if not shard_blocks:
+                    continue
+                fragment_filename = f"canonical_blocks_shard{shard_index:03d}.json"
+                parse_request, _shard_canonical = bind_canonical_evidence(
+                    cfg,
+                    shard_blocks,
+                    merged_content_path=tmp_save_path,
+                    document_page_count=canonical_page_count,
+                    debug_artifact_suffix=f"_shard{shard_index:03d}",
+                    canonical_artifact_filename=fragment_filename,
+                )
+                canonical_shard_fragments.append(fragment_filename)
+            merge_canonical_evidence_shards(
+                cfg, shard_fragment_filenames=canonical_shard_fragments
             )
             document = parse_request.document
             (
