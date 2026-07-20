@@ -936,12 +936,16 @@ class AppState:
         run_config = self.run_dir / "run_config.yaml"
         cfg = load_system_config(str(run_config if run_config.is_file() else DEFAULT_CONFIG))
         cfg.save_path = str(self.run_dir)
-        graph_artifact = find_graph_artifact(self.run_dir)
-        if graph_artifact is not None:
-            if graph_artifact.name == "graph_data_basic.json":
-                cfg.graph.refine_type = "basic"
-            elif graph_artifact.name == "graph_data.json" and cfg.graph.refine_type == "basic":
-                cfg.graph.refine_type = "advanced"
+        # cfg.graph.refine_type, loaded above from this run's own frozen
+        # run_config.yaml, is already exactly what was used to build this
+        # run -- graph_artifact_variant(cfg.graph) (Core/configs/graph_config.py)
+        # is a pure function of cfg.graph alone, so recomputing it here would
+        # always reproduce the same variant the build already used. There is
+        # no build-time fallback/downgrade path that could make the actual
+        # artifact disagree with a fresh config read. Inspecting a JSON
+        # artifact's filename to "correct" refine_type was therefore
+        # correcting a case that cannot happen, while depending on a JSON
+        # file for something the store-backed config already answers.
         attestation_dir = find_retrieval_artifact_dir(self.run_dir)
         if attestation_dir is not None:
             cfg.vdb.manifest_dir_name = str(attestation_dir)
