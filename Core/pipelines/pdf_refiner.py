@@ -6,6 +6,7 @@ from Core.prompts.refiner_prompt import (
     TABLE_MERGE_PROMPT,
     MergeJudgmentsResponse,
     TEXT_MERGE_PROMPT,
+    LABEL_MERGE_PROMPT,
     StitchingJudgmentsResponse,
 )
 from Core.utils.utils import num_tokens, get_json_content, enumerate_pdf_list
@@ -681,6 +682,91 @@ def search_continuation_candidates(
     return candidates
 
 
+def is_likely_content_label(text: str) -> bool:
+    """
+    A short, non-title text block that might be a label introducing the
+    content immediately following it (e.g. "Answer to Check Yourself",
+    "Solution", "Example 3" -- in any wording or language) rather than a
+    self-contained caption or title that happens to also be short.
+
+    is_likely_incomplete_paragraph's own Rule 1 excludes exactly this same
+    short-text population from continuation-merging, because a genuine
+    short caption/title must not swallow whatever unrelated content happens
+    to follow it. This targets that same population from the other
+    direction, for a different question ("does it introduce what follows",
+    not "is it a sentence cut short") -- so the two passes never propose the
+    same block for both judgments.
+
+    Deliberately no keyword list: which labels actually get merged is
+    decided by the LLM judgment this only proposes candidates for (the same
+    judgment that already knows to reject a genuine caption/title). Staying
+    permissive here and letting that real decision happen downstream
+    generalizes across wording and language, instead of only the specific
+    vocabulary anyone thought to list ahead of time.
+    """
+    if not text:
+        return False
+    text = text.strip()
+    if not text:
+        return False
+    words = text.split()
+    # The exact population Rule 1 (above) excludes.
+    if not (len(words) < 5 or len(text) < 25):
+        return False
+    # A sentence ending in terminal punctuation is describing something
+    # complete in itself, not introducing what follows -- language-agnostic
+    # enough (shared across most punctuation-using scripts), unlike a
+    # vocabulary list.
+    if re.search(r"[.!?]$", text):
+        return False
+    # Excludes page numbers, bullets, and other non-linguistic short
+    # fragments that could never be a label in any language -- a structural
+    # check (does it contain a letter), not a vocabulary one.
+    if not any(char.isalpha() for char in text):
+        return False
+    return True
+
+
+def search_label_content_candidate(
+    cur_content: dict,
+    pdf_list: list[dict],
+    cur_idx: int,
+    end_idx: int,
+    max_page_gap: int = 2,
+) -> Optional[dict]:
+    """
+    Find the single block that immediately follows a content label, for the
+    LLM to judge. Unlike search_continuation_candidates (tuned for "does
+    this look like a mid-sentence continuation" -- lowercase start, acronym,
+    bounded uppercase-restart count), a label can be followed by content in
+    any case or form ("1(A) 2(A)..." starts with a digit, "The Second Law
+    states..." starts with a normal capital) -- so this returns the very
+    next non-empty, non-title, non-table, non-image block without those
+    sentence-continuation-specific shape checks, still bounded by the same
+    max_page_gap the rest of this module's search already uses (matching
+    the verified cross-shard carry-over window from sharded_parsing.py).
+    """
+    i = cur_idx + 1
+    cur_page_idx = cur_content["page_idx"]
+    while i <= end_idx and i < len(pdf_list):
+        next_content = pdf_list[i]
+        next_page_idx = next_content.get("page_idx", -1)
+        if next_page_idx > cur_page_idx + max_page_gap:
+            break
+        if (
+            next_content.get("type") in ("table", "image")
+            or next_content.get("text_level", -1) >= 0
+        ):
+            i += 1
+            continue
+        next_text = next_content.get("text", "").strip()
+        if not next_text:
+            i += 1
+            continue
+        return next_content
+    return None
+
+
 def get_json_str_text(text_candidates, max_tokens) -> List[str]:
     """
     Convert the text candidates into a list of JSON strings for LLM input.
@@ -750,23 +836,29 @@ def found_remove_text(text_candidate_pairs: list[tuple[dict, list[dict]]], error
             text_candidate_pairs.pop(i)
 
 
-def llm_text_judge(text_candidate_pairs, llm: LLM):
+def _llm_stitching_judge(
+    text_candidate_pairs, llm: LLM, prompt_template: str, *, log_label: str
+) -> int:
     """
-    Judge the text stitching task using the LLM.
+    Shared retry/parse/merge core for both llm_text_judge (continuation of an
+    incomplete sentence) and llm_label_judge (a short label merged with the
+    content it introduces). The two differ only in prompt wording and in
+    which blocks get proposed as pairs beforehand; the stitching decision
+    format, retry behavior, and merge mechanics are identical.
     """
     if not text_candidate_pairs:
-        log.info("No text candidates found for LLM judgment.")
-        return
+        log.info(f"No {log_label} candidates found for LLM judgment.")
+        return 0
     json_str_list = get_json_str_text(
         text_candidate_pairs, llm.config.max_tokens -
-        num_tokens(TEXT_MERGE_PROMPT) - 400
+        num_tokens(prompt_template) - 400
     )
     llm_infer_results = []
     for number, json_str in json_str_list:
         success = False
         for i in range(2):
             try:
-                prompt = TEXT_MERGE_PROMPT.format(json_text=json_str)
+                prompt = prompt_template.format(json_text=json_str)
                 log.info(f"number of tokens in prompt: {num_tokens(prompt)}")
                 response = llm.get_json_completion(
                     prompt=prompt, schema=StitchingJudgmentsResponse)
@@ -787,14 +879,14 @@ def llm_text_judge(text_candidate_pairs, llm: LLM):
         if not success:
             # remove current json_str from the list if all retries failed
             log.error(
-                f"Failed to process {number} table pairs with LLM judgment.")
+                f"Failed to process {number} {log_label} pairs with LLM judgment.")
             found_remove_text(text_candidate_pairs, json_str)
 
     if len(llm_infer_results) != len(text_candidate_pairs):
         log.error(
             f"LLM inference results length mismatch: {len(llm_infer_results)} vs {len(text_candidate_pairs)}"
         )
-        return
+        return 0
     # Merge the results reversely
     i = len(llm_infer_results) - 1
     merged_cnt = 0
@@ -822,7 +914,28 @@ def llm_text_judge(text_candidate_pairs, llm: LLM):
         merged_cnt += 1
         i -= 1
 
+    return merged_cnt
+
+
+def llm_text_judge(text_candidate_pairs, llm: LLM):
+    """
+    Judge the text stitching task using the LLM.
+    """
+    merged_cnt = _llm_stitching_judge(
+        text_candidate_pairs, llm, TEXT_MERGE_PROMPT, log_label="text"
+    )
     log.info(f"LLM text judgment completed. Merged {merged_cnt} texts.")
+
+
+def llm_label_judge(label_candidate_pairs, llm: LLM):
+    """
+    Judge whether each short label introduces its single following
+    candidate block, using the LLM.
+    """
+    merged_cnt = _llm_stitching_judge(
+        label_candidate_pairs, llm, LABEL_MERGE_PROMPT, log_label="label"
+    )
+    log.info(f"LLM label judgment completed. Merged {merged_cnt} labels.")
 
 
 def merge_text_and_mark_invalid(prev_content: dict, merged_list: list[dict]):
@@ -908,6 +1021,60 @@ def text_merger(pdf_list: list[Optional[str]], llm: LLM) -> list[Optional[str]]:
 
     llm_text_judge(llm_infer_candidates, llm)
     log.info("LLM text judgment completed.")
+
+    return pdf_list
+
+
+def label_merger(pdf_list: list[Optional[str]], llm: LLM) -> list[Optional[str]]:
+    """
+    Merge a short section label (e.g. "Answer to Check Yourself", "Solution")
+    with the single content block that immediately follows it, when the
+    parser split them into two separate blocks -- mirrors text_merger's
+    structure exactly, using is_likely_content_label/search_label_content_candidate
+    instead of is_likely_incomplete_paragraph/search_continuation_candidates.
+    """
+    labels = []
+    for content in pdf_list:
+        if (
+            content is None
+            or content.get("type") != "text"
+            or content.get("text_level", -1) >= 0
+            or content.get("invalid")
+        ):
+            continue
+        text = content.get("text", "")
+        if is_likely_content_label(text):
+            labels.append(content)
+
+    if not labels:
+        log.info("No content labels found.")
+        return pdf_list
+
+    log.info(f"Found {len(labels)} content labels.")
+    llm_infer_candidates = []
+    for i in range(len(labels)):
+        cur_content = labels[i]
+        start_idx = pdf_list.index(cur_content)
+        end_search_id = (
+            pdf_list.index(labels[i + 1])
+            if i + 1 < len(labels)
+            else len(pdf_list) - 1
+        )
+        candidate = search_label_content_candidate(
+            cur_content, pdf_list, start_idx, end_search_id
+        )
+        if candidate is None:
+            continue
+        llm_infer_candidates.append((cur_content, [candidate]))
+
+    if not llm_infer_candidates:
+        log.info("No candidates found for merging content labels.")
+        return pdf_list
+    log.info(
+        f"Found {len(llm_infer_candidates)} candidates for merging content labels."
+    )
+
+    llm_label_judge(llm_infer_candidates, llm)
 
     return pdf_list
 
@@ -1286,6 +1453,11 @@ def pdf_info_refiner(
 
     # Then we refine the PDF information by merging incomplete paragraphs and tables
     pdf_list = text_merger(pdf_list, llm)
+    # A short section label ("Answer to Check Yourself", "Solution") split
+    # from the content it introduces -- a different pattern from a sentence
+    # cut short, so a separate pass after text_merger, before invalid items
+    # from that pass are excluded below.
+    pdf_list = label_merger(pdf_list, llm)
     pdf_list = table_merger(pdf_list, llm)
 
     # After merging, we need to re-enumerate the pdf_list. A sharded caller

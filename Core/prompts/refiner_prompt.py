@@ -270,3 +270,94 @@ Now, based on the provided stitching tasks, generate a single JSON object that c
 {json_text}
 
 Output:"""
+
+
+LABEL_MERGE_PROMPT = """
+You are an expert AI assistant specializing in document structure analysis. Your task is to determine whether a short, heading-like label is the introduction to a single following content block -- the two were split into separate blocks by a PDF parser, but belong together as one unit. Common genuine examples: "Solution:" followed by the worked solution; "Answer to Check Yourself" followed by the actual answers; "Example 3" followed by that example's text; "Note" or "Hint" followed by the note/hint itself.
+
+**Input**
+
+You will receive a JSON list of tasks to evaluate. Each object contains two keys: `incomplete_text` and `candidate_list`.
+
+* **`incomplete_text`**: A short, label-like phrase -- a heading-style phrase, not a full sentence -- that may or may not introduce the content that follows it in the document.
+* **`candidate_list`**: Always exactly one candidate: the single block that immediately follows the label in reading order. Each candidate has `pdf_id` and `text`.
+
+---
+
+**Decision Criteria**
+
+1.  **Step 1: Ask whether the label plausibly introduces the candidate.** Would a reader naturally expect exactly this content to appear directly under exactly this label -- an answer key under "Answer to X", a worked solution under "Solution", an example's content under "Example N", a note's text under "Note"?
+
+2.  **Step 2: Reject genuine standalone captions and section titles.** Do NOT merge if the label is complete and self-sufficient on its own (a figure caption, a section heading that starts a new, unrelated topic) and the following content is not specifically what the label promises -- captions and section titles are supposed to stand alone from whatever text happens to follow them structurally, not be merged with it.
+
+3.  **Step 3: When genuinely uncertain, do not merge.** A missed merge only leaves two adjacent nodes; a wrong merge fuses two unrelated pieces of content into one, which is the worse outcome.
+
+---
+
+**Output Format**
+
+Your response MUST be a single, valid JSON array (a list), where the order of objects perfectly matches the input task order. Each object in the list must have the following structure:
+
+```json
+{{
+    "judgments": [
+        {{
+            "stitched_pdf_ids": ["<List_of_Integers>"],
+            "explanation": "<String>"
+        }}
+    ]
+}}
+```
+
+**Field Descriptions:**
+
+* **`stitched_pdf_ids`**: A list containing the single candidate `pdf_id` if it should be merged, or `[-1]` if it should not.
+
+* **`explanation`**: A brief, one-sentence rationale explaining your decision.
+
+---
+
+**Example of Usage**
+
+**LLM Input**
+
+```json
+[
+    {{
+        "incomplete_text": "Answer to Check Yourself",
+        "candidate_list": [
+            {{ "pdf_id": 43, "text": "1(A) 2(A) 3(A) 4(D) 5(A)" }}
+        ]
+    }},
+    {{
+        "incomplete_text": "Figure 3: The pulley system",
+        "candidate_list": [
+            {{ "pdf_id": 51, "text": "The Second Law of Motion states that the rate of change of momentum of a body is directly proportional to the net force applied." }}
+        ]
+    }}
+]
+```
+
+**Expected JSON Output**
+
+```json
+{{
+    "judgments": [
+        {{
+            "stitched_pdf_ids": [43],
+            "explanation": "The label explicitly promises an answer key and the candidate is exactly that."
+        }},
+        {{
+            "stitched_pdf_ids": [-1],
+            "explanation": "The label is a complete, self-sufficient figure caption and the candidate starts an unrelated new topic, not a description of the figure."
+        }}
+    ]
+}}
+```
+
+---
+Now, based on the provided labeling tasks, generate a single JSON object that contains the list of your judgments
+
+{json_text}
+
+Output:"""
