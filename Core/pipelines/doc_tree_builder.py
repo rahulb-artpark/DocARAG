@@ -51,6 +51,7 @@ from docarag.domain import (
     ParseRequest,
     ParseStatus,
     QualityStatus,
+    RelationType,
 )
 from docarag.domain.base import CONTRACT_SCHEMA_VERSION, content_sha256
 from docarag.ports import ParserRegistry
@@ -63,6 +64,19 @@ log = logging.getLogger(__name__)
 
 PARSER_OBSERVATION_SCHEMA_VERSION = "docarag.parser-observations.v1"
 MAX_CORE_INGESTION_ARTIFACT_BYTES = 128 * 1024 * 1024
+
+# The only relation kinds mineru_compat.py's _STRUCTURAL_FIELDS registers
+# with allow_cross_page=True -- the sole kinds a per-shard bind_canonical_evidence
+# call could see an UNRESOLVED_RELATION_TARGET issue for, purely because its
+# target landed in a different shard, not because the reference is broken.
+_CROSS_PAGE_RELATION_TYPE_VALUES = frozenset(
+    {
+        RelationType.REFERENCES.value,
+        RelationType.REFERENCED_BY.value,
+        RelationType.TABLE_CONTINUES.value,
+        RelationType.TABLE_CONTINUED_FROM.value,
+    }
+)
 
 
 class CanonicalEvidenceBindingError(RuntimeError):
@@ -552,7 +566,7 @@ def bind_canonical_evidence(
     document_page_count: int | None = None,
     debug_artifact_suffix: str = "",
     canonical_artifact_filename: str = CANONICAL_EVIDENCE_FILE,
-) -> tuple[ParseRequest, tuple[CanonicalBlock, ...]]:
+) -> tuple[ParseRequest, tuple[CanonicalBlock, ...], bool]:
     """Translate MinerU blocks and attach immutable evidence IDs one-to-one.
 
     The legacy dictionaries remain in their original order.  The adapter may
@@ -578,6 +592,16 @@ def bind_canonical_evidence(
     reader (``evidence_projection.py``, ``evidence_persist.py``,
     ``docarag.provenance``) still expects -- this function's own writing
     logic doesn't need to know which mode it's in beyond the filename.
+
+    Returns ``(request, canonical_blocks, has_unresolved_cross_page_relation)``.
+    The third value is ``True`` only if some block's relation is one of the
+    kinds that can legitimately point across a page (a table continuation or
+    an explicit reference) and this call's own blocks didn't include its
+    target -- for a per-shard caller, that means the target is probably in a
+    different shard, not that the reference is genuinely broken, and a
+    whole-document call would resolve it. A per-shard caller should treat
+    this as a signal to fall back to one whole-document call for full
+    correctness rather than trust the per-shard result for this document.
     """
 
     request = _make_parse_request(
@@ -675,6 +699,26 @@ def bind_canonical_evidence(
         raise CanonicalEvidenceBindingError(
             "MinerU complete-observation reconciliation failed"
         ) from exc
+
+    # A relation whose kind can legitimately point across a page
+    # (TABLE_CONTINUES/TABLE_CONTINUED_FROM/REFERENCES/REFERENCED_BY -- the
+    # only kinds mineru_compat.py registers allow_cross_page=True) is
+    # resolved at translation time (mineru_compat.py's _attach_structural_relations),
+    # inside this same call's own ParserRegistry.parse(request) above -- not
+    # by reconcile_observations. A per-shard caller only ever passes one
+    # shard's blocks into that translation call, so a relation whose target
+    # lives in a different shard is never even found there: it never becomes
+    # an ObservationRelation at all (confirmed live -- checked
+    # reconcile_observations' own issues first, found nothing, because
+    # nothing was created for reconciliation to flag). It's recorded only in
+    # each observation's own "mineru_structural_ref_resolution" metadata
+    # with status "unresolved" -- the actual, verified signal to check.
+    has_unresolved_cross_page_relation = any(
+        entry.get("status") == "unresolved"
+        and entry.get("relation_type") in _CROSS_PAGE_RELATION_TYPE_VALUES
+        for observation in result.observations
+        for entry in observation.metadata.get("mineru_structural_ref_resolution", ())
+    )
 
     crop_store = LocalContentAddressedArtifactStore(
         Path(cfg.save_path) / "asset_cas", create=True
@@ -849,7 +893,13 @@ def bind_canonical_evidence(
         len(canonical_blocks),
         canonical_path,
     )
-    return request, tuple(canonical_blocks)
+    if has_unresolved_cross_page_relation:
+        log.info(
+            "shard has a relation whose target is outside this call's own "
+            "blocks (table continuation or reference) -- a whole-document "
+            "bind is needed for a fully correct result"
+        )
+    return request, tuple(canonical_blocks), has_unresolved_cross_page_relation
 
 
 def merge_canonical_evidence_shards(
@@ -1587,13 +1637,18 @@ def build_tree_from_pdf(
             )
             canonical_shard_fragments: list[str] = []
             parse_request = None
+            needs_whole_document_fallback = False
             for shard_index, shard_blocks in enumerate(
                 partition_blocks_by_shard(pdf_list, canonical_shard_ranges)
             ):
                 if not shard_blocks:
                     continue
                 fragment_filename = f"canonical_blocks_shard{shard_index:03d}.json"
-                parse_request, _shard_canonical = bind_canonical_evidence(
+                (
+                    parse_request,
+                    _shard_canonical,
+                    shard_has_cross_page_gap,
+                ) = bind_canonical_evidence(
                     cfg,
                     shard_blocks,
                     merged_content_path=tmp_save_path,
@@ -1602,9 +1657,39 @@ def build_tree_from_pdf(
                     canonical_artifact_filename=fragment_filename,
                 )
                 canonical_shard_fragments.append(fragment_filename)
-            merge_canonical_evidence_shards(
-                cfg, shard_fragment_filenames=canonical_shard_fragments
-            )
+                needs_whole_document_fallback = (
+                    needs_whole_document_fallback or shard_has_cross_page_gap
+                )
+
+            if needs_whole_document_fallback:
+                # Rare: a table continuation or explicit reference has its
+                # target in a different shard than its source, so shard-local
+                # reconciliation couldn't resolve it -- confirmed by
+                # bind_canonical_evidence's own issue list, not guessed.
+                # Falling back to one whole-document call (the pre-sharding,
+                # already-proven-correct path) costs the memory bound for
+                # this document -- and, since crop/VLM work isn't cached
+                # across calls, repeats that work -- but a correct answer
+                # matters more than a shard-scoped guess for a case this
+                # narrow. merge_canonical_evidence_shards is skipped: this
+                # call publishes canonical_blocks.json directly, superseding
+                # the (now-stale, left on disk as ordinary debug fragments)
+                # per-shard files written above.
+                log.info(
+                    "canonical evidence has a relation spanning shard "
+                    "boundaries; falling back to one whole-document bind "
+                    "for full correctness"
+                )
+                parse_request, _canonical, _ = bind_canonical_evidence(
+                    cfg,
+                    pdf_list,
+                    merged_content_path=tmp_save_path,
+                    document_page_count=canonical_page_count,
+                )
+            else:
+                merge_canonical_evidence_shards(
+                    cfg, shard_fragment_filenames=canonical_shard_fragments
+                )
             document = parse_request.document
             (
                 canonical_artifact_path,

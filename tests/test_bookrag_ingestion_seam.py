@@ -443,7 +443,7 @@ class BookRAGIngestionSeamTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return request, (canonical,)
+                return request, (canonical,), False
 
             with ExitStack() as stack:
                 for patcher in patches:
@@ -485,6 +485,113 @@ class BookRAGIngestionSeamTests(unittest.TestCase):
                 str((Path(cfg.save_path) / "canonical_blocks.json").resolve()),
                 tree.meta_info.canonical_artifact_path,
             )
+
+    def test_cross_shard_relation_gap_falls_back_to_one_whole_document_bind(self):
+        # Two shards (shard_pages=1, two pages) with the FIRST shard's
+        # bind_canonical_evidence call reporting a cross-page relation gap.
+        # build_tree_from_pdf must fall back to one additional whole-document
+        # call instead of merging the (now-superseded) per-shard fragments.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self.make_cfg(root)
+            cfg.mineru.shard_pages = 1
+            document = self.document(cfg)
+            canonical = self.block(document)
+            merged_path = (
+                Path(cfg.save_path) / "auto" / "source_merged_content.json"
+            )
+            merged_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy = [
+                {"type": "text", "text": "page 0 content", "page_idx": 0},
+                {"type": "text", "text": "page 1 content", "page_idx": 1},
+            ]
+            merged_path.write_text(json.dumps(legacy), encoding="utf-8")
+            request = ParseRequest(
+                document=document,
+                pages=(PageRef(document.document_version_id, 0),),
+            )
+            captured: dict[str, object] = {}
+            patches = self.pipeline_patches(captured)
+            bind_calls: list[list[dict]] = []
+
+            def bind(
+                _cfg,
+                pdf_list,
+                *,
+                merged_content_path,
+                document_page_count=None,
+                debug_artifact_suffix="",
+                canonical_artifact_filename="canonical_blocks.json",
+            ):
+                bind_calls.append([dict(block) for block in pdf_list])
+                for block in pdf_list:
+                    block["canonical_block_id"] = canonical.block_id
+                    block["canonical_revision_id"] = canonical.revision_id
+                canonical_path = Path(cfg.save_path) / canonical_artifact_filename
+                canonical_path.write_text(
+                    json.dumps(
+                        {
+                            "artifact_schema_version": CANONICAL_EVIDENCE_SCHEMA_VERSION,
+                            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+                            "document": document.to_dict(),
+                            "parse_request_id": request.request_id,
+                            "parse_result_sha256": "0" * 64,
+                            "parser_manifest": {},
+                            "block_count": len(pdf_list),
+                            "canonical_blocks": [canonical.to_dict()],
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                # Only the very first call (shard 0) reports the gap.
+                return request, (canonical,), len(bind_calls) == 1
+
+            with ExitStack() as stack:
+                for patcher in patches:
+                    stack.enter_context(patcher)
+                stack.enter_context(
+                    mock.patch.object(
+                        doc_tree_builder,
+                        "parse_doc",
+                        side_effect=AssertionError(
+                            "cached MinerU content must be reused"
+                        ),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        doc_tree_builder, "bind_canonical_evidence", side_effect=bind,
+                    )
+                )
+                merger = stack.enter_context(
+                    mock.patch.object(
+                        doc_tree_builder,
+                        "merge_canonical_evidence_shards",
+                        side_effect=AssertionError(
+                            "merge must be skipped when falling back"
+                        ),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        doc_tree_builder,
+                        "project_to_bookrag_pdf_list",
+                        side_effect=AssertionError(
+                            "default MinerU rows are already normalized"
+                        ),
+                    )
+                )
+                build_tree_from_pdf(cfg)
+
+            # Two shard calls (one block each) plus one fallback call with
+            # both blocks together.
+            self.assertEqual(3, len(bind_calls))
+            self.assertEqual(1, len(bind_calls[0]))
+            self.assertEqual(1, len(bind_calls[1]))
+            self.assertEqual(2, len(bind_calls[2]))
+            self.assertEqual({0, 1}, {b["page_idx"] for b in bind_calls[2]})
+            merger.assert_not_called()
 
     def test_provider_source_mismatch_stops_before_bookrag_or_mineru(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -90,7 +90,7 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
         merged_path = Path(cfg.save_path) / "auto" / "source_merged_content.json"
         merged_path.parent.mkdir(parents=True, exist_ok=True)
         merged_path.write_text(json.dumps(blocks), encoding="utf-8")
-        request, canonical = bind_canonical_evidence(
+        request, canonical, _has_unresolved_cross_page_relation = bind_canonical_evidence(
             cfg,
             blocks,
             merged_content_path=merged_path,
@@ -379,7 +379,7 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             merged_path.parent.mkdir(parents=True, exist_ok=True)
             merged_path.write_text(json.dumps(blocks), encoding="utf-8")
 
-            whole_request, whole_canonical = bind_canonical_evidence(
+            whole_request, whole_canonical, _has_unresolved = bind_canonical_evidence(
                 cfg,
                 deepcopy(blocks),
                 merged_content_path=merged_path,
@@ -438,6 +438,81 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             self.bind(root, deepcopy(raw))
             second = (canonical_path.read_bytes(), observation_path.read_bytes())
             self.assertEqual(first, second)
+
+    def test_missing_table_continuation_target_is_flagged_for_fallback(self):
+        # Simulates what a per-shard bind_canonical_evidence call sees when a
+        # table's continuation landed in a different shard: only table-1 is
+        # present, so its next_table_id can't resolve within this call.
+        blocks = [
+            {
+                "type": "table",
+                "block_id": "table-1",
+                "table_body": "<table><tr><td>1</td></tr></table>",
+                "page_idx": 0,
+                "next_table_id": "table-2",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg = self.make_cfg(Path(tmp))
+            merged_path = Path(_cfg.save_path) / "auto" / "source_merged_content.json"
+            merged_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_path.write_text(json.dumps(blocks), encoding="utf-8")
+            _request, _canonical, has_unresolved = bind_canonical_evidence(
+                _cfg, blocks, merged_content_path=merged_path,
+            )
+            self.assertTrue(has_unresolved)
+
+    def test_table_continuation_resolved_within_one_call_is_not_flagged(self):
+        # Control: both halves present in the same call (as a whole-document
+        # bind, or two blocks that happen to land in the same shard) resolve
+        # normally and must not trigger the fallback signal.
+        blocks = [
+            {
+                "type": "table",
+                "block_id": "table-1",
+                "table_body": "<table><tr><td>1</td></tr></table>",
+                "page_idx": 0,
+                "next_table_id": "table-2",
+            },
+            {
+                "type": "table",
+                "block_id": "table-2",
+                "table_body": "<table><tr><td>2</td></tr></table>",
+                "page_idx": 1,
+                "previous_table_id": "table-1",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg = self.make_cfg(Path(tmp))
+            merged_path = Path(_cfg.save_path) / "auto" / "source_merged_content.json"
+            merged_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_path.write_text(json.dumps(blocks), encoding="utf-8")
+            _request, canonical, has_unresolved = bind_canonical_evidence(
+                _cfg, blocks, merged_content_path=merged_path,
+            )
+            self.assertFalse(has_unresolved)
+            self.assertEqual(2, len(canonical))
+
+    def test_an_unrelated_needs_review_reason_does_not_trigger_fallback(self):
+        # A page-reconciliation mismatch also produces NEEDS_REVIEW quality,
+        # but it is not a cross-page relation gap and must not be conflated
+        # with one -- the fallback signal is specifically about relations
+        # whose target this call's own blocks didn't include.
+        blocks = self.blocks()  # includes one block with _reconciliation unmatched_content
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, _request, canonical = self.bind(Path(tmp), blocks)
+            self.assertTrue(
+                any(item.quality_status.value == "needs_review" for item in canonical)
+            )
+        with tempfile.TemporaryDirectory() as tmp2:
+            _cfg2 = self.make_cfg(Path(tmp2))
+            merged_path = Path(_cfg2.save_path) / "auto" / "source_merged_content.json"
+            merged_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_path.write_text(json.dumps(blocks), encoding="utf-8")
+            _request2, _canonical2, has_unresolved = bind_canonical_evidence(
+                _cfg2, blocks, merged_content_path=merged_path,
+            )
+            self.assertFalse(has_unresolved)
 
     def test_complete_observation_reconciliation_preserves_structural_links(self):
         with tempfile.TemporaryDirectory() as tmp:
