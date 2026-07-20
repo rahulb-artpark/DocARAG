@@ -149,6 +149,36 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             self.assertEqual(projected["text"], blocks[0]["text"])
             self.assertEqual(projected["text_format"], blocks[0]["text_format"])
 
+    def test_table_row_channels_follow_the_projection(self):
+        # MinerU's raw caption and footnote strings differ from the canonical
+        # ones in whitespace, and the hydrator compares exactly.
+        blocks = [
+            {
+                "type": "table",
+                "table_body": "<table><tr><td>42</td></tr></table>",
+                "table_caption": [],
+                "table_footnote": ["The \" symbol means arcseconds. "],
+                "img_path": "/evidence/table-1.png",
+                "page_idx": 0,
+                "middle_json": {
+                    "type": "table",
+                    "bbox": [10, 100, 400, 260],
+                    "index": 1,
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+            projected = project_canonical_blocks(request.document, canonical)[0]
+            self.assertEqual(
+                list(projected["table_caption"]), blocks[0]["table_caption"]
+            )
+            self.assertEqual(
+                list(projected["table_footnote"]), blocks[0]["table_footnote"]
+            )
+            self.assertEqual(projected["table_body"], blocks[0]["table_body"])
+
     def test_canonical_artifacts_tree_node_and_retrieval_share_source_binding(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -778,6 +778,13 @@ def bind_canonical_evidence(
         if projected.get("type") == "equation":
             attachment["text"] = projected.get("text", "")
             attachment["text_format"] = projected.get("text_format", "")
+        # A table row's channels must follow the projection for the same
+        # reason: MinerU's raw caption and footnote strings differ from the
+        # canonical ones in whitespace, and the hydrator compares exactly.
+        if projected.get("type") == "table":
+            attachment["table_caption"] = list(projected.get("table_caption", []))
+            attachment["table_footnote"] = list(projected.get("table_footnote", []))
+            attachment["table_body"] = projected.get("table_body", "")
 
     canonical_payload = {
         "artifact_schema_version": CANONICAL_EVIDENCE_SCHEMA_VERSION,

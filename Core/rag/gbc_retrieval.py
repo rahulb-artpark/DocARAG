@@ -202,8 +202,8 @@ class Retriever:
         values: list[str] = []
         if node.type == NodeType.TABLE:
             try:
-                table_text = table2text(meta.__dict__)
-            except (KeyError, TypeError, ValueError):
+                table_text = table2text(meta.model_dump())
+            except (AttributeError, KeyError, TypeError, ValueError):
                 table_text = ""
             if isinstance(table_text, str) and table_text.strip():
                 values.append(table_text)
