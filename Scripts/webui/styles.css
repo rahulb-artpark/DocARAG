@@ -204,6 +204,37 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .evidence .enode .tx { font-size: 12.5px; color: #333; }
 .evidence .ents { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
+.answer .cite {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin: 0 1px;
+  text-decoration: none;
+  vertical-align: text-top;
+  transform: translateY(-2px);
+}
+.answer .cite:hover { text-decoration: underline; }
+
+.refList { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.refCard {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  transition: background-color .3s ease, border-color .3s ease;
+}
+.refCard.flash { background: var(--accent-soft); border-color: var(--accent); }
+.refHead { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.refLabel { font-size: 11.5px; font-weight: 700; color: var(--accent); }
+.refType { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.refPage { font-size: 11px; color: var(--muted); }
+.refSnippet { font-size: 12.5px; color: #333; }
+.refThumb { max-width: 100%; max-height: 120px; border-radius: 6px; margin: 4px 0; display: block; }
+.refJump { display: inline-block; font-size: 11.5px; margin-top: 4px; }
+
 .composer { display: flex; gap: 10px; padding: 14px 22px 20px; border-top: 1px solid var(--line); background: var(--panel); }
 .composer textarea {
   flex: 1; resize: none; border: 1px solid var(--line); border-radius: 10px;

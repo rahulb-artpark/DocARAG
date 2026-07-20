@@ -661,6 +661,35 @@ def normalize_type(value):
     return str(value or "").replace("NodeType.", "")
 
 
+def citations_from_retrieval(retrieval):
+    """Flatten each iteration's ordered evidence labels into one reference list.
+
+    Labels are already unique and ordered by the answer generator (plain
+    E-numbers for a simple question, Q1-E1/Q2-E1 style for a complex one),
+    so this only concatenates -- it must not re-derive or re-sort them.
+    """
+
+    citations = []
+    seen = set()
+    for iteration in (retrieval or {}).get("iterations") or []:
+        for citation in iteration.get("citations") or []:
+            label = citation.get("label")
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            citations.append(
+                {
+                    "label": label,
+                    "nodeId": citation.get("index_id"),
+                    "type": normalize_type(citation.get("type")),
+                    "page": citation.get("page"),
+                    "snippet": citation.get("snippet") or "",
+                    "hasImage": bool(citation.get("has_image")),
+                }
+            )
+    return citations
+
+
 def bind_server(host, port, handler, attempts=20):
     last_error = None
     last_candidate = min(65535, port + attempts - 1)
@@ -1003,6 +1032,7 @@ class AppState:
                 "question": question,
                 "answer": answer,
                 "node_ids": normalized_node_ids,
+                "citations": citations_from_retrieval(retrieval),
                 "run_dir": str(self.run_dir),
                 "elapsed_seconds": elapsed,
                 "system_config": str(config_path),
@@ -1031,6 +1061,7 @@ class AppState:
             return {
                 "answer": answer,
                 "nodeIds": result["node_ids"],
+                "citations": result["citations"],
                 "elapsedSec": elapsed,
                 "retrieval": retrieval,
                 "tokenUsage": token_usage,

@@ -1267,6 +1267,7 @@ async function submitChat(event) {
     });
     pending.querySelector(".bubble").innerHTML =
       `<div class="who">BookRAG</div>` + renderAnswer(data);
+    linkifyCitations(pending, data.citations);
     wireEvidenceLinks(pending);
     typesetMath(pending);
   } catch (err) {
@@ -1283,31 +1284,95 @@ function renderAnswer(data) {
   const md = window.marked ? marked.parse(data.answer || "") : escapeHtml(data.answer || "");
   let html = `<div class="answer">${md}</div>`;
   html += `<div class="meta">${(data.nodeIds || []).length} nodes retrieved · ${data.elapsedSec}s</div>`;
-  html += renderEvidence(data.retrieval);
+  html += renderReferences(data.citations);
+  html += renderRetrievedEntities(data.retrieval);
   return html;
 }
 
-function renderEvidence(retrieval) {
+// The answer's own [E1] / [Q1-E1] markers are what the model actually cited;
+// they are the reference list, not a separate summary of everything fetched.
+function renderReferences(citations) {
+  if (!citations || !citations.length) return "";
+  const cards = citations.map((c) => {
+    const img = c.hasImage && c.nodeId != null
+      ? `<img class="refThumb" src="/api/tree-image?id=${encodeURIComponent(c.nodeId)}" alt="" loading="lazy" />`
+      : "";
+    const jump = c.nodeId != null
+      ? `<a class="linkish refJump" data-tree="${escapeHtml(c.nodeId)}">view in tree →</a>`
+      : "";
+    return `<div class="refCard" id="ref-${escapeHtml(c.label)}">
+      <div class="refHead">
+        <span class="refLabel">${escapeHtml(c.label)}</span>
+        ${c.type ? `<span class="refType">${escapeHtml(c.type)}</span>` : ""}
+        ${c.page ? `<span class="refPage">p${escapeHtml(c.page)}</span>` : ""}
+      </div>
+      ${img}
+      ${c.snippet ? `<div class="refSnippet">${escapeHtml(clip(c.snippet, 260))}</div>` : ""}
+      ${jump}
+    </div>`;
+  }).join("");
+  return `<details class="evidence" open><summary>References (${citations.length})</summary><div class="refList">${cards}</div></details>`;
+}
+
+// Entities the retrieval touched but that the answer may not have named
+// directly -- kept as a secondary, collapsed fold so it doesn't compete
+// with the actual references for attention.
+function renderRetrievedEntities(retrieval) {
   if (!retrieval || !retrieval.iterations) return "";
-  const its = retrieval.iterations;
   let inner = "";
-  for (const it of its) {
-    if (it.sub_query) inner += `<div class="subq">▸ ${escapeHtml(it.sub_query)}</div>`;
-    const textNodes = it.retrieval_nodes || it.iteration_text_nodes || [];
-    for (const nd of textNodes) {
-      inner += `<div class="enode"><div class="id">
-        <a class="linkish" data-tree="${escapeHtml(nd.index_id)}">§${escapeHtml(nd.index_id)}</a>${nd.page ? " · p" + escapeHtml(nd.page) : ""}</div>
-        <div class="tx">${escapeHtml(clip(nd.content, 320))}</div></div>`;
-    }
+  for (const it of retrieval.iterations) {
     const g = it.iteration_graph_nodes || [];
-    if (g.length) {
-      inner += `<div class="ents">entities: ${g.slice(0, 14).map((e) =>
-        `<a class="linkish" data-entity="${escapeHtml(e.entity_name)}">${escapeHtml(e.entity_name)}</a>`).join(", ")}</div>`;
-    }
+    if (!g.length) continue;
+    if (it.sub_query) inner += `<div class="subq">▸ ${escapeHtml(it.sub_query)}</div>`;
+    inner += `<div class="ents">entities: ${g.slice(0, 14).map((e) =>
+      `<a class="linkish" data-entity="${escapeHtml(e.entity_name)}">${escapeHtml(e.entity_name)}</a>`).join(", ")}</div>`;
   }
-  if (!inner) return "";
-  const count = its.reduce((a, it) => a + ((it.retrieval_nodes || it.iteration_text_nodes || []).length), 0);
-  return `<details class="evidence" open><summary>Retrieved evidence (${count} nodes)</summary>${inner}</details>`;
+  return inner ? `<details class="evidence"><summary>Entities touched</summary>${inner}</details>` : "";
+}
+
+// Turn [E1]/[Q1-E1] markers inside the rendered answer into links to their
+// reference card. Only labels the backend actually issued are linkified --
+// stray bracketed text in the model's prose is left alone. Text nodes only,
+// so this cannot corrupt markup or touch code blocks.
+function linkifyCitations(scope, citations) {
+  const known = new Set((citations || []).map((c) => c.label));
+  if (!known.size) return;
+  const root = scope.querySelector(".answer");
+  if (!root) return;
+  const pattern = /\[([A-Za-z0-9][\w-]*)\]/g;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) =>
+      node.parentElement && node.parentElement.closest("code, pre, a")
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT,
+  });
+  const targets = [];
+  let node;
+  while ((node = walker.nextNode())) {
+    pattern.lastIndex = 0;
+    if (pattern.test(node.textContent)) targets.push(node);
+  }
+  for (const textNode of targets) {
+    const text = textNode.textContent;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    pattern.lastIndex = 0;
+    let m;
+    while ((m = pattern.exec(text))) {
+      const label = m[1];
+      if (!known.has(label)) continue;
+      frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const a = document.createElement("a");
+      a.className = "cite";
+      a.href = `#ref-${label}`;
+      a.dataset.cite = label;
+      a.textContent = `[${label}]`;
+      frag.appendChild(a);
+      last = m.index + m[0].length;
+    }
+    frag.appendChild(document.createTextNode(text.slice(last)));
+    textNode.replaceWith(frag);
+  }
 }
 
 function wireEvidenceLinks(scope) {
@@ -1317,5 +1382,14 @@ function wireEvidenceLinks(scope) {
     a.onclick = () => {
       const ent = (state.graph.nodes || []).find((n) => n.label === a.dataset.entity);
       if (ent) { activateView("graph"); selectEntity(ent.id); }
+    });
+  scope.querySelectorAll("[data-cite]").forEach((a) =>
+    a.onclick = (e) => {
+      e.preventDefault();
+      const target = scope.querySelector(`#ref-${a.dataset.cite}`);
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      target.classList.add("flash");
+      setTimeout(() => target.classList.remove("flash"), 1200);
     });
 }

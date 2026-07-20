@@ -63,6 +63,16 @@ def start(port: int, run_dir: str | None) -> int:
         payload = json.loads(_pid_file().read_text(encoding="utf-8"))
         print(f"web UI already running: http://127.0.0.1:{payload['port']}")
         return 0
+    if _health(port) is not None:
+        # Something answers /api/health on this port but owns no pidfile --
+        # an untracked process from outside this service. Declaring success
+        # against it would silently manage the wrong server.
+        print(
+            f"port {port} is already serving an untracked process; "
+            "stop it manually or choose a different --port",
+            file=sys.stderr,
+        )
+        return 1
     repo = Path(__file__).resolve().parent.parent
     command = [sys.executable, str(repo / "Scripts" / "web.py"), "--port", str(port)]
     if run_dir:
