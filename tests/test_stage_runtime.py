@@ -208,6 +208,7 @@ class DurableStageRuntimeTests(unittest.TestCase):
                     retrieval_manifest_path=manifest_path,
                     qdrant_collection="TreeVDB",
                     qdrant_point_count=40,
+                    metadata={"entity_collection": "TreeVDB_entity"},
                 )
 
         self.assertEqual(1, len(ledger.index_revision_specs))
@@ -219,6 +220,60 @@ class DurableStageRuntimeTests(unittest.TestCase):
         self.assertEqual(40, publication.qdrant_point_count)
         # No redundant duplicate of the identity spec.revision_id already is.
         self.assertNotIn("shell_index_revision_id", spec.metadata)
+
+    def test_publish_index_revision_spec_metadata_is_always_empty(self):
+        # docarag/evidence_persist.py's _admit_revision always admits this
+        # same revision_id first (before any stage runs), with metadata={}
+        # (IndexRevisionSpec's default -- it passes none). create_index_revision
+        # rejects a later call for the same identity whose metadata differs
+        # byte-for-byte (ImmutableRecordConflict) -- so if this call ever put
+        # caller-supplied, publish-time-only details (entity_collection,
+        # retrieval_identity_sha256, ...) into IndexRevisionSpec.metadata,
+        # every single publish would permanently fail against the row
+        # admission already created. Regression test for exactly that: the
+        # metadata this call sends to create_index_revision must stay empty
+        # no matter what the caller passes, and the caller's details must
+        # still be observable -- just from the checkpoint event, which has
+        # no identity-matching contract to violate.
+        ledger = _MemoryLedger()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree_path = root / "tree.pkl"
+            graph_path = root / "graph_data.json"
+            manifest_path = root / "attestation.json"
+            for path in (tree_path, graph_path, manifest_path):
+                path.write_text("{}", encoding="utf-8")
+            with durable_stage(
+                "vector", environment=_environment(), ledger=ledger
+            ) as stage:
+                stage.publish_index_revision(
+                    configuration_sha256="b" * 64,
+                    canonical_artifact_sha256="c" * 64,
+                    tree_artifact_path=tree_path,
+                    graph_artifact_path=graph_path,
+                    retrieval_manifest_path=manifest_path,
+                    qdrant_collection="TreeVDB",
+                    qdrant_point_count=40,
+                    metadata={
+                        "entity_collection": "TreeVDB_entity",
+                        "retrieval_identity_sha256": "d" * 64,
+                    },
+                )
+
+        spec = ledger.index_revision_specs[0]
+        self.assertEqual({}, dict(spec.metadata))
+        published_events = [
+            event for event in ledger.events
+            if event.event_type == "stage.checkpoint"
+            and event.payload.get("checkpoint") == "index-revision.published"
+        ]
+        self.assertEqual(1, len(published_events))
+        self.assertEqual(
+            "TreeVDB_entity", published_events[0].payload.get("entity_collection")
+        )
+        self.assertEqual(
+            "d" * 64, published_events[0].payload.get("retrieval_identity_sha256")
+        )
 
     def test_failed_stage_is_requeued_and_failure_is_observable(self):
         ledger = _MemoryLedger()

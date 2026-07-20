@@ -863,10 +863,17 @@ class DurableStage:
             # one document, one with data and never ready, one ready and
             # empty.
             revision_id=self.runtime.index_revision_id,
-            metadata={
-                **dict(metadata or {}),
-                "publication_schema": "docarag.index-publication.v1",
-            },
+            # No metadata here, ever: with an explicit revision_id,
+            # create_index_revision's ON CONFLICT DO NOTHING + verify-match
+            # check compares metadata byte-for-byte against whatever row
+            # already exists -- and the ledger's own admission path
+            # (evidence_persist.py's _admit_revision) always creates this
+            # same row first, with empty metadata, well before any stage
+            # reaches this call. Passing anything caller-supplied here would
+            # make this call permanently raise ImmutableRecordConflict
+            # instead of publishing. Publish-time details belong in the
+            # checkpoint below, an append-only event log with no
+            # identity-matching contract, not in this identity-bearing spec.
         )
         state = self.runtime.ledger.create_index_revision(spec)
         if state is IndexRevisionState.FAILED:
@@ -883,6 +890,7 @@ class DurableStage:
         self.checkpoint(
             "index-revision.published",
             {
+                **dict(metadata or {}),
                 "qdrant_point_count": qdrant_point_count,
                 "relational_revision_id": spec.revision_id,
                 "retrieval_manifest_sha256": manifest_sha256,
