@@ -13,6 +13,7 @@ from Core.Index.Tree import DocumentTree
 from Core.configs.system_config import SystemConfig
 from Core.pipelines.outline_extractor import extract_pdf_outline_in_chunks
 from Core.pipelines.pdf_refiner import pdf_info_refiner
+from Core.pipelines.sharded_parsing import offset_page_indices, pdf_page_count, shard_ranges
 from Core.pipelines.tree_node_builder import create_node_by_type
 from Core.pipelines.tree_node_summary import generate_tree_node_summary
 from Core.provider.TokenTracker import TokenTracker
@@ -1343,26 +1344,58 @@ def build_tree_from_pdf(
                     pdf_list = json.load(f)
                 print(f"Loaded content from {tmp_save_path}")
             else:
-                # Extract content from the PDF file
+                # Extract content one bounded page-range shard at a time. A
+                # whole document parsed in a single MinerU call renders, OCRs
+                # and layout-analyzes every page at once -- that is what
+                # drives peak memory for a large PDF, and it is bounded here
+                # to cfg.mineru.shard_pages pages regardless of document size.
                 log.info(f"Extracting content from {cfg.pdf_path}...")
-                middle_json, content_list = parse_doc(
-                    cfg.pdf_path,
-                    output_dir=cfg.save_path,
-                    backend=backend,
-                    method=method,
-                    server_url=server_url,
-                    lang=cfg.mineru.lang,
-                )
-
                 file_name = str(Path(cfg.pdf_path).stem)
                 save_dir = os.path.join(cfg.save_path, method)
-                pdf_list = merge_middle_content(
-                    middle_json,
-                    content_list,
-                    parse_dir=os.path.join(cfg.save_path, method),
-                    save_dir=save_dir,
-                    file_name=file_name,
-                )  # merge middle json content with content list.
+                page_count = pdf_page_count(cfg.pdf_path)
+                shards = list(shard_ranges(page_count, cfg.mineru.shard_pages))
+                pdf_list = []
+                for shard_index, (start_page_id, end_page_id) in enumerate(shards):
+                    middle_json, content_list = parse_doc(
+                        cfg.pdf_path,
+                        output_dir=cfg.save_path,
+                        backend=backend,
+                        method=method,
+                        server_url=server_url,
+                        lang=cfg.mineru.lang,
+                        start_page_id=start_page_id,
+                        end_page_id=end_page_id,
+                        # Without this, do_parse's own .md/_middle.json/
+                        # _content_list.json debug dumps use the same
+                        # document-derived name every shard and each call
+                        # silently overwrites the previous shard's dump.
+                        pdf_file_name=f"{file_name}_shard{shard_index:03d}",
+                    )
+                    middle_json, content_list = offset_page_indices(
+                        middle_json, content_list, start_page_id
+                    )
+                    # reconcile_middle_content matches middle_json against
+                    # content_list one page at a time with no cross-page
+                    # state (confirmed by reading it), so reconciling shard
+                    # by shard produces the same result as reconciling the
+                    # whole document at once.
+                    shard_pdf_list = merge_middle_content(
+                        middle_json,
+                        content_list,
+                        parse_dir=save_dir,
+                        save_dir=save_dir,
+                        file_name=f"{file_name}_shard{shard_index:03d}",
+                    )
+                    pdf_list.extend(shard_pdf_list)
+                    log.info(
+                        "shard %d/%d (pages %d-%d): %d items (%d total so far)",
+                        shard_index + 1, len(shards), start_page_id, end_page_id,
+                        len(shard_pdf_list), len(pdf_list),
+                    )
+
+                os.makedirs(save_dir, exist_ok=True)
+                with open(tmp_save_path, "w", encoding="utf-8") as f:
+                    json.dump(pdf_list, f, ensure_ascii=False, indent=4)
 
                 # tmp pdf_list save for fast test
                 log.info(f"Content extracted and saved to {tmp_save_path}")

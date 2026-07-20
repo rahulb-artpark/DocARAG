@@ -49,6 +49,23 @@ RefineFn = Callable[[list[dict[str, Any]], int], list[dict[str, Any]]]
 CARRY_PAGES = 2
 
 
+def pdf_page_count(pdf_path: str) -> int:
+    """Return a PDF's page count without rendering or OCRing any page.
+
+    Opens the file's structure only (the same pypdfium2 library MinerU already
+    depends on) -- this is what the shard loop needs to plan ranges before any
+    expensive work starts.
+    """
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(pdf_path)
+    try:
+        return len(document)
+    finally:
+        document.close()
+
+
 def shard_ranges(page_count: int, shard_size: int) -> Iterator[tuple[int, int]]:
     """Yield (start_page_id, end_page_id), both inclusive, 0-indexed."""
 
@@ -196,5 +213,6 @@ __all__ = [
     "ParsedShard",
     "offset_page_indices",
     "parse_sharded",
+    "pdf_page_count",
     "shard_ranges",
 ]

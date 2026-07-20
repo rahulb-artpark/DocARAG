@@ -7,15 +7,43 @@ exact evidence each test below is checking.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from Core.pipelines.sharded_parsing import (
     CARRY_PAGES,
     ParsedShard,
     offset_page_indices,
     parse_sharded,
+    pdf_page_count,
     shard_ranges,
 )
+
+
+class PdfPageCountTests(unittest.TestCase):
+    def _make_pdf(self, page_count: int) -> str:
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument.new()
+        for _ in range(page_count):
+            document.new_page(200, 200)
+        path = str(Path(self._tmpdir.name) / "doc.pdf")
+        document.save(path)
+        document.close()
+        return path
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_counts_pages_without_rendering(self):
+        # Same pypdfium2 library MinerU's own page-slicing already depends on
+        # (see do_parse) -- this only opens the document structure.
+        self.assertEqual(5, pdf_page_count(self._make_pdf(5)))
+
+    def test_single_page_document(self):
+        self.assertEqual(1, pdf_page_count(self._make_pdf(1)))
 
 
 class ShardRangesTests(unittest.TestCase):

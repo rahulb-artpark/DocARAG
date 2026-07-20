@@ -158,6 +158,7 @@ def parse_doc(
     server_url=None,
     start_page_id: int = 0,
     end_page_id: int | None = None,
+    pdf_file_name: str | None = None,
 ):
     """
     Parameter description:
@@ -184,11 +185,19 @@ def parse_doc(
     end_page_id: Last page to parse, inclusive. Default None (the last page).
         Passing a bounded range parses only that shard: rendering, OCR and
         layout analysis never see or hold pages outside it.
+    pdf_file_name: Base name for do_parse's own debug dumps (the .md,
+        _content_list.json and _middle.json files it writes under
+        output_dir). Defaults to pdf_path's stem, exactly as before. A
+        sharded caller should override this per shard -- do_parse always
+        writes those three files under the *same* pdf_path-derived name
+        regardless of start_page_id/end_page_id, so calling it more than
+        once with the default name makes each call silently overwrite the
+        previous shard's dump instead of covering the whole document.
     """
     try:
         from mineru.cli.common import read_fn
 
-        file_name = str(Path(pdf_path).stem)
+        file_name = pdf_file_name if pdf_file_name is not None else str(Path(pdf_path).stem)
         pdf_bytes = read_fn(pdf_path)
         return do_parse(
             output_dir=output_dir,
