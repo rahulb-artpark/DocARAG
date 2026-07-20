@@ -1514,7 +1514,7 @@ class GBCRAG(BaseRAG):
             self._retrieve(query, current_step)
             self._notify_retrieval_ready(context, current_step)
 
-            final_answer, partial_answers = self.answer.answer_simple_question(
+            final_answer, partial_answers, citations = self.answer.answer_simple_question(
                 query=query,
                 retrieved_nodes=current_step.retrieval_nodes,
                 entities=current_step.iteration_graph_nodes,
@@ -1523,6 +1523,7 @@ class GBCRAG(BaseRAG):
             )
             current_step.partial_answers = partial_answers
             current_step.generated_answer = final_answer
+            current_step.citations = citations
             current_step.answer_validation = _citation_validation_from_partials(
                 partial_answers
             )
@@ -1546,7 +1547,7 @@ class GBCRAG(BaseRAG):
                 self._retrieve(sub_question, current_step)
                 self._notify_retrieval_ready(context, current_step)
 
-                sub_answer, partial_answers = self.answer.answer_simple_question(
+                sub_answer, partial_answers, citations = self.answer.answer_simple_question(
                     query=sub_question,
                     retrieved_nodes=current_step.retrieval_nodes,
                     entities=current_step.iteration_graph_nodes,
@@ -1556,6 +1557,7 @@ class GBCRAG(BaseRAG):
                 )
                 current_step.partial_answers = partial_answers
                 current_step.generated_answer = sub_answer
+                current_step.citations = citations
                 current_step.answer_validation = _citation_validation_from_partials(
                     partial_answers
                 )
@@ -1654,13 +1656,14 @@ class GBCRAG(BaseRAG):
                 self._process_retrieved_nodes(tree_data, current_step)
                 self._notify_retrieval_ready(context, current_step)
                 # Call the dedicated global answer agent method
-                final_answer, partials = self.answer.answer_global_question(
+                final_answer, partials, citations = self.answer.answer_global_question(
                     original_query=query_analysis.original_query,
                     operation=operation,
                     filtered_nodes=current_step.retrieval_nodes,
                     require_citations=self.evidence_hydrator is not None,
                 )
                 current_step.partial_answers = partials
+                current_step.citations = citations
                 current_step.answer_validation = _citation_validation_from_partials(
                     partials
                 )

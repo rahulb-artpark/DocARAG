@@ -200,6 +200,7 @@ class GlobalQueryBoundTests(unittest.TestCase):
                     }
                 }
             ],
+            [],
         )
         context = GBCRAGContext(query="Summarize every table")
 

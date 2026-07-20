@@ -74,6 +74,40 @@ def _evidence_identity(node: Dict[str, Any], position: int) -> str:
     return f"legacy:retrieval-position:{position}"
 
 
+def _citation_index(evidence_nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return each evidence label once, in first-seen order, for a UI to link.
+
+    ``evidence_nodes`` already carries the labels an answer's inline [E1]
+    citations refer to (set in ``_prepare_evidence``/``answer_global_question``);
+    this is the same list, deduplicated, describing what each label points to.
+    """
+
+    seen: set[str] = set()
+    citations: List[Dict[str, Any]] = []
+    for node in evidence_nodes:
+        evidence_id = node.get("evidence_id")
+        label = node.get("evidence_label")
+        if not label or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        content = node.get("content")
+        snippet = content.strip() if isinstance(content, str) else ""
+        node_type = node.get("type", "text")
+        if isinstance(node_type, NodeType):
+            node_type = node_type.value
+        citations.append(
+            {
+                "label": label,
+                "index_id": node.get("index_id", node.get("node_id")),
+                "type": str(node_type),
+                "page": node.get("page"),
+                "snippet": snippet[:400],
+                "has_image": bool(node.get("img_path")),
+            }
+        )
+    return citations
+
+
 _CANONICAL_TEXT_KINDS = (
     "text",
     "ocr_text",
@@ -870,7 +904,7 @@ class AnswerAgent:
         evidence_nodes: List[Dict[str, Any]],
         *,
         require_citations: bool,
-    ) -> Tuple[str, List[Dict[str, Any]]]:
+    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Validate that generated references belong to supplied evidence.
 
         This is a structural source-reference gate, not a semantic entailment
@@ -894,13 +928,14 @@ class AnswerAgent:
                     "answer_citation_validation": validation_payload,
                 }
             )
+        citations = _citation_index(evidence_nodes)
         if require_citations and not validation.valid:
             log.error(
                 "Rejecting answer with invalid source references: %s",
                 validation.status,
             )
-            return CITATION_VALIDATION_FAILURE_ANSWER, partial_answers
-        return answer, partial_answers
+            return CITATION_VALIDATION_FAILURE_ANSWER, partial_answers, citations
+        return answer, partial_answers, citations
 
     def answer_simple_question(
         self,
@@ -913,7 +948,7 @@ class AnswerAgent:
         *,
         require_citations: bool = False,
         evidence_scope: str | None = None,
-    ) -> Tuple[str, List[Dict[str, Any]]]:
+    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Orchestrates answering a single, simple question by preparing evidence,
         building prompts, and synthesizing results.
@@ -1314,7 +1349,7 @@ Your concise analysis of this single piece of evidence:
         filtered_nodes: List[Dict],
         *,
         require_citations: bool = False,
-    ) -> Tuple[str, List[Dict[str, Any]]]:
+    ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Answers a global question by analyzing each filtered node individually
         and then synthesizing the results.
@@ -1322,6 +1357,7 @@ Your concise analysis of this single piece of evidence:
         if not filtered_nodes:
             return (
                 "I found no items matching the specified filters to answer the question.",
+                [],
                 [],
             )
 

@@ -131,7 +131,7 @@ class AnswerEvidenceTests(unittest.TestCase):
         ]
         before = deepcopy(retrieved)
 
-        answer, partial = agent.answer_simple_question("What is stated?", retrieved)
+        answer, partial, _citations = agent.answer_simple_question("What is stated?", retrieved)
 
         self.assertEqual(before, retrieved)
         self.assertEqual([before], hydrator.calls)
@@ -167,7 +167,7 @@ class AnswerEvidenceTests(unittest.TestCase):
             "citation": {"citation_id": trusted_citation_id},
         }
 
-        answer, partials = agent.answer_simple_question(
+        answer, partials, _citations = agent.answer_simple_question(
             "Does the question text [E777] change provenance?",
             [node],
             require_citations=True,
@@ -297,7 +297,7 @@ class AnswerEvidenceTests(unittest.TestCase):
         ]
         before = deepcopy(retrieved)
 
-        answer, partials = agent.answer_global_question(
+        answer, partials, _citations = agent.answer_global_question(
             "What does every diagram require?", "ANALYZE", retrieved
         )
 
@@ -354,7 +354,7 @@ class AnswerEvidenceTests(unittest.TestCase):
         }
         before = deepcopy(node)
 
-        answer, partials = agent.answer_global_question(
+        answer, partials, _citations = agent.answer_global_question(
             "Summarize all diagrams.", "SUMMARIZE", [node]
         )
 

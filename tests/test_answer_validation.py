@@ -119,7 +119,7 @@ class AnswerCitationValidationTests(unittest.TestCase):
         captured = []
         agent = _agent("The value is 42 [E1].", captured)
 
-        answer, partials = agent.answer_simple_question(
+        answer, partials, _citations = agent.answer_simple_question(
             "What is the value?", [_node()], require_citations=True
         )
 
@@ -132,7 +132,7 @@ class AnswerCitationValidationTests(unittest.TestCase):
     def test_strict_answer_fails_closed_when_model_omits_citation(self):
         agent = _agent("The value is 42.", [])
 
-        answer, partials = agent.answer_simple_question(
+        answer, partials, _citations = agent.answer_simple_question(
             "What is the value?", [_node()], require_citations=True
         )
 
@@ -144,7 +144,7 @@ class AnswerCitationValidationTests(unittest.TestCase):
     def test_strict_answer_fails_closed_on_compound_marker(self):
         agent = _agent("The value is 42 [E1, E2].", [])
 
-        answer, partials = agent.answer_simple_question(
+        answer, partials, _citations = agent.answer_simple_question(
             "What is the value?", [_node()], require_citations=True
         )
 
@@ -156,7 +156,7 @@ class AnswerCitationValidationTests(unittest.TestCase):
     def test_legacy_answer_is_reported_but_not_rejected(self):
         agent = _agent("Compatibility answer.", [])
 
-        answer, partials = agent.answer_simple_question(
+        answer, partials, _citations = agent.answer_simple_question(
             "What is the value?", [_node()]
         )
 
@@ -170,7 +170,7 @@ class AnswerCitationValidationTests(unittest.TestCase):
         captured = []
         agent = _agent("The value is 42 [Q1-E1].", captured)
 
-        answer, partials = agent.answer_simple_question(
+        answer, partials, _citations = agent.answer_simple_question(
             "What is the value?",
             [_node()],
             require_citations=True,
@@ -376,10 +376,12 @@ class AnswerCitationValidationTests(unittest.TestCase):
             (
                 "First [Q1-E1].",
                 [{"answer_citation_validation": first_validation}],
+                [{"label": "Q1-E1"}],
             ),
             (
                 "Second [Q2-E1].",
                 [{"answer_citation_validation": second_validation}],
+                [{"label": "Q2-E1"}],
             ),
         ]
         final_validation = {

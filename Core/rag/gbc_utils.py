@@ -48,6 +48,10 @@ class SubStep(BaseModel):
     partial_answers: Union[str | List[Any]] = Field(default_factory=list)
     generated_answer: str = ""
     answer_validation: Dict[str, Any] = Field(default_factory=dict)
+    # The exact E1..En list the answer's inline citations refer to, in the
+    # order and dedup those labels were assigned -- so a UI can link [E1] to
+    # the evidence it names instead of re-deriving the mapping.
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
     global_filtered_count: int = 0
     global_evidence_limit: int = 0
     global_budget_exhausted: bool = False
