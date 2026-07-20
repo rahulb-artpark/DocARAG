@@ -713,7 +713,9 @@ class AppState:
         self._rag_identity_key = None
         self._store = None
         self._tree_cache = None
+        self._tree_cache_key = None
         self._graph_cache = None
+        self._graph_cache_key = None
         self._readiness_cache_key = None
         self._readiness_cache = None
 
@@ -742,7 +744,9 @@ class AppState:
                 self._store.close()
             self._store = None
             self._tree_cache = None
+            self._tree_cache_key = None
             self._graph_cache = None
+            self._graph_cache_key = None
             self._readiness_cache_key = None
             self._readiness_cache = None
             self.run_dir = run_dir
@@ -763,7 +767,13 @@ class AppState:
         return Handler._safe_doc_name(self.run_dir)
 
     def tree_payload(self):
-        if self._tree_cache is not None:
+        # Cached only until the run's own state changes -- a query made
+        # while a stage was still running (before its evidence was fully
+        # persisted) must not be served forever afterward as if it were
+        # complete. See the matching note on graph_payload for the incident
+        # this fixes.
+        key = query_readiness_stat_key(self.run_dir)
+        if self._tree_cache is not None and self._tree_cache_key == key:
             return self._tree_cache
 
         store = self.store()
@@ -819,10 +829,18 @@ class AppState:
             "nodes": flat,
         }
         self._tree_cache = payload
+        self._tree_cache_key = key
         return payload
 
     def graph_payload(self):
-        if self._graph_cache is not None:
+        # Cached only until the run's own state changes. Without this, a
+        # request made while the graph stage was still running -- persist
+        # had not written any entities/statements yet -- would cache an
+        # empty payload and keep serving it forever, even long after the
+        # real data existed in Postgres: the graph panel would show
+        # "not loading" permanently for a run that actually finished fine.
+        key = query_readiness_stat_key(self.run_dir)
+        if self._graph_cache is not None and self._graph_cache_key == key:
             return self._graph_cache
 
         from Core.rag.stored_index import entity_node_name
@@ -889,6 +907,7 @@ class AppState:
             "links": links,
         }
         self._graph_cache = payload
+        self._graph_cache_key = key
         return payload
 
     def ensure_rag(self):

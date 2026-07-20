@@ -307,6 +307,7 @@ class WebDiscoveryTests(unittest.TestCase):
                 {"source": {"path": "/data/sample.pdf"}},
             )
             state = self.web.AppState(run)
+            cache_key = ("test-fixture-key",)
             state._tree_cache = {
                 "docName": "sample.pdf",
                 "runDir": str(run),
@@ -315,6 +316,7 @@ class WebDiscoveryTests(unittest.TestCase):
                     {"id": 2, "content": "Speaker text", "summary": ""},
                 ],
             }
+            state._tree_cache_key = cache_key
             tree = SimpleNamespace(
                 graph_entities=lambda: [
                     {
@@ -345,7 +347,10 @@ class WebDiscoveryTests(unittest.TestCase):
             )
             state._store = SimpleNamespace(tree=tree, close=lambda: None)
 
-            payload = state.graph_payload()
+            with patch.object(
+                self.web, "query_readiness_stat_key", return_value=cache_key
+            ):
+                payload = state.graph_payload()
 
             self.assertEqual(2, len(payload["nodes"]))
             speaker = payload["nodes"][0]
