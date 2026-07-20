@@ -382,7 +382,9 @@ def _normalized_block_native_key(block: dict[str, object]) -> str:
     return content_sha256(spatial_identity)
 
 
-def _make_parse_request(cfg: SystemConfig, pdf_list: list[dict]) -> ParseRequest:
+def _make_parse_request(
+    cfg: SystemConfig, pdf_list: list[dict], *, document_page_count: int | None = None
+) -> ParseRequest:
     source = cfg.source
     if source is None:
         raise CanonicalEvidenceBindingError(
@@ -412,7 +414,17 @@ def _make_parse_request(cfg: SystemConfig, pdf_list: list[dict]) -> ParseRequest
         mime_type="application/pdf",
         source_uri=source.original_uri,
         display_name=source.display_name,
-        page_count=page_indices[-1] + 1,
+        # A shard only ever sees its own blocks, so page_indices[-1] + 1
+        # truncates page_count for every shard but the one containing the
+        # document's last page. document_version_id doesn't depend on
+        # page_count (only on source_uri/content_sha256), so this was never
+        # an identity bug -- just wrong descriptive metadata. The per-shard
+        # caller passes the document's real total; the non-sharded caller
+        # (or a test) still gets today's derived-from-blocks behavior.
+        page_count=(
+            document_page_count if document_page_count is not None
+            else page_indices[-1] + 1
+        ),
         metadata={
             "snapshot_path": source.snapshot_path or cfg.pdf_path,
             "parser_input_path": cfg.pdf_path,
@@ -531,15 +543,29 @@ def bind_canonical_evidence(
     pdf_list: list[dict],
     *,
     merged_content_path: str | os.PathLike[str],
+    document_page_count: int | None = None,
+    debug_artifact_suffix: str = "",
 ) -> tuple[ParseRequest, tuple[CanonicalBlock, ...]]:
     """Translate MinerU blocks and attach immutable evidence IDs one-to-one.
 
     The legacy dictionaries remain in their original order.  The adapter may
     sort its typed observations by page/reading order, so an injected stable
     native ID is used for the lossless join back to each dictionary.
+
+    ``document_page_count`` lets a per-shard caller report the document's
+    real total instead of the truncated one this function would otherwise
+    derive from just the blocks it was given (see ``_make_parse_request``).
+
+    ``debug_artifact_suffix`` is folded into this call's debug/audit dump
+    name (``..._parser_observations.json``) so a per-shard caller's dumps
+    don't silently overwrite each other under the same document-derived
+    name -- the same bug class already found and fixed for ``do_parse``'s
+    own dumps when the parse stage was sharded.
     """
 
-    request = _make_parse_request(cfg, pdf_list)
+    request = _make_parse_request(
+        cfg, pdf_list, document_page_count=document_page_count
+    )
     occurrence_by_digest: dict[str, int] = {}
     prepared_blocks: list[dict[str, object]] = []
     native_ids: list[str] = []
@@ -597,7 +623,7 @@ def bind_canonical_evidence(
     observation_path = (
         Path(cfg.save_path)
         / cfg.mineru.method
-        / f"{Path(cfg.pdf_path).stem}_parser_observations.json"
+        / f"{Path(cfg.pdf_path).stem}{debug_artifact_suffix}_parser_observations.json"
     )
     # Failed/partial translations remain inspectable even though no canonical
     # evidence or tree is allowed to publish from them.

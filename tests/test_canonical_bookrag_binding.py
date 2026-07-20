@@ -83,7 +83,7 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             },
         ]
 
-    def bind(self, root: Path, blocks: list[dict]):
+    def bind(self, root: Path, blocks: list[dict], **kwargs):
         cfg = self.make_cfg(root)
         merged_path = Path(cfg.save_path) / "auto" / "source_merged_content.json"
         merged_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +92,7 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             cfg,
             blocks,
             merged_content_path=merged_path,
+            **kwargs,
         )
         return cfg, request, canonical
 
@@ -299,6 +300,67 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             self.assertEqual(
                 "mineru_page_reconciliation:unmatched_content",
                 retrieval["reconciliation_method"],
+            )
+
+    def test_document_page_count_override_is_not_truncated_to_this_calls_blocks(
+        self,
+    ):
+        # A per-shard caller only ever sees its own shard's blocks (here,
+        # pages 0-1), so deriving page_count from them would silently
+        # truncate it for every shard but the one containing the document's
+        # last page. document_page_count lets the caller report the real
+        # total instead.
+        blocks = self.blocks()
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, _canonical = self.bind(
+                Path(tmp), blocks, document_page_count=50
+            )
+            self.assertEqual(50, request.document.page_count)
+
+    def test_document_page_count_defaults_to_derived_value_when_omitted(self):
+        blocks = self.blocks()
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, _canonical = self.bind(Path(tmp), blocks)
+            self.assertEqual(2, request.document.page_count)
+
+    def test_debug_artifact_suffix_prevents_shard_dumps_from_overwriting_each_other(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = self.make_cfg(root)
+            merged_path = Path(cfg.save_path) / "auto" / "source_merged_content.json"
+            merged_path.parent.mkdir(parents=True, exist_ok=True)
+            merged_path.write_text(json.dumps(self.blocks()), encoding="utf-8")
+
+            bind_canonical_evidence(
+                cfg,
+                [self.blocks()[0]],
+                merged_content_path=merged_path,
+                debug_artifact_suffix="_shard000",
+            )
+            bind_canonical_evidence(
+                cfg,
+                [self.blocks()[1]],
+                merged_content_path=merged_path,
+                debug_artifact_suffix="_shard001",
+            )
+
+            dump_dir = Path(cfg.save_path) / "auto"
+            self.assertTrue(
+                (dump_dir / "source_shard000_parser_observations.json").is_file()
+            )
+            self.assertTrue(
+                (dump_dir / "source_shard001_parser_observations.json").is_file()
+            )
+
+    def test_omitted_debug_artifact_suffix_matches_todays_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg, _request, _canonical = self.bind(root, self.blocks())
+            self.assertTrue(
+                (Path(cfg.save_path) / "auto" / "source_parser_observations.json")
+                .is_file()
             )
 
     def test_artifacts_are_byte_deterministic_for_the_same_parser_output(self):
