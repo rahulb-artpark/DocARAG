@@ -16,6 +16,7 @@ from docarag.persistence import (
     WorkState,
     durable_stage,
 )
+from docarag.persistence.contracts import IndexRevisionState
 
 
 def _environment() -> dict[str, str]:
@@ -107,6 +108,15 @@ class _MemoryLedger:
     def record_artifact(self, receipt):
         self.receipts.append(receipt)
 
+    def create_index_revision(self, spec):
+        self.index_revision_specs = getattr(self, "index_revision_specs", [])
+        self.index_revision_specs.append(spec)
+        return IndexRevisionState.BUILDING
+
+    def publish_index_revision(self, spec, publication):
+        self.published = getattr(self, "published", [])
+        self.published.append((spec, publication))
+
     @staticmethod
     def _assert_scope(scope):
         if scope != DocumentScope(
@@ -171,6 +181,44 @@ class DurableStageRuntimeTests(unittest.TestCase):
         result = ledger.completed[0][1]
         self.assertEqual(2, result["checkpoint_count"])
         self.assertEqual([receipt.receipt_id], result["receipt_ids"])
+
+    def test_publish_index_revision_uses_the_pipelines_own_revision_id(self):
+        # DOCARAG_INDEX_REVISION_ID in _environment() is "revision-a" -- the
+        # same identity every other stage's work_item_id/artifact receipt in
+        # this run is keyed by. Leaving IndexRevisionSpec.revision_id unset
+        # here previously let it derive a different, content-hash identity,
+        # so the row this call marked 'ready' was never the row
+        # persist_document_evidence wrote blocks/entities/statements into.
+        ledger = _MemoryLedger()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree_path = root / "tree.pkl"
+            graph_path = root / "graph_data.json"
+            manifest_path = root / "attestation.json"
+            for path in (tree_path, graph_path, manifest_path):
+                path.write_text("{}", encoding="utf-8")
+            with durable_stage(
+                "vector", environment=_environment(), ledger=ledger
+            ) as stage:
+                stage.publish_index_revision(
+                    configuration_sha256="b" * 64,
+                    canonical_artifact_sha256="c" * 64,
+                    tree_artifact_path=tree_path,
+                    graph_artifact_path=graph_path,
+                    retrieval_manifest_path=manifest_path,
+                    qdrant_collection="TreeVDB",
+                    qdrant_point_count=40,
+                )
+
+        self.assertEqual(1, len(ledger.index_revision_specs))
+        spec = ledger.index_revision_specs[0]
+        self.assertEqual("revision-a", spec.revision_id)
+        self.assertEqual(1, len(ledger.published))
+        published_spec, publication = ledger.published[0]
+        self.assertEqual("revision-a", published_spec.revision_id)
+        self.assertEqual(40, publication.qdrant_point_count)
+        # No redundant duplicate of the identity spec.revision_id already is.
+        self.assertNotIn("shell_index_revision_id", spec.metadata)
 
     def test_failed_stage_is_requeued_and_failure_is_observable(self):
         ledger = _MemoryLedger()

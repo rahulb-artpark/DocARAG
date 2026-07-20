@@ -852,10 +852,20 @@ class DurableStage:
             canonical_artifact_sha256=canonical_digest,
             qdrant_collection=qdrant_collection,
             qdrant_vector_name=qdrant_vector_name,
+            # This pipeline already names its revision (self.runtime.index_revision_id,
+            # the same identity every other stage's work_item_id/artifact receipt
+            # is keyed by) -- IndexRevisionSpec's own contract is to keep that
+            # name rather than derive a different one. Leaving revision_id
+            # unset here previously left create_index_revision to derive its
+            # own content-hash identity instead, so the row this call marks
+            # 'ready' was never the same row persist_document_evidence wrote
+            # blocks/entities/statements into: two disconnected revisions for
+            # one document, one with data and never ready, one ready and
+            # empty.
+            revision_id=self.runtime.index_revision_id,
             metadata={
                 **dict(metadata or {}),
                 "publication_schema": "docarag.index-publication.v1",
-                "shell_index_revision_id": self.runtime.index_revision_id,
             },
         )
         state = self.runtime.ledger.create_index_revision(spec)
