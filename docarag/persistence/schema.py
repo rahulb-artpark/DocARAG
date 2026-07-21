@@ -775,9 +775,16 @@ CREATE TABLE docarag.node_retrieval (
     CONSTRAINT node_retrieval_len CHECK (text_len >= 0)
 );
 
+-- retrieval_text is excluded from INCLUDE: a btree index tuple (key plus
+-- every INCLUDE column together) is capped at roughly a third of a page
+-- (~2704 bytes on the default build), and retrieval_text is free text up to
+-- 16000 characters -- large enough that a single real node overflowed the
+-- limit and failed the whole write. Losing index-only-scan for this one
+-- column costs one heap fetch per candidate; a hard write failure costs the
+-- entire revision.
 CREATE INDEX node_retrieval_feed_idx
     ON docarag.node_retrieval (revision_key)
-    INCLUDE (node_key, node_kind, page_no, retrieval_text);
+    INCLUDE (node_key, node_kind, page_no);
 """.strip()
 
 

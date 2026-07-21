@@ -492,9 +492,33 @@ def _read(path: Path) -> object:
         raise ProjectionError(f"{path.name} exceeds the artifact size limit")
     try:
         with path.open(encoding="utf-8") as handle:
-            return json.load(handle)
+            payload = json.load(handle)
     except (OSError, ValueError) as exc:
         raise ProjectionError(f"{path.name} is not readable JSON") from exc
+    return _strip_nul_bytes(payload)
+
+
+def _strip_nul_bytes(value: object) -> object:
+    """Drop NUL (0x00) characters from every string in a parsed artifact.
+
+    PostgreSQL's text and jsonb types both reject an embedded NUL outright --
+    psycopg raises before the value even reaches the server, for a raw
+    literal NUL or (server-side, via jsonb's own JSON parser) its escaped
+    "\\u0000" form alike. MinerU emits a literal NUL as its fallback for a
+    handful of glyphs a source PDF's font has no usable Unicode mapping for
+    (seen in practice: Greek letters and a degree sign, in Zernike-polynomial
+    notation). Rare, but real, so this runs once here, on every artifact this
+    module reads, rather than trusting every downstream field access to
+    remember the constraint.
+    """
+
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, dict):
+        return {key: _strip_nul_bytes(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul_bytes(item) for item in value]
+    return value
 
 
 def _sequence(payload: object, key: str | None) -> list[object]:
