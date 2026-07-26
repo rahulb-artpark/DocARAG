@@ -1,6 +1,28 @@
 # DocARAG Index Scaling Plan — Tree + Graph for Large Documents (BookRAG-based)
 
-**Status:** draft for review (v2 — replanned). No code changes until agreed.
+## Implementation status
+
+Landed (each committed separately, full suite green at 1,274 tests):
+
+| Item | Commit | Verified by |
+|---|---|---|
+| T1 outline `think_mode` | `2cc4677` | real facade: 114.3s exhausted → 8.7s, max level 1 → 4 |
+| G2 merge atomicity + fallback | `4c5ace7` | 3 tests fail pre-fix with the production error |
+| G1 resumable refinement | `f669a09` | snapshot/restore + resume-skip tests |
+| T3 merger concurrency | `fd82809` | order preserved when completion order reverses |
+| G9 per-entity GPU flush removed | `e3af77e` | source guard; provider self-manages on a threshold |
+| G7 extraction/refinement overlap | `7a6afc2` | deterministic overlap test via an event |
+| Phase 0 ER counters | `d370981` | per-outcome counts, logged against graph size |
+| T2 packing cap named | `593a575` | value unchanged; lever made explicit |
+
+**Blocked on a fixture, not on design.** Every remaining item (G3, G4, G5, G6,
+G8, T4, T5, T6, Phase 6, Phase 7) changes merge decisions, tree structure, or
+needs a measured baseline — and this plan's own gates require proving that
+change is not a regression. That needs the golden + ~500pp scale fixtures from
+open question 1. Landing them without that would trade the quality guarantee
+for speed, which is the one thing the plan forbids.
+
+**Status:** v2 replanned; items above implemented.
 **Goal:** make tree + graph index construction complete, and complete in
 industry-acceptable time, on 1000–5000 page documents — **without degrading**
 tree-node, entity, or entity-resolution quality. Speed comes from durability,
