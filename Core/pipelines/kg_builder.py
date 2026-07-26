@@ -25,6 +25,7 @@ from rich.logging import RichHandler
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from itertools import batched
 
 # log_dir = "/home/wangshu/multimodal/GBC-RAG/test/index_qwen3/logs"
@@ -132,16 +133,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
                     source_id=res.get("node_idx", -1),
                 )
 
-        # Keep at most one configured microbatch of extraction results in memory.
-        # Each successful node has its own durable extraction file before refinement,
-        # so a failed later node can be resumed without publishing an incomplete KG.
-        source_nodes = (
-            node
-            for node in tree.nodes
-            if node is not tree.root_node and node.index_id not in refined_node_ids
-        )
-        extracted_count = len(refined_node_ids)
-        for node_batch in batched(source_nodes, cfg.graph.extraction_batch_size):
+        def extract_batch(node_batch):
             title_work = []
             ordinary_nodes = []
             for node in node_batch:
@@ -165,22 +157,57 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
             # Preserve the legacy deterministic node order even though title and
             # non-title provider streams are executed separately within a batch.
             batch_results.sort(key=lambda item: item.get("node_idx", -1))
-            for result in batch_results:
-                refine_extraction(result)
-                refined_node_ids.add(result.get("node_idx", -1))
-                extracted_count += 1
-            save_refinement_state(
-                cfg.save_path,
-                graph=graph_index,
-                alias_map=kg_refiner.entity_alias_map,
-                refined_node_ids=refined_node_ids,
-                variant=variant,
+            return batch_results
+
+        # Each successful node has its own durable extraction file before refinement,
+        # so a failed later node can be resumed without publishing an incomplete KG.
+        source_nodes = (
+            node
+            for node in tree.nodes
+            if node is not tree.root_node and node.index_id not in refined_node_ids
+        )
+        extracted_count = len(refined_node_ids)
+        node_batches = batched(source_nodes, cfg.graph.extraction_batch_size)
+
+        # Refinement is serial and holds one provider slot, leaving the rest of
+        # max_workers idle. Extracting the next batch while the current one is
+        # being refined keeps them busy; the provider's own admission semaphore
+        # still caps total concurrency, so this cannot oversubscribe the model.
+        # At most two microbatches of extraction results are held at once.
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kg-extraction"
+        ) as extraction_pump:
+            upcoming = next(node_batches, None)
+            pending = (
+                extraction_pump.submit(extract_batch, upcoming)
+                if upcoming is not None
+                else None
             )
-            log.info(
-                "Committed KG extraction/refinement for %d/%d tree nodes",
-                extracted_count,
-                max(0, len(tree.nodes) - 1),
-            )
+            while pending is not None:
+                batch_results = pending.result()
+                upcoming = next(node_batches, None)
+                pending = (
+                    extraction_pump.submit(extract_batch, upcoming)
+                    if upcoming is not None
+                    else None
+                )
+
+                for result in batch_results:
+                    refine_extraction(result)
+                    refined_node_ids.add(result.get("node_idx", -1))
+                    extracted_count += 1
+                save_refinement_state(
+                    cfg.save_path,
+                    graph=graph_index,
+                    alias_map=kg_refiner.entity_alias_map,
+                    refined_node_ids=refined_node_ids,
+                    variant=variant,
+                )
+                log.info(
+                    "Committed KG extraction/refinement for %d/%d tree nodes",
+                    extracted_count,
+                    max(0, len(tree.nodes) - 1),
+                )
 
         log.info("Knowledge graph extraction completed.")
         log.info("Extracted %d nodes from the document tree.", extracted_count)

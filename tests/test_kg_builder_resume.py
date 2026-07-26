@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -184,6 +185,63 @@ class RefinementResumeTests(unittest.TestCase):
             refiner = _refiner_mock()
             _run(_config(directory), _tree(2), _Extractor(), refiner)
             refiner.rebuild_vdb_from_graph.assert_not_called()
+
+
+class ExtractionPrefetchTests(unittest.TestCase):
+    def test_the_next_batch_extracts_while_the_current_one_is_refined(self):
+        second_extraction = threading.Event()
+
+        class _SignallingExtractor(_Extractor):
+            def __init__(self) -> None:
+                super().__init__()
+                self.batches = 0
+
+            def iter_extract_kg(self, nodes):
+                self.batches += 1
+                if self.batches == 2:
+                    second_extraction.set()
+                return super().iter_extract_kg(nodes)
+
+        overlapped: list[bool] = []
+        refiner = _refiner_mock()
+        refiner.advanced_kg_refiner.side_effect = lambda *a, **k: overlapped.append(
+            second_extraction.wait(timeout=5)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            _run(
+                _config(directory, batch_size=2),
+                _tree(4),
+                _SignallingExtractor(),
+                refiner,
+            )
+
+        # Refining the first batch must not have to wait for the second batch's
+        # extraction to be requested -- that is the whole point of the prefetch.
+        self.assertTrue(overlapped[0])
+
+    def test_refinement_still_runs_in_node_order(self):
+        refiner = _refiner_mock()
+        order: list[int] = []
+        refiner.advanced_kg_refiner.side_effect = lambda **kwargs: order.append(
+            kwargs["source_id"]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            _run(_config(directory, batch_size=2), _tree(6), _Extractor(), refiner)
+
+        self.assertEqual([1, 2, 3, 4, 5, 6], order)
+
+    def test_an_extraction_failure_still_propagates(self):
+        extractor = Mock()
+        extractor.iter_extract_kg.side_effect = RuntimeError("model failed")
+        extractor.iter_extract_titles.return_value = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                _run(
+                    _config(directory), _tree(4), extractor, _refiner_mock()
+                )
 
 
 if __name__ == "__main__":
