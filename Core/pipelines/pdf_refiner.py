@@ -24,6 +24,11 @@ from docarag.derived_identity import (
 
 log = logging.getLogger(__name__)
 
+# Pairs packed into one judgment call, on top of the token budget. Raising it
+# cuts the number of calls proportionally but changes what each prompt asks, so
+# measure the response-length-mismatch rate before moving it.
+MAX_PAIRS_PER_JUDGMENT = 3
+
 
 _DIRECT_EVIDENCE_FIELDS = (
     "canonical_block_id",
@@ -793,8 +798,10 @@ def get_json_str_text(text_candidates, max_tokens) -> List[str]:
             [current_json], selected_columns=columns)
         current_tokens = num_tokens(cur_json_str)
 
-        if (number_of_tokens + current_tokens < max_tokens) and number_of_pairs < 3:
-            # max 3 text pairs
+        if (
+            number_of_tokens + current_tokens < max_tokens
+            and number_of_pairs < MAX_PAIRS_PER_JUDGMENT
+        ):
             pairs_lists.append(current_json)
             number_of_tokens += current_tokens
             number_of_pairs += 1
@@ -1251,8 +1258,10 @@ def get_json_str_table_pairs(
         cur_json_str = get_json_content(
             [current_json], selected_columns=columns)
         current_tokens = num_tokens(cur_json_str)
-        if (number_of_tokens + current_tokens < max_tokens) and number_of_pairs < 3:
-            # max 3 table pairs
+        if (
+            number_of_tokens + current_tokens < max_tokens
+            and number_of_pairs < MAX_PAIRS_PER_JUDGMENT
+        ):
             json_pairs.append(current_json)
             number_of_tokens += current_tokens
             number_of_pairs += 1
