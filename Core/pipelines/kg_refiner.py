@@ -536,12 +536,13 @@ class KGRefiner:
             metadata_str(ent["metadata"]) for ent in similar_entities
         ]
 
+        # rerank() already empties its cache once enough content has passed
+        # through, so entity resolution must not force a collection per entity.
         scores = self.reranker.rerank(
             query=embed_text,
             documents=similar_entities_str,
             instruction=ER_RERANK_INSTRUCTION,
         )
-        self.reranker.clean_cache()
 
         ranked_results = sorted(
             zip(similar_entities, scores), key=lambda x: x[1], reverse=True

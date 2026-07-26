@@ -215,6 +215,12 @@ class KGRefinementCorrectnessTests(unittest.TestCase):
         source = inspect.getsource(KGRefiner)
         self.assertNotIn("get_all_nodes()", source)
 
+    def test_resolution_does_not_force_a_gpu_collection_per_entity(self):
+        # rerank() empties its own cache on a content threshold; calling it per
+        # entity ran a full gc plus a cuda sync ~119k times on a large document.
+        source = inspect.getsource(KGRefiner)
+        self.assertNotIn("clean_cache()", source)
+
 
 if __name__ == "__main__":
     unittest.main()
