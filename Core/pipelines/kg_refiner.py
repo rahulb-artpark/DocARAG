@@ -181,6 +181,20 @@ class KGRefiner:
             self.entity_alias_map[alias] = root
         return root
 
+    def _concatenated_merge(self, old_entity: Entity, new_entity: Entity) -> Entity:
+        """Merge under the old entity's identity, keeping both descriptions."""
+
+        return Entity(
+            entity_name=old_entity.entity_name,
+            entity_type=old_entity.entity_type,
+            description=(
+                old_entity.description
+                + self._DESCRIPTION_SEP_
+                + new_entity.description
+            ),
+            source_ids=set(old_entity.source_ids).union(new_entity.source_ids),
+        )
+
     def entity_merge(
         self,
         old_entity: Entity,
@@ -195,29 +209,14 @@ class KGRefiner:
         Returns:
             Entity: The merged entity with updated description and source IDs.
         """
-        # 1. delete old entity from the vector database
-
-        self.delete_entity_from_vdb(old_entity)
-
-        # 2. merge the two entities
         old_node_name = self.graph_index.get_node_name_from_entity(old_entity)
         new_node_name = self.graph_index.get_node_name_from_entity(new_entity)
+        entity_c: Optional[Entity] = None
+
         if (old_node_name == new_node_name) or merged_to_old_entity:
-            # 2.1 if have the same node name, or merged to old entity,
-            # Directly merged if the entity name and type are the same
             log.info("merged directly")
-            new_description = (
-                old_entity.description + self._DESCRIPTION_SEP_ + new_entity.description
-            )
-            merged_entity = Entity(
-                entity_name=old_entity.entity_name,
-                entity_type=old_entity.entity_type,
-                description=new_description,
-                source_ids=set(old_entity.source_ids).union(new_entity.source_ids),
-            )
+            merged_entity = self._concatenated_merge(old_entity, new_entity)
         else:
-            # 2.2 if have different node name, use LLM to create new entity
-            log.info("merged by LLM summarization")
             old_entity_dict = old_entity.model_dump(exclude={"source_ids"})
             old_entity_dict["description"] = truncate_description(
                 old_entity_dict["description"], max_words=200
@@ -239,64 +238,76 @@ class KGRefiner:
                     ensure_ascii=False,
                 ),
             )
-            res_entity: MergedEntitySchema = self.llm.get_json_completion(
-                prompt=prompt, schema=MergedEntitySchema
+            try:
+                res_entity: MergedEntitySchema = self.llm.get_json_completion(
+                    prompt=prompt, schema=MergedEntitySchema
+                )
+            except Exception as error:
+                # Coreference was already decided; only the synthesized name is
+                # lost, so keep the merge rather than failing the whole stage.
+                log.warning(
+                    "Entity summarization failed for '%s' + '%s' (%s); merging directly.",
+                    old_entity.entity_name,
+                    new_entity.entity_name,
+                    type(error).__name__,
+                )
+                merged_entity = self._concatenated_merge(old_entity, new_entity)
+            else:
+                log.info("merged by LLM summarization")
+                res_entity.entity_name = res_entity.entity_name.lower()
+                res_entity.entity_type = res_entity.entity_type.upper()
+                res_entity.entity_type = res_entity.entity_type.replace(" ", "_")
+
+                merged_entity = Entity(
+                    entity_name=res_entity.entity_name,
+                    entity_type=res_entity.entity_type,
+                    description=(
+                        old_entity.description
+                        + self._DESCRIPTION_SEP_
+                        + new_entity.description
+                    ),
+                    source_ids=set(old_entity.source_ids).union(new_entity.source_ids),
+                )
+
+                merged_node_name = self.graph_index.get_node_name_from_entity(
+                    merged_entity
+                )
+                if (
+                    merged_node_name != old_node_name
+                    and merged_node_name in self.graph_index.kg
+                ):
+                    # The name the LLM chose is already a distinct entity, so
+                    # that entity is folded in as well.
+                    entity_c = self.graph_index.get_entity_by_node_name(
+                        merged_node_name
+                    )
+                    log.info(
+                        f"Entity '{merged_node_name}' already exists in the graph. "
+                        "Merging it with the old entity.\n"
+                    )
+                    log.info(
+                        f"Old entity: {old_entity.entity_name} ({old_entity.entity_type}), \n"
+                        f"New entity: {new_entity.entity_name} ({new_entity.entity_type}), \n"
+                        f"Entity C: {entity_c.entity_name} ({entity_c.entity_type})"
+                    )
+                    merged_entity.description += (
+                        self._DESCRIPTION_SEP_ + entity_c.description
+                    )
+                    merged_entity.source_ids = set(merged_entity.source_ids).union(
+                        entity_c.source_ids
+                    )
+
+        # Mutations begin here. Nothing above touches the graph or the vector
+        # store, so a failed summarization leaves both consistent.
+        self.delete_entity_from_vdb(old_entity)
+        if entity_c is not None:
+            self.delete_entity_from_vdb(entity_c)
+            self.graph_index.update_entity(
+                old_entity_name=entity_c.entity_name,
+                old_entity_type=entity_c.entity_type,
+                new_entity=old_entity,
             )
-            res_entity.entity_name = res_entity.entity_name.lower()
-            res_entity.entity_type = res_entity.entity_type.upper()
-            res_entity.entity_type = res_entity.entity_type.replace(" ", "_")
 
-            description = (
-                old_entity.description + self._DESCRIPTION_SEP_ + new_entity.description
-            )
-
-            merged_entity = Entity(
-                entity_name=res_entity.entity_name,
-                entity_type=res_entity.entity_type,
-                description=description,
-                source_ids=set(old_entity.source_ids).union(new_entity.source_ids),
-            )
-
-            # 2.3 If the llm generated merged entity is another entity (entityC) in the graph,
-            # merged entity_c to merged_entity and then update the graph index.
-            # delete entity_c from the vdb
-
-            merged_node_name = self.graph_index.get_node_name_from_entity(merged_entity)
-            if (
-                merged_node_name != old_node_name
-                and merged_node_name in self.graph_index.kg
-            ):
-                # If the merged entity is another entity (entityC) in the graph,
-                # merge entityC to old entity and then update the graph index.
-                entity_c = self.graph_index.get_entity_by_node_name(merged_node_name)
-
-                log.info(
-                    f"Entity '{merged_node_name}' already exists in the graph. "
-                    "Merging it with the old entity.\n"
-                )
-                log.info(
-                    f"Old entity: {old_entity.entity_name} ({old_entity.entity_type}), \n"
-                    f"New entity: {new_entity.entity_name} ({new_entity.entity_type}), \n"
-                    f"Entity C: {entity_c.entity_name} ({entity_c.entity_type})"
-                )
-                self.delete_entity_from_vdb(entity_c)
-
-                # Merge entityC to old_entity
-                self.graph_index.update_entity(
-                    old_entity_name=entity_c.entity_name,
-                    old_entity_type=entity_c.entity_type,
-                    new_entity=old_entity,
-                )
-                merged_entity.description += (
-                    self._DESCRIPTION_SEP_ + entity_c.description
-                )
-                merged_entity.source_ids = set(merged_entity.source_ids).union(
-                    entity_c.source_ids
-                )
-                # since entity_c is the same as merged_entity, no need to update alias map
-
-        # 3. update the graph index with the merged entity
-        # merge old_entity to merged_entity
         self.graph_index.update_entity(
             old_entity_name=old_entity.entity_name,
             old_entity_type=old_entity.entity_type,
@@ -310,9 +321,6 @@ class KGRefiner:
             f"New entity type: '{merged_entity.entity_type}', \n"
         )
 
-        # Update the entity alias map
-        old_node_name = self.graph_index.get_node_name_from_entity(old_entity)
-        new_node_name = self.graph_index.get_node_name_from_entity(new_entity)
         merged_node_name = self.graph_index.get_node_name_from_entity(merged_entity)
         self.entity_alias_map[old_node_name] = merged_node_name
         self.entity_alias_map[new_node_name] = merged_node_name
