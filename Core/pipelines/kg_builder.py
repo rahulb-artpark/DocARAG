@@ -5,6 +5,11 @@ from Core.pipelines.kg_refiner import KGRefiner
 from Core.configs.system_config import SystemConfig
 from Core.configs.graph_config import graph_artifact_variant
 from Core.configs.llm_config import indexing_llm_config
+from Core.pipelines.kg_refinement_state import (
+    clear_state as clear_refinement_state,
+    load_state as load_refinement_state,
+    save_state as save_refinement_state,
+)
 from Core.pipelines.vdb_index import tree_vector_scope
 
 from Core.provider.llm import LLM
@@ -82,7 +87,13 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
             f"No existing knowledge graph found at {target_graph_path}. Creating a new one..."
         )
 
-    graph_index = Graph(save_path=cfg.save_path, variant=variant)
+    resumed = load_refinement_state(cfg.save_path, variant=variant)
+    if resumed is None:
+        graph_index = Graph(save_path=cfg.save_path, variant=variant)
+        refined_node_ids: set[int] = set()
+    else:
+        graph_index = resumed.graph
+        refined_node_ids = set(resumed.refined_node_ids)
 
     kg_extractor = KGExtractor(
         cfg_graph=cfg.graph, llm=llm, vlm=vlm, save_path=cfg.save_path
@@ -100,6 +111,11 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         scope_filter=entity_scope,
         g=cfg.graph.g,
     )
+    if resumed is not None:
+        # KGRefiner resets the entity collection on construction, so the vector
+        # store has to be rebuilt from the restored graph before any resolution.
+        kg_refiner.entity_alias_map.update(resumed.alias_map)
+        kg_refiner.rebuild_vdb_from_graph()
 
     try:
         def refine_extraction(res):
@@ -119,8 +135,12 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         # Keep at most one configured microbatch of extraction results in memory.
         # Each successful node has its own durable extraction file before refinement,
         # so a failed later node can be resumed without publishing an incomplete KG.
-        source_nodes = (node for node in tree.nodes if node is not tree.root_node)
-        extracted_count = 0
+        source_nodes = (
+            node
+            for node in tree.nodes
+            if node is not tree.root_node and node.index_id not in refined_node_ids
+        )
+        extracted_count = len(refined_node_ids)
         for node_batch in batched(source_nodes, cfg.graph.extraction_batch_size):
             title_work = []
             ordinary_nodes = []
@@ -147,7 +167,15 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
             batch_results.sort(key=lambda item: item.get("node_idx", -1))
             for result in batch_results:
                 refine_extraction(result)
+                refined_node_ids.add(result.get("node_idx", -1))
                 extracted_count += 1
+            save_refinement_state(
+                cfg.save_path,
+                graph=graph_index,
+                alias_map=kg_refiner.entity_alias_map,
+                refined_node_ids=refined_node_ids,
+                variant=variant,
+            )
             log.info(
                 "Committed KG extraction/refinement for %d/%d tree nodes",
                 extracted_count,
@@ -167,6 +195,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         log.info("Knowledge graph refinement completed.")
         kg_refinement_cost = token_tracker.record_stage("kg_refinement")
         log.info(f"Knowledge graph refinement cost: {kg_refinement_cost}")
+        clear_refinement_state(cfg.save_path)
         return graph_index
     finally:
         kg_refiner.close()

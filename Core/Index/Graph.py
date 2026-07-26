@@ -377,19 +377,50 @@ class Graph:
         # use dynamic filename based on variant
         save_path = os.path.join(self.save_dir, self.data_filename)
 
-        graph_json_data = json_graph.node_link_data(self.kg, edges="links")
-
-        data_to_save = {
-            "graph": graph_json_data,
-            "tree2kg": {k: list(v) for k, v in self.tree2kg.items()},
-            "variant": self.variant,
-        }
+        data_to_save = self.to_payload()
 
         # 3. 保存为格式化的JSON文件
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(data_to_save, f, cls=SetEncoder, indent=4, ensure_ascii=False)
 
         log.info(f"Graph data successfully saved to: {save_path}")
+
+    def to_payload(self) -> dict:
+        """Serializable form of this graph, shared with checkpointing."""
+
+        return {
+            "graph": json_graph.node_link_data(self.kg, edges="links"),
+            "tree2kg": {k: list(v) for k, v in self.tree2kg.items()},
+            "variant": self.variant,
+        }
+
+    @classmethod
+    def from_payload(
+        cls, payload: dict, save_path: str = None, variant: str = None
+    ) -> "Graph":
+        """Rebuild a graph from :meth:`to_payload` output."""
+
+        graph_instance = cls(save_path=save_path, variant=variant)
+
+        # Match ``to_payload(edges="links")`` explicitly. NetworkX 3.6 changes
+        # the default edge-key name, so relying on the library default would
+        # make existing BookRAG graph artifacts version-sensitive.
+        graph_instance.kg = json_graph.node_link_graph(
+            payload["graph"], edges="links"
+        )
+
+        for _, node_data in graph_instance.kg.nodes(data=True):
+            if "source_ids" in node_data and isinstance(node_data["source_ids"], list):
+                node_data["source_ids"] = set(node_data["source_ids"])
+
+        for _, _, edge_data in graph_instance.kg.edges(data=True):
+            if "source_ids" in edge_data and isinstance(edge_data["source_ids"], list):
+                edge_data["source_ids"] = set(edge_data["source_ids"])
+
+        graph_instance.tree2kg = defaultdict(
+            set, {int(k): set(v) for k, v in payload["tree2kg"].items()}
+        )
+        return graph_instance
 
     @classmethod
     def load_from_dir(cls, load_dir: str, variant: str = None) -> "Graph":
@@ -403,25 +434,8 @@ class Graph:
         with open(load_path, "r", encoding="utf-8") as f:
             loaded_data = json.load(f)
 
-        graph_instance = cls(save_path=load_dir, variant=variant)
-
-        # Match ``save_graph(edges="links")`` explicitly. NetworkX 3.6 changes
-        # the default edge-key name, so relying on the library default would
-        # make existing BookRAG graph artifacts version-sensitive.
-        graph_instance.kg = json_graph.node_link_graph(
-            loaded_data["graph"], edges="links"
-        )
-
-        for _, node_data in graph_instance.kg.nodes(data=True):
-            if "source_ids" in node_data and isinstance(node_data["source_ids"], list):
-                node_data["source_ids"] = set(node_data["source_ids"])
-
-        for _, _, edge_data in graph_instance.kg.edges(data=True):
-            if "source_ids" in edge_data and isinstance(edge_data["source_ids"], list):
-                edge_data["source_ids"] = set(edge_data["source_ids"])
-
-        graph_instance.tree2kg = defaultdict(
-            set, {int(k): set(v) for k, v in loaded_data["tree2kg"].items()}
+        graph_instance = cls.from_payload(
+            loaded_data, save_path=load_dir, variant=variant
         )
 
         log.info(f"Graph data successfully loaded from: {load_path}")

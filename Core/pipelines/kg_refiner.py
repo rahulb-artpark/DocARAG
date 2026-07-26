@@ -21,6 +21,7 @@ from Core.utils.bounded_executor import iter_bounded_ordered
 
 
 from collections import defaultdict
+from itertools import batched
 from typing import Optional, List
 import json
 import logging
@@ -388,6 +389,25 @@ class KGRefiner:
             "node_id": self.graph_index.get_node_name_from_entity(entity),
             **self.scope_filter,
         }
+
+    _VDB_REBUILD_BATCH = 512
+
+    def rebuild_vdb_from_graph(self) -> int:
+        """Repopulate the entity vector store from the graph after a resume.
+
+        Node names are already unique, so batching cannot hide a duplicate.
+        """
+
+        restored = 0
+        for node_names in batched(self.graph_index.kg.nodes, self._VDB_REBUILD_BATCH):
+            entities = [
+                self.graph_index.get_entity_by_node_name(node_name)
+                for node_name in node_names
+            ]
+            self.add_entities_to_vdb(entities)
+            restored += len(entities)
+        log.info("Rebuilt the entity vector store with %d entities", restored)
+        return restored
 
     def add_entities_to_vdb(self, entities: List[Entity]) -> None:
         """
