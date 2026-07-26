@@ -26,6 +26,10 @@ log = logging.getLogger(__name__)
 
 CompletionKeyT = TypeVar("CompletionKeyT")
 
+# Calls at or above this are worth explaining; steady-state calls are ~1s and
+# logging every one of tens of thousands would drown the run log.
+SLOW_CALL_SECONDS = 5.0
+
 
 def _close_controller_client(controller: object) -> None:
     """Release a controller's HTTP client without depending on its SDK type.
@@ -434,6 +438,37 @@ class OllamaController(BaseLLMController):
         mode = self.think if self.think is not None else requested
         return {} if mode is None else {"think": mode}
 
+    def _log_slow_call(self, response: Any, wall_seconds: float, kind: str) -> None:
+        """Attribute a slow call to a reload, a queue wait, or generation.
+
+        Ollama reports how long it spent itself, so whatever is left of the
+        wall time was spent waiting to be served.
+        """
+
+        if wall_seconds < SLOW_CALL_SECONDS or not isinstance(response, dict):
+            return
+
+        def seconds(key: str) -> float:
+            try:
+                return int(response.get(key, 0) or 0) / 1e9
+            except (TypeError, ValueError):
+                return 0.0
+
+        server_total = seconds("total_duration")
+        logging.getLogger(__name__).warning(
+            "slow %s call: wall=%.1fs server=%.1fs load=%.1fs prompt_eval=%.1fs "
+            "eval=%.1fs unaccounted=%.1fs prompt_tokens=%s eval_tokens=%s",
+            kind,
+            wall_seconds,
+            server_total,
+            seconds("load_duration"),
+            seconds("prompt_eval_duration"),
+            seconds("eval_duration"),
+            max(0.0, wall_seconds - server_total),
+            response.get("prompt_eval_count"),
+            response.get("eval_count"),
+        )
+
     def _prepare_messages(
         self, prompt_or_memory: Union[str, Memory], add_system_prompt: bool = True
     ) -> List[Dict[str, Any]]:
@@ -462,7 +497,9 @@ class OllamaController(BaseLLMController):
         }
         if json_response:
             parameters["format"] = "json"
+        started = time.monotonic()
         response = self.client.chat(**parameters)
+        self._log_slow_call(response, time.monotonic() - started, "text")
 
         if response:
             tracker = TokenTracker.get_instance()
@@ -492,6 +529,7 @@ class OllamaController(BaseLLMController):
         if images:
             # Ollama expects images at the top level of the message dictionary
             messages[-1]["images"] = images
+        started = time.monotonic()
         response = self.client.chat(
             model=self.model,
             messages=messages,
@@ -500,6 +538,7 @@ class OllamaController(BaseLLMController):
             keep_alive=self.keep_alive,
             **self._think_kwargs(think_mode),
         )
+        self._log_slow_call(response, time.monotonic() - started, "structured")
 
         if response:
             tracker = TokenTracker.get_instance()
