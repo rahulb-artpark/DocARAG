@@ -10,6 +10,7 @@ import tempfile
 from typing import Protocol
 
 from Core.Index.Tree import DocumentTree
+from Core.configs.llm_config import indexing_llm_config
 from Core.configs.system_config import SystemConfig
 from Core.pipelines.outline_extractor import extract_pdf_outline_in_chunks
 from Core.pipelines.pdf_refiner import pdf_info_refiner
@@ -1763,7 +1764,7 @@ def build_tree_from_pdf(
         tree_meta.routed_audit_artifact_sha256 = audit_artifact_sha256
         tree_meta.routed_audit_artifact_size_bytes = audit_artifact_size_bytes
 
-    llm = LLM(cfg.llm)
+    llm = LLM(indexing_llm_config(cfg.llm))
     vlm = VLM(cfg.vlm) if cfg.tree.use_vlm else None
 
     with durable_stage(

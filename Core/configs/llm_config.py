@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 import math
 import re
 from typing import Optional, Union
@@ -165,3 +165,11 @@ class LLMConfig:
             raise ValueError(
                 "keep_alive and unload_on_close are only configurable for Ollama"
             )
+
+
+def indexing_llm_config(config: LLMConfig) -> LLMConfig:
+    """Disable model thinking for index construction unless configured."""
+
+    if not is_dataclass(config) or getattr(config, "think", None) is not None:
+        return config
+    return replace(config, think=False)

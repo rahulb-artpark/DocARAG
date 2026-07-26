@@ -4,6 +4,7 @@ from Core.pipelines.kg_extractor import KGExtractor
 from Core.pipelines.kg_refiner import KGRefiner
 from Core.configs.system_config import SystemConfig
 from Core.configs.graph_config import graph_artifact_variant
+from Core.configs.llm_config import indexing_llm_config
 from Core.pipelines.vdb_index import tree_vector_scope
 
 from Core.provider.llm import LLM
@@ -46,7 +47,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
     :param graph_config: GraphConfig object containing configuration for the graph.
     :return: A tuple containing the KGExtractor and KGRefiner instances.
     """
-    llm = LLM(cfg.llm)
+    llm = LLM(indexing_llm_config(cfg.llm))
     vlm = VLM(cfg.vlm) if cfg.graph.image_description_force else None
 
     # try load_the graph if constructed before
