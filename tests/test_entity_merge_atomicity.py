@@ -4,7 +4,7 @@ import unittest
 from collections import defaultdict
 
 from Core.Index.Graph import Entity, Graph
-from Core.pipelines.kg_refiner import KGRefiner
+from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
 
 
 class _RecordingVDB:
@@ -53,6 +53,7 @@ def _refiner(llm: _LLM, *seed: Entity) -> tuple[KGRefiner, Graph, _RecordingVDB]
     refiner.vdb = vdb
     refiner.entity_to_vdb_id = defaultdict(str)
     refiner.entity_alias_map = defaultdict(str)
+    refiner.er_stats = EntityResolutionStats()
     for index, entity in enumerate(seed):
         graph.add_and_link(tree_node_id=index + 1, entities=[entity])
         refiner.entity_to_vdb_id[graph.get_node_name_from_entity(entity)] = (

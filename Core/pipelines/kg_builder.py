@@ -208,6 +208,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
                     extracted_count,
                     max(0, len(tree.nodes) - 1),
                 )
+                kg_refiner.er_stats.log_snapshot(len(graph_index.kg.nodes))
 
         log.info("Knowledge graph extraction completed.")
         log.info("Extracted %d nodes from the document tree.", extracted_count)

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from Core.Index.Graph import Entity, Relationship
 from Core.configs.graph_config import GraphConfig
 from Core.pipelines.kg_extractor import KGExtractor, LLMExtractor, LocalExtractor
-from Core.pipelines.kg_refiner import KGRefiner
+from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
 
 
 class GraphConfigValidationTests(unittest.TestCase):
@@ -161,6 +161,7 @@ class KGRefinementCorrectnessTests(unittest.TestCase):
 
     def test_all_gradient_candidates_returns_no_ambiguous_shortlist(self):
         refiner = object.__new__(KGRefiner)
+        refiner.er_stats = EntityResolutionStats()
         refiner.similar_search_topk = 10
         refiner.similar_search_distance_threshold = 0.2
         refiner.similar_search_mink = 1

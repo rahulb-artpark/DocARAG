@@ -21,6 +21,7 @@ from Core.utils.bounded_executor import iter_bounded_ordered
 
 
 from collections import defaultdict
+from dataclasses import dataclass, fields
 from itertools import batched
 from typing import Optional, List
 import json
@@ -37,6 +38,63 @@ class KGRefinementError(RuntimeError):
         self.entity_name = entity_name
         self.error = error
         super().__init__(f"KG refinement failed for entity {entity_name!r}: {error}")
+
+
+@dataclass
+class EntityResolutionStats:
+    """Where each entity's resolution went, and what it cost.
+
+    The cheap outcomes (``gate_skips``, ``low_score_skips``, ``direct_merges``)
+    and the expensive ones (``rerank_calls`` and the model calls) are counted
+    separately because they scale differently: as the graph fills, fewer new
+    entities clear the distance gate cheaply, so the share taking the model path
+    rises with document size. Logging a snapshot against the graph's node count
+    makes that curve measurable during a run rather than reconstructed from logs
+    afterwards.
+    """
+
+    entities_resolved: int = 0
+    gate_skips: int = 0
+    low_score_skips: int = 0
+    rerank_calls: int = 0
+    case_a_no_gradient: int = 0
+    case_b_single_alias: int = 0
+    case_b_multiple_aliases: int = 0
+    llm_selection_calls: int = 0
+    direct_merges: int = 0
+    llm_summarized_merges: int = 0
+    summarization_fallbacks: int = 0
+
+    @property
+    def llm_calls(self) -> int:
+        return self.llm_selection_calls + self.llm_summarized_merges
+
+    def as_dict(self) -> dict[str, int]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    def log_snapshot(self, graph_node_count: int) -> None:
+        resolved = self.entities_resolved
+        share = (100.0 * self.rerank_calls / resolved) if resolved else 0.0
+        log.info(
+            "entity resolution: graph_nodes=%d resolved=%d rerank=%d (%.1f%%) "
+            "llm_calls=%d (select=%d merge=%d fallback=%d) "
+            "cheap(gate=%d low_score=%d direct=%d) "
+            "gradient(case_a=%d single=%d multi=%d)",
+            graph_node_count,
+            resolved,
+            self.rerank_calls,
+            share,
+            self.llm_calls,
+            self.llm_selection_calls,
+            self.llm_summarized_merges,
+            self.summarization_fallbacks,
+            self.gate_skips,
+            self.low_score_skips,
+            self.direct_merges,
+            self.case_a_no_gradient,
+            self.case_b_single_alias,
+            self.case_b_multiple_aliases,
+        )
 
 
 class KGRefiner:
@@ -77,6 +135,7 @@ class KGRefiner:
         self.vdb = None
         self.entity_to_vdb_id: dict[str, str] = defaultdict(str)
         self.entity_alias_map: dict[str, str] = defaultdict(str)
+        self.er_stats = EntityResolutionStats()
         try:
             self.embedder = TextEmbeddingProvider(
                 model_name=graph_config.embedding_config.model_name,
@@ -215,6 +274,7 @@ class KGRefiner:
         entity_c: Optional[Entity] = None
 
         if (old_node_name == new_node_name) or merged_to_old_entity:
+            self.er_stats.direct_merges += 1
             log.info("merged directly")
             merged_entity = self._concatenated_merge(old_entity, new_entity)
         else:
@@ -246,6 +306,7 @@ class KGRefiner:
             except Exception as error:
                 # Coreference was already decided; only the synthesized name is
                 # lost, so keep the merge rather than failing the whole stage.
+                self.er_stats.summarization_fallbacks += 1
                 log.warning(
                     "Entity summarization failed for '%s' + '%s' (%s); merging directly.",
                     old_entity.entity_name,
@@ -254,6 +315,7 @@ class KGRefiner:
                 )
                 merged_entity = self._concatenated_merge(old_entity, new_entity)
             else:
+                self.er_stats.llm_summarized_merges += 1
                 log.info("merged by LLM summarization")
                 res_entity.entity_name = res_entity.entity_name.lower()
                 res_entity.entity_type = res_entity.entity_type.upper()
@@ -500,12 +562,14 @@ class KGRefiner:
         mink = self.similar_search_mink
         g = self.similar_search_g
 
+        self.er_stats.entities_resolved += 1
         embed_text = self.graph_index.get_node_name_from_entity(entity)
         similar_entities = self.vdb.search(embed_text, top_k=topk)
         min_distance = (
             similar_entities[0]["distance"] if similar_entities else float("inf")
         )
         if min_distance > distance_threshold:
+            self.er_stats.gate_skips += 1
             log.info(
                 f"No similar entities found for '{entity.entity_name}' with type '{entity.entity_type}'. "
                 f"Minimum distance: {min_distance}, threshold: {distance_threshold}."
@@ -538,6 +602,7 @@ class KGRefiner:
 
         # rerank() already empties its cache once enough content has passed
         # through, so entity resolution must not force a collection per entity.
+        self.er_stats.rerank_calls += 1
         scores = self.reranker.rerank(
             query=embed_text,
             documents=similar_entities_str,
@@ -550,6 +615,7 @@ class KGRefiner:
 
         # 4.1 max score < 0.5 not similar enough, return empty list
         if not ranked_results or ranked_results[0][1] < 0.5:
+            self.er_stats.low_score_skips += 1
             return []
 
         # 4.2 gradient-based selection
@@ -567,8 +633,13 @@ class KGRefiner:
 
         if len(sel_entities) == len(ranked_results):
             # 4.3 If all entities are selected, return empty list
+            self.er_stats.case_a_no_gradient += 1
             return []
 
+        if len(sel_entities) == 1:
+            self.er_stats.case_b_single_alias += 1
+        else:
+            self.er_stats.case_b_multiple_aliases += 1
         log.info(f"After gradient-select, found {len(sel_entities)} similar entities.")
 
         res_entities = []
@@ -609,6 +680,7 @@ class KGRefiner:
         prompt = ENTITY_RESOLUATION_PROMPT.format(input_json=input_json_str)
 
         # 2. Call the LLM
+        self.er_stats.llm_selection_calls += 1
         try:
             res: ERExtractSel = self.llm.get_json_completion(
                 prompt=prompt, schema=ERExtractSel
