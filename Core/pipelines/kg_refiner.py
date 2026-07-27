@@ -317,8 +317,10 @@ class KGRefiner:
             else:
                 self.er_stats.llm_summarized_merges += 1
                 log.info("merged by LLM summarization")
-                res_entity.entity_name = res_entity.entity_name.lower()
-                res_entity.entity_type = res_entity.entity_type.upper()
+                # The node id is built from these, and the vector store rejects
+                # one with surrounding whitespace.
+                res_entity.entity_name = res_entity.entity_name.strip().lower()
+                res_entity.entity_type = res_entity.entity_type.strip().upper()
                 res_entity.entity_type = res_entity.entity_type.replace(" ", "_")
 
                 merged_entity = Entity(

@@ -212,3 +212,27 @@ class ExistingTargetEntityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SynthesizedNameNormalizationTests(unittest.TestCase):
+    """A merged name becomes a vector-store node id, which rejects whitespace."""
+
+    def test_surrounding_whitespace_is_stripped(self):
+        old = _entity("llm", "METHOD", "one")
+        new = _entity("large language model", "CONCEPT", "two")
+        llm = _LLM(
+            reply=Entity(
+                entity_name="  Accuracy Of The Fit \n",
+                entity_type="  metric or measure  ",
+                description="d",
+                source_ids=set(),
+            )
+        )
+        refiner, graph, _vdb = _refiner(llm, old)
+
+        merged = refiner.entity_merge(old, new)
+
+        self.assertEqual("accuracy of the fit", merged.entity_name)
+        self.assertEqual("METRIC_OR_MEASURE", merged.entity_type)
+        node_id = graph.get_node_name_from_entity(merged)
+        self.assertEqual(node_id, node_id.strip())
