@@ -29,6 +29,13 @@ _PAYLOAD_SCHEMA = "_docarag_schema"
 _RESERVED_PAYLOAD_KEYS = frozenset(
     {_PAYLOAD_RECORD_ID, _PAYLOAD_CONTENT, _PAYLOAD_SCHEMA}
 )
+#: Named dense vectors of the hybrid entity collection. ``name`` reproduces the
+#: pre-hybrid behaviour exactly, so the schema adds evidence rather than
+#: replacing the only signal ever measured against the quality bar.
+_HYBRID_DENSE_VECTORS = ("name", "context")
+#: Sparse vector carrying term frequencies; Qdrant applies IDF server-side.
+_HYBRID_SPARSE_VECTOR = "lexical"
+
 _KEYWORD_PAYLOAD_INDEXES = (
     "tenant_id",
     "corpus_id",
@@ -449,11 +456,14 @@ class VectorStore:
         timeout_seconds: float = 10.0,
         scope_filter: Mapping[str, Any] | None = None,
         allow_collection_reset: bool = False,
+        hybrid_entity_schema: bool = False,
         client: Any | None = None,
         models: Any | None = None,
     ) -> None:
         if embedding_model is None:
             raise TypeError("embedding_model is required")
+        if not isinstance(hybrid_entity_schema, bool):
+            raise TypeError("hybrid_entity_schema must be a boolean")
         if not isinstance(collection_name, str) or not collection_name.strip():
             raise ValueError("collection_name must be a non-empty string")
         if collection_name != collection_name.strip():
@@ -525,6 +535,11 @@ class VectorStore:
         self._payload_indexes_ready = False
         self.scope_filter = dict(normalized_scope)
         self.allow_collection_reset = allow_collection_reset
+        # The entity collection carries named dense vectors plus a sparse one;
+        # the tree-node collection keeps the single unnamed vector. Making this
+        # per-instance is what keeps the query path's own index out of the
+        # entity migration -- one VectorStore class serves both shapes.
+        self.hybrid_entity_schema = hybrid_entity_schema
         self.collection = _CollectionCountView(self)
         self._read_lease = None
         log.info("Qdrant collection '%s' configured at %s", collection_name, qdrant_url)
@@ -545,16 +560,39 @@ class VectorStore:
             raise RuntimeError("Qdrant returned an invalid collection-exists response")
         return exists
 
-    @staticmethod
-    def _vector_params(collection_info: Any) -> tuple[int, str]:
+    def _vector_params(self, collection_info: Any) -> tuple[int, str]:
         try:
             vectors = collection_info.config.params.vectors
         except AttributeError as exc:
             raise RuntimeError("Qdrant returned an invalid collection configuration") from exc
         if isinstance(vectors, Mapping):
+            if not self.hybrid_entity_schema:
+                raise RuntimeError(
+                    "DocARAG requires one unnamed dense vector; named-vector collection "
+                    "configuration is incompatible"
+                )
+            missing = set(_HYBRID_DENSE_VECTORS).difference(vectors)
+            if missing:
+                raise RuntimeError(
+                    "hybrid entity collection is missing dense vectors: "
+                    + ", ".join(sorted(missing))
+                )
+            # Both dense vectors come from one embedder, so a collection whose
+            # halves disagree cannot have been written by this code.
+            sizes = {
+                name: getattr(vectors[name], "size", None)
+                for name in _HYBRID_DENSE_VECTORS
+            }
+            if len(set(sizes.values())) != 1:
+                raise RuntimeError(
+                    f"hybrid entity dense vectors disagree on dimension: {sizes}"
+                )
+            vectors = vectors[_HYBRID_DENSE_VECTORS[0]]
+        elif self.hybrid_entity_schema:
             raise RuntimeError(
-                "DocARAG requires one unnamed dense vector; named-vector collection "
-                "configuration is incompatible"
+                "hybrid entity collection requires named dense vectors; found an "
+                "unnamed vector, so this collection predates the hybrid schema "
+                "and must be rebuilt"
             )
         size = getattr(vectors, "size", None)
         distance = getattr(vectors, "distance", None)
@@ -626,13 +664,34 @@ class VectorStore:
             return
         self._payload_indexes_ready = False
         try:
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=self._models.VectorParams(
-                    size=vector_size,
-                    distance=self._models.Distance.COSINE,
-                ),
-            )
+            if self.hybrid_entity_schema:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config={
+                        name: self._models.VectorParams(
+                            size=vector_size,
+                            distance=self._models.Distance.COSINE,
+                        )
+                        for name in _HYBRID_DENSE_VECTORS
+                    },
+                    sparse_vectors_config={
+                        _HYBRID_SPARSE_VECTOR: self._models.SparseVectorParams(
+                            index=self._models.SparseIndexParams(),
+                            # IDF from collection statistics, so the client
+                            # sends raw term frequencies and no vocabulary has
+                            # to be persisted or kept in sync with the index.
+                            modifier=self._models.Modifier.IDF,
+                        )
+                    },
+                )
+            else:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=self._models.VectorParams(
+                        size=vector_size,
+                        distance=self._models.Distance.COSINE,
+                    ),
+                )
         except Exception as exc:
             if not self._is_conflict(exc):
                 raise
@@ -839,6 +898,211 @@ class VectorStore:
             )
         log.info("Texts upserted successfully")
         return ids
+
+    def _require_hybrid(self) -> None:
+        if not self.hybrid_entity_schema:
+            raise RuntimeError(
+                "this operation requires a vector store opened with "
+                "hybrid_entity_schema=True"
+            )
+
+    def add_entity_points(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        batch_size: int = 256,
+    ) -> List[str]:
+        """Write one point per entity carrying all three vectors.
+
+        Each record supplies ``name_text`` (embedded as today), ``context_text``
+        (embedded with the description), ``lexical_terms`` (raw frequencies for
+        server-side IDF) and ``metadata``.  Both dense vectors go through one
+        embedder call per batch so the collection's halves cannot drift apart.
+        """
+
+        self._require_hybrid()
+        self._require_open()
+        if not records:
+            return []
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size < 1
+        ):
+            raise ValueError("batch_size must be at least 1")
+
+        record_ids: List[str] = []
+        for start in range(0, len(records), batch_size):
+            batch = records[start : start + batch_size]
+            name_texts = [record["name_text"] for record in batch]
+            context_texts = [record["context_text"] for record in batch]
+            metadatas = [
+                self._apply_scope(
+                    _normalized_metadata(record["metadata"], modality="text")
+                )
+                for record in batch
+            ]
+            ids = [
+                stable_vector_record_id(
+                    name_text,
+                    metadata,
+                    modality="text",
+                    strict_source_identity=True,
+                )
+                for name_text, metadata in zip(name_texts, metadatas)
+            ]
+            # One call over both halves: a second call could observe a changed
+            # model and produce vectors that are not comparable.
+            embeddings = _normalize_vectors(
+                self.embedding_model.embed_texts(name_texts + context_texts),
+                2 * len(batch),
+            )
+            name_vectors = embeddings[: len(batch)]
+            context_vectors = embeddings[len(batch) :]
+            self._ensure_collection(len(name_vectors[0]))
+            points = []
+            for index, record in enumerate(batch):
+                terms = record["lexical_terms"] or {}
+                points.append(
+                    self._models.PointStruct(
+                        id=qdrant_point_id(ids[index]),
+                        vector={
+                            _HYBRID_DENSE_VECTORS[0]: name_vectors[index],
+                            _HYBRID_DENSE_VECTORS[1]: context_vectors[index],
+                            _HYBRID_SPARSE_VECTOR: self._models.SparseVector(
+                                indices=[int(term) for term in terms],
+                                values=[float(value) for value in terms.values()],
+                            ),
+                        },
+                        payload=self._payload(
+                            ids[index], name_texts[index], metadatas[index]
+                        ),
+                    )
+                )
+            self.client.upsert(
+                collection_name=self.collection_name, points=points, wait=True
+            )
+            record_ids.extend(ids)
+        log.info("Upserted %d entity points into Qdrant", len(record_ids))
+        return record_ids
+
+    def search_entities(
+        self,
+        *,
+        name_text: str,
+        context_text: str,
+        lexical_terms: Mapping[int, float],
+        top_k: int,
+        group_by: str,
+        name_score_threshold: float | None = None,
+        context_score_threshold: float | None = None,
+        metadata_filter: Mapping[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Fuse the three vectors and return one hit per distinct entity.
+
+        ``group_by`` collapses a merged entity's several points server-side, so
+        BookRAG 4.3.2 sees one row per entity and ``top_k`` counts entities
+        rather than points -- no over-fetch, and duplicates cannot reach the
+        gradient through a caller that forgot to collapse them.
+
+        The score thresholds are the distance gate, pushed into the prefetches.
+        A candidate enters fusion only by clearing a floor on some vector, so an
+        empty result means nothing plausible was found -- the same outcome the
+        pre-hybrid gate produced, now reachable through the context and lexical
+        vectors as well.
+        """
+
+        self._require_hybrid()
+        self._require_open()
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("top_k must be at least 1")
+        if not isinstance(group_by, str) or not group_by.strip():
+            raise ValueError("group_by must be a non-empty string")
+        if not self._collection_exists():
+            return []
+
+        query_filter = self._qdrant_filter(metadata_filter, None)
+        embeddings = _normalize_vectors(
+            self.embedding_model.embed_texts([name_text, context_text]), 2
+        )
+        self._validate_existing_collection(len(embeddings[0]))
+        # Fusion needs a deeper pool than it returns: a point ranked outside a
+        # prefetch's own limit cannot be recovered by the fusion step.
+        prefetch_limit = max(top_k * 4, 32)
+        prefetches = [
+            self._models.Prefetch(
+                query=embeddings[0],
+                using=_HYBRID_DENSE_VECTORS[0],
+                filter=query_filter,
+                limit=prefetch_limit,
+                score_threshold=name_score_threshold,
+            ),
+            self._models.Prefetch(
+                query=embeddings[1],
+                using=_HYBRID_DENSE_VECTORS[1],
+                filter=query_filter,
+                limit=prefetch_limit,
+                score_threshold=context_score_threshold,
+            ),
+        ]
+        if lexical_terms:
+            prefetches.append(
+                self._models.Prefetch(
+                    query=self._models.SparseVector(
+                        indices=[int(term) for term in lexical_terms],
+                        values=[float(v) for v in lexical_terms.values()],
+                    ),
+                    using=_HYBRID_SPARSE_VECTOR,
+                    filter=query_filter,
+                    limit=prefetch_limit,
+                )
+            )
+        response = self.client.query_points_groups(
+            collection_name=self.collection_name,
+            prefetch=prefetches,
+            query=self._models.FusionQuery(fusion=self._models.Fusion.RRF),
+            group_by=group_by,
+            group_size=1,
+            limit=top_k,
+            query_filter=query_filter,
+            with_payload=True,
+        )
+        groups = getattr(response, "groups", None)
+        if not isinstance(groups, Iterable):
+            raise RuntimeError("Qdrant returned an invalid grouped query response")
+        results = []
+        for group in groups:
+            hits = getattr(group, "hits", None)
+            if not hits:
+                continue
+            results.append(self._retrieval_result(hits[0]))
+        return results
+
+    def set_canonical_id(
+        self, *, field_name: str, current_value: str, canonical_value: str
+    ) -> None:
+        """Repoint every point of a merged entity in one server-side call.
+
+        Filtering on the field rather than on point ids makes a merge chain
+        collapse correctly: repointing C to E moves the points that already
+        followed A into C along with C's own, without the caller tracking them.
+        """
+
+        self._require_hybrid()
+        self._require_open()
+        for value, label in ((current_value, "current"), (canonical_value, "canonical")):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label}_value must be a non-empty string")
+        if not self._collection_exists() or current_value == canonical_value:
+            return
+        self.client.set_payload(
+            collection_name=self.collection_name,
+            payload={field_name: canonical_value},
+            points=self._models.FilterSelector(
+                filter=self._qdrant_filter({field_name: current_value})
+            ).filter,
+            wait=True,
+        )
 
     def delete_text_by_metadata(self, metadata: dict):
         """Delete records matching metadata within this store's scope."""
