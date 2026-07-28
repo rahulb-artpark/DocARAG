@@ -25,6 +25,11 @@ from Core.pipelines.tree_node_builder import create_node_by_type
 from Core.pipelines.tree_node_summary import generate_tree_node_summary
 from Core.provider.TokenTracker import TokenTracker
 from Core.utils.phase_timing import PhaseTimings
+
+#: canonical_bind is the tree stage's largest phase and its internals have never
+#: been separated. Module-level because the function is called once per shard
+#: and the interesting total is across all of them.
+_BIND_TIMINGS = PhaseTimings("canonical bind")
 from Core.provider.extract_pdf_info import merge_middle_content, parse_doc
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
@@ -719,7 +724,8 @@ def bind_canonical_evidence(
         )
 
     try:
-        reconciled = reconcile_observations(result.observations)
+        with _BIND_TIMINGS.time("reconcile"):
+            reconciled = reconcile_observations(result.observations)
     except (ReconciliationError, TypeError, ValueError) as exc:
         raise CanonicalEvidenceBindingError(
             "MinerU complete-observation reconciliation failed"
@@ -748,10 +754,12 @@ def bind_canonical_evidence(
     crop_store = LocalContentAddressedArtifactStore(
         Path(cfg.save_path) / "asset_cas", create=True
     )
-    reconciled_blocks, cas_crop_assets = materialize_visual_crops(
+    with _BIND_TIMINGS.time("crop_materialization"):
+        reconciled_blocks, cas_crop_assets = materialize_visual_crops(
         tuple(reconciled.canonical_blocks), crop_store, cfg.save_path
     )
-    reconciled_blocks = _enrich_figures(cfg, reconciled_blocks, crop_store)
+    with _BIND_TIMINGS.time("figure_enrichment"):
+        reconciled_blocks = _enrich_figures(cfg, reconciled_blocks, crop_store)
 
     canonical_by_observation_id: dict[str, CanonicalBlock] = {}
     for canonical in reconciled_blocks:
@@ -910,7 +918,8 @@ def bind_canonical_evidence(
         "canonical_blocks": [item.to_dict() for item in canonical_blocks],
     }
     canonical_path = Path(cfg.save_path) / canonical_artifact_filename
-    _atomic_write_json(canonical_path, canonical_payload)
+    with _BIND_TIMINGS.time("canonical_write"):
+        _atomic_write_json(canonical_path, canonical_payload)
     for block, attachment in zip(pdf_list, attachments, strict=True):
         block.update(attachment)
     log.info(
@@ -1836,4 +1845,5 @@ def build_tree_from_pdf(
             metadata={"node_count": len(tree_index.nodes)},
         )
     timings.log_summary()
+    _BIND_TIMINGS.log_summary()
     return tree_index
