@@ -166,6 +166,27 @@ here:
 | overhead share | **17%** |
 | token-compute share | **83%** |
 
+### Every batch size is slower than one at a time
+
+Swept against a one-at-a-time baseline on 40 real cases:
+
+| batch | per decision | vs baseline | agreement | extra merges |
+| --- | --- | --- | --- | --- |
+| **1** | **1.11 s** | -- | baseline | -- |
+| 2 | 1.40 s | **0.79x** | 38/40 | 0 |
+| 3 | 1.54 s | **0.72x** | 37/40 | 2 |
+| 5 | 1.22 s | **0.91x** | 37/40 | 2 |
+
+Batching is not merely failing to help, it costs up to 28%. Attention is
+quadratic in sequence length, so packing three tasks makes one sequence ~3x
+longer, the attention term grows ~9x, and each task pays ~3x more for it --
+buying quadratic cost to save a linear 191 ms. Batch 5 recovers slightly only
+because the overhead saving finally grows large enough to offset part of it,
+and it never catches up. Quality moves the same way.
+
+There is no batch size that wins on either axis, so both batching paths were
+removed. One at a time is the optimum, not the fallback.
+
 Five decisions cost five decisions' worth of tokens however they are packed, so
 the arithmetic ceiling is `5x1121 / (191 + 5x930)` = **1.16x**, and the longer
 batched prompt consumed all of it. It also changed 3 of 40 merge decisions.
