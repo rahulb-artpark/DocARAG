@@ -324,11 +324,21 @@ def _validated_index_revision_id(
     return value
 
 
-def tree_vector_scope(tree: DocumentTree, vdb_cfg: VDBConfig) -> dict[str, str]:
-    """Return the immutable payload scope shared by tree writes and reads."""
+def _document_vector_scope(
+    *,
+    source_sha256: str,
+    document_version_id: str,
+    vdb_cfg: VDBConfig,
+    run_directory: str | os.PathLike[str],
+    index_kind: str,
+) -> dict[str, str]:
+    """Derive one document's immutable payload scope.
 
-    source_sha256 = tree.meta_info.source_sha256
-    document_version_id = tree.meta_info.document_version_id
+    Writers and readers must derive this the same way or a read silently sees
+    another document's points -- or, worse, none of its own.  Deriving it in one
+    place is what keeps them from drifting apart.
+    """
+
     if not _is_lower_sha256(source_sha256):
         raise VectorIndexBindingError("tree source_sha256 must be lowercase SHA-256")
     if (
@@ -349,11 +359,42 @@ def tree_vector_scope(tree: DocumentTree, vdb_cfg: VDBConfig) -> dict[str, str]:
         **_validated_tenant_scope(vdb_cfg),
         "document_version_id": document_version_id,
         "index_revision_id": _validated_index_revision_id(
-            vdb_cfg, run_directory=tree.save_dir
+            vdb_cfg, run_directory=run_directory
         ),
         "source_sha256": source_sha256,
-        "index_kind": "tree",
+        "index_kind": index_kind,
     }
+
+
+def tree_vector_scope(tree: DocumentTree, vdb_cfg: VDBConfig) -> dict[str, str]:
+    """Return the immutable payload scope shared by tree writes and reads."""
+
+    return _document_vector_scope(
+        source_sha256=tree.meta_info.source_sha256,
+        document_version_id=tree.meta_info.document_version_id,
+        vdb_cfg=vdb_cfg,
+        run_directory=tree.save_dir,
+        index_kind="tree",
+    )
+
+
+def entity_vector_scope(
+    meta_info, vdb_cfg: VDBConfig, *, run_directory: str | os.PathLike[str]
+) -> dict[str, str]:
+    """Return the scope entity points are written with and must be read through.
+
+    Takes the tree's metadata rather than the tree so the query path -- which
+    holds a stored view, not a ``DocumentTree`` -- reaches the same scope the
+    refiner wrote, through the same code.
+    """
+
+    return _document_vector_scope(
+        source_sha256=getattr(meta_info, "source_sha256", ""),
+        document_version_id=getattr(meta_info, "document_version_id", ""),
+        vdb_cfg=vdb_cfg,
+        run_directory=run_directory,
+        index_kind="entity",
+    )
 
 
 def _qdrant_state(

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from Core.rag.stored_index import (
     StoredGraphIndex,
@@ -239,6 +244,103 @@ class StoredIndexTests(unittest.TestCase):
             self.assertEqual(0, store.closed)
 
         self.assertEqual(1, store.closed)
+
+
+class _ScopedStore:
+    """A store carrying the identity the entity scope is derived from."""
+
+    def __init__(self, run_dir):
+        self.tree = _FakeTree()
+        self.run_dir = run_dir
+        self.revision_id = "rev-1"
+        self.revision_key = "rev-key"
+        self.scope = SimpleNamespace(
+            tenant_id="tenant-a",
+            corpus_id="corpus-a",
+            document_version_id="docv_1",
+        )
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+class StoredEntitySearchTests(unittest.TestCase):
+    """How the query path opens the collection the refiner wrote.
+
+    Both facts pinned here were wrong in production and no test held either:
+    the store was opened without the hybrid schema, so every entity search
+    raised; and without the writer's scope, so it answered one document's
+    question from another document's graph.
+    """
+
+    SHA = "e2be53beeeab9232eb51badbe5982796f14c128304b9e7254027e94ad69515df"
+
+    def _config(self):
+        embedding = SimpleNamespace(
+            model_name="m", backend="ollama", max_length=512,
+            device="cpu", api_base="http://localhost:11434",
+            api_key=None, num_ctx=None,
+        )
+        return SimpleNamespace(
+            graph=SimpleNamespace(
+                embedding_config=embedding,
+                entity_collection_name="entities",
+            ),
+            vdb=SimpleNamespace(
+                qdrant_url="http://localhost:6335",
+                api_key_env="QDRANT_API_KEY",
+                timeout_seconds=10.0,
+                tenant_id="tenant-a",
+                corpus_id="corpus-a",
+                document_version_id="docv_1",
+                index_revision_id="rev-1",
+            ),
+        )
+
+    def _open(self, directory):
+        (Path(directory) / "run-manifest.json").write_text(
+            json.dumps(
+                {"source": {"sha256": self.SHA, "path": str(Path(directory) / "doc.pdf")}}
+            ),
+            encoding="utf-8",
+        )
+        store = _ScopedStore(Path(directory))
+        opened = {}
+
+        def vector_store(**kwargs):
+            opened.update(kwargs)
+            return Mock()
+
+        with patch("Core.provider.embedding.TextEmbeddingProvider", Mock()), patch(
+            "Core.provider.vdb.VectorStore", vector_store
+        ):
+            index = StoredIndex(store, config=self._config())
+        return index, opened
+
+    def test_the_entity_store_is_opened_with_the_hybrid_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _index, opened = self._open(directory)
+
+        # Named dense vectors plus a sparse one cannot be read by an
+        # unqualified search; without this the first question raises.
+        self.assertIs(True, opened["hybrid_entity_schema"])
+
+    def test_the_entity_store_is_opened_with_the_writers_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _index, opened = self._open(directory)
+
+        self.assertEqual(
+            {
+                "tenant_id": "tenant-a",
+                "corpus_id": "corpus-a",
+                "document_version_id": "docv_1",
+                "index_revision_id": "rev-1",
+                "source_sha256": self.SHA,
+                "index_kind": "entity",
+            },
+            opened["scope_filter"],
+        )
 
 
 if __name__ == "__main__":

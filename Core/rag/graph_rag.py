@@ -118,6 +118,10 @@ class GraphRAG(BaseRAG):
         """
         entities_str = [self._get_entity_embed_text(entity) for entity in entities]
         Qent_GBCent_map = defaultdict(list)
+        # The floor is the gate, applied inside the search where the scores are
+        # still similarities. Fusion returns ranks, so the nearest candidate
+        # always looks close and a threshold applied afterwards rejects nothing.
+        similarity_floor = 1.0 - self.threshold_e
         for ent_str in entities_str:
             query_res = collapse_entity_hits(
                 self.gbc_index.entity_vdb.search_entities(
@@ -126,11 +130,18 @@ class GraphRAG(BaseRAG):
                     lexical_terms=lexical_terms(lexical_text(ent_str, "")),
                     top_k=1,
                     group_by=CANONICAL_FIELD,
+                    name_score_threshold=similarity_floor,
+                    context_score_threshold=similarity_floor,
                 ),
                 limit=1,
             )
             if not query_res:
-                log.info("No graph entity candidate found for '%s'.", ent_str)
+                log.info(
+                    "No graph entity candidate for '%s' cleared the similarity "
+                    "floor %.4f.",
+                    ent_str,
+                    similarity_floor,
+                )
                 continue
             retrieve_name = query_res[0]["metadata"].get("entity_name")
             retrieve_type = query_res[0]["metadata"].get("entity_type")

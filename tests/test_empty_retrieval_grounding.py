@@ -160,9 +160,11 @@ class EmptyRetrievalGroundingTests(unittest.TestCase):
         rag.vlm.generate.assert_not_called()
 
     def test_graph_entity_mapping_handles_an_empty_entity_index(self):
+        search = Mock(return_value=[])
         rag = object.__new__(GraphRAG)
+        rag.threshold_e = 0.3
         rag.gbc_index = SimpleNamespace(
-            entity_vdb=SimpleNamespace(search_entities=Mock(return_value=[])),
+            entity_vdb=SimpleNamespace(search_entities=search),
             GraphIndex=Mock(),
         )
         entity = SimpleNamespace(entity_name="missing", entity_type="PRODUCT")
@@ -171,6 +173,24 @@ class EmptyRetrievalGroundingTests(unittest.TestCase):
 
         self.assertEqual({}, dict(result))
         rag.gbc_index.GraphIndex.get_node_name_from_str.assert_not_called()
+
+    def test_graph_entity_mapping_gates_on_similarity_not_on_fused_rank(self):
+        # Fusion scores rank candidates against each other, so the nearest one
+        # scores well even when the document contains nothing related. The
+        # threshold has to reach the vectors as a floor or it rejects nothing.
+        search = Mock(return_value=[])
+        rag = object.__new__(GraphRAG)
+        rag.threshold_e = 0.3
+        rag.gbc_index = SimpleNamespace(
+            entity_vdb=SimpleNamespace(search_entities=search),
+            GraphIndex=Mock(),
+        )
+
+        rag._entity_map([SimpleNamespace(entity_name="a", entity_type="B")])
+
+        floor = search.call_args.kwargs
+        self.assertAlmostEqual(0.7, floor["name_score_threshold"])
+        self.assertAlmostEqual(0.7, floor["context_score_threshold"])
 
 
 if __name__ == "__main__":

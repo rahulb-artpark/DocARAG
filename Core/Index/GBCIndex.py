@@ -4,7 +4,7 @@ from Core.configs.graph_config import entity_attestation_directory, graph_artifa
 from Core.Index.Graph import Graph
 from Core.provider.embedding import TextEmbeddingProvider
 from Core.provider.vdb import VectorStore
-from Core.pipelines.vdb_index import tree_vector_scope
+from Core.pipelines.vdb_index import entity_vector_scope
 from Core.pipelines.entity_facets import (
     CANONICAL_FIELD,
     context_text,
@@ -73,10 +73,9 @@ class GBC:
 
         if self.TreeIndex is None:
             raise ValueError("Entity Qdrant scope requires a source-bound BookRAG tree")
-        self.entity_scope = {
-            **tree_vector_scope(self.TreeIndex, config.vdb),
-            "index_kind": "entity",
-        }
+        self.entity_scope = entity_vector_scope(
+            self.TreeIndex.meta_info, config.vdb, run_directory=self.TreeIndex.save_dir
+        )
         self.entity_attestation_path = entity_attestation_directory(
             self.save_dir, config.graph
         )

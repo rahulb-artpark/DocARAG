@@ -251,10 +251,19 @@ class StoredIndex:
     def _open_entity_search(self, config) -> None:
         # Retrieval scores query entities against graph node names and searches
         # the entity vectors, so both are opened with the index they serve.
+        from Core.pipelines.vdb_index import entity_vector_scope
         from Core.provider.embedding import TextEmbeddingProvider
         from Core.provider.vdb import VectorStore
 
         embedding_config = config.graph.embedding_config
+        # One collection holds every document's entities, so a read without the
+        # scope the refiner wrote answers this document's question with another
+        # document's graph.
+        entity_scope = entity_vector_scope(
+            self.TreeIndex.meta_info,
+            config.vdb,
+            run_directory=getattr(self._store, "run_dir", ""),
+        )
         try:
             self.embedder = TextEmbeddingProvider(
                 model_name=embedding_config.model_name,
@@ -270,6 +279,12 @@ class StoredIndex:
                 embedding_model=self.embedder,
                 collection_name=config.graph.entity_collection_name,
                 api_key_env=config.vdb.api_key_env,
+                timeout_seconds=config.vdb.timeout_seconds,
+                scope_filter=entity_scope,
+                # Same collection the refiner writes, so the same schema. A
+                # store opened without this reads named vectors as unnamed and
+                # fails on the first query, not at open time.
+                hybrid_entity_schema=True,
             )
         except BaseException:
             self.close()

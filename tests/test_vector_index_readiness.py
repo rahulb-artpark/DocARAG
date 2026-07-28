@@ -311,6 +311,35 @@ class VectorIndexReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(vdb_index.VectorIndexBindingError, "corpus_id"):
                 vdb_index.tree_vector_scope(tree, config)
 
+    def test_the_entity_scope_differs_from_the_tree_scope_only_in_kind(self):
+        # The refiner writes entity points with this scope and the query path
+        # reads through it. Deriving it twice is what let the reader lose it:
+        # one collection holds every document, so a read without the writer's
+        # scope answers from another document's graph.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = _tree(directory)
+            config = _config(directory)
+
+            entity = vdb_index.entity_vector_scope(
+                tree.meta_info, config, run_directory=tree.save_dir
+            )
+            tree_scope = vdb_index.tree_vector_scope(tree, config)
+
+            self.assertEqual("entity", entity.pop("index_kind"))
+            self.assertEqual("tree", tree_scope.pop("index_kind"))
+            self.assertEqual(tree_scope, entity)
+
+    def test_the_entity_scope_refuses_a_document_it_cannot_identify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = _tree(directory)
+            config = _config(directory)
+            tree.meta_info.source_sha256 = ""
+
+            with self.assertRaises(vdb_index.VectorIndexBindingError):
+                vdb_index.entity_vector_scope(
+                    tree.meta_info, config, run_directory=tree.save_dir
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

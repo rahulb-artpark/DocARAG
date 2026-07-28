@@ -319,7 +319,14 @@ class GBCRAG(BaseRAG):
         except Exception as e:
             log.warning(f"Retrieval callback failed: {e}")
 
-    def _search_entities(self, text: str, top_k: int, label: str) -> list:
+    def _search_entities(
+        self,
+        text: str,
+        top_k: int,
+        label: str,
+        *,
+        score_floor: float | None = None,
+    ) -> list:
         """Search the entity index the way the refiner writes it.
 
         The collection carries named dense vectors plus a sparse one, so an
@@ -329,6 +336,12 @@ class GBCRAG(BaseRAG):
         during resolution -- ``Graph_Reasoning`` runs PageRank through the
         GT-Link matrix, so a repeated entity is double-weighted and
         ``Skyline_Ranker`` sees inflated dimensions.
+
+        ``score_floor`` is the similarity gate, and it has to be applied here
+        rather than to the returned distance: fusion scores come from *ranks*,
+        so the closest candidate scores about the same whether it is the right
+        entity or the least wrong one in a document that does not contain the
+        subject at all. An empty result is the gate firing.
         """
 
         hits = self.gbc_index.entity_vdb.search_entities(
@@ -337,6 +350,8 @@ class GBCRAG(BaseRAG):
             lexical_terms=lexical_terms(lexical_text(text, "")),
             top_k=top_k,
             group_by=CANONICAL_FIELD,
+            name_score_threshold=score_floor,
+            context_score_threshold=score_floor,
         )
         # Bound before collapsing: _bounded_results reads the response lazily
         # and stops one past the limit, which is what keeps a misbehaving store
@@ -428,39 +443,43 @@ class GBCRAG(BaseRAG):
         ]
         Qent_GBCent_map = defaultdict(list)
         res_list = []
+        # The gate is a similarity floor inside the search, not a comparison
+        # against what it returns. Fused scores rank candidates against each
+        # other, so the nearest one scores well even when nothing in the
+        # document is related -- read as a distance it accepted everything.
+        similarity_floor = 1.0 - self.threshold_e
         for ent_str in entities_str:
             query_res = self._search_entities(
-                ent_str, 2, "entity-vector search"
+                ent_str, 2, "entity-vector search", score_floor=similarity_floor
             )
             if not query_res:
-                log.info(f"No GBC entity candidates found for '{ent_str}'.")
+                # `force_one` is retained as a compatibility argument, but must
+                # not override the configured quality threshold.  An unrelated
+                # graph seed is worse than an empty entity leg because it can
+                # promote an entire wrong subtree.  Section/text candidates
+                # remain available to the caller when no entity is close.
+                res_list.append(ent_str)
+                log.info(
+                    "No GBC entity candidate for '%s' cleared the similarity "
+                    "floor %.4f.",
+                    ent_str,
+                    similarity_floor,
+                )
                 continue
-            min_distance = query_res[0]["distance"]
             retrieve_name = query_res[0]["metadata"].get("entity_name")
             retrieve_type = query_res[0]["metadata"].get("entity_type")
             node_name = self.gbc_index.GraphIndex.get_node_name_from_str(
                 retrieve_name, retrieve_type
             )
-            if min_distance < self.threshold_e:
-                Qent_GBCent_map[ent_str].append(node_name)
-                log.info(f"Entity '{ent_str}' mapped to GBC entity: {node_name}")
-            else:
-                res_list.append((ent_str, node_name, min_distance))
+            Qent_GBCent_map[ent_str].append(node_name)
+            log.info(f"Entity '{ent_str}' mapped to GBC entity: {node_name}")
 
-        if force_one and len(Qent_GBCent_map) == 0 and len(res_list) > 0:
-            # `force_one` is retained as a compatibility argument, but must not
-            # override the configured quality threshold.  An unrelated graph
-            # seed is worse than an empty entity leg because it can promote an
-            # entire wrong subtree.  Section/text candidates remain available
-            # to the caller when no entity is sufficiently close.
-            closest = min(res_list, key=lambda item: item[2])
+        if force_one and not Qent_GBCent_map and res_list:
             log.info(
-                "No entity candidate met threshold %.4f; closest candidate "
-                "for '%s' was '%s' at distance %.4f and was rejected.",
-                self.threshold_e,
-                closest[0],
-                closest[1],
-                closest[2],
+                "No entity candidate met the similarity floor %.4f; %d query "
+                "entities were rejected and the entity leg is empty.",
+                similarity_floor,
+                len(res_list),
             )
 
         return Qent_GBCent_map
