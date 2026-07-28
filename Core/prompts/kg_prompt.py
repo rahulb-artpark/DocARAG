@@ -1131,6 +1131,141 @@ class ERExtractSel(BaseModel):
     explanation: str = Field(default="")  # Entity type
 
 
+class ERBatchDecision(BaseModel):
+    """One adjudication inside a batch, tied to its task by ``task_id``."""
+
+    task_id: int
+    select_id: int
+    explanation: str = Field(default="")
+
+
+class ERBatchExtractSel(BaseModel):
+    decisions: list[ERBatchDecision] = Field(default_factory=list)
+
+
+ENTITY_RESOLUTION_BATCH_PROMPT = """
+-Goal-
+You are an expert Entity Resolution Adjudicator. You will be given SEVERAL
+independent tasks. Each task has one "New Entity" and its own list of
+"Candidate Entities". For each task, decide whether the new entity refers to
+the exact same real-world concept as one of that task's candidates.
+
+---
+-Critical Rules-
+
+1.  **The tasks are independent.** Candidates are numbered from 0 within each
+    task. A candidate id only ever refers to the candidate list of the task it
+    appears in. Never let one task's entities influence another's decision.
+
+2.  **Answer every task exactly once.** Return one decision per `task_id` given,
+    no more and no fewer. Echo the `task_id` back so each decision can be
+    matched to its task.
+
+3.  **Adjudicate each task by these rules:**
+    * **`entity_name` (High Importance):** The names must be extremely similar,
+      a direct abbreviation (e.g., "LLM" vs. "Large Language Model"), or a
+      well-known alias. **If the names represent distinct, parallel concepts
+      (like "Event Detection" and "Named Entity Recognition"), they are NOT a
+      match, even if their descriptions are very similar.**
+    * **`entity_type` (Medium Importance):** The types do not need to be
+      identical, but they must be closely related and compatible.
+    * **`description` (Contextual Importance):** Descriptions may differ because
+      they come from different parts of a document. Look past surface text and
+      decide whether they describe the **same underlying object or concept**.
+
+4.  **Be Strict and Conservative.** Your standard for a match must be very high.
+    An incorrect merge can corrupt the knowledge graph. A missed merge is less
+    harmful.
+    * **When in doubt, you MUST output -1 for that task.**
+    * **Assume No Match by Default**: most new entities are genuinely new. Find
+      **strong, convincing evidence** before declaring a match.
+
+---
+-Input Data Format-
+
+```json
+{{
+  "tasks": [
+    {{
+      "task_id": 0,
+      "new_entity": {{"entity_name": "<String>", "entity_type": "<String>", "description": "<String>"}},
+      "candidate_entities": [
+        {{"id": 0, "entity_name": "<String>", "entity_type": "<String>", "description": "<String>"}}
+      ]
+    }}
+  ]
+}}
+```
+
+---
+-Output Schema & Format-
+Your response MUST be a single, valid JSON object with one decision per task.
+Do not include any other text or markdown formatting.
+
+```json
+{{
+  "decisions": [
+    {{"task_id": "integer", "select_id": "integer", "explanation": "string"}}
+  ]
+}}
+```
+
+---
+-Input Data-
+
+{input_json}
+"""
+
+
+class SynthesizedDescription(BaseModel):
+    """One rewritten description, tied to its entity by ``entity_id``."""
+
+    entity_id: int
+    description: str
+
+
+class SynthesizedDescriptions(BaseModel):
+    descriptions: list[SynthesizedDescription] = Field(default_factory=list)
+
+
+DESCRIPTION_SYNTHESIS_BATCH = """
+**Task**: You will be given several entities. Each has a `description` field
+fragmented with `<SEP>` separators. For EACH entity, synthesize its fragments
+into a single, clean paragraph.
+
+**Instructions**:
+
+1.  **Synthesize**: For each entity, combine all unique and non-contradictory
+    facts from its own description fragments into one coherent paragraph.
+2.  **Contextualize**: Each paragraph must be written in the third person and
+    include that entity's name, so the description is self-contained.
+3.  **Stay within the entity**: Never mix facts between entities. Each
+    description must be built only from that entity's own fragments.
+4.  **Answer every entity exactly once**: return one result per `entity_id`
+    given, no more and no fewer, echoing the `entity_id` back.
+
+**Output Schema**: a single valid JSON object, no extra text or markdown.
+
+```json
+{{
+  "descriptions": [
+    {{"entity_id": "integer", "description": "string"}}
+  ]
+}}
+```
+
+-----
+
+**Input Entities**:
+
+```json
+{input_json}
+```
+
+**Output**:
+"""
+
+
 DESCRIPTION_SYNTHESIS = """
 **Task**: You will be given a JSON object containing an entity. The `description` field is fragmented with `<SEP>` separators. Your goal is to synthesize these fragments into a single, clean paragraph and output it as a valid Python string.
 

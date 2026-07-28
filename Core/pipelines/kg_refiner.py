@@ -12,9 +12,13 @@ from Core.prompts.kg_prompt import (
     DEFAULT_ENTITY_TYPES,
     MergedEntitySchema,
     ENTITY_RESOLUATION_PROMPT,
+    ENTITY_RESOLUTION_BATCH_PROMPT,
+    ERBatchExtractSel,
     ERExtractSel,
     ER_RERANK_INSTRUCTION,
     DESCRIPTION_SYNTHESIS,
+    DESCRIPTION_SYNTHESIS_BATCH,
+    SynthesizedDescriptions,
 )
 from Core.utils.utils import truncate_description
 from Core.utils.bounded_executor import iter_bounded_ordered
@@ -30,6 +34,18 @@ import logging
 import gc
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _Decision:
+    """An adjudication reached before any of this node's entities committed."""
+
+    candidates: List["Entity"]
+    selected: Optional["Entity"]
+
+
+#: No decision was precomputed, so resolution adjudicates on its own.
+_UNDECIDED = None
 
 
 class KGRefinementError(RuntimeError):
@@ -65,6 +81,13 @@ class EntityResolutionStats:
     direct_merges: int = 0
     llm_summarized_merges: int = 0
     summarization_fallbacks: int = 0
+    # Descriptions rewritten inside a batched call rather than one per call.
+    batched_descriptions: int = 0
+    # Adjudications answered inside a batched call, and the ones that had to be
+    # re-decided alone because an earlier commit in the same node moved their
+    # candidates. The second number is the cost of the safety rule.
+    batched_selections: int = 0
+    batch_revalidations: int = 0
     # Counts alone cannot rank the work: a rerank share of 85% says nothing
     # about whether reranking or the model calls dominate the stage.
     timings: PhaseTimings = field(
@@ -738,13 +761,202 @@ class KGRefiner:
             print(f"Warning: LLM returned an out-of-bounds ID: {select_id}")
             return None
 
-    def entity_resolution(self, new_entity: Entity) -> Entity:
+    def _adjudicate_batched(
+        self, entities: List[Entity]
+    ) -> dict[int, "_Decision"]:
+        """Retrieve and adjudicate this node's entities before anything commits.
+
+        Only entities that would take the search path *right now* are handled;
+        anything already in the graph or the alias map is left to the ordinary
+        serial path, whose direct merges are cheap and order-dependent.
+
+        Tasks are batched so that no two in a call share a candidate. Algorithm
+        1's sequential dependency is that one commit changes what the next
+        entity retrieves, and disjoint candidates are exactly the condition
+        under which that cannot happen.
+        """
+
+        prepared: list[tuple[Entity, List[Entity], set[str]]] = []
+        for entity in entities:
+            node_name = self.graph_index.get_node_name_from_entity(entity)
+            if node_name in self.graph_index.kg or node_name in self.entity_alias_map:
+                continue
+            candidates = self.search_similar_entities(entity)
+            if not candidates:
+                # Gate skip, low score, or case_a: recorded by the counters and
+                # needing no model call at all.
+                prepared.append((entity, [], set()))
+                continue
+            names = {
+                self.graph_index.get_node_name_from_entity(candidate)
+                for candidate in candidates
+            }
+            prepared.append((entity, candidates, names))
+
+        decisions: dict[int, _Decision] = {}
+        batch: list[tuple[Entity, List[Entity]]] = []
+        claimed: set[str] = set()
+
+        def flush() -> None:
+            nonlocal batch, claimed
+            if not batch:
+                return
+            for (new_entity, candidates), selected in zip(
+                batch, self.er_selection_by_llm_batch(batch)
+            ):
+                decisions[id(new_entity)] = _Decision(
+                    candidates=candidates, selected=selected
+                )
+            batch = []
+            claimed = set()
+
+        for entity, candidates, names in prepared:
+            if not candidates:
+                decisions[id(entity)] = _Decision(candidates=[], selected=None)
+                continue
+            if names & claimed or len(batch) >= self.MAX_TASKS_PER_ADJUDICATION:
+                flush()
+            batch.append((entity, candidates))
+            claimed |= names
+        flush()
+        return decisions
+
+    #: Adjudications per batched call. Independent decisions, so the only limit
+    #: is how many the model answers reliably; a mismatched response count
+    #: falls back to deciding each alone, which costs a call rather than a
+    #: wrong merge.
+    MAX_TASKS_PER_ADJUDICATION = 5
+
+    def er_selection_by_llm_batch(
+        self, tasks: List[tuple[Entity, List[Entity]]]
+    ) -> List[Optional[Entity]]:
+        """Adjudicate several independent entities in one model call.
+
+        Callers must guarantee the tasks share no candidates, so no decision
+        here can change what another should have seen. Any response that is not
+        one usable decision per task is discarded wholesale and the batch is
+        re-decided one at a time: a partially-parsed batch is how a decision
+        gets attributed to the wrong entity, and a wrong merge silently
+        redirects every edge through ``process_relationships``.
+        """
+
+        if not tasks:
+            return []
+        if len(tasks) == 1:
+            return [self.er_selection_by_llm(*tasks[0])]
+
+        payload = {
+            "tasks": [
+                {
+                    "task_id": task_id,
+                    **json.loads(
+                        self._prepare_selection_input(new_entity, candidates)
+                    ),
+                }
+                for task_id, (new_entity, candidates) in enumerate(tasks)
+            ]
+        }
+        prompt = ENTITY_RESOLUTION_BATCH_PROMPT.format(
+            input_json=json.dumps(payload, indent=2, ensure_ascii=False)
+        )
+
+        self.er_stats.llm_selection_calls += 1
+        try:
+            with self.er_stats.timings.time("llm_select_batch"):
+                res: ERBatchExtractSel = self.llm.get_json_completion(
+                    prompt=prompt, schema=ERBatchExtractSel
+                )
+        except Exception as error:
+            log.warning(
+                "Batched entity adjudication failed (%s); deciding %d tasks singly.",
+                type(error).__name__,
+                len(tasks),
+            )
+            return self._decide_singly(tasks)
+
+        by_task: dict[int, int] = {}
+        for decision in getattr(res, "decisions", None) or []:
+            task_id = decision.task_id
+            if not isinstance(task_id, int) or isinstance(task_id, bool):
+                continue
+            if task_id in by_task or not 0 <= task_id < len(tasks):
+                # A repeated or invented task id means the model lost track of
+                # the mapping, so no decision in this response can be trusted.
+                by_task.clear()
+                break
+            by_task[task_id] = decision.select_id
+
+        if len(by_task) != len(tasks):
+            log.warning(
+                "Batched adjudication returned %d usable decisions for %d tasks; "
+                "deciding singly.",
+                len(by_task),
+                len(tasks),
+            )
+            return self._decide_singly(tasks)
+
+        self.er_stats.batched_selections += len(tasks)
+        results: List[Optional[Entity]] = []
+        for task_id, (new_entity, candidates) in enumerate(tasks):
+            select_id = by_task[task_id]
+            if (
+                isinstance(select_id, bool)
+                or not isinstance(select_id, int)
+                or not 0 <= select_id < len(candidates)
+            ):
+                results.append(None)
+                continue
+            log.info(
+                "Batched selection: '%s' -> '%s'",
+                new_entity.entity_name,
+                candidates[select_id].entity_name,
+            )
+            results.append(candidates[select_id])
+        return results
+
+    def _decide_still_holds_names(self, decision: "_Decision") -> List[str]:
+        return [
+            self.graph_index.get_node_name_from_entity(candidate)
+            for candidate in decision.candidates
+        ]
+
+    def _decision_still_holds(self, decision: "_Decision") -> bool:
+        """Is the graph unchanged in the places this decision depended on?
+
+        A candidate that has since been merged away is no longer the entity the
+        model was shown, so the answer cannot be applied. Checking the graph
+        rather than tracking what each commit touched keeps the rule true even
+        if the commit path grows another side effect.
+        """
+
+        for node_name in self._decide_still_holds_names(decision):
+            if node_name not in self.graph_index.kg:
+                return False
+            if node_name in self.entity_alias_map:
+                return False
+        return True
+
+    def _decide_singly(
+        self, tasks: List[tuple[Entity, List[Entity]]]
+    ) -> List[Optional[Entity]]:
+        return [
+            self.er_selection_by_llm(new_entity, candidates)
+            for new_entity, candidates in tasks
+        ]
+
+    def entity_resolution(
+        self, new_entity: Entity, decision: Optional["_Decision"] = _UNDECIDED
+    ) -> Entity:
         """
         Resolves the new entity by comparing it with similar entities.
         Merge the new entity with the most similar one if they are true duplicated entity.
 
         Args:
             new_entity (Entity): The new entity to resolve.
+            decision (_Decision | None): An adjudication reached before this
+                node's entities began committing. Used only if the graph still
+                matches what it was adjudicated against; otherwise discarded and
+                re-decided here, so batching can never apply a stale answer.
         Returns:
             Entity: The resolved entity, which may be a merged entity or the new entity itself.
         """
@@ -780,7 +992,16 @@ class KGRefiner:
             return merged_entity
 
         # 2. search similar entities in the vector database
-        similar_entities = self.search_similar_entities(new_entity)
+        if decision is not _UNDECIDED and self._decision_still_holds(decision):
+            similar_entities = decision.candidates
+            sel_existing_entity = decision.selected
+        else:
+            if decision is not _UNDECIDED:
+                # An earlier commit in this node moved one of the candidates
+                # this was adjudicated against, so the answer is stale.
+                self.er_stats.batch_revalidations += 1
+            similar_entities = self.search_similar_entities(new_entity)
+            sel_existing_entity = _UNDECIDED
         if len(new_entity.source_ids) != 1:
             raise ValueError(
                 f"Expected exactly one source_id, but found {len(new_entity.source_ids)}."
@@ -794,9 +1015,10 @@ class KGRefiner:
             return new_entity
 
         # 2.2 If similar entities are found, use the LLM to determine if exist one of them is the same entity as the new one.
-        sel_existing_entity = self.er_selection_by_llm(
-            new_entity=new_entity, similar_entities=similar_entities
-        )
+        if sel_existing_entity is _UNDECIDED:
+            sel_existing_entity = self.er_selection_by_llm(
+                new_entity=new_entity, similar_entities=similar_entities
+            )
         if sel_existing_entity is None:
             # If no similar entity is selected, add the new entity directly
             self.graph_index.add_and_link(tree_node_id=source_id, entities=new_entity)
@@ -928,16 +1150,27 @@ class KGRefiner:
             # 2. For each entity, perform resolution and update the graph index.
             new_entity_list = []
             unknown_entities = []
+            known_entities = []
             for entity in entities:
                 if entity.entity_type == "UNKNOWN":
                     # 2.1 for unknown entity type, perform resolution
                     # For unknown entities, we need to resolve them later.
                     unknown_entities.append(entity)
-                    continue
+                else:
+                    known_entities.append(entity)
 
-                # 2.2 for other entity types, perform resolution
+            # 2.2 Adjudicate up front, several entities per model call, then
+            # commit in the original order. Retrieval is read-only and this
+            # node's entities cannot see each other (add_entities_to_vdb is
+            # deferred to 2.3), so the decisions are the same ones the
+            # one-at-a-time loop would have reached.
+            decisions = self._adjudicate_batched(known_entities)
+
+            for entity in known_entities:
                 old_entity_name = entity.entity_name
-                new_entity: Entity = self.entity_resolution(entity)
+                new_entity: Entity = self.entity_resolution(
+                    entity, decision=decisions.pop(id(entity), _UNDECIDED)
+                )
                 entity_map[old_entity_name] = new_entity
                 new_entity_list.append(new_entity)
 
@@ -1021,6 +1254,92 @@ class KGRefiner:
         )
         return entity
 
+    #: Entities rewritten per synthesis call. Each description is built only
+    #: from its own fragments, so packing several changes nothing about any one
+    #: of them -- unlike adjudication, where the model must not see across tasks.
+    MAX_ENTITIES_PER_SYNTHESIS = 5
+
+    def _synthesize_entity_descriptions(self, entities: List[Entity]) -> List[str]:
+        """Rewrite several entities' descriptions in one model call.
+
+        A response that is not one usable description per entity is discarded
+        whole and the batch is rewritten one at a time. Applying a partially
+        parsed batch is how one entity's description is written onto another,
+        which would be silent and permanent.
+        """
+
+        if not entities:
+            return []
+        if len(entities) == 1:
+            return [self._synthesize_entity_description(entities[0])]
+
+        payload = {
+            "entities": [
+                {
+                    "entity_id": index,
+                    **entity.model_dump(exclude={"source_ids"}),
+                }
+                for index, entity in enumerate(entities)
+            ]
+        }
+        prompt = DESCRIPTION_SYNTHESIS_BATCH.format(
+            input_json=json.dumps(payload, indent=2, ensure_ascii=False)
+        )
+        try:
+            with self.er_stats.timings.time("llm_describe_batch"):
+                res: SynthesizedDescriptions = self.llm.get_json_completion(
+                    prompt=prompt, schema=SynthesizedDescriptions
+                )
+        except Exception as error:
+            log.warning(
+                "Batched description synthesis failed (%s); rewriting %d singly.",
+                type(error).__name__,
+                len(entities),
+            )
+            return self._synthesize_singly(entities)
+
+        by_entity: dict[int, str] = {}
+        for item in getattr(res, "descriptions", None) or []:
+            entity_id = item.entity_id
+            if isinstance(entity_id, bool) or not isinstance(entity_id, int):
+                continue
+            if entity_id in by_entity or not 0 <= entity_id < len(entities):
+                by_entity.clear()
+                break
+            if not isinstance(item.description, str) or not item.description.strip():
+                continue
+            by_entity[entity_id] = item.description
+
+        if len(by_entity) != len(entities):
+            log.warning(
+                "Batched synthesis returned %d usable descriptions for %d entities; "
+                "rewriting singly.",
+                len(by_entity),
+                len(entities),
+            )
+            return self._synthesize_singly(entities)
+
+        self.er_stats.batched_descriptions += len(entities)
+        return [by_entity[index] for index in range(len(entities))]
+
+    def _synthesize_singly(self, entities: List[Entity]) -> List[str]:
+        """Rewrite one at a time, naming the entity that actually failed.
+
+        Batching made a whole batch the unit of work, so an unnamed failure
+        would be reported against the batch's first entity rather than the one
+        whose model call raised.
+        """
+
+        descriptions = []
+        for entity in entities:
+            try:
+                descriptions.append(self._synthesize_entity_description(entity))
+            except KGRefinementError:
+                raise
+            except Exception as error:
+                raise KGRefinementError(entity.entity_name, error) from error
+        return descriptions
+
     def refine_entity_description(self, entity: Entity) -> Entity:
         """Compatibility wrapper for one fail-fast, serialized refinement."""
 
@@ -1046,9 +1365,11 @@ class KGRefiner:
                     yield entity
 
         refined_count = 0
+        # Batches are the unit of work, so packing and concurrency compose:
+        # several entities per call, several calls in flight.
         outcomes = iter_bounded_ordered(
-            entities_to_refine(),
-            self._synthesize_entity_description,
+            batched(entities_to_refine(), self.MAX_ENTITIES_PER_SYNTHESIS),
+            self._synthesize_entity_descriptions,
             max_workers=self.graph_config.refinement_max_workers,
             max_in_flight=self.graph_config.refinement_max_in_flight,
             thread_name_prefix="kg-refinement",
@@ -1056,18 +1377,22 @@ class KGRefiner:
         for outcome in outcomes:
             if not outcome.ok:
                 assert outcome.error is not None
+                if isinstance(outcome.error, KGRefinementError):
+                    # Already attributed to the entity whose call raised.
+                    raise outcome.error
                 raise KGRefinementError(
-                    outcome.item.entity_name, outcome.error
+                    outcome.item[0].entity_name, outcome.error
                 ) from outcome.error
-            try:
-                self._apply_refined_description(outcome.item, outcome.unwrap())
-            except KGRefinementError:
-                raise
-            except Exception as error:
-                raise KGRefinementError(
-                    outcome.item.entity_name, error
-                ) from error
-            refined_count += 1
+            # Applied serially and in order: synthesis is read-only, but this
+            # writes the graph and the vector store.
+            for entity, description in zip(outcome.item, outcome.unwrap()):
+                try:
+                    self._apply_refined_description(entity, description)
+                except KGRefinementError:
+                    raise
+                except Exception as error:
+                    raise KGRefinementError(entity.entity_name, error) from error
+                refined_count += 1
         if refined_count == 0:
             log.info("No entities need to be refined.")
             return

@@ -159,6 +159,10 @@ class BoundedKGRefinementTests(unittest.TestCase):
         return refiner
 
     def test_refinement_applies_state_serially_without_reembedding(self):
+        # Synthesis batches several entities per model call, so the unit of
+        # concurrency is a batch. Enough entities for more than two batches
+        # keeps this measuring the bound rather than the batch size.
+        entity_count = 4 * KGRefiner.MAX_ENTITIES_PER_SYNTHESIS
         entities = [
             Entity(
                 entity_name=f"entity-{index}",
@@ -166,7 +170,7 @@ class BoundedKGRefinementTests(unittest.TestCase):
                 description="left<SEP>right",
                 source_ids={index},
             )
-            for index in range(5)
+            for index in range(entity_count)
         ]
         lock = threading.Lock()
         active = 0
@@ -190,12 +194,12 @@ class BoundedKGRefinementTests(unittest.TestCase):
         self.assertEqual(refiner.deleted, [])
         self.assertEqual(
             [update[0][0] for update in refiner.vdb.updates],
-            [f"vdb-{index}" for index in range(5)],
+            [f"vdb-{index}" for index in range(entity_count)],
         )
-        self.assertEqual(len(refiner.graph_index.updates), 5)
+        self.assertEqual(len(refiner.graph_index.updates), entity_count)
         self.assertEqual(
             [entity.description for entity in entities],
-            [f"refined entity-{index}" for index in range(5)],
+            [f"refined entity-{index}" for index in range(entity_count)],
         )
 
     def test_refinement_failure_is_typed_and_not_written_as_content(self):
