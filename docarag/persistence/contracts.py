@@ -327,7 +327,11 @@ class WorkSpec:
     idempotency_key: str
     payload: JsonObject = field(default_factory=dict)
     priority: int = 0
-    max_attempts: int = 3
+    # A stage measured in hours cannot share a retry budget with one measured
+    # in seconds: the graph stage ran 7h14m on a 1,871-page document, so three
+    # attempts is one crash away from a dead work item that has to be reset by
+    # hand. The cap only has to bound a retry loop, not be tight.
+    max_attempts: int = 12
     work_item_id: str = field(init=False)
 
     def __post_init__(self) -> None:

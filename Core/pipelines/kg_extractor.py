@@ -1075,7 +1075,12 @@ class KGExtractor:
         entity_descriptions: dict[tuple[str, str], list[str]] = {}
         for entity in res.get("entities", []):
             entity.entity_name = _clean_name(entity.entity_name)
-            entity.entity_type = entity.entity_type.upper()
+            # Strip before collapsing spaces: the type is half the node id, and
+            # a model returning " METHOD " would otherwise become "_METHOD_",
+            # a distinct type whose id the vector store then rejects for
+            # surrounding whitespace -- the failure that ended a run at 12,352
+            # of 16,091 nodes.
+            entity.entity_type = entity.entity_type.strip().upper()
             entity.entity_type = entity.entity_type.replace(" ", "_")
             entity_name_set.add(entity.entity_name)
             key = (entity.entity_name, entity.entity_type)

@@ -434,7 +434,16 @@ PY
     echo " [2] graph  ✅ done   ($ents entities, $(basename "$graph_artifact"))$dur"
   elif [[ -f "$d/tree.pkl" ]]; then
     local gdir="$d/kg_extractor_res" done_n=0
-    done_n="$(ls "$gdir" 2>/dev/null | wc -l | tr -d ' ')"
+    # Extraction results survive across attempts, so counting everything in the
+    # directory reports a previous run's work as this one's progress -- and on a
+    # resumed stage that reads as nearly complete from the first second. Count
+    # only what this attempt produced, and only the result files themselves.
+    if [[ -n "${gstart:-}" ]] && (( gstart > 0 )); then
+      done_n="$(find "$gdir" -maxdepth 1 -type f -name '*.json' \
+        -newermt "@$gstart" 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      done_n="$(find "$gdir" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+    fi
     local pct=""; (( total > 0 && done_n > 0 )) && pct="  (~$(( done_n * 100 / total ))%)"
     if [[ "${stage_status[graph]:-}" == "failed" ]] || { [[ "$run_status" == "failed" ]] && [[ "$current_stage" == "graph" ]]; }; then
       local gerr="${stage_error[graph]:-}"
