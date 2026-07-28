@@ -195,9 +195,36 @@ sets `num_ctx: 16384` precisely to avoid this, and the loaded instance is not
 honouring it. At 16K the cache would be a fraction of that, leaving room for
 several parallel slots.
 
-So the lever is `OLLAMA_NUM_PARALLEL` plus a correctly sized context, not
-application code. It would apply to every model-bound stage at once --
-adjudication, description synthesis, outline extraction, node summaries.
+### Why, and why it cannot be configured away
+
+`OLLAMA_NUM_PARALLEL=4` and `OLLAMA_CONTEXT_LENGTH=16384` were applied and the
+server accepted both. The context fix worked -- the resident model dropped from
+32.2 GiB to 24.8 GiB at `ctx=16384`. Parallelism did not, and the log says why:
+
+```text
+level=WARN source=sched.go:423
+msg="model architecture does not currently support parallel requests"
+architecture=qwen35moe
+```
+
+Ollama 0.20.4 forces `Parallel:1` for MoE architectures whatever the
+environment says. Confirmed by contrast on the same server: `gemma4:31b` and
+`gpt-oss:20b` are dense, are granted `Parallel:4` (`KvSize:65536`), and reach
+1.84x and 1.16x at four concurrent.
+
+Switching to a dense model to buy parallelism is a net loss, and for the reason
+that makes MoE attractive in the first place: only a fraction of the parameters
+are active per token, which is why `qwen3.6:35b` adjudicates in 1.21 s at all.
+`gpt-oss:20b` measured 2.07 s serial for the same work, so even at 1.16x it is
+slower than the MoE model running alone. The architecture that makes it fast is
+the architecture Ollama will not batch.
+
+So there is no configuration that unlocks this. The options are to keep the
+model serial, to upgrade Ollama and re-test, or to serve it through vLLM, which
+does continuous-batch MoE -- and which this repository already uses for the
+reranker and embedder in `config/gbc.yaml`.
+
+The context correction is worth keeping regardless: ~7.4 GiB of VRAM back.
 
 ## What this implies
 
