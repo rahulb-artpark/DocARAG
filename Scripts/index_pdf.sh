@@ -1569,6 +1569,12 @@ export DOCARAG_CORPUS_ID="$CORPUS_ID"
 export DOCARAG_DOCUMENT_ID="$DOCUMENT_ID"
 export DOCARAG_DOCUMENT_VERSION_ID="$DOCUMENT_VERSION_ID"
 export DOCARAG_INDEX_REVISION_ID="$REVISION_ID"
+# The vdb stage publishes the index revision to PostgreSQL and requires this to
+# be a real digest; without it construct_index reads None and the publication is
+# refused after the whole graph has already been built. It is the same digest
+# the revision id is derived from above, and it is verified against the config
+# bytes at read time, so exporting it adds no new trust.
+export DOCARAG_SYSTEM_CONFIG_SHA256="$CONFIG_SHA256"
 
 WORKDIR="${DOCARAG_RUNS_DIR:-$REPO/runs}"
 if [[ "$WORKDIR" != /* ]]; then
