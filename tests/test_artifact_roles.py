@@ -42,7 +42,12 @@ class ArtifactRoleTests(unittest.TestCase):
                 ),
                 roles["retrieval_attestation"],
             )
-            self.assertEqual("bookrag-entities", roles["entity_collection"])
+            # The name carries the vector schema: Qdrant cannot convert an
+            # unnamed collection to named vectors, so a migration is a new
+            # collection rather than a mutated one.
+            self.assertEqual(
+                "bookrag-entities-hybrid-v1", roles["entity_collection"]
+            )
             self.assertTrue(
                 Path(roles["entity_attestation"]).parent.name.startswith(
                     "entity_attestation_0.6_"

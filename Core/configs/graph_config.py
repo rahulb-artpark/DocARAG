@@ -57,7 +57,12 @@ class GraphConfig:
     # KG refinement
     refine_type: str = "advanced"  # Options: "basic", "advanced"
     g: float = 0.6  # For advanced refinement, the gradient similarity threshold
-    entity_collection_name: str = "bookrag-entities"
+    # The hybrid schema stores named dense vectors plus a sparse one, which
+    # Qdrant cannot convert an unnamed collection into. The name carries the
+    # schema so a pre-hybrid collection is never opened as if it were current,
+    # and so migrating does not mean dropping other documents' entities out of
+    # a collection they share.
+    entity_collection_name: str = "bookrag-entities-hybrid-v1"
 
     embedding_config: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     reranker_config: RerankerConfig = field(default_factory=RerankerConfig)
