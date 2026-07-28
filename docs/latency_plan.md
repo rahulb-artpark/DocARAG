@@ -23,9 +23,9 @@ resolution, the tree stage, and query retrieval (commit 242afeb).
 Results: `latency_measurements.md`. They killed both Phase 1 items and
 re-pointed Phase 3, which is what this phase was for.
 
-The headline: the graph stage is **model-bound**. Rerank is **2.5%** of its
-434.6 minutes, not the dominant cost the 85.4% figure was read as. Only cutting
-model calls moves it.
+The headline: the graph stage is **entity resolution's model calls and nothing
+else** -- 9,005 of them at ~2.9 s. Rerank is **1.6%** of its 434.6 minutes, not
+the dominant cost the 85.4% figure was read as.
 
 ## Phase 1 -- withdrawn, both items
 
@@ -44,9 +44,15 @@ model calls moves it.
 
 ## Phase 2 -- G4, batch entity adjudications (graph)
 
-**Now the whole graph opportunity, not a secondary one.** 14,561 model calls for
-15,481 entities, and `multi=7,970` means adjudication is genuinely needed rather
-than avoidable. Batch several independent decisions per call.
+**This is the graph stage, not a step in it.** The completed run made 9,005
+model calls at ~2.9 s each -- `select=5700`, `merge=3305` -- and reranking, the
+previous suspect, is 1.6%. Both call sites are worth batching; selection is the
+larger half. `multi=5044` means adjudication is genuinely needed rather than
+avoidable.
+
+Note also `direct=9738`: more resolutions already end in a model-free direct
+merge than in any adjudicated outcome. Converting an adjudication into a direct
+merge is worth more than making one faster.
 
 Safe because entities sharing **no candidates** cannot influence each other:
 Algorithm 1's sequential dependency is that one commit changes what the next

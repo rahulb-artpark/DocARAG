@@ -11,14 +11,31 @@ entity text. Every number here replaces an estimate in `latency_plan.md`.
 | graph | 434.6 min |
 | vdb | 8.0 min |
 
+## What the graph stage actually did
+
+The final ER snapshot of the completed run (the plan quoted an earlier partial
+run's counters; these supersede them):
+
+```text
+graph_nodes=25325 resolved=8201 rerank=7007 (85.4%)
+llm_calls=9005 (select=5700 merge=3305 fallback=0)
+cheap(gate=1194 low_score=325 direct=9738)
+gradient(case_a=982 single=656 multi=5044)
+```
+
+The stage's log opens with `Resuming refinement from ...` and one line from
+`kg_extractor`: extraction was reused from `kg_extractor_res/`, so those 434.6
+minutes were **entity resolution almost end to end**. 9,005 model calls over
+26,076 seconds is **~2.9 s per call**, which is the stage.
+
 ## Reranking is not the graph stage's cost
 
-`rerank=11201 (85.4%)` was call frequency. Measured on the real reranker
+`rerank=7007 (85.4%)` was call frequency. Measured on the real reranker
 (Qwen3-Reranker-0.6B, local, cuda:0) over 40 calls of 10 candidates drawn from
 the run's own 25,081 described entities:
 
 - a rerank costs **58 ms** (median 57 ms)
-- 11,201 reranks is **10.9 min**, or **2.5% of the 434.6-minute graph stage**
+- 7,007 reranks is **6.8 min**, or **1.6% of the 434.6-minute graph stage**
 
 The document sizes explain it. The plan assumed descriptions near the
 10,000-char truncation; the real distribution is **median 177 chars, p90 472,
@@ -30,12 +47,12 @@ short is launch-bound, not compute-bound.
 The plan claimed 10 candidates at `batch_size=4` run 3 forward passes where 1
 would do, and that batching is output-identical. Both halves are wrong.
 
-| | mean per call | over 11,201 reranks |
+| | mean per call | over 7,007 reranks |
 | --- | --- | --- |
-| `batch_size=4` | 58 ms | 10.9 min |
-| `batch_size=10` | 44 ms | 8.3 min |
+| `batch_size=4` | 58 ms | 6.8 min |
+| `batch_size=10` | 44 ms | 5.2 min |
 
-**1.31x, worth 2.6 minutes of a 7-hour stage.** And it is not free:
+**1.31x, worth 1.6 minutes of a 7-hour stage.** And it is not free:
 
 | comparison | max delta | reordered | crossed the 0.5 floor |
 | --- | --- | --- | --- |
@@ -52,7 +69,7 @@ attention mask covers it, and RoPE is relative, so a uniform shift cancels.
 What remains is float non-determinism from differently-shaped batched matmuls,
 and near-tied candidates are dense enough that it reorders them anyway.
 
-0.6% of the stage for perturbed merge decisions is a bad trade. Not doing it.
+0.4% of the stage for perturbed merge decisions is a bad trade. Not doing it.
 
 ## Query-path thinking: large, but not free
 
@@ -85,17 +102,22 @@ comparisons regressed and a 23.7x saving is too large to abandon on a probe.
 
 ## What this implies
 
-The graph stage is **model-bound**: ~30,000 LLM calls (extraction over 16,092
-tree nodes, plus 14,561 for resolution) against 434.6 minutes is roughly 0.85 s
-per call, and rerank accounts for 2.5%. Cutting model calls is the only change
-that moves it.
+The graph stage is **9,005 model calls at ~2.9 s each, and nothing else that
+matters**. Rerank is 1.6%; vector search and embedding are smaller still.
 
-- **Phase 2 (batch ER adjudications) is the whole graph opportunity**, not a
-  secondary one. 14,561 calls is measured, not estimated.
-- **Phase 3 (named vectors) keeps its value but loses its stated reason.** It
-  was justified as making reranking cheaper, which is 2.5% of the stage. Better
+- **Phase 2 (batch ER adjudications) is the graph stage.** Not a step in it.
+  The two call sites are `er_selection_by_llm` (5,700) and `entity_merge`'s
+  summarization (3,305); both are worth batching, and the split says selection
+  is the larger half.
+- **`direct=9738` is the shape to exploit.** More resolutions end in a direct
+  merge, costing no model call, than in any adjudicated outcome. Anything that
+  converts an adjudication into a direct merge is worth more than making the
+  adjudication faster.
+- **Phase 3 (named vectors) keeps its design but loses its stated reason.** It
+  was justified as making reranking cheaper, which is 1.6% of the stage. Better
   candidates are still worth having -- because they cut *adjudications*, which
-  is the 97%. Same design, different premise, and it must be measured in model
-  calls saved rather than rerank time.
+  are effectively the other 98%. Measure it in model calls saved.
+- **G8 is dead.** It parallelised embed, search and rerank: together a rounding
+  error here.
 - **The tree stage is the larger target and remains unmeasured at 851.3 min.**
   Phase 0's instrumentation is in place; it needs one run to break that down.
