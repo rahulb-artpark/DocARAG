@@ -11,6 +11,7 @@ import unittest
 
 from Core.pipelines.entity_facets import (
     CANONICAL_FIELD,
+    _CONTEXT_DESCRIPTION_WORDS,
     collapse_entity_hits,
     context_text,
     lexical_terms,
@@ -38,10 +39,14 @@ class ContextTextTests(unittest.TestCase):
         self.assertEqual("Name: llm", context_text("Name: llm", "   "))
 
     def test_a_long_description_is_bounded(self):
-        # Descriptions grow by one clause per merge; embedders would truncate
-        # silently, so the budget is spent here where every producer shares it.
-        text = context_text("n", " ".join(str(i) for i in range(500)))
-        self.assertEqual(120, len(text.split("Description: ")[1].split()))
+        # Both producers must cut at the same place or one entity gets
+        # different vectors from different code paths. The bound is asserted
+        # against the constant so the two cannot drift apart.
+        text = context_text("n", " ".join(str(i) for i in range(2000)))
+        self.assertEqual(
+            _CONTEXT_DESCRIPTION_WORDS,
+            len(text.split("Description: ")[1].split()),
+        )
 
 
 class LexicalTermTests(unittest.TestCase):

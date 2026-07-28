@@ -56,7 +56,13 @@ CANONICAL_FIELD = "canonical_id"
 # (mean margin 0.4458 at every setting above 60). Retrieval is indifferent
 # here, so this bounds embedding input rather than buying quality -- do not
 # read it as a quality knob.
-_CONTEXT_DESCRIPTION_WORDS = 120
+#
+# Set generously at 500 for that reason: since quality does not depend on it,
+# the cap should keep as much of a description as it can while still bounding
+# the input. 500 words is roughly 650 tokens, well inside the embedder's 2048,
+# and past the 731-word maximum seen in the sampled corpus for all but the
+# longest entities.
+_CONTEXT_DESCRIPTION_WORDS = 500
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 
