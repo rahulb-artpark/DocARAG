@@ -5,11 +5,24 @@ entity text. Every number here replaces an estimate in `latency_plan.md`.
 
 ## Stage wall clock (Postgres `stage_state`)
 
-| stage | duration |
-| --- | --- |
-| tree | 851.3 min |
-| graph | 434.6 min |
-| vdb | 8.0 min |
+| stage | ran | duration | on current code? |
+| --- | --- | --- | --- |
+| tree | 07-20 22:38 - 07-21 12:49 | 851.3 min | **no -- pre-fix** |
+| graph | 07-27 19:04 - 07-28 02:19 | 434.6 min | yes |
+| vdb | 07-28 03:22 - 03:30 | 8.0 min | yes |
+
+**The tree number is not comparable to the other two.** All three tree fixes
+landed on 2026-07-26 -- `2cc4677` (thinking), `fd82809` (concurrent merger
+passes), `593a575` (packing cap) -- five days after that run, and the tree
+artifacts are stamped 07-21 17:33, so they were never rebuilt. The graph stage
+ran 07-27, after.
+
+Rescaling it is not straightforward either. The fixes measured 2.9x and 5.1x,
+but on small documents, and they touch only the model-driven phases. MinerU
+parsing is untouched and scales with page count, so on 1,871 pages it is a much
+larger share of the stage and the realized speedup will be lower. What the tree
+stage costs today is unknown; `PhaseTimings` now separates `mineru_parse` from
+the phases the fixes actually changed, so one run answers it.
 
 ## What the graph stage actually did
 
@@ -119,5 +132,6 @@ matters**. Rerank is 1.6%; vector search and embedding are smaller still.
   are effectively the other 98%. Measure it in model calls saved.
 - **G8 is dead.** It parallelised embed, search and rerank: together a rounding
   error here.
-- **The tree stage is the larger target and remains unmeasured at 851.3 min.**
-  Phase 0's instrumentation is in place; it needs one run to break that down.
+- **The graph stage is the top target on current code.** It is the only stage
+  above with a post-fix number. The tree stage's 851.3 min is pre-fix and cannot
+  rank against it until one instrumented run replaces it.

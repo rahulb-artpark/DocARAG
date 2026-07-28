@@ -94,10 +94,17 @@ tolerance, ER-decision diff, and retrieval recall on the fixed question set.
 
 ## Phase 4 -- tree
 
-**The larger target: 851.3 minutes, nearly twice the graph stage, and still
-unbroken-down.** Phase 0's instrumentation covers MinerU parsing, content merge,
-canonical binding, layout recheck, outline, construction and summaries; one run
-turns the list below from four guesses into a ranking.
+**Cost unknown on current code.** The 851.3-minute figure is from 2026-07-20,
+five days before the three tree fixes landed, and the artifacts were never
+rebuilt -- so it cannot be ranked against the graph stage's post-fix 434.6 min.
+The small-document speedups were 2.9x and 5.1x, but the fixes touch only the
+model-driven phases; MinerU parsing is untouched and grows with page count, so
+expect less on 1,871 pages.
+
+Phase 0's instrumentation separates `mineru_parse` and `merge_content` from
+`layout_recheck`, `outline`, `construct` and `summary`, which is exactly the
+split needed to tell how much headroom is left. One run turns the list below
+from four guesses into a ranking -- do that before building any of it.
 
 1. **Merger packing.** `MAX_PAIRS_PER_JUDGMENT = 3` caps a batch at three pairs
    regardless of remaining token budget, fixing 2,022 candidates into ~674
@@ -141,10 +148,11 @@ quality.
 
 Revised by Phase 0's results. Phase 1 is withdrawn, so:
 
-**2** (the graph stage's only real lever, no migration), then **4** (the larger
-stage, once one instrumented run ranks its phases), then **5**'s per-call-site
-thinking question, then **3** only if Phase 2 leaves adjudications high enough
-to justify the migration.
+**2** (the graph stage's only real lever, no migration, and the only stage with
+a post-fix measurement), then **4** -- but measurement first, since its 851.3 min
+predates the tree fixes and may already be much smaller. Then **5**'s
+per-call-site thinking question, then **3** only if Phase 2 leaves adjudications
+high enough to justify the migration.
 
 G8 -- parallelising resolution's read-only prep -- is now clearly not worth it.
 It targeted embedding, search and rerank, which together are a small share of a
