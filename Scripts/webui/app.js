@@ -620,14 +620,23 @@ function toggleGraphPhysics() {
   $("graphPhysics").textContent = graphPhysicsOn ? "Freeze" : "Unfreeze";
 }
 
+// A force layout over thousands of entities is both unreadable and slow enough
+// to hang the tab, so an unfiltered view falls back to the best-connected ones.
+// Searching or picking a type narrows it first and keeps everything that matches.
+const GRAPH_RENDER_BUDGET = 400;
+
 function visibleEntities() {
   const q = $("graphSearch").value.trim().toLowerCase();
   const type = $("entityTypeFilter").value;
-  return (state.graph.nodes || []).filter((n) => {
+  const matched = (state.graph.nodes || []).filter((n) => {
     const okType = !type || (n.type || "UNKNOWN") === type;
     const hay = `${n.label} ${n.type} ${n.description}`.toLowerCase();
     return okType && (!q || hay.includes(q));
   });
+  if (matched.length <= GRAPH_RENDER_BUDGET) return matched;
+  return [...matched]
+    .sort((a, b) => (b.degree || 0) - (a.degree || 0))
+    .slice(0, GRAPH_RENDER_BUDGET);
 }
 
 function toVisEntity(n, labelsOn) {
@@ -756,8 +765,11 @@ function applyGraphFilter() {
     title: `${l.sourceName} → ${l.targetName}\n${clip(l.description, 160)}`,
   })));
 
+  const total = (state.graph.nodes || []).length;
+  const capped = visN.length >= GRAPH_RENDER_BUDGET && total > GRAPH_RENDER_BUDGET;
   $("graphStats").textContent =
-    `${visN.length} of ${(state.graph.nodes || []).length} entities · ${links.length} relationships shown`;
+    `${visN.length} of ${total} entities · ${links.length} relationships shown`
+    + (capped ? " · most-connected first; search or filter to see others" : "");
   renderEntityList(visN);
   $("graphHint").textContent = labelsOn
     ? "scroll to pan · Ctrl+scroll = zoom"
@@ -862,12 +874,48 @@ function wireTreeControls() {
   $("treeFit").addEventListener("click", () => state.treeNet && state.treeNet.fit({ animation: true }));
 }
 
+// Hierarchical layout is superlinear in node count, so a 16k-node document
+// hangs the tab before it paints. Draw a bounded slice instead: the shallow
+// structure, plus whatever the reader is currently looking at.
+const TREE_RENDER_BUDGET = 600;
+
+function treeRenderSubset(all, focusId) {
+  if (all.length <= TREE_RENDER_BUDGET) return all;
+  const byId = new Map(all.map((n) => [n.id, n]));
+  const keep = new Map();
+
+  // The focused node, its ancestors, and its children always survive.
+  for (let cur = byId.get(focusId); cur; cur = byId.get(cur.parentId)) keep.set(cur.id, cur);
+  if (keep.size) for (const n of all) if (n.parentId === focusId) keep.set(n.id, n);
+
+  // Fill the remainder breadth-first so the document's outline is what shows.
+  const level = state.treeLevelById || new Map();
+  const rest = all
+    .filter((n) => !keep.has(n.id))
+    .sort((a, b) => (level.get(a.id) || 0) - (level.get(b.id) || 0) || a.id - b.id);
+  for (const n of rest) {
+    if (keep.size >= TREE_RENDER_BUDGET) break;
+    keep.set(n.id, n);
+  }
+
+  // An edge is only drawn when its parent is present, so pull ancestors in.
+  for (const n of [...keep.values()]) {
+    for (let p = byId.get(n.parentId); p && !keep.has(p.id); p = byId.get(p.parentId)) {
+      keep.set(p.id, p);
+    }
+  }
+  return [...keep.values()];
+}
+
 function buildTreeNetwork() {
   const container = $("treeNet");
   const labelsOn = $("treeLabels").checked;
-  const nodes = new vis.DataSet(state.tree.nodes.map((n) => toVisTreeNode(n, labelsOn)));
+  const shown = treeRenderSubset(state.tree.nodes, state.selectedTreeId);
+  const shownIds = new Set(shown.map((n) => n.id));
+  state.treeShownCount = shown.length;
+  const nodes = new vis.DataSet(shown.map((n) => toVisTreeNode(n, labelsOn)));
   const edges = new vis.DataSet(
-    state.tree.nodes.filter((n) => n.parentId !== null).map((n) => ({
+    shown.filter((n) => n.parentId !== null && shownIds.has(n.parentId)).map((n) => ({
       from: n.parentId, to: n.id, arrows: "to",
       color: { color: "#cbd3da", highlight: "#0f766e" }, width: 1,
     }))
@@ -957,7 +1005,10 @@ function renderTreeList() {
     const hay = `${n.content} ${n.type} ${n.summary}`.toLowerCase();
     return okType && (!q || hay.includes(q));
   });
-  $("treeStats").textContent = `${list.length} of ${state.tree.nodes.length} tree nodes`;
+  const drawn = state.treeShownCount || 0;
+  $("treeStats").textContent = `${list.length} of ${state.tree.nodes.length} tree nodes`
+    + (drawn && drawn < state.tree.nodes.length
+        ? ` · ${drawn} drawn; click a node to redraw around it` : "");
   const root = $("treeList");
   root.innerHTML = "";
   for (const n of list.slice(0, 500)) {
@@ -1035,6 +1086,14 @@ function recolorTree(hlSet) {
 function selectTreeNode(id) {
   const n = state.treeNodesById.get(id);
   if (!n) return;
+  state.selectedTreeId = id;
+  // Outside the drawn slice: redraw it centred on this node so the reader can
+  // walk into parts of a large document the budget left out.
+  if (state.treeBuilt && !state.treeNodes.get(id)) {
+    try { state.treeNet.destroy(); } catch (_) { /* already gone */ }
+    state.treeBuilt = false;
+    buildTreeNetwork();
+  }
   if (state.treeBuilt && state.treeNodes.get(id)) {
     state.treeNet.selectNodes([id]);
     state.treeNet.focus(id, { scale: 0.9, animation: true });
