@@ -153,6 +153,52 @@ refused. A wrong merge silently redirects every edge through
 already cheap for what it decides; the count is what has to come down, not the
 per-call cost.
 
+## Batching the model: both kinds measured, both flat
+
+**Prompt batching** (N adjudications packed into one prompt, one response):
+**1.00x**. It amortizes only the fixed per-request cost, and that cost is small
+here:
+
+| | |
+| --- | --- |
+| per-request floor (trivial prompt and output) | 191 ms |
+| real ER adjudication | 1,121 ms |
+| overhead share | **17%** |
+| token-compute share | **83%** |
+
+Five decisions cost five decisions' worth of tokens however they are packed, so
+the arithmetic ceiling is `5x1121 / (191 + 5x930)` = **1.16x**, and the longer
+batched prompt consumed all of it. It also changed 3 of 40 merge decisions.
+The earlier "~165 min" estimate assumed overhead dominated; it is 17%.
+
+**Concurrent requests**: **1.05-1.08x, and flat from 2 to 8 workers** -- the
+signature of a server that is not overlapping them. Confirmed directly with
+identical generations:
+
+| | measured | if serial | if parallel |
+| --- | --- | --- | --- |
+| 1 generation | 1.30 s | -- | -- |
+| 2 concurrent | 2.50 s | 2.60 s | ~1.30 s |
+| 4 concurrent | 4.89 s | 5.20 s | ~1.30 s |
+
+**Ollama is running one generation at a time.** This is the finding that
+explains the whole investigation: it is why prompt batching had nothing to win,
+why concurrency did nothing, and why `refine_entities` costs its full ~126
+minutes despite already running through `iter_bounded_ordered` at
+`refinement_max_workers=8`. That parallelism has been silently defeated by the
+server all along.
+
+A second problem compounds it. The resident model reports `ctx=262144` and
+occupies **32.2 GiB** against a 22.3 GiB model -- roughly 10 GiB of KV cache for
+a 256K context, on a 47.3 GiB card with 14.6 GiB free. `config/ollama-gbc.yaml`
+sets `num_ctx: 16384` precisely to avoid this, and the loaded instance is not
+honouring it. At 16K the cache would be a fraction of that, leaving room for
+several parallel slots.
+
+So the lever is `OLLAMA_NUM_PARALLEL` plus a correctly sized context, not
+application code. It would apply to every model-bound stage at once --
+adjudication, description synthesis, outline extraction, node summaries.
+
 ## What this implies
 
 The graph stage is **9,005 model calls at ~2.9 s each, and nothing else that
