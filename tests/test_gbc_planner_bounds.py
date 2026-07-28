@@ -222,9 +222,9 @@ class _EntityStore:
         self.callback = callback or (lambda _query, _top_k: [])
         self.calls = []
 
-    def search(self, *, query_text, top_k):
-        self.calls.append((query_text, top_k))
-        return self.callback(query_text, top_k)
+    def search_entities(self, *, name_text, top_k, **kwargs):
+        self.calls.append((name_text, top_k))
+        return self.callback(name_text, top_k)
 
 
 class EntityFanoutBoundTests(unittest.TestCase):

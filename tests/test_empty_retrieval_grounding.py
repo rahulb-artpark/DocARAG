@@ -162,7 +162,7 @@ class EmptyRetrievalGroundingTests(unittest.TestCase):
     def test_graph_entity_mapping_handles_an_empty_entity_index(self):
         rag = object.__new__(GraphRAG)
         rag.gbc_index = SimpleNamespace(
-            entity_vdb=SimpleNamespace(search=Mock(return_value=[])),
+            entity_vdb=SimpleNamespace(search_entities=Mock(return_value=[])),
             GraphIndex=Mock(),
         )
         entity = SimpleNamespace(entity_name="missing", entity_type="PRODUCT")

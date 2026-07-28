@@ -3,6 +3,13 @@ from typing import Any, List, Tuple, Dict
 import os
 
 from Core.Index.Tree import NodeType
+from Core.pipelines.entity_facets import (
+    CANONICAL_FIELD,
+    collapse_entity_hits,
+    context_text,
+    lexical_terms,
+    lexical_text,
+)
 from Core.rag.base_rag import BaseRAG
 from Core.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
 from Core.provider.llm import LLM
@@ -112,7 +119,16 @@ class GraphRAG(BaseRAG):
         entities_str = [self._get_entity_embed_text(entity) for entity in entities]
         Qent_GBCent_map = defaultdict(list)
         for ent_str in entities_str:
-            query_res = self.gbc_index.entity_vdb.search(query_text=ent_str, top_k=1)
+            query_res = collapse_entity_hits(
+                self.gbc_index.entity_vdb.search_entities(
+                    name_text=ent_str,
+                    context_text=context_text(ent_str, ""),
+                    lexical_terms=lexical_terms(lexical_text(ent_str, "")),
+                    top_k=1,
+                    group_by=CANONICAL_FIELD,
+                ),
+                limit=1,
+            )
             if not query_res:
                 log.info("No graph entity candidate found for '%s'.", ent_str)
                 continue

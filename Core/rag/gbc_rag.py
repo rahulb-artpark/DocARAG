@@ -28,6 +28,13 @@ from Core.rag.gbc_plan import (
     PlanResult,
 )
 from Core.rag.gbc_retrieval import HybridRetrievalBinding, Retriever
+from Core.pipelines.entity_facets import (
+    CANONICAL_FIELD,
+    collapse_entity_hits,
+    context_text,
+    lexical_terms,
+    lexical_text,
+)
 from docarag.asset_material import AssetMaterialResolver
 from docarag.bookrag_projection import BookRAGAssetMaterializationLease
 from docarag.domain.evidence import AssetKind, AssetRef, DocumentRef
@@ -312,6 +319,31 @@ class GBCRAG(BaseRAG):
         except Exception as e:
             log.warning(f"Retrieval callback failed: {e}")
 
+    def _search_entities(self, text: str, top_k: int, label: str) -> list:
+        """Search the entity index the way the refiner writes it.
+
+        The collection carries named dense vectors plus a sparse one, so an
+        unqualified search cannot read it. Grouping returns one row per entity;
+        the collapse behind it guards a ``canonical_id`` written by a refiner
+        run that this reader did not observe. Duplicates matter more here than
+        during resolution -- ``Graph_Reasoning`` runs PageRank through the
+        GT-Link matrix, so a repeated entity is double-weighted and
+        ``Skyline_Ranker`` sees inflated dimensions.
+        """
+
+        hits = self.gbc_index.entity_vdb.search_entities(
+            name_text=text,
+            context_text=context_text(text, ""),
+            lexical_terms=lexical_terms(lexical_text(text, "")),
+            top_k=top_k,
+            group_by=CANONICAL_FIELD,
+        )
+        # Bound before collapsing: _bounded_results reads the response lazily
+        # and stops one past the limit, which is what keeps a misbehaving store
+        # from being drained. Collapsing first would materialise it.
+        bounded = self._bounded_results(hits, limit=top_k, label=label)
+        return collapse_entity_hits(bounded, limit=top_k)
+
     def _get_entity_embed_text(self, entity: QuestionEntity) -> str:
         return f"Name: {entity.entity_name}\nType: {entity.entity_type}"
 
@@ -397,10 +429,8 @@ class GBCRAG(BaseRAG):
         Qent_GBCent_map = defaultdict(list)
         res_list = []
         for ent_str in entities_str:
-            query_res = self._bounded_results(
-                self.gbc_index.entity_vdb.search(query_text=ent_str, top_k=2),
-                limit=2,
-                label="entity-vector search",
+            query_res = self._search_entities(
+                ent_str, 2, "entity-vector search"
             )
             if not query_res:
                 log.info(f"No GBC entity candidates found for '{ent_str}'.")
@@ -453,13 +483,8 @@ class GBCRAG(BaseRAG):
 
         # 1. retrieval relevent entities from the query
         candidate_limit = self._configured_int("query_entity_candidate_limit", 5)
-        retrieval_ents = self._bounded_results(
-            self.gbc_index.entity_vdb.search(
-                query_text=query,
-                top_k=candidate_limit,
-            ),
-            limit=candidate_limit,
-            label="query entity candidate search",
+        retrieval_ents = self._search_entities(
+            query, candidate_limit, "query entity candidate search"
         )
         retrieval_node_names = set()
         retrieval_nodes = []

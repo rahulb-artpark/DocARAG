@@ -12,8 +12,8 @@ class _EntityStore:
         self.results = [] if results is None else results
         self.queries = []
 
-    def search(self, *, query_text, top_k):
-        self.queries.append((query_text, top_k))
+    def search_entities(self, *, name_text, top_k, **kwargs):
+        self.queries.append((name_text, top_k))
         return self.results
 
 
