@@ -878,24 +878,48 @@ function wireTreeControls() {
 // hangs the tab before it paints. Draw a bounded slice instead: the shallow
 // structure, plus whatever the reader is currently looking at.
 const TREE_RENDER_BUDGET = 600;
+const SIBLING_WINDOW = 12;      // siblings kept either side of the focus
+const MAX_CHILDREN_DRAWN = 10;  // children drawn per node, so depth survives
 
 function treeRenderSubset(all, focusId) {
   if (all.length <= TREE_RENDER_BUDGET) return all;
   const byId = new Map(all.map((n) => [n.id, n]));
+  const childrenOf = new Map();
+  for (const n of all) {
+    if (n.parentId === null || n.parentId === undefined) continue;
+    if (!childrenOf.has(n.parentId)) childrenOf.set(n.parentId, []);
+    childrenOf.get(n.parentId).push(n);
+  }
+
+  const focus =
+    byId.get(focusId) || all.find((n) => n.parentId === null || n.parentId === undefined) || all[0];
   const keep = new Map();
 
-  // The focused node, its ancestors, and its children always survive.
-  for (let cur = byId.get(focusId); cur; cur = byId.get(cur.parentId)) keep.set(cur.id, cur);
-  if (keep.size) for (const n of all) if (n.parentId === focusId) keep.set(n.id, n);
+  // The path back to the root gives the node its context.
+  for (let cur = focus; cur; cur = byId.get(cur.parentId)) keep.set(cur.id, cur);
 
-  // Fill the remainder breadth-first so the document's outline is what shows.
-  const level = state.treeLevelById || new Map();
-  const rest = all
-    .filter((n) => !keep.has(n.id))
-    .sort((a, b) => (level.get(a.id) || 0) - (level.get(b.id) || 0) || a.id - b.id);
-  for (const n of rest) {
-    if (keep.size >= TREE_RENDER_BUDGET) break;
-    keep.set(n.id, n);
+  // A window of siblings, not all of them: a title here can have thousands,
+  // which would spend the whole budget before anything below is reached.
+  if (focus.parentId !== null && focus.parentId !== undefined) {
+    const sibs = childrenOf.get(focus.parentId) || [];
+    const at = Math.max(0, sibs.findIndex((s) => s.id === focus.id));
+    for (const s of sibs.slice(Math.max(0, at - SIBLING_WINDOW), at + SIBLING_WINDOW + 1)) {
+      keep.set(s.id, s);
+    }
+  }
+
+  // Then spend the budget going *down* from the focus. Taking only the first
+  // few children of each node keeps breadth from crowding out depth, so the
+  // view shows several levels instead of one very wide one.
+  const queue = [focus];
+  while (queue.length && keep.size < TREE_RENDER_BUDGET) {
+    const cur = queue.shift();
+    const kids = childrenOf.get(cur.id) || [];
+    for (const c of kids.slice(0, MAX_CHILDREN_DRAWN)) {
+      if (keep.size >= TREE_RENDER_BUDGET) break;
+      keep.set(c.id, c);
+      queue.push(c);
+    }
   }
 
   // An edge is only drawn when its parent is present, so pull ancestors in.
