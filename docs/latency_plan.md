@@ -15,37 +15,38 @@ than an afternoon is gated on a measurement that justifies it.
 `rerank=11201 (85.4%)` counts *how often* a rerank happens, not time spent in
 it. Rerank duration has never been measured. Phase 0 exists because of that.
 
-## Phase 0 -- measure (mandatory, no behaviour change)
+## Phase 0 -- measure (done)
 
-Add duration accumulators beside the existing `EntityResolutionStats` counts:
-embed, vector search, rerank, LLM select, LLM merge. Same for the tree stage's
-phases and for query retrieval. Log with the per-batch snapshot already in place.
+`PhaseTimings` accumulates seconds and calls per operation across entity
+resolution, the tree stage, and query retrieval (commit 242afeb).
 
-Deliverable: seconds per operation per stage. Every later phase cites it.
+Results: `latency_measurements.md`. They killed both Phase 1 items and
+re-pointed Phase 3, which is what this phase was for.
 
-Risk: none. Without it, Phases 3 and 5 are guesses.
+The headline: the graph stage is **model-bound**. Rerank is **2.5%** of its
+434.6 minutes, not the dominant cost the 85.4% figure was read as. Only cutting
+model calls moves it.
 
-## Phase 1 -- output-identical wins
+## Phase 1 -- withdrawn, both items
 
-1. **Rerank batching.** `TextRerankerProvider.rerank(batch_size=4)`; entity
-   resolution passes up to 10 candidates, so each rerank runs 3 forward passes
-   where 1 would do. Raise the batch to cover the candidate count. Scores are
-   per-document, so batching is pure chunking -- assert scores equal the
-   unbatched result and the change is provably free.
-2. **Query-path thinking.** `indexing_llm_config` disabled model thinking for
-   tree and graph only; the query path still runs at the model's default. The
-   measured effect on indexing was 114.3s to 8.7s on the same prompt. Untested
-   on query schemas, and `parse_structured` already recovers a fenced answer.
-   Largest single untouched win in the repository.
-
-Gate: rerank scores identical; query answers spot-checked against the current
-path on a fixed question set.
+1. **Rerank batching -- rejected.** Measured 1.31x, not 3x, because the real ER
+   documents are median 177 chars rather than near the 10,000-char truncation.
+   Worth 2.6 minutes of a 7-hour stage, and not output-identical: against a
+   bit-for-bit deterministic control, changing the batch reordered candidates in
+   **21 of 40** calls, which changes merge decisions.
+2. **Query-path thinking -- large but not free.** 23.7x on entity extraction and
+   6.5x on section selection, so the latency claim held. But two of six
+   comparisons regressed: an entity was dropped, and one selection returned
+   `select_id=-1` where thinking chose a section. Unlike indexing -- where
+   thinking consumed the budget and the model emitted nothing -- the reasoning
+   here earns its cost. Revisit per call site against a real question set, not
+   as a blanket switch.
 
 ## Phase 2 -- G4, batch entity adjudications (graph)
 
-14,561 model calls for 15,481 entities, and `multi=7,970` means adjudication is
-genuinely needed rather than avoidable. Batch several independent decisions per
-call.
+**Now the whole graph opportunity, not a secondary one.** 14,561 model calls for
+15,481 entities, and `multi=7,970` means adjudication is genuinely needed rather
+than avoidable. Batch several independent decisions per call.
 
 Safe because entities sharing **no candidates** cannot influence each other:
 Algorithm 1's sequential dependency is that one commit changes what the next
@@ -59,9 +60,12 @@ mismatch rate, which is the failure mode the tree mergers already guard against.
 
 ## Phase 3 -- named vectors + shared dedup (graph and query)
 
-**Only if Phase 0 shows rerank is expensive.** Entity search embeds the node
-name alone; descriptions sit in the payload unembedded, so the reranker carries
-all semantic work. Design and rationale: `entity_resolution_retrieval.md`.
+**Same design, different premise.** Phase 0 showed rerank is 2.5% of the graph
+stage, so "make reranking cheaper" no longer justifies a migration. Better
+candidates are still worth having, for the other reason in the design: they cut
+**adjudications**, which are the 97%. Measure this one in model calls saved, not
+rerank seconds. Entity search embeds the node name alone; descriptions sit in
+the payload unembedded. Design and rationale: `entity_resolution_retrieval.md`.
 
 Three things must ship together:
 
@@ -84,6 +88,11 @@ tolerance, ER-decision diff, and retrieval recall on the fixed question set.
 
 ## Phase 4 -- tree
 
+**The larger target: 851.3 minutes, nearly twice the graph stage, and still
+unbroken-down.** Phase 0's instrumentation covers MinerU parsing, content merge,
+canonical binding, layout recheck, outline, construction and summaries; one run
+turns the list below from four guesses into a ranking.
+
 1. **Merger packing.** `MAX_PAIRS_PER_JUDGMENT = 3` caps a batch at three pairs
    regardless of remaining token budget, fixing 2,022 candidates into ~674
    calls. Filling the budget is roughly a 3x call reduction. Raise it while
@@ -103,10 +112,12 @@ tolerance, ER-decision diff, and retrieval recall on the fixed question set.
 
 ## Phase 5 -- query retrieval
 
-Phase 1's thinking fix and rerank batching apply directly. Phase 3's dedup
-protects PageRank and Skyline from double-weighting. Re-measure query latency
-after each, on the fixed question set, and keep answers diffed against current
-output so a latency win is never taken on quality.
+Thinking is worth 23.7x on entity extraction and 6.5x on section selection, and
+that is far too large to leave alone -- but the probe regressed two of six
+comparisons, so it has to be resolved per call site against a real question set.
+Phase 3's dedup protects PageRank and Skyline from double-weighting. Keep
+answers diffed against current output so a latency win is never taken on
+quality.
 
 ## What keeps this safe
 
@@ -122,9 +133,16 @@ output so a latency win is never taken on quality.
 
 ## Order
 
-Phase 0, then 1 (free), then 2 (largest reduction, no migration), then 4 (tree,
-independent of the graph work), then 3 only if Phase 0 justifies the migration,
-then 5. G8 -- parallelising resolution's read-only prep -- stays last: it depends
-on Phase 0's premise, and the reranker is one local model on `cuda:0`, so
-concurrent calls serialise on the GIL and the CUDA stream regardless. Embedding
-and search would overlap; rerank likely will not.
+Revised by Phase 0's results. Phase 1 is withdrawn, so:
+
+**2** (the graph stage's only real lever, no migration), then **4** (the larger
+stage, once one instrumented run ranks its phases), then **5**'s per-call-site
+thinking question, then **3** only if Phase 2 leaves adjudications high enough
+to justify the migration.
+
+G8 -- parallelising resolution's read-only prep -- is now clearly not worth it.
+It targeted embedding, search and rerank, which together are a small share of a
+model-bound stage; and under `config/ollama-gbc.yaml` the reranker is one local
+0.6B model on `cuda:0`, so concurrent calls serialise on the GIL and the CUDA
+stream anyway. (Under the vLLM-backed configs the reranker is an HTTP service
+and would overlap -- but there it is even less of the cost.)
