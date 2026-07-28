@@ -1032,7 +1032,7 @@ class VectorStore:
         # Fusion needs a deeper pool than it returns: a point ranked outside a
         # prefetch's own limit cannot be recovered by the fusion step.
         prefetch_limit = max(top_k * 4, 32)
-        prefetches = [
+        dense = [
             self._models.Prefetch(
                 query=embeddings[0],
                 using=_HYBRID_DENSE_VECTORS[0],
@@ -1048,15 +1048,22 @@ class VectorStore:
                 score_threshold=context_score_threshold,
             ),
         ]
+        prefetches = list(dense)
         if lexical_terms:
+            # Nested, so the sparse vector reorders what the dense floors
+            # already admitted rather than contributing candidates of its own.
+            # IDF scores are unbounded and depend on term rarity, so there is no
+            # threshold that would mean for it what a cosine floor means for the
+            # dense vectors -- left flat it returns the nearest available match
+            # for anything at all, and the distance gate can never fire.
             prefetches.append(
                 self._models.Prefetch(
+                    prefetch=list(dense),
                     query=self._models.SparseVector(
                         indices=[int(term) for term in lexical_terms],
                         values=[float(v) for v in lexical_terms.values()],
                     ),
                     using=_HYBRID_SPARSE_VECTOR,
-                    filter=query_filter,
                     limit=prefetch_limit,
                 )
             )

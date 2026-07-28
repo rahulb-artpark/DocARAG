@@ -626,6 +626,7 @@ class KGRefiner:
                 top_k=topk,
                 group_by=CANONICAL_FIELD,
                 name_score_threshold=similarity_floor,
+                context_score_threshold=similarity_floor,
             )
         # Qdrant already returns one row per canonical entity; this is the net
         # for a canonical_id not yet caught up with an in-flight merge, where
