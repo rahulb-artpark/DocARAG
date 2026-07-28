@@ -131,6 +131,21 @@ class ResolutionCountingTests(unittest.TestCase):
         self.assertEqual(1, refiner.er_stats.case_a_no_gradient)
         self.assertEqual(0, refiner.er_stats.case_b_single_alias)
 
+    def test_one_strong_candidate_is_an_alias_not_a_missing_gradient(self):
+        # A lone candidate competes with nothing, so "every candidate was
+        # selected" says nothing about ambiguity -- and it has already cleared
+        # the similarity floor and the reranker bar. Counting it as case (a)
+        # discarded the clearest merges in a document: it drove case_a from 13
+        # to 273 on the Celestron run once hybrid retrieval shortened the
+        # candidate lists, leaving 160 entities unmerged.
+        refiner = _refiner([_hit("a", 0.1)], [0.9], "a")
+
+        found = refiner.search_similar_entities(_probe())
+
+        self.assertEqual(1, len(found))
+        self.assertEqual(1, refiner.er_stats.case_b_single_alias)
+        self.assertEqual(0, refiner.er_stats.case_a_no_gradient)
+
     def test_a_sharp_drop_counts_as_a_single_alias(self):
         refiner = _refiner(
             [_hit("a", 0.1), _hit("b", 0.1)], [0.9, 0.1], "a", "b"

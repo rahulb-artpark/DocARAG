@@ -697,8 +697,16 @@ class KGRefiner:
             else:
                 break
 
-        if len(sel_entities) == len(ranked_results):
-            # 4.3 If all entities are selected, return empty list
+        if len(ranked_results) > 1 and len(sel_entities) == len(ranked_results):
+            # 4.3 If all entities are selected, return empty list.
+            #
+            # Case (a) is about ambiguity: the gradient found no boundary among
+            # candidates that compete with each other, so none of them can be
+            # trusted as the alias. A single candidate competes with nothing --
+            # it is trivially "all of them" -- and it has already cleared the
+            # similarity floor and the reranker's 0.5 bar, which makes it the
+            # strongest evidence available rather than the weakest. Treating
+            # that as no-gradient discards the clearest merges in the document.
             self.er_stats.case_a_no_gradient += 1
             return []
 
