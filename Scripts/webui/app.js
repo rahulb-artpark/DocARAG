@@ -907,20 +907,31 @@ function treeRenderSubset(all, focusId) {
   return [...keep.values()];
 }
 
-function buildTreeNetwork() {
-  const container = $("treeNet");
+// Refill the drawn slice in place. Replacing the network instead loses the
+// canvas, and vis re-runs the hierarchical layout on a DataSet change anyway.
+function populateTreeNetwork() {
   const labelsOn = $("treeLabels").checked;
   const shown = treeRenderSubset(state.tree.nodes, state.selectedTreeId);
   const shownIds = new Set(shown.map((n) => n.id));
   state.treeShownCount = shown.length;
-  const nodes = new vis.DataSet(shown.map((n) => toVisTreeNode(n, labelsOn)));
-  const edges = new vis.DataSet(
+  state.treeNodes.clear();
+  state.treeEdges.clear();
+  state.treeNodes.add(shown.map((n) => toVisTreeNode(n, labelsOn)));
+  state.treeEdges.add(
     shown.filter((n) => n.parentId !== null && shownIds.has(n.parentId)).map((n) => ({
       from: n.parentId, to: n.id, arrows: "to",
       color: { color: "#cbd3da", highlight: "#0f766e" }, width: 1,
     }))
   );
+}
+
+function buildTreeNetwork() {
+  const container = $("treeNet");
+  const nodes = new vis.DataSet();
+  const edges = new vis.DataSet();
   state.treeNodes = nodes;
+  state.treeEdges = edges;
+  populateTreeNetwork();
 
   state.treeNet = new vis.Network(container, { nodes, edges }, {
     layout: { hierarchical: { enabled: true, direction: "LR", sortMethod: "directed",
@@ -991,9 +1002,13 @@ function toVisTreeNode(n, labelsOn) {
 
 function rebuildTreeLabels() {
   const labelsOn = $("treeLabels").checked;
-  state.treeNodes.update(state.tree.nodes.map((n) => ({
-    id: n.id, label: labelsOn ? `#${n.id} ${clip(nodeLabel(n), 40)}` : `#${n.id}`,
-  })));
+  // update() inserts ids it does not find, so relabel only what is drawn --
+  // otherwise toggling labels would quietly restore the whole tree.
+  state.treeNodes.update(state.tree.nodes
+    .filter((n) => state.treeNodes.get(n.id))
+    .map((n) => ({
+      id: n.id, label: labelsOn ? `#${n.id} ${clip(nodeLabel(n), 40)}` : `#${n.id}`,
+    })));
 }
 
 function renderTreeList() {
@@ -1087,12 +1102,11 @@ function selectTreeNode(id) {
   const n = state.treeNodesById.get(id);
   if (!n) return;
   state.selectedTreeId = id;
-  // Outside the drawn slice: redraw it centred on this node so the reader can
-  // walk into parts of a large document the budget left out.
+  // Outside the drawn slice: refill it around this node so the reader can walk
+  // into parts of a large document the budget left out.
   if (state.treeBuilt && !state.treeNodes.get(id)) {
-    try { state.treeNet.destroy(); } catch (_) { /* already gone */ }
-    state.treeBuilt = false;
-    buildTreeNetwork();
+    populateTreeNetwork();
+    renderTreeList();
   }
   if (state.treeBuilt && state.treeNodes.get(id)) {
     state.treeNet.selectNodes([id]);
