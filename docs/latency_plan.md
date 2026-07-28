@@ -92,36 +92,48 @@ Three things must ship together:
 Gate: Figure 6 metrics (entities, density, diameter, components) within
 tolerance, ER-decision diff, and retrieval recall on the fixed question set.
 
-## Phase 4 -- tree
+## Phase 4 -- tree (rewritten against measurement)
 
-**Cost unknown on current code.** The 851.3-minute figure is from 2026-07-20,
-five days before the three tree fixes landed, and the artifacts were never
-rebuilt -- so it cannot be ranked against the graph stage's post-fix 434.6 min.
-The small-document speedups were 2.9x and 5.1x, but the fixes touch only the
-model-driven phases; MinerU parsing is untouched and grows with page count, so
-expect less on 1,871 pages.
+Measured, 137.0s wall on `Basic_computer_concept.pdf`:
 
-Phase 0's instrumentation separates `mineru_parse` and `merge_content` from
-`layout_recheck`, `outline`, `construct` and `summary`, which is exactly the
-split needed to tell how much headroom is left. One run turns the list below
-from four guesses into a ranking -- do that before building any of it.
+| phase | time | share | what it is |
+| --- | --- | --- | --- |
+| `figure_enrichment` | 60.8s | **44.3%** | VLM, ~25 figures over 3 shards (~2.4s each) |
+| `summary` | 38.7s | 28.3% | LLM, one call per node |
+| `layout_recheck` | 18.1s | 13.2% | LLM merger judgments |
+| `mineru_parse` | 13.7s | 10.0% | no model |
+| `outline` | 5.2s | 3.8% | LLM |
+| `construct` | 0.0s | 0.0% | no model |
 
-1. **Merger packing.** `MAX_PAIRS_PER_JUDGMENT = 3` caps a batch at three pairs
-   regardless of remaining token budget, fixing 2,022 candidates into ~674
-   calls. Filling the budget is roughly a 3x call reduction. Raise it while
-   watching the mismatch rate.
-2. **Sparse outline recheck.** Skip the model for titles the layout already
-   classifies unambiguously (explicit numbering, the single height-max first-page
-   title). Gate: deterministic assignments must agree with the model on the
-   fixtures before the skip is trusted.
-3. **Outline batch parallelism.** Batches are a sequential fold today -- each
-   reads the accumulated outline. Feed every batch a precomputed level-0/level-1
-   skeleton instead so they are independent, with deterministic parent repair in
-   one post-pass. Gate: structural diff within reviewed tolerance.
-4. **Summary depth.** Summaries are level-sequential and the old flat tree was
-   the maximally parallel case, so the corrected hierarchy may have cost time
-   here. Measure before and after; if it hurts, overlap independent subtrees --
-   a node needs only its own children, not its whole level.
+`canonical_bind` was 44.6% and is **99.5% figure enrichment** -- reconciliation,
+crop materialization and the artifact write are 0.1s between them. The phase
+that looked like four kinds of work is one.
+
+**Model calls are 90% of the tree stage** (122.8s of 137.0s), so it has exactly
+the ceiling the graph stage has, and for the same reason: Ollama serialises
+every request.
+
+That kills three of the four items this phase used to propose:
+
+1. ~~Merger packing~~ -- packing more pairs per call is prompt batching, already
+   measured at 1.00x on adjudication and 1.04x on synthesis. Dead.
+2. **Sparse outline recheck** -- the one survivor, and the only kind of change
+   that works against a serialised model: skip the call entirely where the
+   layout already answers unambiguously. Worth 3.8% here.
+3. ~~Outline batch parallelism~~ -- concurrency, which the server does not honour.
+   Dead.
+4. ~~Summary depth / overlapping subtrees~~ -- also concurrency. Dead.
+
+The surviving principle generalises past item 2 and is where the effort belongs:
+**do not call a model for something deterministic.** `layout_recheck` is 13.2%
+and is merger judgments, many of which are decidable from geometry and numbering
+without asking. `figure_enrichment` at 44.3% is the largest target, and the
+question there is whether every visual block genuinely needs a VLM description
+or whether some are decorative and skippable -- a quality question that needs
+the same decision-diff gate the ER work uses, not a latency assumption.
+
+Nothing here is worth building until that question is answered, so this phase is
+deliberately not implemented.
 
 ## Phase 5 -- query retrieval
 
