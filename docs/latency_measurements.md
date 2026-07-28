@@ -276,3 +276,30 @@ matters**. Rerank is 1.6%; vector search and embedding are smaller still.
 - **The graph stage is the top target on current code.** It is the only stage
   above with a post-fix number. The tree stage's 851.3 min is pre-fix and cannot
   rank against it until one instrumented run replaces it.
+
+## The context cap is quality-neutral (2026-07-28)
+
+`_CONTEXT_DESCRIPTION_WORDS = 120` was a guess. Swept over 64 real entities from
+the 1,871-page run, descriptions running to a 214-word median and 731-word max,
+against alias probes and the near-identical `chief ray` / `marginal ray` pair:
+
+| cap | alias recall | mean margin | worst margin | ray pair separated |
+| --- | --- | --- | --- | --- |
+| 60 | 4/4 | 0.4510 | 0.1667 | yes |
+| 120 | 4/4 | 0.4458 | 0.1667 | yes |
+| 300 | 4/4 | 0.4458 | 0.1667 | yes |
+| uncapped | 4/4 | 0.4458 | 0.1667 | yes |
+
+At 120 most of these descriptions are truncated and at 300 or uncapped they are
+not, yet the fused ranking is identical. Fusion scores come from ranks, so a
+change that does not reorder anything cannot move them, and truncating the
+context vector does not reorder anything here.
+
+So the cap's justification is the one that was always sound -- both producers
+must cut identically or the same entity gets different vectors from different
+code paths, and the attestation compares them -- plus bounding embedding input.
+It is not a quality knob and should not be tuned as one. The name vector and the
+lexical vector carry enough of the ranking that context truncation does not show.
+
+Measured with 4 probes over 64 entities; a corpus-scale check could still find a
+case where it matters.
