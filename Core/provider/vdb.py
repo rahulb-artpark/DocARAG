@@ -46,6 +46,9 @@ _KEYWORD_PAYLOAD_INDEXES = (
     "modality",
     "node_type",
     "canonical_revision_id",
+    # Grouped entity search and merge repointing both filter on this, so it is
+    # indexed for the same reason the scope fields are.
+    "canonical_id",
 )
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_IDENTITY_FIELDS = (

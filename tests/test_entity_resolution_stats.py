@@ -19,8 +19,10 @@ class _VDB:
     def __init__(self, hits):
         self._hits = hits
 
-    def search(self, text, top_k):
-        return self._hits
+    def search_entities(self, *, top_k, **kwargs):
+        # The gate is a server-side score floor now, so an empty result is what
+        # "nothing plausible" looks like rather than a distance comparison.
+        return [h for h in self._hits if h["distance"] <= 0.2][:top_k]
 
 
 class _Reranker:
@@ -34,12 +36,15 @@ class _Reranker:
 
 
 def _hit(name: str, distance: float) -> dict:
+    node_id = f"Name: {name}\nType: METHOD"
     return {
         "distance": distance,
         "metadata": {
             "entity_name": name,
             "entity_type": "METHOD",
             "description": f"{name} description",
+            "node_id": node_id,
+            "canonical_id": node_id,
         },
     }
 
@@ -64,6 +69,7 @@ def _refiner(hits, scores, *seeded: str) -> KGRefiner:
     refiner.reranker = _Reranker(scores)
     refiner.entity_to_vdb_id = defaultdict(str)
     refiner.entity_alias_map = defaultdict(str)
+    refiner.get_latest_entity_name = lambda name: name
     refiner.er_stats = EntityResolutionStats()
     refiner.similar_search_topk = 10
     refiner.similar_search_distance_threshold = 0.2

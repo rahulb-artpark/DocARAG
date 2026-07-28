@@ -19,6 +19,13 @@ from Core.prompts.kg_prompt import (
 from Core.utils.utils import truncate_description
 from Core.utils.bounded_executor import iter_bounded_ordered
 from Core.utils.phase_timing import PhaseTimings
+from Core.pipelines.entity_facets import (
+    CANONICAL_FIELD,
+    collapse_entity_hits,
+    context_text,
+    lexical_terms,
+    lexical_text,
+)
 
 
 from collections import defaultdict
@@ -179,6 +186,7 @@ class KGRefiner:
                 api_key_env=vdb_config.api_key_env,
                 timeout_seconds=vdb_config.timeout_seconds,
                 scope_filter=self.scope_filter,
+                hybrid_entity_schema=True,
             )
             self.vdb.reset()
         except Exception:
@@ -251,6 +259,17 @@ class KGRefiner:
         for alias in path:
             self.entity_alias_map[alias] = root
         return root
+
+    def _canonical_node_name(self, node_name: str) -> str:
+        """The entity a node id resolves to, or itself if it never merged.
+
+        ``get_latest_entity_name`` raises for a node absent from the alias map,
+        which is the normal case: only merged entities are recorded there.
+        """
+
+        if node_name not in self.entity_alias_map:
+            return node_name
+        return self.get_latest_entity_name(node_name)
 
     def _concatenated_merge(self, old_entity: Entity, new_entity: Entity) -> Entity:
         """Merge under the old entity's identity, keeping both descriptions."""
@@ -376,9 +395,7 @@ class KGRefiner:
 
         # Mutations begin here. Nothing above touches the graph or the vector
         # store, so a failed summarization leaves both consistent.
-        self.delete_entity_from_vdb(old_entity)
         if entity_c is not None:
-            self.delete_entity_from_vdb(entity_c)
             self.graph_index.update_entity(
                 old_entity_name=entity_c.entity_name,
                 old_entity_type=entity_c.entity_type,
@@ -402,6 +419,13 @@ class KGRefiner:
         self.entity_alias_map[old_node_name] = merged_node_name
         self.entity_alias_map[new_node_name] = merged_node_name
         self.entity_alias_map[merged_node_name] = merged_node_name
+
+        # Repointing reads the alias map, so it has to follow it. The absorbed
+        # entities keep their vectors and are reached through the survivor.
+        self.delete_entity_from_vdb(old_entity)
+        if entity_c is not None:
+            self.delete_entity_from_vdb(entity_c)
+        self.entity_to_vdb_id.pop(old_node_name, None)
 
         return merged_entity
 
@@ -463,6 +487,7 @@ class KGRefiner:
             "entity_type": entity.entity_type,
             "description": entity.description,
             "node_id": self.graph_index.get_node_name_from_entity(entity),
+            CANONICAL_FIELD: self.graph_index.get_node_name_from_entity(entity),
             **self.scope_filter,
         }
 
@@ -508,8 +533,8 @@ class KGRefiner:
 
         entities = list(entity_map.values())
 
-        embed_texts = []
-        metadatas = []
+        records = []
+        owners = []
         for ent in entities:
             node_name = self.graph_index.get_node_name_from_entity(ent)
             if node_name in self.entity_to_vdb_id:
@@ -518,43 +543,50 @@ class KGRefiner:
                     "Skipping adding it again."
                 )
                 continue
-            embed_texts.append(node_name)
-            metadatas.append(self.get_vdb_meta_data(ent))
-        if not embed_texts:
+            description = ent.description or ""
+            records.append(
+                {
+                    "name_text": node_name,
+                    "context_text": context_text(node_name, description),
+                    "lexical_terms": lexical_terms(
+                        lexical_text(node_name, description)
+                    ),
+                    "metadata": self.get_vdb_meta_data(ent),
+                }
+            )
+            owners.append(node_name)
+        if not records:
             return
 
         with self.er_stats.timings.time("vdb_add"):
-            vdbids: List[str] = self.vdb.add_texts(
-                texts=embed_texts,
-                metadatas=metadatas,
-                strict_source_identity=True,
-            )
-        for embed_text, vdbid in zip(embed_texts, vdbids):
-            if embed_text in self.entity_to_vdb_id:
-                log.warning(
-                    f"Entity '{embed_text}' already exists in the vector database. "
-                    "Overwriting the existing entry."
-                )
-            self.entity_to_vdb_id[embed_text] = vdbid
+            vdbids: List[str] = self.vdb.add_entity_points(records)
+        for node_name, vdbid in zip(owners, vdbids):
+            self.entity_to_vdb_id[node_name] = vdbid
 
     def delete_entity_from_vdb(self, old_entity: Entity) -> None:
+        """Repoint a merged entity's vectors instead of removing them.
+
+        The vectors stay exactly as written, so an entity absorbed into another
+        remains findable by the phrasing it was extracted with rather than only
+        by the survivor's synthesized name. Filtering on ``canonical_id``
+        collapses chains for free: repointing C to E also moves the points that
+        already followed A into C.
+
+        The alias map remains the source of truth; this payload field is a
+        derived cache that lets Qdrant group server-side.
         """
-        Deletes an entity from the vector database.
-        Args:
-            entity (Entity): The entity to delete from the vector database.
-        """
+
         embed_text = self.graph_index.get_node_name_from_entity(old_entity)
-        vdbid = self.entity_to_vdb_id.get(embed_text, None)
-        if vdbid is not None:
-            self.vdb.delete_text_by_ids(ids=[vdbid])
-            del self.entity_to_vdb_id[embed_text]
-            log.info(f"delete entity {embed_text} from vector database.")
-        else:
-            log.info(
-                f"Entity '{old_entity.entity_name}' with type '{old_entity.entity_type}' "
-                f"not found in the vector database. Cannot delete."
+        canonical = self._canonical_node_name(embed_text)
+        if canonical == embed_text:
+            return
+        with self.er_stats.timings.time("vdb_repoint"):
+            self.vdb.set_canonical_id(
+                field_name=CANONICAL_FIELD,
+                current_value=embed_text,
+                canonical_value=canonical,
             )
-            log.info("this may cause add duplicate entities later.")
+        log.info("repointed %s to %s in the vector store", embed_text, canonical)
 
     def search_similar_entities(self, entity: Entity) -> List[Entity]:
         """
@@ -579,16 +611,32 @@ class KGRefiner:
 
         self.er_stats.entities_resolved += 1
         embed_text = self.graph_index.get_node_name_from_entity(entity)
+        description = entity.description or ""
+        # The gate is now a floor inside the prefetches. A candidate reaches
+        # fusion only by clearing it on some vector, so an empty result is the
+        # same "nothing plausible" outcome as before -- but now also reachable
+        # through the context and lexical vectors, which is the point: those are
+        # the true duplicates a name-only comparison was silently rejecting.
+        similarity_floor = 1.0 - distance_threshold
         with self.er_stats.timings.time("vector_search"):
-            similar_entities = self.vdb.search(embed_text, top_k=topk)
-        min_distance = (
-            similar_entities[0]["distance"] if similar_entities else float("inf")
+            hits = self.vdb.search_entities(
+                name_text=embed_text,
+                context_text=context_text(embed_text, description),
+                lexical_terms=lexical_terms(lexical_text(embed_text, description)),
+                top_k=topk,
+                group_by=CANONICAL_FIELD,
+                name_score_threshold=similarity_floor,
+            )
+        # Qdrant already returns one row per canonical entity; this is the net
+        # for a canonical_id not yet caught up with an in-flight merge, where
+        # the alias map is authoritative and the payload merely current.
+        similar_entities = collapse_entity_hits(
+            hits, limit=topk, resolve=self._canonical_node_name
         )
-        if min_distance > distance_threshold:
+        if not similar_entities:
             self.er_stats.gate_skips += 1
             log.info(
-                f"No similar entities found for '{entity.entity_name}' with type '{entity.entity_type}'. "
-                f"Minimum distance: {min_distance}, threshold: {distance_threshold}."
+                f"No similar entities found for '{entity.entity_name}' with type '{entity.entity_type}'."
             )
             return []
 

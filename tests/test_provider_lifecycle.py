@@ -242,9 +242,11 @@ class GBCResourceLifecycleTests(unittest.TestCase):
                 gbc.rebuild_vdb(batch_size=2)
 
             gbc.entity_vdb.reset.assert_called_once_with()
+            # Entity points now, each carrying the three vectors the fused
+            # query reads; the bound being tested is unchanged.
             batch_lengths = [
-                len(call.kwargs["texts"])
-                for call in gbc.entity_vdb.add_texts.call_args_list
+                len(call.args[0])
+                for call in gbc.entity_vdb.add_entity_points.call_args_list
             ]
             self.assertEqual(batch_lengths, [2, 2, 1])
 

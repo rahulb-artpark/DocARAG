@@ -166,14 +166,17 @@ class KGRefinementCorrectnessTests(unittest.TestCase):
         refiner.similar_search_distance_threshold = 0.2
         refiner.similar_search_mink = 1
         refiner.similar_search_g = 0.5
+        refiner.entity_alias_map = {}
         refiner.vdb = SimpleNamespace(
-            search=lambda *_args, **_kwargs: [
+            search_entities=lambda **_kwargs: [
                 {
                     "distance": 0.1,
                     "metadata": {
                         "entity_name": "first",
                         "entity_type": "TYPE",
                         "description": "first",
+                        "node_id": "first:TYPE",
+                        "canonical_id": "first:TYPE",
                     },
                 },
                 {
@@ -182,6 +185,8 @@ class KGRefinementCorrectnessTests(unittest.TestCase):
                         "entity_name": "second",
                         "entity_type": "TYPE",
                         "description": "second",
+                        "node_id": "second:TYPE",
+                        "canonical_id": "second:TYPE",
                     },
                 },
             ]

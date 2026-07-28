@@ -5,6 +5,12 @@ from Core.Index.Graph import Graph
 from Core.provider.embedding import TextEmbeddingProvider
 from Core.provider.vdb import VectorStore
 from Core.pipelines.vdb_index import tree_vector_scope
+from Core.pipelines.entity_facets import (
+    CANONICAL_FIELD,
+    context_text,
+    lexical_terms,
+    lexical_text,
+)
 from Core.utils.artifact_paths import qdrant_collection_state, qdrant_endpoint_sha256
 from Core.utils.vector_index_manifest import (
     VectorIndexAttestationReadLease,
@@ -96,6 +102,8 @@ class GBC:
                 api_key_env=config.vdb.api_key_env,
                 timeout_seconds=config.vdb.timeout_seconds,
                 scope_filter=self.entity_scope,
+                # Same collection the refiner writes, so the same schema.
+                hybrid_entity_schema=True,
             )
             if self._entity_read_lease is not None:
                 self.entity_vdb.attach_read_lease(self._entity_read_lease)
@@ -108,13 +116,23 @@ class GBC:
         )
 
     def _entity_records(self):
+        """The entity points this index publishes, in the refiner's shape.
+
+        A rebuilt index is read by the same fused, grouped query the refiner
+        uses, so it has to carry the same three vectors. ``canonical_id`` is the
+        node's own id here: merges are already resolved by the time the graph is
+        saved, so every surviving entity is its own canonical.
+        """
+
         for node_name in sorted(self.GraphIndex.kg.nodes):
             entity = self.GraphIndex.get_entity_by_node_name(node_name)
+            description = entity.description or ""
             yield node_name, {
                 "entity_name": entity.entity_name,
                 "entity_type": entity.entity_type,
-                "description": entity.description,
+                "description": description,
                 "node_id": node_name,
+                CANONICAL_FIELD: node_name,
                 **self.entity_scope,
             }
 
@@ -144,7 +162,7 @@ class GBC:
             for text, metadata in records
         ]
         identity = {
-            "schema": "docarag.bookrag-entity-qdrant-index.v2",
+            "schema": "docarag.bookrag-entity-qdrant-index.v3",
             "source_sha256": self.entity_scope["source_sha256"],
             "document_version_id": self.entity_scope["document_version_id"],
             "index_revision_id": self.entity_scope["index_revision_id"],
@@ -217,30 +235,31 @@ class GBC:
             invalidate_vector_index_attestation(self.entity_attestation_path)
             try:
                 self.entity_vdb.reset()
-                texts = []
-                meta_datas = []
+                records = []
                 total = 0
+
+                def _record(text, metadata):
+                    description = metadata.get("description", "") or ""
+                    return {
+                        "name_text": text,
+                        "context_text": context_text(text, description),
+                        "lexical_terms": lexical_terms(
+                            lexical_text(text, description)
+                        ),
+                        "metadata": metadata,
+                    }
+
                 for text, metadata in self._entity_records():
-                    texts.append(text)
-                    meta_datas.append(metadata)
-                    if len(texts) >= batch_size:
-                        self.entity_vdb.add_texts(
-                            texts=texts,
-                            metadatas=meta_datas,
-                            batch_size=batch_size,
-                            strict_source_identity=True,
+                    records.append(_record(text, metadata))
+                    if len(records) >= batch_size:
+                        self.entity_vdb.add_entity_points(
+                            records, batch_size=batch_size
                         )
-                        total += len(texts)
-                        texts = []
-                        meta_datas = []
-                if texts:
-                    self.entity_vdb.add_texts(
-                        texts=texts,
-                        metadatas=meta_datas,
-                        batch_size=batch_size,
-                        strict_source_identity=True,
-                    )
-                    total += len(texts)
+                        total += len(records)
+                        records = []
+                if records:
+                    self.entity_vdb.add_entity_points(records, batch_size=batch_size)
+                    total += len(records)
                 observed = self.entity_vdb.count()
                 if observed != total or total != expected["point_count"]:
                     raise ValueError(

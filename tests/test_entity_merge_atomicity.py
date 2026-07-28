@@ -8,11 +8,14 @@ from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
 
 
 class _RecordingVDB:
+    """Records repointings; a merge no longer removes the absorbed vectors."""
+
     def __init__(self) -> None:
         self.deleted: list[str] = []
+        self.repointed: list[tuple[str, str]] = []
 
-    def delete_text_by_ids(self, ids: list[str]) -> None:
-        self.deleted.extend(ids)
+    def set_canonical_id(self, *, field_name, current_value, canonical_value):
+        self.repointed.append((current_value, canonical_value))
 
 
 class _LLM:
@@ -53,6 +56,7 @@ def _refiner(llm: _LLM, *seed: Entity) -> tuple[KGRefiner, Graph, _RecordingVDB]
     refiner.vdb = vdb
     refiner.entity_to_vdb_id = defaultdict(str)
     refiner.entity_alias_map = defaultdict(str)
+    refiner.get_latest_entity_name = KGRefiner.get_latest_entity_name.__get__(refiner)
     refiner.er_stats = EntityResolutionStats()
     for index, entity in enumerate(seed):
         graph.add_and_link(tree_node_id=index + 1, entities=[entity])
@@ -175,7 +179,9 @@ class SummarizationFailureTests(unittest.TestCase):
         self.assertEqual("METHOD", merged.entity_type)
         self.assertEqual("one<SEP>two", merged.description)
         self.assertEqual({1, 2}, set(merged.source_ids))
-        self.assertEqual(["vdb-llm"], vdb.deleted)
+        # The absorbed entity keeps its vectors and is reached through the
+        # survivor, so nothing is deleted.
+        self.assertEqual([], vdb.deleted)
 
     def test_the_graph_still_holds_the_merged_entity_after_a_failure(self):
         old = _entity("llm", "METHOD", "one")
@@ -207,7 +213,13 @@ class ExistingTargetEntityTests(unittest.TestCase):
 
         self.assertEqual("one<SEP>two<SEP>three", merged.description)
         self.assertEqual({1, 2, 3}, set(merged.source_ids))
-        self.assertEqual({"vdb-llm", "vdb-gpt"}, set(vdb.deleted))
+        self.assertEqual([], vdb.deleted)
+        # Only the old entity is repointed. Entity C is the survivor here --
+        # the model chose its name -- so its points already carry the right
+        # canonical id and repointing it would be a self-reference.
+        self.assertEqual(
+            [("Name: llm\nType: METHOD", "Name: gpt\nType: METHOD")], vdb.repointed
+        )
 
 
 if __name__ == "__main__":

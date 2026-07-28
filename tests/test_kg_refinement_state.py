@@ -148,10 +148,13 @@ class _AddOnlyVDB:
         self.added: list[str] = []
         self.batches: list[int] = []
 
-    def add_texts(self, texts, metadatas, strict_source_identity=False):
-        self.batches.append(len(texts))
-        self.added.extend(texts)
-        return [f"vdb-{index}" for index in range(len(self.added) - len(texts), len(self.added))]
+    def add_entity_points(self, records, **kwargs):
+        self.batches.append(len(records))
+        self.added.extend(r["name_text"] for r in records)
+        return [
+            f"vdb-{index}"
+            for index in range(len(self.added) - len(records), len(self.added))
+        ]
 
 
 class RebuildVDBFromGraphTests(unittest.TestCase):
