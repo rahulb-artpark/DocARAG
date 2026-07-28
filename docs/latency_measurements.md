@@ -113,15 +113,62 @@ So: no blanket `think=False` on the query path. Worth pursuing per call site,
 against a real question set rather than three queries, since two of the six
 comparisons regressed and a 23.7x saving is too large to abandon on a probe.
 
+## Per-call latency, measured (2026-07-28)
+
+The `~2.9 s per call` figure above was arithmetic, not measurement: 434.6
+minutes divided by 9,005 calls, which silently assumed adjudication was the
+entire stage. Timed directly against the run's own entity text, on the real
+prompts:
+
+| work | per call | count | total |
+| --- | --- | --- | --- |
+| ER adjudication (`qwen3.6:35b`, think off) | **1.21 s** | 9,005 | **181.7 min** |
+| description synthesis (`refine_entities`) | **0.76 s** | ~10,000 | **126.5 min** |
+| rerank | 0.058 s | 7,007 | 6.8 min |
+| | | | **~315 of 434.6 min** |
+
+Two corrections follow. Adjudication is **42%** of the stage, not all of it. And
+**description synthesis is a comparable cost that was never on the plan** -- it
+is not in the 9,005, because `llm_calls` counts only `select` and `merge`. It
+runs once per merged entity, and ~13,000 merges produce roughly 10,000 of them.
+
+~120 minutes remain unattributed. Vector search, embedding upserts and the G1
+snapshot write are the candidates; the snapshot serialises the whole graph, so
+it is the one to measure first. Phase 0's accumulators cover all of them.
+
+## Swapping the adjudication model: rejected
+
+40 real cases, 10 candidates each, decisions diffed against `qwen3.6:35b`:
+
+| model | mean | agreement | extra merges | missed merges |
+| --- | --- | --- | --- | --- |
+| `qwen3.6:35b` | 1.21 s | baseline | | |
+| `gemma4:e2b` | 0.81 s (1.5x) | **78%** | **9/40** | 0 |
+| `gpt-oss:20b` | 2.07 s (slower) | 95% | 1 | 1 |
+
+`gemma4:e2b` buys 0.4 s per call for a 22.5% rate of merges the baseline
+refused. A wrong merge silently redirects every edge through
+`process_relationships`, so that is the expensive direction to be wrong in.
+`gpt-oss:20b` is both slower and no more faithful. The 35B model at 1.21 s is
+already cheap for what it decides; the count is what has to come down, not the
+per-call cost.
+
 ## What this implies
 
 The graph stage is **9,005 model calls at ~2.9 s each, and nothing else that
 matters**. Rerank is 1.6%; vector search and embedding are smaller still.
 
-- **Phase 2 (batch ER adjudications) is the graph stage.** Not a step in it.
-  The two call sites are `er_selection_by_llm` (5,700) and `entity_merge`'s
-  summarization (3,305); both are worth batching, and the split says selection
-  is the larger half.
+- **Phase 2 (batch ER adjudications) is the largest measured block**, at 181.7
+  of 434.6 minutes, and it is strictly sequential -- Algorithm 1's dependency is
+  that one commit changes what the next entity retrieves. Batching the 5,700
+  `er_selection_by_llm` calls five at a time is worth roughly 145 minutes even
+  if each batched call costs double.
+- **Description synthesis is the surprise, and it is already parallel.** 126.5
+  minutes of work, but `refine_entities` runs it through `iter_bounded_ordered`
+  at `refinement_max_workers` (default 8), so its wall time should be far less
+  than its summed cost. Whether it actually is has never been checked -- that
+  ratio is exactly what `PhaseTimings` reports, and it decides whether this is
+  126 minutes to win or already solved.
 - **`direct=9738` is the shape to exploit.** More resolutions end in a direct
   merge, costing no model call, than in any adjudicated outcome. Anything that
   converts an adjudication into a direct merge is worth more than making the
