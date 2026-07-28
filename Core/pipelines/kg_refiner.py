@@ -18,10 +18,11 @@ from Core.prompts.kg_prompt import (
 )
 from Core.utils.utils import truncate_description
 from Core.utils.bounded_executor import iter_bounded_ordered
+from Core.utils.phase_timing import PhaseTimings
 
 
 from collections import defaultdict
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from itertools import batched
 from typing import Optional, List
 import json
@@ -64,13 +65,22 @@ class EntityResolutionStats:
     direct_merges: int = 0
     llm_summarized_merges: int = 0
     summarization_fallbacks: int = 0
+    # Counts alone cannot rank the work: a rerank share of 85% says nothing
+    # about whether reranking or the model calls dominate the stage.
+    timings: PhaseTimings = field(
+        default_factory=lambda: PhaseTimings("entity resolution"), repr=False
+    )
 
     @property
     def llm_calls(self) -> int:
         return self.llm_selection_calls + self.llm_summarized_merges
 
     def as_dict(self) -> dict[str, int]:
-        return {field.name: getattr(self, field.name) for field in fields(self)}
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name != "timings"
+        }
 
     def log_snapshot(self, graph_node_count: int) -> None:
         resolved = self.entities_resolved
@@ -95,6 +105,7 @@ class EntityResolutionStats:
             self.case_b_single_alias,
             self.case_b_multiple_aliases,
         )
+        self.timings.log_summary()
 
 
 class KGRefiner:
@@ -300,9 +311,10 @@ class KGRefiner:
                 ),
             )
             try:
-                res_entity: MergedEntitySchema = self.llm.get_json_completion(
-                    prompt=prompt, schema=MergedEntitySchema
-                )
+                with self.er_stats.timings.time("llm_merge"):
+                    res_entity: MergedEntitySchema = self.llm.get_json_completion(
+                        prompt=prompt, schema=MergedEntitySchema
+                    )
             except Exception as error:
                 # Coreference was already decided; only the synthesized name is
                 # lost, so keep the merge rather than failing the whole stage.
@@ -511,11 +523,12 @@ class KGRefiner:
         if not embed_texts:
             return
 
-        vdbids: List[str] = self.vdb.add_texts(
-            texts=embed_texts,
-            metadatas=metadatas,
-            strict_source_identity=True,
-        )
+        with self.er_stats.timings.time("vdb_add"):
+            vdbids: List[str] = self.vdb.add_texts(
+                texts=embed_texts,
+                metadatas=metadatas,
+                strict_source_identity=True,
+            )
         for embed_text, vdbid in zip(embed_texts, vdbids):
             if embed_text in self.entity_to_vdb_id:
                 log.warning(
@@ -566,7 +579,8 @@ class KGRefiner:
 
         self.er_stats.entities_resolved += 1
         embed_text = self.graph_index.get_node_name_from_entity(entity)
-        similar_entities = self.vdb.search(embed_text, top_k=topk)
+        with self.er_stats.timings.time("vector_search"):
+            similar_entities = self.vdb.search(embed_text, top_k=topk)
         min_distance = (
             similar_entities[0]["distance"] if similar_entities else float("inf")
         )
@@ -605,11 +619,12 @@ class KGRefiner:
         # rerank() already empties its cache once enough content has passed
         # through, so entity resolution must not force a collection per entity.
         self.er_stats.rerank_calls += 1
-        scores = self.reranker.rerank(
-            query=embed_text,
-            documents=similar_entities_str,
-            instruction=ER_RERANK_INSTRUCTION,
-        )
+        with self.er_stats.timings.time("rerank"):
+            scores = self.reranker.rerank(
+                query=embed_text,
+                documents=similar_entities_str,
+                instruction=ER_RERANK_INSTRUCTION,
+            )
 
         ranked_results = sorted(
             zip(similar_entities, scores), key=lambda x: x[1], reverse=True
@@ -684,9 +699,10 @@ class KGRefiner:
         # 2. Call the LLM
         self.er_stats.llm_selection_calls += 1
         try:
-            res: ERExtractSel = self.llm.get_json_completion(
-                prompt=prompt, schema=ERExtractSel
-            )
+            with self.er_stats.timings.time("llm_select"):
+                res: ERExtractSel = self.llm.get_json_completion(
+                    prompt=prompt, schema=ERExtractSel
+                )
         except Exception as e:
             log.error(f"LLM call failed: {e}")
             return None
@@ -953,9 +969,10 @@ class KGRefiner:
         prompt = DESCRIPTION_SYNTHESIS.format(
             input_json=json.dumps(json_entity, indent=2, ensure_ascii=False)
         )
-        refined_description = self.llm.get_completion(
-            prompt=prompt, json_response=False
-        )
+        with self.er_stats.timings.time("llm_describe"):
+            refined_description = self.llm.get_completion(
+                prompt=prompt, json_response=False
+            )
         if not refined_description or not refined_description.strip():
             raise ValueError("LLM returned an empty entity description")
         return refined_description

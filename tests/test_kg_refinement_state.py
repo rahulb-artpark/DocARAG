@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from Core.Index.Graph import Entity, Graph
-from Core.pipelines.kg_refiner import KGRefiner
+from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
 from Core.pipelines.kg_refinement_state import (
     SCHEMA_VERSION,
     clear_state,
@@ -161,6 +161,7 @@ class RebuildVDBFromGraphTests(unittest.TestCase):
         refiner.vdb = vdb
         refiner.entity_to_vdb_id = {}
         refiner.scope_filter = {"tenant_id": "t"}
+        refiner.er_stats = EntityResolutionStats()
         return refiner
 
     def test_every_graph_entity_is_restored(self):

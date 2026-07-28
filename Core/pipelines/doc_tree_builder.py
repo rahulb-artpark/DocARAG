@@ -24,6 +24,7 @@ from Core.pipelines.sharded_parsing import (
 from Core.pipelines.tree_node_builder import create_node_by_type
 from Core.pipelines.tree_node_summary import generate_tree_node_summary
 from Core.provider.TokenTracker import TokenTracker
+from Core.utils.phase_timing import PhaseTimings
 from Core.provider.extract_pdf_info import merge_middle_content, parse_doc
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
@@ -1523,6 +1524,7 @@ def build_tree_from_pdf(
     os.makedirs(cfg.save_path, exist_ok=True)
 
     tree_index = DocumentTree(meta_dict=meta_dict, cfg=cfg)
+    timings = PhaseTimings("tree stage")
 
     source_sha256 = cfg.source.sha256 if cfg.source else None
     with durable_stage(
@@ -1585,21 +1587,22 @@ def build_tree_from_pdf(
                 shards = list(shard_ranges(page_count, cfg.mineru.shard_pages))
                 pdf_list = []
                 for shard_index, (start_page_id, end_page_id) in enumerate(shards):
-                    middle_json, content_list = parse_doc(
-                        cfg.pdf_path,
-                        output_dir=cfg.save_path,
-                        backend=backend,
-                        method=method,
-                        server_url=server_url,
-                        lang=cfg.mineru.lang,
-                        start_page_id=start_page_id,
-                        end_page_id=end_page_id,
-                        # Without this, do_parse's own .md/_middle.json/
-                        # _content_list.json debug dumps use the same
-                        # document-derived name every shard and each call
-                        # silently overwrites the previous shard's dump.
-                        pdf_file_name=f"{file_name}_shard{shard_index:03d}",
-                    )
+                    with timings.time("mineru_parse"):
+                        middle_json, content_list = parse_doc(
+                            cfg.pdf_path,
+                            output_dir=cfg.save_path,
+                            backend=backend,
+                            method=method,
+                            server_url=server_url,
+                            lang=cfg.mineru.lang,
+                            start_page_id=start_page_id,
+                            end_page_id=end_page_id,
+                            # Without this, do_parse's own .md/_middle.json/
+                            # _content_list.json debug dumps use the same
+                            # document-derived name every shard and each call
+                            # silently overwrites the previous shard's dump.
+                            pdf_file_name=f"{file_name}_shard{shard_index:03d}",
+                        )
                     middle_json, content_list = offset_page_indices(
                         middle_json, content_list, start_page_id
                     )
@@ -1608,13 +1611,14 @@ def build_tree_from_pdf(
                     # state (confirmed by reading it), so reconciling shard
                     # by shard produces the same result as reconciling the
                     # whole document at once.
-                    shard_pdf_list = merge_middle_content(
-                        middle_json,
-                        content_list,
-                        parse_dir=save_dir,
-                        save_dir=save_dir,
-                        file_name=f"{file_name}_shard{shard_index:03d}",
-                    )
+                    with timings.time("merge_content"):
+                        shard_pdf_list = merge_middle_content(
+                            middle_json,
+                            content_list,
+                            parse_dir=save_dir,
+                            save_dir=save_dir,
+                            file_name=f"{file_name}_shard{shard_index:03d}",
+                        )
                     pdf_list.extend(shard_pdf_list)
                     log.info(
                         "shard %d/%d (pages %d-%d): %d items (%d total so far)",
@@ -1668,18 +1672,19 @@ def build_tree_from_pdf(
                 if not shard_blocks:
                     continue
                 fragment_filename = f"canonical_blocks_shard{shard_index:03d}.json"
-                (
-                    parse_request,
-                    _shard_canonical,
-                    shard_has_cross_page_gap,
-                ) = bind_canonical_evidence(
-                    cfg,
-                    shard_blocks,
-                    merged_content_path=tmp_save_path,
-                    document_page_count=canonical_page_count,
-                    debug_artifact_suffix=f"_shard{shard_index:03d}",
-                    canonical_artifact_filename=fragment_filename,
-                )
+                with timings.time("canonical_bind"):
+                    (
+                        parse_request,
+                        _shard_canonical,
+                        shard_has_cross_page_gap,
+                    ) = bind_canonical_evidence(
+                        cfg,
+                        shard_blocks,
+                        merged_content_path=tmp_save_path,
+                        document_page_count=canonical_page_count,
+                        debug_artifact_suffix=f"_shard{shard_index:03d}",
+                        canonical_artifact_filename=fragment_filename,
+                    )
                 canonical_shard_fragments.append(fragment_filename)
                 needs_whole_document_fallback = (
                     needs_whole_document_fallback or shard_has_cross_page_gap
@@ -1704,12 +1709,13 @@ def build_tree_from_pdf(
                     "boundaries; falling back to one whole-document bind "
                     "for full correctness"
                 )
-                parse_request, _canonical, _ = bind_canonical_evidence(
-                    cfg,
-                    pdf_list,
-                    merged_content_path=tmp_save_path,
-                    document_page_count=canonical_page_count,
-                )
+                with timings.time("canonical_bind_whole_document"):
+                    parse_request, _canonical, _ = bind_canonical_evidence(
+                        cfg,
+                        pdf_list,
+                        merged_content_path=tmp_save_path,
+                        document_page_count=canonical_page_count,
+                    )
             else:
                 merge_canonical_evidence_shards(
                     cfg, shard_fragment_filenames=canonical_shard_fragments
@@ -1772,11 +1778,14 @@ def build_tree_from_pdf(
         payload={"use_vlm": bool(cfg.tree.use_vlm)},
         source_sha256=document.content_sha256,
     ) as tree_stage:
-        pdf_list = pdf_info_refiner(pdf_list, llm)
-        title_outline = extract_pdf_outline_in_chunks(pdf_list, llm)
-        tree_index = construct_tree_index(
-            tree_index=tree_index, pdf_list=pdf_list, title_outline=title_outline
-        )
+        with timings.time("layout_recheck"):
+            pdf_list = pdf_info_refiner(pdf_list, llm)
+        with timings.time("outline"):
+            title_outline = extract_pdf_outline_in_chunks(pdf_list, llm)
+        with timings.time("construct"):
+            tree_index = construct_tree_index(
+                tree_index=tree_index, pdf_list=pdf_list, title_outline=title_outline
+            )
         token_tracker = TokenTracker.get_instance()
         tree_index_cost = token_tracker.record_stage("tree_index_construction")
         log.info(f"Tree index construction cost: {tree_index_cost}")
@@ -1791,12 +1800,13 @@ def build_tree_from_pdf(
     ) as summary_stage:
         if cfg.tree.node_summary:
             # Generate summaries for each node
-            tree_index = generate_tree_node_summary(
-                tree_index=tree_index,
-                llm=llm,
-                use_VLM=cfg.tree.use_vlm,
-                vlm=vlm,
-            )
+            with timings.time("summary"):
+                tree_index = generate_tree_node_summary(
+                    tree_index=tree_index,
+                    llm=llm,
+                    use_VLM=cfg.tree.use_vlm,
+                    vlm=vlm,
+                )
             token_tracker = TokenTracker.get_instance()
             summary_cost = token_tracker.record_stage("tree_node_summary")
             log.info(f"Tree node summary generation cost: {summary_cost}")
@@ -1825,4 +1835,5 @@ def build_tree_from_pdf(
             source_sha256=document.content_sha256,
             metadata={"node_count": len(tree_index.nodes)},
         )
+    timings.log_summary()
     return tree_index

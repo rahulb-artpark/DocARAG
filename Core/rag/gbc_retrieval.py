@@ -14,6 +14,7 @@ from Core.provider.rerank import TextRerankerProvider
 from Core.Index.Tree import TreeNode, NodeType
 from Core.utils.table_utils import table2text
 from Core.utils.utils import num_tokens, TextProcessor
+from Core.utils.phase_timing import PhaseTimings
 from Core.prompts.gbc_prompt import TEXT_RERANKER_PROMPT, MM_RERANKER_INSTRUCTION
 from Core.rag.gbc_utils import (
     enhance_graph_with_semantic_links,
@@ -121,6 +122,9 @@ class Retriever:
         self.retrieval_binding = retrieval_binding
         self.last_fusion_result = None
         self.last_semantic_selector_by_node: dict[int, dict[str, object]] = {}
+        # Shared with GBCRAG so one summary covers planning and retrieval
+        # rather than two that cannot be added together.
+        self.timings = PhaseTimings("query retrieval")
 
     @staticmethod
     def _bounded_scalar_text(value: object, *, max_chars: int = 512) -> str:
@@ -873,7 +877,8 @@ class Retriever:
         Rerank the original text in the subtree based on their relevance to the query.
         Use Reranker model
         """
-        candidates = self._hybrid_candidates(subtree_nodes, query)
+        with self.timings.time("candidate_fusion"):
+            candidates = self._hybrid_candidates(subtree_nodes, query)
         if not candidates:
             return []
 
@@ -899,9 +904,10 @@ class Retriever:
             doc_text.append(text)
 
         try:
-            scores = self.reranker.rerank(
-                query=query, documents=doc_text, instruction=TEXT_RERANKER_PROMPT
-            )
+            with self.timings.time("text_rerank"):
+                scores = self.reranker.rerank(
+                    query=query, documents=doc_text, instruction=TEXT_RERANKER_PROMPT
+                )
             try:
                 score_count = len(scores)
             except TypeError as exc:
@@ -965,14 +971,15 @@ class Retriever:
         subtree_nodes: List[TreeNode],
     ) -> Tuple[List[Tuple[int, float]], List[str]]:
         ents_sim = {}
-        for q_ent_name, gbc_ents in ent_map.items():
-            for node_name in gbc_ents:
-                if node_name not in subgraph.nodes():
-                    continue
-                # compute similarity between the query entity and the GBC entity
-                sim = self.embedder.compute_texts_sim(q_ent_name, node_name)
-                positive_sim = (sim + 1) / 2
-                ents_sim[node_name] = ents_sim.get(node_name, 0.0) + positive_sim
+        with self.timings.time("entity_similarity"):
+            for q_ent_name, gbc_ents in ent_map.items():
+                for node_name in gbc_ents:
+                    if node_name not in subgraph.nodes():
+                        continue
+                    # compute similarity between the query entity and the GBC entity
+                    sim = self.embedder.compute_texts_sim(q_ent_name, node_name)
+                    positive_sim = (sim + 1) / 2
+                    ents_sim[node_name] = ents_sim.get(node_name, 0.0) + positive_sim
 
         total_sim_sum = sum(ents_sim.values())
 
@@ -986,16 +993,18 @@ class Retriever:
 
         pagerank_alpha: float = self.alpha
         # --- 步骤 1 & 2: 增强图并计算 PageRank 分数 ---
-        enhanced_graph = enhance_graph_with_semantic_links(
-            graph=subgraph, embedder=self.embedder, x_percentile=self.x_percentile
-        )
+        with self.timings.time("semantic_links"):
+            enhanced_graph = enhance_graph_with_semantic_links(
+                graph=subgraph, embedder=self.embedder, x_percentile=self.x_percentile
+            )
 
-        pagerank_scores = nx.pagerank(
-            enhanced_graph,
-            alpha=pagerank_alpha,
-            personalization=personalization_vector,
-            weight="weight",  # 可以考虑使用相似度作为边的权重
-        )
+        with self.timings.time("pagerank"):
+            pagerank_scores = nx.pagerank(
+                enhanced_graph,
+                alpha=pagerank_alpha,
+                personalization=personalization_vector,
+                weight="weight",  # 可以考虑使用相似度作为边的权重
+            )
 
         # sort the ranked list by score and filter by topk_ent
         res_entities = [(ent, score) for ent, score in pagerank_scores.items()]

@@ -1450,7 +1450,9 @@ class GBCRAG(BaseRAG):
 
         subtree_ids = [node.index_id for node in subtree_nodes]
 
-        subgraph: nx.Graph = self.gbc_index.GraphIndex.get_kg_subgraph(subtree_ids)
+        timings = self.retriever.timings
+        with timings.time("subgraph"):
+            subgraph: nx.Graph = self.gbc_index.GraphIndex.get_kg_subgraph(subtree_ids)
 
         start_ent_map = iter_context.gbc_entity_map
 
@@ -1483,10 +1485,13 @@ class GBCRAG(BaseRAG):
         iter_context: IterationStep, Iteration context for the current step.
         """
 
-        Qent_GBCent_map = self._get_query_entity(query)
+        timings = self.retriever.timings
+        with timings.time("query_entities"):
+            Qent_GBCent_map = self._get_query_entity(query)
         iter_context.gbc_entity_map = Qent_GBCent_map
 
-        tree_nodes = self.link_tree_node(Qent_GBCent_map)
+        with timings.time("link_tree_nodes"):
+            tree_nodes = self.link_tree_node(Qent_GBCent_map)
         iter_context.linked_tree_nodes = tree_nodes
 
         # 3. Use LLM to select the most relevant section or supplementary sections
@@ -1496,10 +1501,12 @@ class GBCRAG(BaseRAG):
                 self.gbc_index.TreeIndex.root_node.index_id
             ]
         else:
-            self.llm_section_selection(query, tree_nodes, iter_context)
+            with timings.time("section_selection"):
+                self.llm_section_selection(query, tree_nodes, iter_context)
 
         # 4. Graph-based retrieval on subgraph projected by the subtree (Select Section)
         self.get_GBC_info(iter_context)
+        timings.log_summary()
 
     def process_analysis(self, context: GBCRAGContext, query_analysis: PlanResult):
         log.info(f"Query analysis type: {query_analysis.query_type}")
