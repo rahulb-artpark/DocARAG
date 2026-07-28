@@ -707,11 +707,25 @@ class KGRefiner:
             self.er_stats.case_b_multiple_aliases += 1
         log.info(f"After gradient-select, found {len(sel_entities)} similar entities.")
 
+        # A hit's payload names the entity as it was written. Once that entity
+        # has been merged away it is no longer in the graph, and only the
+        # entity it resolves to is -- so the candidate is looked up by
+        # canonical id rather than by the name that matched.
         res_entities = []
         for ent, _ in sel_entities:
-            entity_name = ent["metadata"].get("entity_name", "")
-            entity_type = ent["metadata"].get("entity_type", "")
-            res_entities.append(self.graph_index.get_entity(entity_name, entity_type))
+            metadata = ent["metadata"]
+            node_name = self._canonical_node_name(
+                metadata.get(CANONICAL_FIELD) or metadata.get("node_id", "")
+            )
+            if node_name not in self.graph_index.kg:
+                log.info(
+                    "Candidate %s is no longer in the graph; skipping it.",
+                    node_name,
+                )
+                continue
+            res_entities.append(
+                self.graph_index.get_entity_by_node_name(node_name)
+            )
         return res_entities
 
     def _prepare_selection_input(
