@@ -426,6 +426,12 @@ _VISUAL_NODE_TYPE_BY_BLOCK = {
     BlockType.CHART: "chart",
     BlockType.DIAGRAM: "diagram",
 }
+
+# Title depths. 1 is reserved for the document's own title so no section
+# heading can outrank it; a heading MinerU labelled but did not level sits
+# below every explicitly levelled one rather than competing with them.
+_DOC_TITLE_LEVEL = 1
+_UNLEVELLED_TITLE_LEVEL = 6
 _VISUAL_SUBTYPES = frozenset(
     {
         "chart",
@@ -1309,7 +1315,15 @@ def _project_text(block: CanonicalBlock, row: dict[str, object]) -> None:
             "selected_asset_ids": [],
         }
     )
-    if block.block_type is BlockType.TITLE:
+    if block.block_type is BlockType.DOC_TITLE:
+        # A document title is a title, and outranks every section heading.
+        # Without a level it reaches the tree as ordinary body text and the
+        # document ends up with no title at all -- which is what happened to
+        # "Human Eye and the Colourful World", leaving the summariser to call
+        # the document's own name "nonsensical or corrupted".
+        row["text_level"] = _DOC_TITLE_LEVEL
+        row["is_document_title"] = True
+    elif block.block_type is BlockType.TITLE:
         level = block.metadata.get("level")
         if isinstance(level, int) and not isinstance(level, bool) and 1 <= level <= 6:
             row["text_level"] = level
@@ -1317,6 +1331,12 @@ def _project_text(block: CanonicalBlock, row: dict[str, object]) -> None:
             match = re.match(r"^(#{1,6})\s+", str(selected.content))
             if match:
                 row["text_level"] = len(match.group(1))
+        else:
+            # MinerU 3.x labelled this a heading even though it carries no
+            # explicit level. Saying "a heading of unknown depth" beats
+            # discarding the parser's judgement and making the outline pass
+            # rediscover it from the prose.
+            row["text_level"] = _UNLEVELLED_TITLE_LEVEL
 
 
 def _project_table(
