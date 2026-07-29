@@ -979,6 +979,31 @@ def _node_content(node) -> str:
     return str(getattr(getattr(node, "meta_info", None), "content", "") or "").strip()
 
 
+def _context_contribution(node) -> str:
+    """What one neighbour contributes to an equation's context.
+
+    A figure's own prose is its caption, which the store keeps in its own field
+    rather than folding into ``content``.  Reading ``content`` alone therefore
+    drops "Figure 1.5: the event M that Romeo and Juliet will arrive within 15
+    minutes" and leaves only the vision model's account of the pixels -- the
+    geometry without the situation, which is the half that does not answer the
+    question.  Figures are indexed on caption plus footnote for exactly this
+    reason, so a neighbouring equation reads them the same way.
+    """
+
+    meta = getattr(node, "meta_info", None)
+    caption = str(getattr(meta, "caption", "") or "").strip()
+    footnote = str(getattr(meta, "footnote", "") or "").strip()
+    content = _node_content(node)
+    # Some producers already fold the caption into the content; joining them
+    # again would feed the embedder the same sentence twice.
+    if caption and caption in content:
+        caption = ""
+    if footnote and footnote in content:
+        footnote = ""
+    return " ".join(part for part in (caption, footnote, content) if part)
+
+
 def _equation_self_text(node) -> str:
     """What the equation says, in words and in symbols."""
 
@@ -1013,7 +1038,7 @@ def _equation_context_text(node) -> str:
         return ""
     span = _EQUATION_CONTEXT_NEIGHBOURS
     window = siblings[max(0, position - span) : position + span + 1]
-    parts = [content for item in window if (content := _node_content(item))]
+    parts = [text for item in window if (text := _context_contribution(item))]
     return "\n".join(parts)[:_EQUATION_CONTEXT_CHARS]
 
 

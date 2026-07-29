@@ -157,7 +157,9 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                     "table heading|a|b|",
                     "figure captionfigure footnote",
                     r"E=mc^2",
-                    "E=mc^2\nConclusion",
+                    # The neighbouring figure contributes its caption, which is
+                    # where a figure's prose lives; content alone would lose it.
+                    "figure caption figure footnote\nE=mc^2\nConclusion",
                     "Conclusion",
                 ],
                 [item for batch in text_batches for item in batch],
@@ -172,7 +174,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                     # The crop is paired with the neighbourhood, not the LaTeX:
                     # a picture of the symbols and a transcription of the same
                     # symbols are the same evidence twice.
-                    "E=mc^2\nConclusion",
+                    "figure caption figure footnote\nE=mc^2\nConclusion",
                 ],
                 [
                     item
@@ -208,11 +210,15 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             return node
 
         child(NodeType.TEXT, pdf_id=2, page_idx=0, content="Far earlier sentence.")
+        # The store keeps a figure's caption in its own field and leaves
+        # content as the vision model's account of the pixels, so a neighbour
+        # that reads content alone loses the half naming the subject.
         child(
             NodeType.IMAGE,
             pdf_id=3,
             page_idx=0,
-            content="Figure 1.5: the event M that Romeo and Juliet arrive within 15 minutes.",
+            caption="Figure 1.5: the event M that Romeo and Juliet arrive within 15 minutes.",
+            content="A 2D plot with a shaded band around the diagonal.",
         )
         equation = child(
             NodeType.EQUATION,
@@ -239,11 +245,33 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             ]
 
             self.assertIn(
-                "Figure 1.5: the event M that Romeo and Juliet arrive within 15 minutes.\n"
+                "Figure 1.5: the event M that Romeo and Juliet arrive within 15 minutes. "
+                "A 2D plot with a shaded band around the diagonal.\n"
                 "M = {(x,y) | |x-y| <= 1/4}\n"
                 "and is shaded in the figure.",
                 texts,
             )
+
+    def test_a_caption_already_inside_the_content_is_not_repeated(self):
+        # Some producers fold the caption into content; joining both would
+        # feed the embedder the same sentence twice.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self._equation_in_prose(directory)
+            figure = tree.root_node.children[0].children[1]
+            figure.meta_info.content = (
+                "Figure 1.5: the event M that Romeo and Juliet arrive within 15 "
+                "minutes. A 2D plot."
+            )
+
+            context = [
+                record.value
+                for record in vdb_index.iter_tree_index_records(tree)
+                if record.modality == "text" and "Romeo" in record.value
+                and "shaded in the figure" in record.value
+            ]
+
+            self.assertEqual(1, len(context), context)
+            self.assertEqual(1, context[0].count("Figure 1.5:"))
 
     def test_the_equation_context_window_stops_at_one_sibling_each_side(self):
         # Wider windows measured worse on every equation and question tried.
