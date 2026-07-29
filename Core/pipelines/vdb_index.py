@@ -993,6 +993,7 @@ _TEXT_NODE_TYPES = frozenset(
 _CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {
     NodeType.TABLE,
     NodeType.EQUATION,
+    NodeType.LIST,
 }
 
 _EQUATION_CONTEXT_NEIGHBOURS = 1
@@ -1199,12 +1200,16 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
                     _representation_metadata(meta_data, "image"),
                     image_str,
                 )
-        elif node_type == NodeType.TABLE:
+        elif node_type in (NodeType.TABLE, NodeType.LIST):
             # A grid embeds as markup: "<table><tr><td>" is noise, and the
             # cells that carry the meaning are values, not sentences. The
             # summary is the only prose a table has -- "the trigonometric
             # ratios for angles of 0, 30, 45, 60 and 90 degrees" is what a
             # question matches, and it was the one part left out.
+            #
+            # A list has the same shape of problem: its items are fragments
+            # sharing a subject stated once, in the stem above them, so
+            # "Acts as a primary lens" embeds without the eye's cornea in it.
             table_str = _table_text(node)
             yield TreeIndexRecord(
                 "text", table_str, _representation_metadata(meta_data, "text")

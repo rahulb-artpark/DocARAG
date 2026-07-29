@@ -88,6 +88,10 @@ def _with_surroundings(tree_node: TreeNode, body: str, *, neighbours: bool) -> s
 _SELF_DESCRIPTION = {
     NodeType.IMAGE: "This is an image.",
     NodeType.TABLE: "This is a table.",
+    NodeType.LIST: (
+        "This is a list. Say what the items have in common and what they "
+        "enumerate, not each item in turn."
+    ),
     NodeType.CHART: "This is a chart. Report the quantities it plots.",
     NodeType.DIAGRAM: "This is a diagram. Report what it shows and how its parts relate.",
     NodeType.CODE: "This is a code listing. Say what the code does, not how it is written.",
@@ -105,7 +109,7 @@ _PROSE_NODE_TYPES = frozenset(
 _SUMMARISABLE_NODE_TYPES = (
     _CAPTIONED_NODE_TYPES
     | _PROSE_NODE_TYPES
-    | {NodeType.EQUATION, NodeType.CODE, NodeType.ALGORITHM}
+    | {NodeType.EQUATION, NodeType.CODE, NodeType.ALGORITHM, NodeType.LIST}
 )
 
 
@@ -133,6 +137,17 @@ def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
         # is *for*, which is what a question asks about.
         content = _with_surroundings(
             tree_node, tree_node.meta_info.content or "", neighbours=True
+        )
+    elif node_type is NodeType.LIST:
+        # A list's items are fragments that share a subject stated once, in
+        # the stem above them: "1. Cornea" carries the eye, "Acts as a primary
+        # lens" does not. Read without that stem the items summarise into
+        # unattached predicates, so a list gets its surroundings like an
+        # equation rather than a caption.
+        content = _with_surroundings(
+            tree_node,
+            f"{_SELF_DESCRIPTION[node_type]}\n{tree_node.meta_info.content or ''}",
+            neighbours=True,
         )
     elif node_type in (NodeType.CODE, NodeType.ALGORITHM):
         # A listing names its own identifiers but rarely its purpose, and the

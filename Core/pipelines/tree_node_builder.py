@@ -53,6 +53,7 @@ def _evidence_meta(pdf_content: dict) -> dict:
 # raising mid-ingestion.
 _TEXT_CONTENT_TYPES = {
     "text": NodeType.TEXT,
+    "list": NodeType.LIST,
     "code": NodeType.CODE,
     "algorithm": NodeType.ALGORITHM,
     "abstract": NodeType.ABSTRACT,

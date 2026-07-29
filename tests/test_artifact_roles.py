@@ -5,6 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import yaml
+
 from docarag.artifact_roles import resolve_artifact_roles
 from docarag.domain.evidence import DocumentRef
 
@@ -33,7 +35,16 @@ class ArtifactRoleTests(unittest.TestCase):
 
             self.assertEqual(str(run / "graph_data.json"), roles["graph"])
             self.assertEqual("gbc", roles["index_type"])
-            self.assertEqual("TreeVDB", roles["retrieval_collection"])
+            # The claim is that the resolver reports the *configured*
+            # collection, not that the collection has any particular name --
+            # it is renamed whenever the embedder's width changes, and a
+            # hardcoded copy here only records that a rename happened.
+            self.assertEqual(
+                yaml.safe_load(source_config.read_text(encoding="utf-8"))["vdb"][
+                    "collection_name"
+                ],
+                roles["retrieval_collection"],
+            )
             self.assertEqual(
                 str(
                     run

@@ -73,12 +73,12 @@ def _fail(message: str) -> NoReturn:
 # a type added there without being added here hydrates as "unsupported node
 # type" rather than degrading quietly.
 _TEXT_NODE_TYPES = frozenset(
-    {"text", "code", "algorithm", "abstract", "reference"}
+    {"text", "list", "code", "algorithm", "abstract", "reference"}
 )
 _VISUAL_NODE_TYPES = frozenset({"image", "chart", "diagram"})
 # Types that may carry a materialized crop whose path must match the
 # projection. Mirrors vdb_index._CROP_BEARING_NODE_TYPES.
-_CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {"table", "equation"}
+_CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {"table", "equation", "list"}
 
 
 def _non_empty_text(value: object, field_name: str) -> str:

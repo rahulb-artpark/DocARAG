@@ -414,6 +414,7 @@ _VISUAL_BLOCKS = frozenset({BlockType.FIGURE, BlockType.CHART, BlockType.DIAGRAM
 # is a downstream reason for it -- a summariser prompt, an index record shape,
 # or a distinct way of rendering it in an answer.
 _NODE_TYPE_BY_BLOCK = {
+    BlockType.LIST_ITEM: "list",
     BlockType.CODE: "code",
     BlockType.ALGORITHM: "algorithm",
     BlockType.ABSTRACT: "abstract",

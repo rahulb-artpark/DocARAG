@@ -91,12 +91,18 @@ vdb:
   qdrant_url: "http://127.0.0.1:6333"
   api_key_env: "QDRANT_API_KEY"
   timeout_seconds: 10.0
-  collection_name: "TreeVDB"
+  # Named for the embedder and its width: a collection built at one dimension
+  # cannot accept vectors of another, and _validate_existing_collection raises
+  # rather than mixing them. A distinct name means the 1536d gme collection
+  # stays queryable while this one is rebuilt.
+  collection_name: "TreeVDB-qwen3vl-2048"
   embedding_config:
-    model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+    # gme-Qwen2-VL hard-asserts transformers<4.52.0 in its own remote code,
+    # and MinerU 3.4.4 requires >=4.57.3. They cannot share an interpreter, so
+    # the multimodal embedder moves with the parser.
+    model_name: Qwen/Qwen3-VL-Embedding-2B
     device: "cuda:0"
-    # The checkpoint ships float32 and costs 8.3GB; bfloat16 halves it.
-    torch_dtype: bfloat16
+    torch_dtype: float16
 
 rag_force_reprocess: True
 

@@ -24,6 +24,7 @@ class NodeType(str, Enum):
     TABLE = "table"
     EQUATION = "equation"
     TITLE = "title"
+    LIST = "list"
     CODE = "code"
     CHART = "chart"
     DIAGRAM = "diagram"
