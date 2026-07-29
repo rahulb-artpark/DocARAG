@@ -923,6 +923,16 @@ def bind_canonical_evidence(
         # projection.  MinerU leaves a figure's caption list empty, so without
         # this the recovered text and description stay in the canonical layer
         # and every figure reaches retrieval as an empty node.
+        # The adapter calls a block a heading on any of three signals -- the
+        # content-list type, the middle-json type, or a text_level -- while the
+        # tree only ever reads text_level. A heading MinerU declares but does
+        # not level is then a title canonically and body text in the tree, and
+        # the section it opens is lost. Carry the canonical decision across.
+        if projected.get("text_level") is not None:
+            attachment["text_level"] = projected["text_level"]
+        if projected.get("is_document_title"):
+            attachment["is_document_title"] = True
+
         if projected.get("type") == "image":
             attachment["image_caption"] = list(projected.get("image_caption", []))
             attachment["image_footnote"] = list(
