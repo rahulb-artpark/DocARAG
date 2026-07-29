@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
 from Core.Index.Tree import TreeNode, NodeType, DocumentTree
+from Core.pipelines.node_context import nearest_prose, parent_title
 from Core.prompts.summary_prompt import NODE_SUMMARY_PROMPT, SEC_SUMMARY_PROMPT
 from Core.provider.llm import CompletionRequest, CompletionResult, LLM
 from Core.provider.vlm import GenerationRequest, GenerationResult, VLM
@@ -59,6 +60,28 @@ def _summary_model_identity(config: object) -> dict[str, object]:
     return identity
 
 
+#: Bounds one neighbour so a long sibling cannot crowd out the node itself.
+_NEIGHBOUR_CHARS = 600
+
+
+def _with_surroundings(tree_node: TreeNode, body: str, *, neighbours: bool) -> str:
+    """Place a leaf in its section, and optionally between its sentences.
+
+    ``NODE_SUMMARY_PROMPT`` already instructs the model to use a title when one
+    is given; until now none ever was for these types.
+    """
+
+    before, after = nearest_prose(tree_node) if neighbours else ("", "")
+    title = parent_title(tree_node)
+    parts = [
+        f"Title: {title}" if title else "",
+        f"Preceding text: {before[:_NEIGHBOUR_CHARS]}" if before else "",
+        body,
+        f"Following text: {after[:_NEIGHBOUR_CHARS]}" if after else "",
+    ]
+    return "\n".join(part for part in parts if part)
+
+
 def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
     node_type = tree_node.type
     if node_type not in [
@@ -78,6 +101,18 @@ def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
         content += tree_node.meta_info.content or ""
         content += (
             f"\n{tree_node.meta_info.table_body}" if node_type == NodeType.TABLE else ""
+        )
+        # Soft context: a figure already states its own subject in its caption,
+        # so it needs only the heading it sits under to place that subject.
+        content = _with_surroundings(tree_node, content, neighbours=False)
+    elif node_type == NodeType.EQUATION:
+        # A displayed equation states nothing in words. Summarised from its
+        # symbols alone the model can only describe the mathematics -- "a
+        # diagonal band of width 1/4" for the set that decides whether Romeo
+        # and Juliet meet. Given the surroundings it writes what the equation
+        # is *for*, which is what a question asks about.
+        content = _with_surroundings(
+            tree_node, tree_node.meta_info.content or "", neighbours=True
         )
     else:
         content = tree_node.meta_info.content or ""
