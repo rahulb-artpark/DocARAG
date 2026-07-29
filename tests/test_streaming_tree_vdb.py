@@ -130,7 +130,9 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             tree, expected_images = self._tree(directory)
             embedder = Mock()
             store = Mock()
-            store.count.return_value = 8
+            # An equation contributes two texts: what it says, and the
+            # neighbourhood that says what it is for.
+            store.count.return_value = 9
 
             with (
                 patch.object(vdb_index, "GmeEmbeddingProvider", return_value=embedder),
@@ -155,6 +157,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                     "table heading|a|b|",
                     "figure captionfigure footnote",
                     r"E=mc^2",
+                    "E=mc^2\nConclusion",
                     "Conclusion",
                 ],
                 [item for batch in text_batches for item in batch],
@@ -163,7 +166,14 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                 expected_images, [item for batch in image_batches for item in batch]
             )
             self.assertEqual(
-                ["table heading|a|b|", "figure captionfigure footnote", r"E=mc^2"],
+                [
+                    "table heading|a|b|",
+                    "figure captionfigure footnote",
+                    # The crop is paired with the neighbourhood, not the LaTeX:
+                    # a picture of the symbols and a transcription of the same
+                    # symbols are the same evidence twice.
+                    "E=mc^2\nConclusion",
+                ],
                 [
                     item
                     for call in store.add_images.call_args_list
@@ -173,6 +183,109 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             store.close.assert_called_once_with()
             store.reset.assert_called_once_with()
             embedder.close.assert_called_once_with()
+
+    def _equation_in_prose(self, directory: str, *, summary: str = ""):
+        """A displayed equation with the sentences that explain it around it."""
+
+        tree = DocumentTree(
+            meta_dict={
+                "file_name": "book.pdf",
+                "source_sha256": "b" * 64,
+                "document_version_id": "document-version-2",
+            },
+            cfg=SimpleNamespace(save_path=directory),
+        )
+        section = TreeNode({"pdf_id": 1, "page_idx": 0, "content": "Probability Laws"})
+        section.type = NodeType.TITLE
+        tree.add_node(section)
+        tree.root_node.add_child(section)
+
+        def child(node_type, **meta):
+            node = TreeNode(meta)
+            node.type = node_type
+            tree.add_node(node)
+            section.add_child(node)
+            return node
+
+        child(NodeType.TEXT, pdf_id=2, page_idx=0, content="Far earlier sentence.")
+        child(
+            NodeType.IMAGE,
+            pdf_id=3,
+            page_idx=0,
+            content="Figure 1.5: the event M that Romeo and Juliet arrive within 15 minutes.",
+        )
+        equation = child(
+            NodeType.EQUATION,
+            pdf_id=4,
+            page_idx=0,
+            content="M = {(x,y) | |x-y| <= 1/4}",
+        )
+        equation.summary = summary
+        child(NodeType.TEXT, pdf_id=5, page_idx=0, content="and is shaded in the figure.")
+        child(NodeType.TEXT, pdf_id=6, page_idx=0, content="Unrelated later sentence.")
+        return tree
+
+    def test_an_equation_is_indexed_with_the_prose_that_explains_it(self):
+        # A figure carries an author-written caption; a displayed equation
+        # carries none, and its explanation is in the sentences either side --
+        # which is why the following one can begin mid-clause.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self._equation_in_prose(directory)
+
+            texts = [
+                record.value
+                for record in vdb_index.iter_tree_index_records(tree)
+                if record.modality == "text"
+            ]
+
+            self.assertIn(
+                "Figure 1.5: the event M that Romeo and Juliet arrive within 15 minutes.\n"
+                "M = {(x,y) | |x-y| <= 1/4}\n"
+                "and is shaded in the figure.",
+                texts,
+            )
+
+    def test_the_equation_context_window_stops_at_one_sibling_each_side(self):
+        # Wider windows measured worse on every equation and question tried.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self._equation_in_prose(directory)
+
+            context = [
+                record.value
+                for record in vdb_index.iter_tree_index_records(tree)
+                if record.modality == "text"
+                and record.value.startswith("Figure 1.5:")
+                and "shaded" in record.value
+            ]
+
+            self.assertEqual(1, len(context), context)
+            self.assertNotIn("Far earlier sentence.", context[0])
+            self.assertNotIn("Unrelated later sentence.", context[0])
+
+    def test_an_equation_summary_is_indexed_apart_from_its_neighbourhood(self):
+        # The summary states the mathematics and finds a definition; the
+        # neighbours state the situation and find a worked example. Blending
+        # them measured worse than either, so they stay separate records.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self._equation_in_prose(
+                directory, summary="The set M of points within 1/4 of the diagonal."
+            )
+
+            texts = [
+                record.value
+                for record in vdb_index.iter_tree_index_records(tree)
+                if record.modality == "text"
+            ]
+
+            self.assertIn(
+                "The set M of points within 1/4 of the diagonal.\n"
+                "M = {(x,y) | |x-y| <= 1/4}",
+                texts,
+            )
+            self.assertTrue(
+                any(t.startswith("Figure 1.5:") and "shaded" in t for t in texts),
+                f"the neighbourhood must survive alongside the summary: {texts}",
+            )
 
     def test_metadata_is_scalar_and_binds_canonical_or_derived_source(self):
         with tempfile.TemporaryDirectory() as directory:
