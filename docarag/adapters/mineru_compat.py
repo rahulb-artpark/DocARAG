@@ -86,6 +86,55 @@ def _joined_text(value: object) -> str | None:
     return None
 
 
+def _coordinate_quad(value: object) -> tuple[float, float, float, float] | None:
+    """Four finite numbers, or nothing."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    if len(value) != 4:
+        return None
+    try:
+        quad = tuple(float(item) for item in value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if any(item != item or item in (float("inf"), float("-inf")) for item in quad):
+        return None
+    return quad  # type: ignore[return-value]
+
+
+def _descendant_bboxes(node: Mapping[str, object]):
+    for child in node.get("blocks") or ():
+        if not isinstance(child, Mapping):
+            continue
+        quad = _coordinate_quad(child.get("bbox"))
+        if quad is not None:
+            yield quad
+        yield from _descendant_bboxes(child)
+
+
+def _bbox_from_children(middle: Mapping[str, object]) -> list[float] | None:
+    """The extent of a group MinerU never computed one for.
+
+    A figure group with a caption but no image region -- MinerU emits
+    ``{"type": "image", "bbox": [], "blocks": [{"type": "image_caption", ...}]}``
+    -- has no bbox of its own because there is no image sub-block to take one
+    from.  Its children have real geometry, and a group's extent is the union
+    of what it contains, so the caption is placed on the page rather than
+    discarded.  One such block failing a translation that must stay one-to-one
+    with its input took a whole book down with it.
+    """
+
+    quads = list(_descendant_bboxes(middle))
+    if not quads:
+        return None
+    return [
+        min(q[0] for q in quads),
+        min(q[1] for q in quads),
+        max(q[2] for q in quads),
+        max(q[3] for q in quads),
+    ]
+
+
 def _middle_json(block: Mapping[str, object]) -> Mapping[str, object]:
     value = block.get("middle_json", {})
     middle = dict(require_mapping(value, "middle_json"))
@@ -97,6 +146,10 @@ def _middle_json(block: Mapping[str, object]) -> Mapping[str, object]:
         middle["coordinate_space"] = CoordinateSpace.PARSER_PAGE.value
         middle["page_width"] = 1000
         middle["page_height"] = 1000
+    if _coordinate_quad(middle.get("bbox")) is None:
+        derived = _bbox_from_children(middle)
+        if derived is not None:
+            middle["bbox"] = derived
     return middle
 
 
@@ -162,7 +215,12 @@ def _geometry(middle: Mapping[str, object]) -> SourceGeometry | None:
             bbox_value, (str, bytes, bytearray)
         ):
             raise ContractValidationError("middle_json.bbox must be an array")
-        bbox = BoundingBox.from_sequence(bbox_value)
+        # An empty bbox is MinerU declining to place the block, not a
+        # malformed one. Absent geometry is already a supported outcome
+        # below; refusing it here instead failed the whole document, which
+        # cannot be the right answer to one unplaced caption.
+        if len(bbox_value) > 0:
+            bbox = BoundingBox.from_sequence(bbox_value)
     if polygon_value:
         if not isinstance(polygon_value, Sequence) or isinstance(
             polygon_value, (str, bytes, bytearray)

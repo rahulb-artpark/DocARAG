@@ -697,6 +697,97 @@ class MinerUNormalizedAdapterTests(unittest.TestCase):
         self.assertFalse(result.observations)
         self.assertEqual(ErrorClassification.RETRYABLE, result.issues[0].classification)
 
+    def test_a_group_without_its_own_bbox_takes_the_extent_of_its_children(self):
+        # MinerU emits a figure group with a caption but no image region as
+        # {"type": "image", "bbox": [], "blocks": [caption]} -- there is no
+        # image sub-block to take a bbox from. Rejecting it failed a whole
+        # book, because the translation has to stay one-to-one with its input.
+        caption_only = {
+            "type": "image",
+            "image_caption": ["Figure 1: An algorithm."],
+            "image_footnote": [],
+            "page_idx": 1,
+            "middle_json": {
+                "type": "image",
+                "bbox": [],
+                "index": 6,
+                "blocks": [
+                    {"type": "image_caption", "bbox": [94, 658, 501, 689]},
+                ],
+            },
+        }
+
+        result = self.adapter(self.blocks[:1] + [caption_only]).parse(self.request)
+
+        self.assertEqual(ParseStatus.SUCCEEDED, result.status)
+        self.assertEqual(2, len(result.observations))
+        self.assertEqual(
+            [94.0, 658.0, 501.0, 689.0],
+            result.observations[1].geometry.bbox.to_list(),
+        )
+
+    def test_a_group_extent_spans_every_descendant(self):
+        nested = {
+            "type": "image",
+            "image_caption": ["Figure 2: a nested group."],
+            "image_footnote": [],
+            "page_idx": 1,
+            "middle_json": {
+                "type": "image",
+                "bbox": [],
+                "index": 7,
+                "blocks": [
+                    {
+                        "type": "image_caption",
+                        "bbox": [100, 600, 200, 650],
+                        "blocks": [{"type": "line", "bbox": [90, 700, 400, 720]}],
+                    },
+                ],
+            },
+        }
+
+        result = self.adapter(self.blocks[:1] + [nested]).parse(self.request)
+
+        self.assertEqual(
+            [90.0, 600.0, 400.0, 720.0],
+            result.observations[1].geometry.bbox.to_list(),
+        )
+
+    def test_a_block_placed_nowhere_at_all_survives_without_geometry(self):
+        # Nothing to derive an extent from. Absent geometry is already a
+        # supported outcome; it must not be escalated to a failed document.
+        unplaced = {
+            "type": "image",
+            "image_caption": ["Figure 3: placed nowhere."],
+            "image_footnote": [],
+            "page_idx": 1,
+            "middle_json": {"type": "image", "bbox": [], "index": 8},
+        }
+
+        result = self.adapter(self.blocks[:1] + [unplaced]).parse(self.request)
+
+        self.assertEqual(ParseStatus.SUCCEEDED, result.status)
+        self.assertEqual(2, len(result.observations))
+        self.assertIsNone(result.observations[1].geometry)
+
+    def test_a_malformed_bbox_is_still_rejected(self):
+        # Three coordinates is a broken reading, not an unplaced block, and
+        # nothing in the children can correct it.
+        malformed = {
+            "type": "image",
+            "image_caption": ["Figure 4: a broken reading."],
+            "image_footnote": [],
+            "page_idx": 1,
+            "middle_json": {"type": "image", "bbox": [1, 2, 3], "index": 9},
+        }
+
+        result = self.adapter(self.blocks[:1] + [malformed]).parse(self.request)
+
+        self.assertEqual(ParseStatus.PARTIAL, result.status)
+        self.assertEqual(
+            ParseErrorCode.INVALID_NORMALIZED_BLOCK, result.issues[0].code
+        )
+
     def test_loader_can_preserve_permanent_service_input_failure(self):
         issue = ParseIssue(
             ParseErrorCode.INVALID_REQUEST,
