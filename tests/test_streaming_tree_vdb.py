@@ -154,7 +154,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "alpha",
-                    "table heading|a|b|",
+                    "table heading\n|a|b|",
                     "figure captionfigure footnote",
                     r"E=mc^2",
                     # The neighbouring figure contributes its caption, which is
@@ -169,7 +169,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             )
             self.assertEqual(
                 [
-                    "table heading|a|b|",
+                    "table heading\n|a|b|",
                     "figure captionfigure footnote",
                     # The crop is paired with the neighbourhood, not the LaTeX:
                     # a picture of the symbols and a transcription of the same
@@ -313,6 +313,47 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             self.assertTrue(
                 any(t.startswith("Figure 1.5:") and "shaded" in t for t in texts),
                 f"the neighbourhood must survive alongside the summary: {texts}",
+            )
+
+    def test_a_table_is_indexed_with_the_only_prose_it_has(self):
+        # A grid embeds as markup. "<table><tr><td>" is noise and the cells are
+        # values, so the summary is the one part a question resembles -- and it
+        # was the one part left out.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = DocumentTree(
+                meta_dict={
+                    "file_name": "book.pdf",
+                    "source_sha256": "c" * 64,
+                    "document_version_id": "document-version-3",
+                },
+                cfg=SimpleNamespace(save_path=directory),
+            )
+            node = TreeNode(
+                {
+                    "pdf_id": 1,
+                    "page_idx": 0,
+                    "content": "Table 8.1",
+                    "table_body": "<table><tr><td>sin A</td><td>1/2</td></tr></table>",
+                }
+            )
+            node.type = NodeType.TABLE
+            node.summary = "Trigonometric ratios for 0, 30, 45, 60 and 90 degrees."
+            tree.add_node(node)
+            tree.root_node.add_child(node)
+
+            texts = [
+                record.value
+                for record in vdb_index.iter_tree_index_records(tree)
+                if record.modality == "text"
+            ]
+
+            self.assertEqual(
+                [
+                    "Trigonometric ratios for 0, 30, 45, 60 and 90 degrees.\n"
+                    "Table 8.1\n"
+                    "<table><tr><td>sin A</td><td>1/2</td></tr></table>"
+                ],
+                texts,
             )
 
     def test_metadata_is_scalar_and_binds_canonical_or_derived_source(self):

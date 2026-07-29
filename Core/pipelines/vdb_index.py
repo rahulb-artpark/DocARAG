@@ -980,6 +980,19 @@ _node_content = node_content
 _context_contribution = context_contribution
 
 
+def _table_text(node) -> str:
+    """What a table says, in words and in cells.
+
+    The caption names it and the grid holds the values, but neither is a
+    sentence. The summary is, and it is the part a question resembles.
+    """
+
+    summary = str(getattr(node, "summary", "") or "").strip()
+    caption = node_content(node)
+    body = str(getattr(getattr(node, "meta_info", None), "table_body", "") or "").strip()
+    return "\n".join(part for part in (summary, caption, body) if part)
+
+
 def _equation_self_text(node) -> str:
     """What the equation says, in words and in symbols."""
 
@@ -1162,10 +1175,12 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
                     image_str,
                 )
         elif node_type == NodeType.TABLE:
-            table_str = node.meta_info.content or ""
-            table_body = node.meta_info.table_body
-            if table_body:
-                table_str += table_body
+            # A grid embeds as markup: "<table><tr><td>" is noise, and the
+            # cells that carry the meaning are values, not sentences. The
+            # summary is the only prose a table has -- "the trigonometric
+            # ratios for angles of 0, 30, 45, 60 and 90 degrees" is what a
+            # question matches, and it was the one part left out.
+            table_str = _table_text(node)
             yield TreeIndexRecord(
                 "text", table_str, _representation_metadata(meta_data, "text")
             )
