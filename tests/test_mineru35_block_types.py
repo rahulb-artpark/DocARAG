@@ -38,7 +38,7 @@ MINERU_35_BLOCK_TYPES = {
     "title": BlockType.TITLE,
     "interline_equation": BlockType.EQUATION,
     "equation": BlockType.EQUATION,
-    "formula_number": BlockType.EQUATION,
+    "formula_number": BlockType.CAPTION,
     "list": BlockType.LIST_ITEM,
     "index": BlockType.LIST_ITEM,
     "discarded": BlockType.DISCARDED,

@@ -201,10 +201,16 @@ def _block_type(block: Mapping[str, object], middle: Mapping[str, object]) -> tu
         return BlockType.TABLE, subtype
     # interline_equation is what MinerU 3.x actually emits for a display
     # equation; matching only "equation" sent every one of them to UNKNOWN.
-    if raw in {"equation", "interline_equation", "formula_number"}:
+    # inline_equation is deliberately absent: it is a span inside a sentence,
+    # never a block, and is transcribed in place by transcribe_inline_equations.
+    if raw in {"equation", "interline_equation"}:
         return BlockType.EQUATION, subtype or (
             raw if raw != "equation" else None
         )
+    # "(3.1)" beside an equation is its label, not mathematics. As an equation
+    # node it would carry no formula and earn its own index records.
+    if raw == "formula_number":
+        return BlockType.CAPTION, subtype or raw
     if raw in {"code", "code_body"}:
         return BlockType.CODE, subtype
     if raw == "algorithm":
