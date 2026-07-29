@@ -46,7 +46,10 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
                 server_url="https://secret:credential@example.invalid/v1",
             ),
             figures=FigureConfig(
-                ocr=False, describe=False, transcribe_formulas=False
+                ocr=False,
+                describe=False,
+                transcribe_formulas=False,
+                transcribe_tables=False,
             ),
         )
 

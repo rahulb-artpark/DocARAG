@@ -499,12 +499,19 @@ def _enrich_figures(
         transcribe_inline_equations,
     )
 
+    from docarag.table_transcription import (
+        VLMTableTranscriber,
+        transcribe_table_blocks,
+    )
+
     has_visual = any(block.block_type in VISUAL_BLOCK_TYPES for block in blocks)
     has_equations = any(
         block.block_type is BlockType.EQUATION for block in blocks
     )
+    has_tables = any(block.block_type is BlockType.TABLE for block in blocks)
     run_figures = cfg.figures.ocr and has_visual
     run_formulas = cfg.figures.transcribe_formulas and has_equations
+    run_tables = cfg.figures.transcribe_tables and has_tables
     # MinerU crops individual equation spans even inside blocks it never
     # types as EQUATION (a formula written inline in a paragraph, say) --
     # transcribe_equation_blocks only ever looks at BlockType.EQUATION, so
@@ -512,10 +519,15 @@ def _enrich_figures(
     run_inline_formulas = cfg.figures.transcribe_formulas and (
         has_inline_formula_candidates(blocks)
     )
-    if not run_figures and not run_formulas and not run_inline_formulas:
+    if (
+        not run_figures
+        and not run_formulas
+        and not run_inline_formulas
+        and not run_tables
+    ):
         return blocks
 
-    wants_vlm = run_formulas or run_inline_formulas or (
+    wants_vlm = run_formulas or run_inline_formulas or run_tables or (
         run_figures and (cfg.figures.describe or cfg.figures.diagrams)
     )
     vlm = VLM(cfg.vlm) if wants_vlm else None
@@ -553,6 +565,21 @@ def _enrich_figures(
                 formula_stats.transcribed_blocks,
                 formula_stats.skipped_blocks,
                 formula_stats.failed_blocks,
+            )
+        if run_tables:
+            enriched, table_stats = transcribe_table_blocks(
+                enriched,
+                resolver=crop_store.make_asset_resolver(),
+                transcriber=VLMTableTranscriber(vlm),
+            )
+            log.info(
+                "table transcription: %d tables, %d transcribed, %d skipped, "
+                "%d failed, %d rejected on shape",
+                table_stats.table_blocks,
+                table_stats.transcribed_blocks,
+                table_stats.skipped_blocks,
+                table_stats.failed_blocks,
+                table_stats.shape_mismatch_blocks,
             )
         if run_inline_formulas:
             enriched, inline_stats = transcribe_inline_equations(

@@ -12,12 +12,18 @@ class FigureConfig:
     node/edge topology a description flattens away.
     ``transcribe_formulas`` has that model re-read each equation crop, because
     the dedicated formula recognizer drops lines it cannot segment.
+    ``transcribe_tables`` does the same for table crops, whose recognizer fails
+    the same way on notation: a trigonometric ratios table came back with
+    ``1|2`` for a half and empty cells where one over root two belonged.  The
+    re-reading is admitted only when its row and column counts match what the
+    recognizer found, so an invented table cannot replace a damaged one.
     """
 
     ocr: bool = True
     describe: bool = True
     diagrams: bool = True
     transcribe_formulas: bool = True
+    transcribe_tables: bool = True
     ocr_lang: str = "en"
     min_confidence: float = 0.5
 
