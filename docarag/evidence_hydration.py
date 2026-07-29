@@ -67,6 +67,20 @@ def _fail(message: str) -> NoReturn:
     raise EvidenceHydrationError(message)
 
 
+# Node types whose evidence lives in the projection's "text" channel, and
+# those whose evidence lives in its image caption/footnote channels. Both sets
+# mirror bookrag_projection's _NODE_TYPE_BY_BLOCK / _VISUAL_NODE_TYPE_BY_BLOCK:
+# a type added there without being added here hydrates as "unsupported node
+# type" rather than degrading quietly.
+_TEXT_NODE_TYPES = frozenset(
+    {"text", "code", "algorithm", "abstract", "reference"}
+)
+_VISUAL_NODE_TYPES = frozenset({"image", "chart", "diagram"})
+# Types that may carry a materialized crop whose path must match the
+# projection. Mirrors vdb_index._CROP_BEARING_NODE_TYPES.
+_CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {"table", "equation"}
+
+
 def _non_empty_text(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         _fail(f"{field_name} must be a non-empty string")
@@ -1104,8 +1118,11 @@ class CanonicalEvidenceHydrator:
             _fail("direct tree node selected_asset_ids are not canonical block assets")
         projected_type = projected.get("type")
         node_type = _json_value(tree_node.get("type"))
-        if projected_type == "text":
-            if node_type not in {"text", "title"}:
+        # A node keeps the type the projection gave it. The outline pass may
+        # additionally promote any text-carrying node to "title", so that one
+        # substitution is allowed everywhere a text channel is expected.
+        if projected_type in _TEXT_NODE_TYPES:
+            if node_type not in {projected_type, "title"}:
                 _fail("direct tree node type differs from canonical block")
             expected_content = projected.get("text", "")
         elif projected_type == "table":
@@ -1123,8 +1140,8 @@ class CanonicalEvidenceHydrator:
             if node_type != "equation":
                 _fail("direct tree node type differs from canonical block")
             expected_content = projected.get("text", "")
-        elif projected_type == "image":
-            if node_type != "image":
+        elif projected_type in _VISUAL_NODE_TYPES:
+            if node_type != projected_type:
                 _fail("direct tree node type differs from canonical block")
             expected_content = "".join(
                 [
@@ -1138,7 +1155,7 @@ class CanonicalEvidenceHydrator:
             _fail("direct tree node content differs from canonical block")
         projected_img_path = projected.get("img_path")
         if (
-            projected_type in {"table", "equation", "image"}
+            projected_type in _CROP_BEARING_NODE_TYPES
             and projected_img_path
             and tree_node.get("img_path") != projected_img_path
         ):

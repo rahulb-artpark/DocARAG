@@ -121,7 +121,16 @@ def run_stage(run: Path, stage: str) -> int:
     else:
         config = run / "run_config.yaml"
         if not config.is_file():
-            raise RuntimeError(f"run has no frozen configuration: {config}")
+            # No stage has ever run against this revision, so main.py has not
+            # frozen a snapshot yet -- it does that itself, the first time,
+            # from the admitted config snapshot.
+            snapshots = sorted((run / "inputs").glob("system-config-*.yaml"))
+            if not snapshots:
+                raise RuntimeError(
+                    f"run has neither a frozen configuration nor an admitted "
+                    f"snapshot under {run}/inputs"
+                )
+            config = snapshots[0]
         datasets = sorted((run / "inputs").glob("dataset-*.yaml"))
         if not datasets:
             raise RuntimeError(f"run has no dataset snapshot under {run}/inputs")
@@ -148,30 +157,57 @@ def run_stage(run: Path, stage: str) -> int:
             "DOCARAG_RUNS_DIR": str(run.parent.parent),
         }
     )
+
+    from docarag.admission import STAGE_NAMES, update_index_state
+    from docarag.evidence_persist import ensure_revision_admitted
+
+    revision_id = str(manifest["revision_id"])
+    state_path = run / "index-state.json"
+    file_state = json.loads(state_path.read_text(encoding="utf-8"))
+    attempt_id = file_state.get("attempt_id")
+    pid = os.getpid()
+
+    # The ledger row is admission's job, but stage_state/revision_seal are
+    # keyed by revision_key -- so it must exist before the very first stage
+    # of a freshly admitted run, not just before persistence.
+    ensure_revision_admitted(run)
+
     with _connect() as connection:
         key = _revision_key(connection, run)
         with _stage_lock(connection, key, stage):
             _record(connection, key, stage, "running")
+            if stage in STAGE_NAMES:
+                update_index_state(
+                    state_path, revision_id, pid, "stage_started",
+                    stage=stage, attempt_id=attempt_id,
+                )
             completed = subprocess.run(command, cwd=str(repo), env=env)
             status = "succeeded" if completed.returncode == 0 else "failed"
             error = None if completed.returncode == 0 else f"exit {completed.returncode}"
             _record(connection, key, stage, status, error)
+            if stage in STAGE_NAMES:
+                update_index_state(
+                    state_path, revision_id, pid,
+                    "stage_succeeded" if status == "succeeded" else "stage_failed",
+                    stage=stage, exit_code=completed.returncode, error=error,
+                    attempt_id=attempt_id,
+                )
             if status == "succeeded" and stage == "tree":
-                # New tree rows: graph bindings and vectors no longer
-                # describe them.
-                _record(connection, key, "graph", "stale")
-                _record(connection, key, "vdb", "stale")
-            if status == "succeeded" and stage in ("tree", "graph", "vdb"):
-                # A re-run stage rewrote published artifacts; the manifest
-                # and the sealed run state must describe what is now on disk.
-                republish = _republish(run, repo, env)
-                if republish != 0:
-                    _record(
-                        connection, key, stage,
-                        "failed", "artifact republication failed",
+                # New tree rows invalidate whatever graph/vdb previously
+                # described the old ones -- but a stage that has never run
+                # is "pending", not stale; there is nothing to invalidate.
+                previously_run = {
+                    row["stage"]
+                    for row in connection.execute(
+                        "SELECT stage FROM docarag.stage_state "
+                        "WHERE revision_key = %s AND stage IN ('graph', 'vdb') "
+                        "AND status = 'succeeded'",
+                        (key,),
                     )
-                    print(f"[stage] {stage}: failed (republication)")
-                    return republish
+                }
+                for downstream in ("graph", "vdb"):
+                    if downstream in previously_run:
+                        _record(connection, key, downstream, "stale")
             if status == "succeeded" and stage in ("tree", "graph"):
                 # A stage's output belongs to the store the moment the
                 # stage ends.
@@ -189,6 +225,24 @@ def run_stage(run: Path, stage: str) -> int:
                 )
                 if part.returncode != 0:
                     status = "failed"
+            if status == "succeeded" and stage in ("tree", "graph", "vdb"):
+                # Only a run whose file state now shows every stage
+                # succeeded is publishable -- mirroring the bash driver,
+                # which only finalizes after its whole stage loop completes.
+                current = json.loads(state_path.read_text(encoding="utf-8"))
+                all_succeeded = all(
+                    (current["stages"].get(name) or {}).get("status") == "succeeded"
+                    for name in STAGE_NAMES
+                )
+                if all_succeeded:
+                    republish = _republish(run, repo, env)
+                    if republish != 0:
+                        _record(
+                            connection, key, stage,
+                            "failed", "artifact republication failed",
+                        )
+                        print(f"[stage] {stage}: failed (republication)")
+                        return republish
     print(f"[stage] {stage}: {status}")
     return completed.returncode
 

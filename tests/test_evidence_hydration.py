@@ -135,7 +135,9 @@ def tree_record(document: DocumentRef, block: CanonicalBlock, index_id: int) -> 
         "canonical_relations": deepcopy(row["canonical_relations"]),
         "geometry": block.geometry.to_dict(),
     }
-    if node_type in {"table", "equation", "image"}:
+    # Mirrors evidence_hydration._CROP_BEARING_NODE_TYPES: a chart and a
+    # diagram carry a crop exactly as an image does.
+    if node_type in {"table", "equation", "image", "chart", "diagram"}:
         record["img_path"] = row["img_path"]
     if node_type == "table":
         record.update(

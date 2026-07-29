@@ -280,7 +280,10 @@ class RichBookRAGProjectionTests(unittest.TestCase):
             [row["canonical_block_id"] for row in projected],
         )
         self.assertEqual(
-            ["text", "equation", "table", "image"],
+            # A diagram projects as "diagram", not "image": its topology is
+            # read differently from a photograph, and collapsing the two threw
+            # that distinction away before the tree ever saw it.
+            ["text", "equation", "table", "diagram"],
             [row["type"] for row in projected],
         )
 

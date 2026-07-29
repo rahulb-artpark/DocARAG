@@ -10,7 +10,13 @@ log = logging.getLogger(__name__)
 
 
 class NodeType(str, Enum):
-    """Enum for node types in the document tree."""
+    """Enum for node types in the document tree.
+
+    A node keeps its own type rather than collapsing into TEXT because type
+    decides how the node is summarised, what records it contributes to the
+    index, and how an answer renders it.  A code listing summarised as prose,
+    or a chart indexed as a paragraph, loses the thing that made it findable.
+    """
 
     ROOT = "root"
     TEXT = "text"
@@ -18,6 +24,12 @@ class NodeType(str, Enum):
     TABLE = "table"
     EQUATION = "equation"
     TITLE = "title"
+    CODE = "code"
+    CHART = "chart"
+    DIAGRAM = "diagram"
+    ALGORITHM = "algorithm"
+    ABSTRACT = "abstract"
+    REFERENCE = "reference"
     UNKNOWN = "unknown"
 
 

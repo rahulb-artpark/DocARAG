@@ -164,14 +164,25 @@ def _block_type(block: Mapping[str, object], middle: Mapping[str, object]) -> tu
         if subtype is not None
         else None
     )
-    if raw in {"text", "title", "paragraph"}:
+    if raw in {"text", "title", "paragraph", "doc_title", "paragraph_title"}:
         text_level = block.get("text_level")
         has_title_level = (
             isinstance(text_level, int)
             and not isinstance(text_level, bool)
             and text_level >= 0
         ) or (isinstance(text_level, str) and text_level.isdigit())
-        if raw == "title" or middle_type == "title" or has_title_level:
+        # MinerU 3.x reports the document's own title separately from section
+        # headings.  Keeping them apart is the whole point: the outline pass no
+        # longer has to infer which of several equal-looking titles names the
+        # document, which is what let a mid-document heading adopt most of a
+        # document's blocks.
+        if raw == "doc_title" or middle_type == "doc_title":
+            return BlockType.DOC_TITLE, subtype
+        if (
+            raw in {"title", "paragraph_title"}
+            or middle_type in {"title", "paragraph_title"}
+            or has_title_level
+        ):
             return BlockType.TITLE, subtype
         if middle_type in {"list", "list_item"}:
             return BlockType.LIST_ITEM, subtype
@@ -182,24 +193,56 @@ def _block_type(block: Mapping[str, object], middle: Mapping[str, object]) -> tu
         return BlockType.PARAGRAPH, subtype
     if raw in _DIAGRAM_SUBTYPES or subtype_label in _DIAGRAM_SUBTYPES:
         return BlockType.DIAGRAM, subtype_label or raw
-    if raw == "image":
-        return BlockType.FIGURE, subtype or "figure"
-    if raw == "chart":
+    if raw in {"image", "image_body", "header_image", "footer_image"}:
+        return BlockType.FIGURE, subtype or ("figure" if raw == "image" else raw)
+    if raw in {"chart", "chart_body"}:
         return BlockType.CHART, subtype or "chart"
-    if raw == "table":
+    if raw in {"table", "table_body"}:
         return BlockType.TABLE, subtype
-    if raw == "equation":
-        return BlockType.EQUATION, subtype
-    if raw == "code":
+    # interline_equation is what MinerU 3.x actually emits for a display
+    # equation; matching only "equation" sent every one of them to UNKNOWN.
+    if raw in {"equation", "interline_equation", "formula_number"}:
+        return BlockType.EQUATION, subtype or (
+            raw if raw != "equation" else None
+        )
+    if raw in {"code", "code_body"}:
         return BlockType.CODE, subtype
+    if raw == "algorithm":
+        return BlockType.ALGORITHM, subtype
+    if raw == "abstract":
+        return BlockType.ABSTRACT, subtype
+    if raw == "ref_text":
+        return BlockType.REFERENCE, subtype
+    if raw in {"aside_text", "vertical_text", "phonetic"}:
+        return BlockType.ASIDE, subtype or raw
+    if raw == "discarded":
+        return BlockType.DISCARDED, subtype or raw
     if raw in {"list", "index"}:
         return BlockType.LIST_ITEM, subtype or raw
+    if raw in {
+        "caption",
+        "image_caption",
+        "table_caption",
+        "chart_caption",
+        "code_caption",
+        "algorithm_caption",
+    }:
+        return BlockType.CAPTION, subtype or raw
     if raw in {"header", "page_header"}:
         return BlockType.HEADER, subtype
     if raw in {"footer", "page_footer", "page_number"}:
         return BlockType.FOOTER, subtype or raw
-    if raw in {"page_footnote", "footnote"}:
-        return BlockType.FOOTNOTE, subtype
+    if raw in {
+        "page_footnote",
+        "footnote",
+        "image_footnote",
+        "table_footnote",
+        "chart_footnote",
+        "code_footnote",
+    }:
+        return BlockType.FOOTNOTE, subtype or (
+            raw if raw != "footnote" else None
+        )
     if subtype is not None:
         return BlockType.UNKNOWN, subtype
     return BlockType.UNKNOWN, None if raw == "unknown" else raw

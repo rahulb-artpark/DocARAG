@@ -46,12 +46,31 @@ def _evidence_meta(pdf_content: dict) -> dict:
     }
 
 
+# Projected type string -> node type, for blocks whose evidence is text and
+# for those whose evidence is a crop. Mirrors bookrag_projection's
+# _NODE_TYPE_BY_BLOCK / _VISUAL_NODE_TYPE_BY_BLOCK. An unrecognised type still
+# falls back to TEXT below, so a future parser type degrades rather than
+# raising mid-ingestion.
+_TEXT_CONTENT_TYPES = {
+    "text": NodeType.TEXT,
+    "code": NodeType.CODE,
+    "algorithm": NodeType.ALGORITHM,
+    "abstract": NodeType.ABSTRACT,
+    "reference": NodeType.REFERENCE,
+}
+_VISUAL_CONTENT_TYPES = {
+    "image": NodeType.IMAGE,
+    "chart": NodeType.CHART,
+    "diagram": NodeType.DIAGRAM,
+}
+
+
 def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
     if pdf_content is None:
         raise ValueError("pdf_content must be a normalized block")
     evidence_meta = _evidence_meta(pdf_content)
     content_type = pdf_content.get("type", "unknown")
-    if content_type == "text":
+    if content_type in _TEXT_CONTENT_TYPES:
         node_meta = {
             "content": pdf_content.get("text", ""),
             "pdf_id": pdf_content.get("pdf_id", -1),
@@ -72,9 +91,14 @@ def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
                 node_meta["title_level"] = level
 
         node = TreeNode(node_meta)
-        node.type = NodeType.TITLE if isTitle else NodeType.TEXT
+        # A title promotion wins over the block's own type: the outline pass
+        # has decided this block opens a section. Otherwise the node keeps the
+        # type the projection gave it, so a code listing stays code.
+        node.type = (
+            NodeType.TITLE if isTitle else _TEXT_CONTENT_TYPES[content_type]
+        )
         node.outline_node = isTitle
-    elif content_type == "image":
+    elif content_type in _VISUAL_CONTENT_TYPES:
         caption = pdf_content.get("image_caption", [])
         caption_str = " ".join(caption) if isinstance(caption, list) else ""
         footnote = pdf_content.get("image_footnote", [])
@@ -90,7 +114,7 @@ def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
             **evidence_meta,
         }
         node = TreeNode(node_meta)
-        node.type = NodeType.IMAGE
+        node.type = _VISUAL_CONTENT_TYPES[content_type]
     elif content_type == "table":
         caption = pdf_content.get("table_caption", [])
         caption_str = " ".join(caption) if isinstance(caption, list) else ""

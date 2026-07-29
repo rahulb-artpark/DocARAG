@@ -20,6 +20,42 @@ def _default_cas_root(run: Path) -> Path:
     return run.parent.parent / "_assets"
 
 
+def ensure_revision_admitted(run: Path, *, database_url: str | None = None) -> int:
+    """Admit a run's revision to the ledger if it is not there already.
+
+    Every stage's Postgres bookkeeping (stage_state, revision_seal) is keyed
+    by revision_key, which only exists once the ledger has a row -- so this
+    runs before the very first stage of a freshly admitted run, not just
+    before persistence. Safe to call repeatedly: admission is a no-op once
+    the row exists.
+    """
+
+    from docarag.persistence.contracts import CorpusScope, IndexRevisionSpec
+    from docarag.persistence.postgres import PostgresLedger
+
+    manifest = json.loads((run / "run-manifest.json").read_text(encoding="utf-8"))
+    source = manifest.get("source")
+    if not isinstance(source, dict) or not source.get("sha256"):
+        raise RuntimeError("run manifest has no source identity")
+    from docarag.domain.evidence import DocumentRef
+
+    document = DocumentRef.identified(
+        content_sha256=source["sha256"],
+        mime_type="application/pdf",
+        source_uri=source.get("uri") or Path(source.get("path", "")).as_uri(),
+        display_name=Path(source.get("path", "document.pdf")).name,
+    )
+    url = database_url or os.environ.get("DOCARAG_DATABASE_URL")
+    if not url:
+        raise RuntimeError("DOCARAG_DATABASE_URL is not set")
+    ledger = PostgresLedger(url)
+    scope = ledger.record_document(
+        CorpusScope(str(manifest["tenant_id"]), str(manifest["corpus_id"])), document
+    )
+    _admit_revision(ledger, scope, manifest, run, IndexRevisionSpec)
+    return ledger.revision_key(scope, str(manifest["revision_id"]))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Persist run evidence to PostgreSQL")
     parser.add_argument("--run", type=Path, required=True)

@@ -1631,6 +1631,7 @@ def build_tree_from_pdf(
                             method=method,
                             server_url=server_url,
                             lang=cfg.mineru.lang,
+                            effort=cfg.mineru.effort,
                             start_page_id=start_page_id,
                             end_page_id=end_page_id,
                             # Without this, do_parse's own .md/_middle.json/

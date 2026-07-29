@@ -2,7 +2,7 @@
 # Single-GPU (cuda:0) + Ollama setup of the full GBC (BookRAG) pipeline.
 # - LLM + VLM + text-embedding  -> served by local Ollama (http://localhost:11434)
 # - Rerankers + multimodal model -> loaded locally in-process via transformers on cuda:0
-# - MinerU PDF parsing           -> "vlm-transformers" backend, loads locally in-process
+# - MinerU PDF parsing           -> "hybrid-engine" backend, loads locally in-process
 #
 # pdf_path / save_path are overridden per-document by the dataset config, so leave as-is.
 
@@ -36,9 +36,19 @@ vlm:
   num_ctx: 16384
 
 mineru:
-  backend: pipeline              # native text layer + dedicated layout/table/formula/OCR models
-  method: auto                   # per page: native text for digital pages, OCR for scanned
-  server_url: http://localhost:30000   # unused with the pipeline backend
+  # hybrid-engine reads handwriting; pipeline does not. Measured on a cursive
+  # scan (10P_CH11.pdf): pipeline scored a 44.9% dictionary-word rate where
+  # printed documents score 93-98%, and found 3 titles. hybrid-engine scored
+  # 96.7% and found 14, including the section heading whose absence had made
+  # one defect's symptoms children of a different defect.
+  #
+  # It costs roughly 6x the parse time (29s vs 5s for 5 pages), which is the
+  # trade this pipeline takes deliberately: a cheap parse that misreads the
+  # page poisons every stage downstream of it.
+  backend: hybrid-engine
+  method: vlm                    # forced by the backend; kept explicit for readability
+  effort: medium                 # "high" adds image/chart analysis; measured no gain here
+  server_url: http://localhost:30000   # unused with a local *-engine backend
   lang: en
 
 figures:

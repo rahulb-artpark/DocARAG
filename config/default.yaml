@@ -25,7 +25,7 @@ vlm:
   backend: ollama
 
 mineru:
-  backend: vlm-sglang-client
+  backend: vlm-http-client
   method: vlm
   server_url: TODO
   lang: en

@@ -970,6 +970,31 @@ def _representation_metadata(metadata: dict, modality: Literal["text", "image"])
 #: How many siblings on each side of an equation carry its explanation.
 #: Measured wider windows dilute: a two-sided span of 2 scored below a span of
 #: 1 on every equation and question tried.
+# Node types whose evidence is a crop, and those whose evidence is prose.
+# A chart and a diagram index exactly like an image -- caption text plus the
+# crop itself -- because what makes them findable is the same pair. Code,
+# algorithms, abstracts and references index like prose. Keeping these as sets
+# means adding a node type is one edit here rather than four scattered
+# equality checks that silently exclude it from the index.
+_VISUAL_NODE_TYPES = frozenset(
+    {NodeType.IMAGE, NodeType.CHART, NodeType.DIAGRAM}
+)
+_TEXT_NODE_TYPES = frozenset(
+    {
+        NodeType.TEXT,
+        NodeType.TITLE,
+        NodeType.CODE,
+        NodeType.ALGORITHM,
+        NodeType.ABSTRACT,
+        NodeType.REFERENCE,
+    }
+)
+# Types that may carry a materialized crop alongside their text.
+_CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {
+    NodeType.TABLE,
+    NodeType.EQUATION,
+}
+
 _EQUATION_CONTEXT_NEIGHBOURS = 1
 
 #: Bounds one equation's context so a long sibling cannot crowd the embedder.
@@ -1159,7 +1184,7 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
         node_type = node.type
         meta_data = _node_trace_metadata(tree, node)
 
-        if node_type == NodeType.IMAGE:
+        if node_type in _VISUAL_NODE_TYPES:
             image_path = node.meta_info.img_path
             image_str = (node.meta_info.caption or "") + (
                 node.meta_info.footnote or ""
@@ -1230,7 +1255,7 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
                     _representation_metadata(meta_data, "image"),
                     context_text or self_text or "",
                 )
-        elif node_type == NodeType.TEXT or node_type == NodeType.TITLE:
+        elif node_type in _TEXT_NODE_TYPES:
             text_content = node.meta_info.content
             if text_content:
                 yield TreeIndexRecord(
@@ -1764,7 +1789,7 @@ def compute_mm_embedding(cfg: SystemConfig, tree_index: DocumentTree):
         content = node.meta_info.content
         img_path = (
             node.meta_info.img_path
-            if node_type in (NodeType.IMAGE, NodeType.TABLE, NodeType.EQUATION)
+            if node_type in _CROP_BEARING_NODE_TYPES
             else None
         )
 

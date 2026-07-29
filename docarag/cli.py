@@ -515,6 +515,24 @@ def command_stage(args: argparse.Namespace) -> int:
     return pipeline_main([args.stage_name, "--run", args.run])
 
 
+def command_admit(args: argparse.Namespace) -> int:
+    _load(args)
+    from docarag.admission import admit
+    from docarag.pipeline import run_all
+
+    try:
+        run_dir = admit(
+            args.pdf, args.config,
+            tenant_id=args.tenant_id, corpus_id=args.corpus_id, runs_dir=args.runs_dir,
+        )
+    except RuntimeError as exc:
+        raise CLIError(str(exc)) from exc
+    print(f"run dir: {run_dir}")
+    if not args.run_now:
+        return 0
+    return run_all(run_dir)
+
+
 def command_pipeline(args: argparse.Namespace) -> int:
     _load(args)
     from docarag.pipeline import main as pipeline_main
@@ -1039,6 +1057,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stage_parser.add_argument("--run", required=True)
     stage_parser.set_defaults(handler=command_stage)
+
+    admit_parser = subparsers.add_parser(
+        "admit",
+        help="Admit a PDF and create its run directory, entirely in Python",
+        description=(
+            "Derives the revision identity, writes the immutable run "
+            "manifest and config/dataset snapshots, and registers the "
+            "revision in the ledger -- the admission Scripts/index_pdf.sh "
+            "performs, with no bash and no detached process. Pass --run-now "
+            "to run tree, graph and vdb synchronously afterward."
+        ),
+    )
+    admit_parser.add_argument("pdf")
+    admit_parser.add_argument("--config", required=True)
+    admit_parser.add_argument("--tenant-id", default="default")
+    admit_parser.add_argument("--corpus-id", default="default")
+    admit_parser.add_argument("--runs-dir")
+    admit_parser.add_argument(
+        "--run-now", action="store_true",
+        help="Run tree, graph and vdb synchronously after admission",
+    )
+    admit_parser.set_defaults(handler=command_admit)
 
     pipeline_parser = subparsers.add_parser(
         "pipeline",

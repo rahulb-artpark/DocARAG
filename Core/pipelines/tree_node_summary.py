@@ -82,21 +82,41 @@ def _with_surroundings(tree_node: TreeNode, body: str, *, neighbours: bool) -> s
     return "\n".join(part for part in parts if part)
 
 
+# A node whose type is absent here gets no summary at all -- and a node with
+# no summary is close to unreachable, because the summary is what the tree
+# index embeds. Every type the projection can produce must appear.
+_SELF_DESCRIPTION = {
+    NodeType.IMAGE: "This is an image.",
+    NodeType.TABLE: "This is a table.",
+    NodeType.CHART: "This is a chart. Report the quantities it plots.",
+    NodeType.DIAGRAM: "This is a diagram. Report what it shows and how its parts relate.",
+    NodeType.CODE: "This is a code listing. Say what the code does, not how it is written.",
+    NodeType.ALGORITHM: "This is an algorithm. Say what it computes and by what strategy.",
+}
+# Types summarised from a caption plus their own body, with soft context: they
+# already state their own subject, so they need only the heading above them.
+_CAPTIONED_NODE_TYPES = frozenset(
+    {NodeType.IMAGE, NodeType.TABLE, NodeType.CHART, NodeType.DIAGRAM}
+)
+# Types summarised as prose, exactly as body text is.
+_PROSE_NODE_TYPES = frozenset(
+    {NodeType.TEXT, NodeType.ABSTRACT, NodeType.REFERENCE}
+)
+_SUMMARISABLE_NODE_TYPES = (
+    _CAPTIONED_NODE_TYPES
+    | _PROSE_NODE_TYPES
+    | {NodeType.EQUATION, NodeType.CODE, NodeType.ALGORITHM}
+)
+
+
 def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
     node_type = tree_node.type
-    if node_type not in [
-        NodeType.TEXT,
-        NodeType.IMAGE,
-        NodeType.TABLE,
-        NodeType.EQUATION,
-    ]:
+    if node_type not in _SUMMARISABLE_NODE_TYPES:
         log.warning(f"Node type {node_type} is not supported for summary generation.")
         return ""
 
-    if node_type in [NodeType.IMAGE, NodeType.TABLE]:
-        content = (
-            "This is an image." if node_type == NodeType.IMAGE else "This is a table."
-        )
+    if node_type in _CAPTIONED_NODE_TYPES:
+        content = _SELF_DESCRIPTION[node_type]
         content += "Here is the caption: "
         content += tree_node.meta_info.content or ""
         content += (
@@ -113,6 +133,15 @@ def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
         # is *for*, which is what a question asks about.
         content = _with_surroundings(
             tree_node, tree_node.meta_info.content or "", neighbours=True
+        )
+    elif node_type in (NodeType.CODE, NodeType.ALGORITHM):
+        # A listing names its own identifiers but rarely its purpose, and the
+        # sentence that says what it is for is the prose introducing it -- the
+        # same problem a displayed equation has, so it gets the same treatment.
+        content = _with_surroundings(
+            tree_node,
+            f"{_SELF_DESCRIPTION[node_type]}\n{tree_node.meta_info.content or ''}",
+            neighbours=True,
         )
     else:
         content = tree_node.meta_info.content or ""
@@ -143,7 +172,7 @@ def generate_node_summary(
     node_type = tree_node.type
     prompt = get_node_summary_prompt(tree_node, max_token=llm.config.max_tokens)
 
-    if use_VLM and vlm is not None and node_type in [NodeType.IMAGE, NodeType.TABLE]:
+    if use_VLM and vlm is not None and node_type in _CAPTIONED_NODE_TYPES:
         # Use VLM for image or table nodes
         image_path = tree_node.meta_info.img_path
         if not os.path.exists(image_path):
@@ -302,7 +331,7 @@ def generate_tree_node_summary(
         return bool(
             use_VLM
             and not node.children
-            and node.type in [NodeType.IMAGE, NodeType.TABLE]
+            and node.type in _CAPTIONED_NODE_TYPES
         )
 
     def pending_summary(

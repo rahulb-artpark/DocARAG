@@ -391,18 +391,41 @@ class BookRAGAssetMaterializationLease:
 
 _TEXT_BLOCKS = frozenset(
     {
+        BlockType.DOC_TITLE,
         BlockType.TITLE,
         BlockType.PARAGRAPH,
         BlockType.LIST_ITEM,
         BlockType.CODE,
+        BlockType.ALGORITHM,
+        BlockType.ABSTRACT,
+        BlockType.REFERENCE,
         BlockType.CAPTION,
         BlockType.FOOTNOTE,
         BlockType.HEADER,
         BlockType.FOOTER,
+        BlockType.ASIDE,
         BlockType.UNKNOWN,
     }
 )
 _VISUAL_BLOCKS = frozenset({BlockType.FIGURE, BlockType.CHART, BlockType.DIAGRAM})
+
+# What a text-carrying block becomes in the tree. Anything absent keeps the
+# historical "text", so a block type only gains its own node type when there
+# is a downstream reason for it -- a summariser prompt, an index record shape,
+# or a distinct way of rendering it in an answer.
+_NODE_TYPE_BY_BLOCK = {
+    BlockType.CODE: "code",
+    BlockType.ALGORITHM: "algorithm",
+    BlockType.ABSTRACT: "abstract",
+    BlockType.REFERENCE: "reference",
+}
+# Visual blocks already project as "image"; chart and diagram are separated
+# because a chart's values and a diagram's topology are read differently from
+# a photograph.
+_VISUAL_NODE_TYPE_BY_BLOCK = {
+    BlockType.CHART: "chart",
+    BlockType.DIAGRAM: "diagram",
+}
 _VISUAL_SUBTYPES = frozenset(
     {
         "chart",
@@ -1278,7 +1301,7 @@ def _project_text(block: CanonicalBlock, row: dict[str, object]) -> None:
         )
     row.update(
         {
-            "type": "text",
+            "type": _NODE_TYPE_BY_BLOCK.get(block.block_type, "text"),
             "text": selected.content,
             "text_format": selected.kind.value,
             "selected_representation_id": selected.representation_id,
@@ -1438,7 +1461,7 @@ def _project_visual(
         )
     row.update(
         {
-            "type": "image",
+            "type": _VISUAL_NODE_TYPE_BY_BLOCK.get(block.block_type, "image"),
             # BookRAG has only caption/footnote text channels for an image leaf.
             # Preserve every selected textual visual channel in the caption field;
             # the rich representations retain their original semantics alongside it.

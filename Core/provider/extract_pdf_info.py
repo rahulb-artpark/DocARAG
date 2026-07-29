@@ -159,6 +159,7 @@ def parse_doc(
     start_page_id: int = 0,
     end_page_id: int | None = None,
     pdf_file_name: str | None = None,
+    effort: str | None = None,
 ):
     """
     Parameter description:
@@ -167,12 +168,17 @@ def parse_doc(
     lang: Language option, default is 'en', optional values include['ch', 'ch_server', 'ch_lite', 'en', 'korean', 'japan', 'chinese_cht', 'ta', 'te', 'ka']。
         Input the languages in the pdf (if known) to improve OCR accuracy.  Optional.
         Adapted only for the case where the backend is set to "pipeline"
-    backend: the backend for parsing pdf:
-        pipeline: More general.
-        vlm-transformers: More general.
-        vlm-sglang-engine: Faster(engine).
-        vlm-sglang-client: Faster(client).
+    backend: the backend for parsing pdf (MinerU 3.x names):
+        pipeline: dedicated layout/OCR models. Fast, but cannot read
+            handwriting -- 44.9% dictionary-word rate on a cursive scan.
+        vlm-engine: local VLM. High accuracy.
+        hybrid-engine: local, MinerU's own default and the accuracy option.
+        vlm-http-client / hybrid-http-client: same models behind an
+            openai-compatible server (needs server_url).
         without method specified, pipeline will be used by default.
+    effort: 'medium' or 'high', accepted only by the hybrid-* backends.
+        'high' enables image/chart analysis. Ignored for other backends
+        because passing it to them raises.
     method: the method for parsing pdf:
         auto: Automatically determine the method based on the file type.
         txt: Use text extraction method.
@@ -199,17 +205,26 @@ def parse_doc(
 
         file_name = pdf_file_name if pdf_file_name is not None else str(Path(pdf_path).stem)
         pdf_bytes = read_fn(pdf_path)
-        return do_parse(
+        # MinerU 3.x takes batches: pdf_file_names / pdf_bytes_list / p_lang_list
+        # replace the 2.x singular pdf_file_name / pdf_bytes / p_lang. One
+        # document per call keeps the sharding contract above unchanged --
+        # each call still parses exactly one bounded page range.
+        call_kwargs = dict(
             output_dir=output_dir,
-            pdf_file_name=file_name,
-            pdf_bytes=pdf_bytes,
-            p_lang=lang,
+            pdf_file_names=[file_name],
+            pdf_bytes_list=[pdf_bytes],
+            p_lang_list=[lang],
             backend=backend,
             parse_method=method,
             server_url=server_url,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
         )
+        # effort is only accepted by the hybrid-* backends; passing it to
+        # pipeline or vlm-engine raises.
+        if effort is not None and backend.startswith("hybrid-"):
+            call_kwargs["effort"] = effort
+        return do_parse(**call_kwargs)
     except Exception as e:
         log.error(f"Error parsing {pdf_path}: {e}")
         raise e

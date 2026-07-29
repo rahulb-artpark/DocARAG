@@ -26,7 +26,7 @@ vlm:
 index_type: "pdf_vanilla"
 
 mineru:
-  backend: vlm-sglang-client
+  backend: vlm-http-client
   method: vlm
   server_url: http://localhost:30000
   lang: en

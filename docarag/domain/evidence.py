@@ -54,6 +54,17 @@ class CoordinateOrigin(StrEnum):
 
 
 class BlockType(StrEnum):
+    """What a parser observed a region to be.
+
+    ``DOC_TITLE`` is separate from ``TITLE`` because a document's own title and
+    a section heading play different structural roles: the first names the
+    whole document and belongs at the tree root, the second opens a subtree.
+    Parsers that cannot tell them apart emit ``TITLE`` and the outline pass has
+    to guess -- which is how a mid-document heading ends up parenting most of a
+    document.
+    """
+
+    DOC_TITLE = "doc_title"
     TITLE = "title"
     PARAGRAPH = "paragraph"
     LIST_ITEM = "list_item"
@@ -63,10 +74,15 @@ class BlockType(StrEnum):
     CHART = "chart"
     DIAGRAM = "diagram"
     CODE = "code"
+    ALGORITHM = "algorithm"
+    ABSTRACT = "abstract"
+    REFERENCE = "reference"
     CAPTION = "caption"
     FOOTNOTE = "footnote"
     HEADER = "header"
     FOOTER = "footer"
+    ASIDE = "aside"
+    DISCARDED = "discarded"
     UNKNOWN = "unknown"
 
 

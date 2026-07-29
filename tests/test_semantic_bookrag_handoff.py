@@ -229,7 +229,7 @@ class SemanticBookRAGHandoffTests(unittest.TestCase):
         expected_node_types = {
             BlockType.TABLE: NodeType.TABLE,
             BlockType.EQUATION: NodeType.EQUATION,
-            BlockType.DIAGRAM: NodeType.IMAGE,
+            BlockType.DIAGRAM: NodeType.DIAGRAM,
         }
         for block in blocks:
             with self.subTest(block_type=block.block_type.value):
