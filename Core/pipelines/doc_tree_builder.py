@@ -21,7 +21,15 @@ from Core.pipelines.sharded_parsing import (
     pdf_page_count,
     shard_ranges,
 )
-from Core.pipelines.tree_node_builder import create_node_by_type
+from Core.pipelines.tree_node_builder import (
+    _TEXT_CONTENT_TYPES,
+    create_node_by_type,
+)
+
+# Projected types that may become a heading. Restricting this to "text" meant
+# a code listing or an abstract could never open a section, and every type
+# added to the projection silently lost the ability to be a title.
+_TITLE_CAPABLE_TYPES = frozenset(_TEXT_CONTENT_TYPES)
 from Core.pipelines.tree_node_summary import generate_tree_node_summary
 from Core.provider.TokenTracker import TokenTracker
 from Core.utils.phase_timing import PhaseTimings
@@ -1351,8 +1359,28 @@ def construct_tree_index(
     # never gets to turn an image/table/equation into a synthetic title node.
     title_ids: set[int] = set()
     title_levels: dict[int, int] = {}
+
+    # The parser's own headings are headings.  The outline pass is an LLM
+    # reading the prose; when it and the parser disagree about whether a block
+    # is a heading, the parser saw the page and it did not.  Seeding from the
+    # parser first means a document keeps the structure MinerU already found --
+    # previously a heading existed only if the LLM independently renominated
+    # it, so a five-page chapter whose parser reported 14 headings was built
+    # from the 4 the outline pass happened to agree on, and one mid-document
+    # heading adopted three quarters of the document.
+    for pdf_id, source_block in blocks_by_id.items():
+        if source_block.get("type", "unknown") not in _TITLE_CAPABLE_TYPES:
+            continue
+        parser_level = source_block.get("text_level")
+        if isinstance(parser_level, bool) or not isinstance(parser_level, int):
+            continue
+        if parser_level < 0:
+            continue
+        title_ids.add(pdf_id)
+        title_levels[pdf_id] = parser_level
+
     for pdf_id, outline_entry in outline_by_id.items():
-        if blocks_by_id[pdf_id].get("type", "unknown") == "text":
+        if blocks_by_id[pdf_id].get("type", "unknown") in _TITLE_CAPABLE_TYPES:
             title_ids.add(pdf_id)
             raw_level = outline_entry.get(
                 "text_level", blocks_by_id[pdf_id].get("text_level", 0)
@@ -1394,6 +1422,8 @@ def construct_tree_index(
 
     attached_title_ids: set[int] = set()
     active_title_node = None
+    # Open headings, shallowest first, for depth-based parenting.
+    open_titles: list[tuple[int, object]] = []
     for pdf_id in ordered_block_ids:
         node = nodes_by_id[pdf_id]
         if pdf_id not in title_ids:
@@ -1401,34 +1431,49 @@ def construct_tree_index(
             parent.add_child(node)
             continue
 
-        outline_entry = outline_by_id[pdf_id]
+        outline_entry = outline_by_id.get(pdf_id)
         text_level = title_levels[pdf_id]
 
-        parent_node = tree_index.root_node
-        raw_parent_id = outline_entry.get("parent_id")
-        if text_level > 0 and raw_parent_id not in (None, 0):
-            try:
-                if isinstance(raw_parent_id, bool):
-                    raise ValueError
-                parent_id = int(raw_parent_id)
-            except (TypeError, ValueError):
-                parent_id = -1
-            if parent_id in attached_title_ids and parent_id < pdf_id:
-                parent_node = nodes_by_id[parent_id]
-            else:
+        if outline_entry is not None:
+            # The outline pass claimed this heading, so its parent decision
+            # stands -- including the documented fallback to root when that
+            # decision is unusable. Inventing a different parent from a level
+            # the same pass produced would not be more trustworthy.
+            parent_node = tree_index.root_node
+            raw_parent_id = outline_entry.get("parent_id")
+            if text_level > 0 and raw_parent_id not in (None, 0):
+                try:
+                    if isinstance(raw_parent_id, bool):
+                        raise ValueError
+                    parent_id = int(raw_parent_id)
+                except (TypeError, ValueError):
+                    parent_id = -1
+                if parent_id in attached_title_ids and parent_id < pdf_id:
+                    parent_node = nodes_by_id[parent_id]
+                else:
+                    log.warning(
+                        "Invalid title parent_id=%r for pdf_id=%d; attaching to root",
+                        raw_parent_id,
+                        pdf_id,
+                    )
+            elif text_level > 0:
                 log.warning(
-                    "Invalid title parent_id=%r for pdf_id=%d; attaching to root",
-                    raw_parent_id,
+                    "Missing title parent for pdf_id=%d level=%d; attaching to root",
                     pdf_id,
+                    text_level,
                 )
-        elif text_level > 0:
-            log.warning(
-                "Missing title parent for pdf_id=%d level=%d; attaching to root",
-                pdf_id,
-                text_level,
-            )
+        else:
+            # A heading the parser found and the outline pass never mentioned.
+            # It has no parent to inherit, so nest by depth: it belongs under
+            # the nearest heading above it that is shallower than itself.
+            # Attaching these to the root instead would flatten exactly the
+            # structure the parser had already worked out.
+            while open_titles and open_titles[-1][0] >= text_level:
+                open_titles.pop()
+            parent_node = open_titles[-1][1] if open_titles else tree_index.root_node
 
         parent_node.add_child(node)
+        open_titles.append((text_level, node))
         attached_title_ids.add(pdf_id)
         active_title_node = node
 
