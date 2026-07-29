@@ -25,6 +25,12 @@ import logging
 
 log = logging.getLogger(__name__)
 
+#: Node types answered from their crop. A chart's values and a diagram's
+#: topology are in the picture, so they are shown, not described.
+_VISUAL_ANSWER_TYPES = frozenset(
+    {NodeType.IMAGE, NodeType.CHART, NodeType.DIAGRAM}
+)
+
 
 CITATION_INSTRUCTION = (
     "Cite factual statements with the supplied evidence labels, for example "
@@ -437,7 +443,7 @@ class AnswerAgent:
             node_type = node.get("type", "text")
             if isinstance(node.get("page"), int):
                 node["page"] += 1  # make page start from 1
-            if node_type == NodeType.IMAGE:
+            if node_type in _VISUAL_ANSWER_TYPES:
                 if _visual_asset_is_verified(node):
                     image_nodes.append(node)
                 else:
@@ -1302,11 +1308,11 @@ Your concise analysis of this single piece of evidence:
             prompt_node["page"] = page
 
         use_vlm = bool(
-            node_type == NodeType.IMAGE
+            node_type in _VISUAL_ANSWER_TYPES
             and img_path
             and _visual_asset_is_verified(prompt_node)
         )
-        if node_type == NodeType.IMAGE and img_path and not use_vlm:
+        if node_type in _VISUAL_ANSWER_TYPES and img_path and not use_vlm:
             log.warning(
                 "Withholding reference-only visual asset for global evidence %s",
                 prompt_node.get("evidence_id", "unknown"),
