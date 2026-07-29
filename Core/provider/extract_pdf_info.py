@@ -38,11 +38,15 @@ def do_parse(
     parse_method="auto",  # The method for parsing PDF, default is 'auto'
     p_formula_enable=True,  # Enable formula parsing
     p_table_enable=True,  # Enable table parsing
-    server_url=None,  # Server URL for vlm-sglang-client backend
+    server_url=None,  # Server URL for the *-http-client backends
     start_page_id: int = 0,  # First page to parse (0-indexed, inclusive)
     end_page_id: int | None = None,  # Last page to parse, inclusive; None = last page
+    effort: str = "medium",  # hybrid-* only: "high" adds image/chart analysis
 ):
-    from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2
+    # Renamed in MinerU 3.x from convert_pdf_bytes_to_bytes_by_pypdfium2;
+    # same (pdf_bytes, start_page_id, end_page_id) contract, which is what the
+    # page-range sharding below depends on.
+    from mineru.cli.common import convert_pdf_bytes_to_bytes
     from mineru.data.data_reader_writer import FileBasedDataWriter
     from mineru.utils.draw_bbox import draw_layout_bbox
     from mineru.utils.enum_class import MakeMode
@@ -51,7 +55,7 @@ def do_parse(
     # Page selection happens here, before analysis: pdfium extracts just this
     # range into a new, small in-memory PDF, so OCR/layout/rendering below
     # only ever sees and holds this shard, never the whole document.
-    new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(
+    new_pdf_bytes = convert_pdf_bytes_to_bytes(
         pdf_bytes, start_page_id=start_page_id, end_page_id=end_page_id
     )
     image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(
@@ -101,25 +105,63 @@ def do_parse(
         content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
 
     else:
-        from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
         from mineru.backend.vlm.vlm_middle_json_mkcontent import (
             union_make as vlm_union_make,
         )
+        from mineru.utils.engine_utils import get_vlm_engine
 
-        if backend.startswith("vlm-"):
-            backend = backend[4:]
-        middle_json, infer_result = vlm_doc_analyze(
-            new_pdf_bytes,
-            image_writer=image_writer,
-            backend=backend,
-            server_url=server_url,
-        )
+        # MinerU 3.x splits the VLM path in two. "vlm-*" runs the vision model
+        # alone; "hybrid-*" runs it alongside the layout models and is the only
+        # backend measured to read handwriting while still emitting prose as
+        # text. Both take an *inference engine* name, not the CLI's backend
+        # name, and "engine" is a request to pick one -- resolved here exactly
+        # as mineru.cli.common.do_parse resolves it, rather than guessed.
+        is_hybrid = backend.startswith("hybrid-")
+        engine = backend[7:] if is_hybrid else backend[4:]
+        if engine == "engine":
+            engine = get_vlm_engine(inference_engine="auto", is_async=False)
+
+        if is_hybrid:
+            from mineru.backend.hybrid.hybrid_analyze import (
+                doc_analyze as hybrid_doc_analyze,
+            )
+
+            middle_json, infer_result = hybrid_doc_analyze(
+                new_pdf_bytes,
+                image_writer=image_writer,
+                backend=engine,
+                parse_method=parse_method,
+                server_url=server_url,
+                effort=effort,
+            )
+        else:
+            from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+
+            middle_json, infer_result = vlm_doc_analyze(
+                new_pdf_bytes,
+                image_writer=image_writer,
+                backend=engine,
+                server_url=server_url,
+            )
         pdf_info = middle_json["pdf_info"]
 
         md_content_str = vlm_union_make(pdf_info, MakeMode.MM_MD, image_dir)
         content_list = vlm_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
 
-        model_output = ("\n" + "-" * 50 + "\n").join(infer_result)
+        # MinerU 2.x returned one string per page; 3.x returns a list per page
+        # (one entry per detected region). Flatten so the debug dump keeps its
+        # one-block-per-separator shape either way -- this is an audit
+        # artifact, and losing it to a TypeError costs the record of what the
+        # model actually emitted.
+        flattened: list[str] = []
+        for page_output in infer_result:
+            if isinstance(page_output, str):
+                flattened.append(page_output)
+            elif isinstance(page_output, (list, tuple)):
+                flattened.extend(str(item) for item in page_output)
+            else:
+                flattened.append(str(page_output))
+        model_output = ("\n" + "-" * 50 + "\n").join(flattened)
         md_writer.write_string(
             f"{pdf_file_name}_model_output.txt",
             model_output,
@@ -205,23 +247,21 @@ def parse_doc(
 
         file_name = pdf_file_name if pdf_file_name is not None else str(Path(pdf_path).stem)
         pdf_bytes = read_fn(pdf_path)
-        # MinerU 3.x takes batches: pdf_file_names / pdf_bytes_list / p_lang_list
-        # replace the 2.x singular pdf_file_name / pdf_bytes / p_lang. One
-        # document per call keeps the sharding contract above unchanged --
-        # each call still parses exactly one bounded page range.
+        # This calls the do_parse defined above, not mineru.cli.common's --
+        # DocARAG drives MinerU's backends directly so it can slice pages
+        # before analysis. Its signature is singular and stays that way.
         call_kwargs = dict(
             output_dir=output_dir,
-            pdf_file_names=[file_name],
-            pdf_bytes_list=[pdf_bytes],
-            p_lang_list=[lang],
+            pdf_file_name=file_name,
+            pdf_bytes=pdf_bytes,
+            p_lang=lang,
             backend=backend,
             parse_method=method,
             server_url=server_url,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
         )
-        # effort is only accepted by the hybrid-* backends; passing it to
-        # pipeline or vlm-engine raises.
+        # effort is only meaningful to the hybrid-* backends.
         if effort is not None and backend.startswith("hybrid-"):
             call_kwargs["effort"] = effort
         return do_parse(**call_kwargs)

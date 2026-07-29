@@ -102,5 +102,35 @@ class MinerU35BlockTypeMapping(unittest.TestCase):
         self.assertEqual(subtype, "some_future_type")
 
 
+class AdapterDeclaresWhatItEmits(unittest.TestCase):
+    """The manifest and the translation must not drift apart.
+
+    The parser port validates every observation against the adapter's declared
+    block_types and aborts the document on an undeclared one. So a type added
+    to _block_type but not to the manifest does not degrade -- it fails the
+    whole bind, which is how 'aside' surfaced only during a real parse.
+    """
+
+    def test_every_mapped_type_is_declared(self):
+        from docarag.adapters.mineru_compat import DECLARED_BLOCK_TYPES
+
+        emitted = {_block_type({"type": raw}, {})[0] for raw in MINERU_35_BLOCK_TYPES}
+        undeclared = sorted(bt.value for bt in emitted - DECLARED_BLOCK_TYPES)
+        self.assertEqual([], undeclared, f"mapped but not declared: {undeclared}")
+
+    def test_every_text_type_can_produce_a_representation(self):
+        """An observation with no representation and no asset is rejected outright."""
+
+        from docarag.adapters.mineru_compat import _TEXT_REPRESENTED_BLOCKS
+        from docarag.domain.evidence import BlockType as BT
+
+        visual = {BT.FIGURE, BT.CHART, BT.DIAGRAM, BT.TABLE, BT.EQUATION}
+        emitted = {_block_type({"type": raw}, {})[0] for raw in MINERU_35_BLOCK_TYPES}
+        missing = sorted(
+            bt.value for bt in emitted - visual - _TEXT_REPRESENTED_BLOCKS
+        )
+        self.assertEqual([], missing, f"no representation path: {missing}")
+
+
 if __name__ == "__main__":
     unittest.main()

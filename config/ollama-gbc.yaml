@@ -47,7 +47,11 @@ mineru:
   # page poisons every stage downstream of it.
   backend: hybrid-engine
   method: vlm                    # forced by the backend; kept explicit for readability
-  effort: medium                 # "high" adds image/chart analysis; measured no gain here
+  # "high" is not just image/chart analysis: on this scan it is the difference
+  # between 3 detected headings and 14. At medium the layout pass returns the
+  # same 3 titles the pipeline backend finds, and a document with 3 headings
+  # has no hierarchy to build -- one of them ends up parenting most of it.
+  effort: high
   server_url: http://localhost:30000   # unused with a local *-engine backend
   lang: en
 

@@ -407,6 +407,56 @@ def _add_structured_representation(
     )
 
 
+# Every canonical type _block_type can return. Declared once so the manifest
+# and the translation cannot drift apart: the parser port validates each
+# observation against the manifest, and a type this adapter maps but does not
+# declare aborts the document rather than degrading it.
+DECLARED_BLOCK_TYPES = frozenset(
+    {
+        BlockType.DOC_TITLE,
+        BlockType.TITLE,
+        BlockType.PARAGRAPH,
+        BlockType.LIST_ITEM,
+        BlockType.TABLE,
+        BlockType.EQUATION,
+        BlockType.FIGURE,
+        BlockType.CHART,
+        BlockType.DIAGRAM,
+        BlockType.CODE,
+        BlockType.ALGORITHM,
+        BlockType.ABSTRACT,
+        BlockType.REFERENCE,
+        BlockType.CAPTION,
+        BlockType.FOOTNOTE,
+        BlockType.HEADER,
+        BlockType.FOOTER,
+        BlockType.ASIDE,
+        BlockType.DISCARDED,
+        BlockType.UNKNOWN,
+    }
+)
+
+_TEXT_REPRESENTED_BLOCKS = frozenset(
+    {
+        BlockType.DOC_TITLE,
+        BlockType.TITLE,
+        BlockType.PARAGRAPH,
+        BlockType.LIST_ITEM,
+        BlockType.ABSTRACT,
+        BlockType.REFERENCE,
+        BlockType.ALGORITHM,
+        BlockType.ASIDE,
+        BlockType.HEADER,
+        BlockType.FOOTER,
+        BlockType.FOOTNOTE,
+        BlockType.CAPTION,
+        BlockType.CODE,
+        BlockType.DISCARDED,
+        BlockType.UNKNOWN,
+    }
+)
+
+
 def _representations(
     block: Mapping[str, object],
     block_type: BlockType,
@@ -414,16 +464,12 @@ def _representations(
     language: str | None,
 ) -> tuple[Representation, ...]:
     result: list[Representation] = []
-    if block_type in {
-        BlockType.TITLE,
-        BlockType.PARAGRAPH,
-        BlockType.LIST_ITEM,
-        BlockType.HEADER,
-        BlockType.FOOTER,
-        BlockType.FOOTNOTE,
-        BlockType.CODE,
-        BlockType.UNKNOWN,
-    }:
+    # Every block type whose evidence is its own text. A type missing here
+    # produces an observation with no representation and no asset, which the
+    # contract rejects outright -- so the document fails to bind rather than
+    # degrading. MinerU 3.x emits aside_text, page_number and doc_title on
+    # ordinary pages, and all three landed here.
+    if block_type in _TEXT_REPRESENTED_BLOCKS:
         _add_text_representation(
             result,
             kind=RepresentationKind.TEXT,
@@ -1452,21 +1498,11 @@ class MinerUNormalizedAdapter:
                 ParserModality.CHART,
                 ParserModality.DIAGRAM,
             ),
-            block_types=(
-                BlockType.TITLE,
-                BlockType.PARAGRAPH,
-                BlockType.LIST_ITEM,
-                BlockType.TABLE,
-                BlockType.EQUATION,
-                BlockType.FIGURE,
-                BlockType.CHART,
-                BlockType.DIAGRAM,
-                BlockType.CODE,
-                BlockType.HEADER,
-                BlockType.FOOTER,
-                BlockType.FOOTNOTE,
-                BlockType.UNKNOWN,
-            ),
+            # What this adapter promises to emit. The port rejects anything
+            # absent here, so this must track _block_type's mapping -- a type
+            # translated but not declared fails the whole document at bind
+            # time, which is how aside_text and doc_title first showed up.
+            block_types=tuple(DECLARED_BLOCK_TYPES),
             accelerator=AcceleratorKind.ANY,
             supports_page_selection=True,
             supports_region_selection=False,

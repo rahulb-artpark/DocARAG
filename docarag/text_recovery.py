@@ -17,6 +17,13 @@ _TEXT_LIKE = {"text", "title", "list", "list_item", "header", "footer", "footnot
 _ASSET_TYPES = {"image", "table", "equation", "interline_equation"}
 _CONTENT_KEYS = (
     "text",
+    # A MinerU 3.x list block puts its items in list_items and carries no
+    # "text" at all. Judged by "text" alone every list looks empty, so
+    # recovery rewrote it from the page's native layer and it reached the tree
+    # as a paragraph -- the list type survived parsing, reconciliation and
+    # projection, and was lost here.
+    "list_items",
+    "code_body",
     "img_path",
     "table_body",
     "image_caption",
