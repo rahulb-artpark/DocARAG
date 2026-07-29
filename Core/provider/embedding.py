@@ -20,6 +20,9 @@ from Core.configs.llm_config import _normalize_api_base
 
 log = logging.getLogger(__name__)
 
+#: Correct weights score ~0.44 here; silently randomized ones score ~0.10.
+_MIN_SEMANTIC_MARGIN = 0.20
+
 
 class BaseEmbedder(ABC):
     MM_EMBEDDER: bool = False
@@ -34,10 +37,10 @@ class BaseEmbedder(ABC):
         pass
 
 
-class _GmeSharedRuntime:
-    """One heavyweight GME runtime shared by explicit provider handles.
+class _MultimodalSharedRuntime:
+    """One heavyweight multimodal runtime shared by explicit provider handles.
 
-    The owner count is protected by ``GmeEmbeddingProvider._pool_lock``.  The
+    The owner count is protected by ``MultimodalEmbeddingProvider._pool_lock``.  The
     condition protects in-flight calls so the final owner cannot unload model
     weights while a request is still using them.
     """
@@ -76,34 +79,62 @@ class _GmeSharedRuntime:
             try:
                 self.release_weights()
             except Exception:
-                log.exception("Failed to clean a partially loaded GME runtime")
+                log.exception("Failed to clean a partially loaded multimodal runtime")
             raise
 
     def _load_model(self) -> None:
         import torch
         from torch.nn import functional as torch_functional
-        from transformers import AutoModel
+
+        from Core.provider.qwen3_vl_embedding import Qwen3VLEmbedder
 
         self.torch = torch
         self.torch_functional = torch_functional
-        self.model = AutoModel.from_pretrained(
-            self.model_name,
-            torch_dtype=self._resolved_dtype(torch),
-            trust_remote_code=True,
-            device_map=self.device_strategy,
-            use_fast=True,
+        # Not AutoModel: the checkpoint has no auto_map, and the
+        # sentence-transformers path silently randomizes every weight.
+        self.model = Qwen3VLEmbedder(
+            self.model_name, dtype=self._resolved_dtype(torch)
         )
-        self.model.eval()
+        self._verify_loaded()
+
+    def _verify_loaded(self) -> None:
+        """Refuse a model that loaded but learned nothing.
+
+        A wrongly loaded checkpoint does not raise -- it returns vectors of
+        the right shape carrying no signal, and the index built on them looks
+        healthy while retrieving noise.
+        """
+
+        probe = self.model.process(
+            [
+                {"text": "why does the sky look blue"},
+                {"text": "Blue light is scattered more strongly by air molecules."},
+                {"text": "A bicycle has two wheels and a chain drive."},
+            ]
+        )
+        vectors = probe.float().cpu()
+        related = float(vectors[0] @ vectors[1])
+        unrelated = float(vectors[0] @ vectors[2])
+        margin = related - unrelated
+        if margin < _MIN_SEMANTIC_MARGIN:
+            raise RuntimeError(
+                f"{self.model_name} loaded but does not discriminate: related "
+                f"{related:.4f} vs unrelated {unrelated:.4f} (margin {margin:.4f} "
+                f"< {_MIN_SEMANTIC_MARGIN}). Weights are probably uninitialized."
+            )
+        log.info(
+            "Multimodal embedder verified: semantic margin %.4f", margin
+        )
 
     def _resolved_dtype(self, torch) -> Any:
         """Resolve the load dtype, defaulting away from a float32 checkpoint.
 
-        gme-Qwen2-VL ships float32 weights, which cost twice the VRAM its
-        architecture needs and leave no room beside a large local LLM.
+        A float32 checkpoint costs twice the VRAM its architecture needs and
+        leaves no room beside a large local LLM.
         """
 
         if self.torch_dtype in (None, "", "auto"):
-            return "auto"
+            return torch.float16
         dtype = getattr(torch, self.torch_dtype, None)
         if dtype is None:
             raise ValueError(f"unsupported torch dtype: {self.torch_dtype}")
@@ -136,9 +167,9 @@ class _GmeSharedRuntime:
                     self._waiting_calls -= 1
 
             if is_cancelled():
-                raise RuntimeError("GME embedding provider closed while waiting")
+                raise RuntimeError("embedding provider closed while waiting")
             if self._closing or self.model is None:
-                raise RuntimeError("GME embedding runtime is closing")
+                raise RuntimeError("embedding runtime is closing")
             self._active_calls += 1
 
     def release_call(self) -> None:
@@ -148,7 +179,7 @@ class _GmeSharedRuntime:
                 # This indicates an internal lifecycle error, not a caller
                 # input error.  Restore a valid counter before failing loudly.
                 self._active_calls = 0
-                raise RuntimeError("GME runtime call lease released twice")
+                raise RuntimeError("runtime call lease released twice")
             self._condition.notify_all()
 
     def notify_waiters(self) -> None:
@@ -178,8 +209,8 @@ class _GmeSharedRuntime:
             torch_runtime.cuda.empty_cache()
 
 
-class GmeEmbeddingProvider(BaseEmbedder):
-    """An owned handle over a keyed, process-local GME model runtime.
+class MultimodalEmbeddingProvider(BaseEmbedder):
+    """An owned handle over a keyed, process-local multimodal model runtime.
 
     Constructing a provider acquires one ownership reference. Providers with
     the same ``(model_name, device)`` reuse the heavyweight model, but remain
@@ -195,11 +226,11 @@ class GmeEmbeddingProvider(BaseEmbedder):
 
     _instance = None
     _pool_lock = RLock()
-    _runtime_pool: dict[tuple[str, str], _GmeSharedRuntime] = {}
+    _runtime_pool: dict[tuple[str, str], _MultimodalSharedRuntime] = {}
 
     def __init__(
         self,
-        model_name: str = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
+        model_name: str = "Qwen/Qwen3-VL-Embedding-2B",
         device: str = "auto",
         torch_dtype: str = "bfloat16",
     ):
@@ -225,31 +256,31 @@ class GmeEmbeddingProvider(BaseEmbedder):
         self._torch_functional = None
 
         log.info(
-            "Acquiring GME runtime for model=%s device=%s",
+            "Acquiring multimodal runtime for model=%s device=%s",
             self.model_name,
             self.device_strategy,
         )
         with type(self)._pool_lock:
             runtime = type(self)._runtime_pool.get(self._pool_key)
             if runtime is None:
-                log.info("Loading a new shared GME model runtime...")
+                log.info("Loading a new shared multimodal runtime...")
                 try:
-                    runtime = _GmeSharedRuntime(
+                    runtime = _MultimodalSharedRuntime(
                         self.model_name,
                         self.device_strategy,
                         self.torch_dtype,
                     )
                 except BaseException:
                     log.error(
-                        "Error loading GME model '%s'.",
+                        "Error loading multimodal model '%s'.",
                         self.model_name,
                         exc_info=True,
                     )
                     raise
                 type(self)._runtime_pool[self._pool_key] = runtime
-                log.info("GME model loaded successfully.")
+                log.info("Multimodal model loaded successfully.")
             else:
-                log.info("Reusing compatible shared GME model runtime.")
+                log.info("Reusing compatible shared multimodal runtime.")
             runtime.owner_count += 1
 
         self._runtime = runtime
@@ -266,7 +297,7 @@ class GmeEmbeddingProvider(BaseEmbedder):
         with self._state_lock:
             runtime = self._runtime
             if self._closed or runtime is None:
-                raise RuntimeError("GME embedding provider is closed")
+                raise RuntimeError("embedding provider is closed")
             closed_event = self._closed_event
 
         # Admission can wait behind another handle. Do not retain the provider
@@ -280,12 +311,12 @@ class GmeEmbeddingProvider(BaseEmbedder):
 
     @staticmethod
     def _normalize_with_runtime(
-        runtime: _GmeSharedRuntime,
+        runtime: _MultimodalSharedRuntime,
         embeddings: Any,
     ) -> np.ndarray:
         functional = runtime.torch_functional
         if functional is None:
-            raise RuntimeError("GME embedding provider is closed")
+            raise RuntimeError("embedding provider is closed")
         normalized_embeddings = functional.normalize(embeddings, p=2, dim=-1)
         return normalized_embeddings.detach().float().cpu().numpy()
 
@@ -305,24 +336,12 @@ class GmeEmbeddingProvider(BaseEmbedder):
         if not texts or not isinstance(texts, list):
             raise ValueError("Input 'texts' must be a non-empty list of strings.")
 
-        with self._use_runtime() as runtime:
-            torch_runtime = runtime.torch
-            all_embeddings = []
-            with torch_runtime.no_grad():
-                for i in tqdm(
-                    range(0, len(texts), batch_size), desc="Embedding Texts"
-                ):
-                    batch_texts = texts[i : i + batch_size]
-
-                    embeddings_tensor = runtime.model.get_text_embeddings(
-                        texts=batch_texts, instruction=instruction
-                    )
-                    all_embeddings.append(embeddings_tensor.cpu())
-
-            # 将所有批次的结果拼接成一个Tensor
-            full_embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
-
-            return self._normalize_with_runtime(runtime, full_embeddings_tensor)
+        return self._embed(
+            [{"text": text} for text in texts],
+            batch_size=batch_size,
+            instruction=instruction,
+            desc="Embedding Texts",
+        )
 
     def embed_images(self, images: List[str], batch_size: int = 4) -> np.ndarray:
         """
@@ -338,23 +357,11 @@ class GmeEmbeddingProvider(BaseEmbedder):
         if not images or not isinstance(images, list):
             raise ValueError("Input 'images' must be a non-empty list of image paths.")
 
-        with self._use_runtime() as runtime:
-            torch_runtime = runtime.torch
-            all_embeddings = []
-            with torch_runtime.no_grad():
-                for i in tqdm(
-                    range(0, len(images), batch_size), desc="Embedding Images"
-                ):
-                    batch_images = images[i : i + batch_size]
-
-                    embeddings_tensor = runtime.model.get_image_embeddings(
-                        images=batch_images
-                    )
-                    all_embeddings.append(embeddings_tensor.cpu())
-
-            full_embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
-
-            return self._normalize_with_runtime(runtime, full_embeddings_tensor)
+        return self._embed(
+            [{"image": image} for image in images],
+            batch_size=batch_size,
+            desc="Embedding Images",
+        )
 
     def embed_fused(
         self, images: List[str], texts: List[str], batch_size: int = 4
@@ -375,39 +382,52 @@ class GmeEmbeddingProvider(BaseEmbedder):
                 "'texts' and 'images' must be non-empty lists of the same length."
             )
 
+        return self._embed(
+            [
+                {"text": text, "image": image}
+                for text, image in zip(texts, images, strict=True)
+            ],
+            batch_size=batch_size,
+            desc="Embedding Fused",
+        )
+
+    def _embed(
+        self,
+        items: List[Dict[str, str]],
+        *,
+        batch_size: int,
+        desc: str,
+        instruction: Optional[str] = None,
+    ) -> np.ndarray:
+        """One batched pass. Text, image and fused differ only in the keys
+        each item carries; the model pools and L2-normalizes them itself."""
+
+        if instruction:
+            items = [{**item, "instruction": instruction} for item in items]
+
         with self._use_runtime() as runtime:
             torch_runtime = runtime.torch
             all_embeddings = []
             with torch_runtime.no_grad():
-                for i in tqdm(
-                    range(0, len(texts), batch_size), desc="Embedding Fused"
-                ):
-                    batch_texts = texts[i : i + batch_size]
-                    batch_images = images[i : i + batch_size]
-
-                    embeddings_tensor = runtime.model.get_fused_embeddings(
-                        texts=batch_texts, images=batch_images
-                    )
-                    all_embeddings.append(embeddings_tensor.cpu())
-
-            full_embeddings_tensor = torch_runtime.cat(all_embeddings, dim=0)
-
-            return self._normalize_with_runtime(runtime, full_embeddings_tensor)
+                for start in tqdm(range(0, len(items), batch_size), desc=desc):
+                    embeddings = runtime.model.process(items[start : start + batch_size])
+                    all_embeddings.append(embeddings.detach().float().cpu())
+            return torch_runtime.cat(all_embeddings, dim=0).numpy()
 
     @classmethod
     def _release_runtime(
         cls,
         key: tuple[str, str],
-        runtime: _GmeSharedRuntime,
+        runtime: _MultimodalSharedRuntime,
     ) -> None:
         with cls._pool_lock:
             pooled = cls._runtime_pool.get(key)
             if pooled is not runtime:
-                raise RuntimeError("GME runtime ownership does not match its pool key")
+                raise RuntimeError("runtime ownership does not match its pool key")
             runtime.owner_count -= 1
             if runtime.owner_count < 0:
                 runtime.owner_count = 0
-                raise RuntimeError("GME runtime ownership released twice")
+                raise RuntimeError("runtime ownership released twice")
             if runtime.owner_count:
                 return
 
@@ -461,7 +481,7 @@ class GmeEmbeddingProvider(BaseEmbedder):
         if runtime is not None:
             runtime.notify_waiters()
             self._release_runtime(key, runtime)
-        log.info("GmeEmbeddingProvider handle closed.")
+        log.info("Multimodal embedding provider handle closed.")
 
     def clear_cache(self) -> None:
         """
@@ -551,54 +571,54 @@ class MMRerankerProvider(BaseEmbedder):
     def __init__(
         self,
         index_path: str,
-        model_name: str = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
+        model_name: str = "Qwen/Qwen3-VL-Embedding-2B",
         device: str = "auto",
         *,
-        gme_provider: Optional[GmeEmbeddingProvider] = None,
-        owns_gme_provider: Optional[bool] = None,
+        mm_provider: Optional[MultimodalEmbeddingProvider] = None,
+        owns_mm_provider: Optional[bool] = None,
     ):
-        if owns_gme_provider is not None and not isinstance(
-            owns_gme_provider, bool
+        if owns_mm_provider is not None and not isinstance(
+            owns_mm_provider, bool
         ):
-            raise ValueError("owns_gme_provider must be a boolean when provided")
-        if gme_provider is None and owns_gme_provider is False:
+            raise ValueError("owns_mm_provider must be a boolean when provided")
+        if mm_provider is None and owns_mm_provider is False:
             raise ValueError(
-                "an internally-created GME provider must be owned by the reranker"
+                "an internally-created multimodal provider must be owned by the reranker"
             )
 
         self.index_path = index_path
         self.doc_metadata = {}
         self.doc_embeddings = np.array([])
         self.question_embeddings = {}
-        self.gme_provider = gme_provider
+        self.mm_provider = mm_provider
         # Injected resources are borrowed unless ownership is explicitly
         # transferred. Internally-created provider handles are always owned.
-        self._owns_gme_provider = (
-            True if gme_provider is None else bool(owns_gme_provider)
+        self._owns_mm_provider = (
+            True if mm_provider is None else bool(owns_mm_provider)
         )
         self._closed = False
 
         log.info(f"Initializing MMRerankerProvider from path: {self.index_path}")
         try:
             self._load_embeddings()
-            if self.gme_provider is None:
-                self.gme_provider = GmeEmbeddingProvider(
+            if self.mm_provider is None:
+                self.mm_provider = MultimodalEmbeddingProvider(
                     model_name=model_name,
                     device=device,
                 )
         except BaseException:
-            provider = self.gme_provider
-            self.gme_provider = None
+            provider = self.mm_provider
+            self.mm_provider = None
             self.doc_metadata.clear()
             self.doc_embeddings = np.array([])
             self.question_embeddings.clear()
             self._closed = True
-            if self._owns_gme_provider and provider is not None:
+            if self._owns_mm_provider and provider is not None:
                 try:
                     provider.close()
                 except Exception:
                     log.exception(
-                        "Failed to close owned GME provider after reranker startup failure"
+                        "Failed to close owned multimodal provider after reranker startup failure"
                     )
             raise
 
@@ -669,7 +689,7 @@ class MMRerankerProvider(BaseEmbedder):
         doc_list: List[Dict[str, str]],
         instruction: Optional[str] = None,
     ) -> List[float]:
-        if self._closed or self.gme_provider is None:
+        if self._closed or self.mm_provider is None:
             raise RuntimeError("MM reranker provider is closed")
         if not query:
             raise ValueError("Query cannot be empty.")
@@ -680,7 +700,7 @@ class MMRerankerProvider(BaseEmbedder):
         if query in self.question_embeddings.keys():
             query_embedding = self.question_embeddings[query]
         else:
-            query_embedding = self.gme_provider.embed_texts(
+            query_embedding = self.mm_provider.embed_texts(
                 [query], instruction=instruction
             )[0]
 
@@ -732,7 +752,7 @@ class MMRerankerProvider(BaseEmbedder):
         return similarities
 
     def close(self) -> None:
-        """Release in-memory data and this reranker's owned GME handle once."""
+        """Release in-memory data and this reranker's owned multimodal handle once."""
 
         if self._closed:
             return
@@ -740,9 +760,9 @@ class MMRerankerProvider(BaseEmbedder):
         self.doc_metadata.clear()
         self.doc_embeddings = np.array([])
         self.question_embeddings.clear()
-        provider = self.gme_provider
-        self.gme_provider = None
-        if self._owns_gme_provider and provider is not None:
+        provider = self.mm_provider
+        self.mm_provider = None
+        if self._owns_mm_provider and provider is not None:
             provider.close()
 
 
@@ -1124,8 +1144,8 @@ if __name__ == "__main__":
     print("Text embeddings shape:", embeddings.shape)
     # test the cuda storage
 
-    mm_embedder = GmeEmbeddingProvider(
-        model_name="Alibaba-NLP/gme-Qwen2-VL-2B-Instruct",
+    mm_embedder = MultimodalEmbeddingProvider(
+        model_name="Qwen/Qwen3-VL-Embedding-2B",
         device="cuda:6",
     )
     texts = ["你好，世界！", "这是一个测试。"]

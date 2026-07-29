@@ -10,16 +10,16 @@ import unittest
 from unittest.mock import Mock, patch
 
 from Core.provider.embedding import (
-    GmeEmbeddingProvider,
+    MultimodalEmbeddingProvider,
     MMRerankerProvider,
-    _GmeSharedRuntime,
+    _MultimodalSharedRuntime,
 )
 
 
 class GmeResourceOwnershipTests(unittest.TestCase):
     @staticmethod
     def _fake_loader(cuda):
-        def load(runtime: _GmeSharedRuntime) -> None:
+        def load(runtime: _MultimodalSharedRuntime) -> None:
             runtime.torch = SimpleNamespace(cuda=cuda)
             runtime.torch_functional = object()
             runtime.model = object()
@@ -27,7 +27,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         return load
 
     @staticmethod
-    def _wait_for_waiters(runtime: _GmeSharedRuntime, count: int) -> None:
+    def _wait_for_waiters(runtime: _MultimodalSharedRuntime, count: int) -> None:
         deadline = monotonic() + 2
         with runtime._condition:
             while runtime._waiting_calls != count:
@@ -40,7 +40,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
                 runtime._condition.wait(timeout=remaining)
 
     @staticmethod
-    def _wait_for_closing(runtime: _GmeSharedRuntime) -> None:
+    def _wait_for_closing(runtime: _MultimodalSharedRuntime) -> None:
         deadline = monotonic() + 2
         with runtime._condition:
             while not runtime._closing:
@@ -54,10 +54,10 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         cuda.is_available.return_value = False
 
         with patch.object(
-            _GmeSharedRuntime, "_load_model", new=self._fake_loader(cuda)
+            _MultimodalSharedRuntime, "_load_model", new=self._fake_loader(cuda)
         ):
-            half = GmeEmbeddingProvider(model_name="test/dtype-gme", device="cuda:0")
-            full = GmeEmbeddingProvider(
+            half = MultimodalEmbeddingProvider(model_name="test/dtype-gme", device="cuda:0")
+            full = MultimodalEmbeddingProvider(
                 model_name="test/dtype-gme", device="cuda:0", torch_dtype="float32"
             )
             try:
@@ -73,12 +73,12 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         key = ("test/shared-gme", "cuda:0", "bfloat16")
 
         with patch.object(
-            _GmeSharedRuntime,
+            _MultimodalSharedRuntime,
             "_load_model",
             new=self._fake_loader(cuda),
         ):
-            first = GmeEmbeddingProvider(model_name=key[0], device=key[1])
-            second = GmeEmbeddingProvider(model_name=key[0], device=key[1])
+            first = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
+            second = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
 
         self.assertIsNot(first, second)
         self.assertIs(first._runtime, second._runtime)
@@ -89,28 +89,28 @@ class GmeResourceOwnershipTests(unittest.TestCase):
 
         self.assertIsNotNone(second._runtime)
         self.assertEqual(1, second._runtime.owner_count)
-        self.assertIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertIn(key, MultimodalEmbeddingProvider._runtime_pool)
         cuda.empty_cache.assert_not_called()
 
         second.close()
         second.close()
 
         cuda.empty_cache.assert_called_once_with()
-        self.assertNotIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertNotIn(key, MultimodalEmbeddingProvider._runtime_pool)
 
     def test_different_model_or_device_never_silently_reuses_runtime(self):
         cuda = Mock()
         cuda.is_available.return_value = False
         loaded = []
 
-        def load(runtime: _GmeSharedRuntime) -> None:
+        def load(runtime: _MultimodalSharedRuntime) -> None:
             loaded.append((runtime.model_name, runtime.device_strategy))
             self._fake_loader(cuda)(runtime)
 
-        with patch.object(_GmeSharedRuntime, "_load_model", new=load):
-            first = GmeEmbeddingProvider(model_name="test/model-a", device="cuda:0")
-            second = GmeEmbeddingProvider(model_name="test/model-b", device="cuda:0")
-            third = GmeEmbeddingProvider(model_name="test/model-a", device="cuda:1")
+        with patch.object(_MultimodalSharedRuntime, "_load_model", new=load):
+            first = MultimodalEmbeddingProvider(model_name="test/model-a", device="cuda:0")
+            second = MultimodalEmbeddingProvider(model_name="test/model-b", device="cuda:0")
+            third = MultimodalEmbeddingProvider(model_name="test/model-a", device="cuda:1")
 
         try:
             self.assertEqual(
@@ -137,11 +137,11 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         key = ("test/inflight-gme", "cuda:0", "bfloat16")
 
         with patch.object(
-            _GmeSharedRuntime,
+            _MultimodalSharedRuntime,
             "_load_model",
             new=self._fake_loader(cuda),
         ):
-            provider = GmeEmbeddingProvider(model_name=key[0], device=key[1])
+            provider = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
         runtime = provider._runtime
         original_wait = runtime.wait_until_idle
 
@@ -162,12 +162,12 @@ class GmeResourceOwnershipTests(unittest.TestCase):
             close_future = executor.submit(provider.close)
             self.assertTrue(close_wait_started.wait(timeout=2))
             self.assertFalse(close_future.done())
-            self.assertIn(key, GmeEmbeddingProvider._runtime_pool)
+            self.assertIn(key, MultimodalEmbeddingProvider._runtime_pool)
             release_call.set()
             use_future.result(timeout=2)
             close_future.result(timeout=2)
 
-        self.assertNotIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertNotIn(key, MultimodalEmbeddingProvider._runtime_pool)
         self.assertIsNone(runtime.model)
 
     def test_shared_runtime_serializes_calls_from_concurrent_handles(self):
@@ -179,12 +179,12 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         key = ("test/serialized-gme", "cuda:0", "bfloat16")
 
         with patch.object(
-            _GmeSharedRuntime,
+            _MultimodalSharedRuntime,
             "_load_model",
             new=self._fake_loader(cuda),
         ):
-            first = GmeEmbeddingProvider(model_name=key[0], device=key[1])
-            second = GmeEmbeddingProvider(model_name=key[0], device=key[1])
+            first = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
+            second = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
         runtime = first._runtime
 
         def hold_first_slot() -> None:
@@ -222,11 +222,11 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         key = ("test/cancelled-waiter-gme", "cuda:0", "bfloat16")
 
         with patch.object(
-            _GmeSharedRuntime,
+            _MultimodalSharedRuntime,
             "_load_model",
             new=self._fake_loader(cuda),
         ):
-            provider = GmeEmbeddingProvider(model_name=key[0], device=key[1])
+            provider = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
         runtime = provider._runtime
 
         def hold_slot() -> None:
@@ -259,41 +259,41 @@ class GmeResourceOwnershipTests(unittest.TestCase):
 
         self.assertEqual(0, runtime._active_calls)
         self.assertEqual(0, runtime._waiting_calls)
-        self.assertNotIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertNotIn(key, MultimodalEmbeddingProvider._runtime_pool)
 
     def test_failed_runtime_load_is_cleaned_and_never_published(self):
         failed_cuda = Mock()
         failed_cuda.is_available.return_value = True
         key = ("test/failing-gme", "cuda:0", "bfloat16")
 
-        def fail_after_partial_allocation(runtime: _GmeSharedRuntime) -> None:
+        def fail_after_partial_allocation(runtime: _MultimodalSharedRuntime) -> None:
             runtime.torch = SimpleNamespace(cuda=failed_cuda)
             runtime.model = object()
             raise RuntimeError("model load failed")
 
         with (
             patch.object(
-                _GmeSharedRuntime,
+                _MultimodalSharedRuntime,
                 "_load_model",
                 new=fail_after_partial_allocation,
             ),
             self.assertRaisesRegex(RuntimeError, "model load failed"),
         ):
-            GmeEmbeddingProvider(model_name=key[0], device=key[1])
+            MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
 
         failed_cuda.empty_cache.assert_called_once_with()
-        self.assertNotIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertNotIn(key, MultimodalEmbeddingProvider._runtime_pool)
 
         healthy_cuda = Mock()
         healthy_cuda.is_available.return_value = False
         with patch.object(
-            _GmeSharedRuntime,
+            _MultimodalSharedRuntime,
             "_load_model",
             new=self._fake_loader(healthy_cuda),
         ):
-            recovered = GmeEmbeddingProvider(model_name=key[0], device=key[1])
+            recovered = MultimodalEmbeddingProvider(model_name=key[0], device=key[1])
         recovered.close()
-        self.assertNotIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertNotIn(key, MultimodalEmbeddingProvider._runtime_pool)
 
     def test_mmr_injected_provider_has_explicit_borrowed_or_owned_lifecycle(self):
         borrowed = Mock()
@@ -301,12 +301,12 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             borrowed_reranker = MMRerankerProvider(
                 directory,
-                gme_provider=borrowed,
+                mm_provider=borrowed,
             )
             owned_reranker = MMRerankerProvider(
                 directory,
-                gme_provider=owned,
-                owns_gme_provider=True,
+                mm_provider=owned,
+                owns_mm_provider=True,
             )
 
         borrowed_reranker.close()
@@ -322,7 +322,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         cuda.is_available.return_value = True
         key = ("test/mmr-shared-gme", "cuda:0", "bfloat16")
         with tempfile.TemporaryDirectory() as directory, patch.object(
-            _GmeSharedRuntime,
+            _MultimodalSharedRuntime,
             "_load_model",
             new=self._fake_loader(cuda),
         ):
@@ -340,7 +340,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         first.close()
         first.close()
 
-        with second.gme_provider._use_runtime() as live_runtime:
+        with second.mm_provider._use_runtime() as live_runtime:
             self.assertIsNotNone(live_runtime.model)
             self.assertEqual(1, live_runtime.owner_count)
         cuda.empty_cache.assert_not_called()
@@ -348,7 +348,7 @@ class GmeResourceOwnershipTests(unittest.TestCase):
         second.close()
         second.close()
         cuda.empty_cache.assert_called_once_with()
-        self.assertNotIn(key, GmeEmbeddingProvider._runtime_pool)
+        self.assertNotIn(key, MultimodalEmbeddingProvider._runtime_pool)
 
     def test_mmr_constructor_failure_releases_only_transferred_ownership(self):
         owned = Mock()
@@ -361,13 +361,13 @@ class GmeResourceOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "metadata is corrupt"):
                 MMRerankerProvider(
                     str(Path("unused")),
-                    gme_provider=owned,
-                    owns_gme_provider=True,
+                    mm_provider=owned,
+                    owns_mm_provider=True,
                 )
             with self.assertRaisesRegex(RuntimeError, "metadata is corrupt"):
                 MMRerankerProvider(
                     str(Path("unused")),
-                    gme_provider=borrowed,
+                    mm_provider=borrowed,
                 )
 
         owned.close.assert_called_once_with()

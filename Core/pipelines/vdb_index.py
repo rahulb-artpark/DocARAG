@@ -10,7 +10,7 @@ import numpy as np
 
 from Core.provider.embedding import (
     TextEmbeddingProvider,
-    GmeEmbeddingProvider,
+    MultimodalEmbeddingProvider,
 )
 from Core.provider.llm import LLM
 from Core.provider.vdb import (
@@ -1327,7 +1327,7 @@ def _write_tree_vector_index(
     active_error = False
     try:
         if vdb_cfg.mm_embedding:
-            embedder = GmeEmbeddingProvider(
+            embedder = MultimodalEmbeddingProvider(
                 model_name=vdb_cfg.embedding_config.model_name,
                 device=vdb_cfg.embedding_config.device,
             )
@@ -1773,7 +1773,7 @@ def load_pdf_lists_from_dir(save_dir):
 
 def compute_mm_embedding(cfg: SystemConfig, tree_index: DocumentTree):
     embedder_cfg = cfg.vdb.embedding_config
-    embedder = GmeEmbeddingProvider(
+    embedder = MultimodalEmbeddingProvider(
         model_name=embedder_cfg.model_name,
         device=embedder_cfg.device,
     )
@@ -1884,7 +1884,7 @@ def compute_mm_embedding(cfg: SystemConfig, tree_index: DocumentTree):
 
 def compute_mm_embedding_question(cfg: SystemConfig, group: pd.DataFrame):
     embedder_cfg = cfg.vdb.embedding_config
-    embedder = GmeEmbeddingProvider(
+    embedder = MultimodalEmbeddingProvider(
         model_name=embedder_cfg.model_name,
         device=embedder_cfg.device,
     )

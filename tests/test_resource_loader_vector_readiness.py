@@ -141,7 +141,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         with (
             patch.object(
                 vdb_index,
-                "GmeEmbeddingProvider",
+                "MultimodalEmbeddingProvider",
                 side_effect=lambda **_kwargs: FakeGmeEmbedder(),
             ),
             patch.object(vdb_index, "VectorStore", FakeStore),
@@ -167,7 +167,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.GmeEmbeddingProvider",
+                    "Core.provider.embedding.MultimodalEmbeddingProvider",
                     side_effect=AssertionError("model loaded before readiness"),
                 ) as model,
                 self.assertRaisesRegex(
@@ -203,7 +203,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.GmeEmbeddingProvider",
+                    "Core.provider.embedding.MultimodalEmbeddingProvider",
                     return_value=model,
                 ) as model_factory,
                 patch("Core.provider.vdb.VectorStore", return_value=store) as store_factory,
@@ -263,7 +263,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             config.source.sha256 = "b" * 64
             with (
-                patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
+                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -278,7 +278,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                 "another-collection"
             )
             with (
-                patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
+                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -290,7 +290,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             changed_model = _config(directory, model_name="gme-v2")
             with (
-                patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
+                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -325,7 +325,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             store = LeaseAwareStore()
             with (
                 patch(
-                    "Core.provider.embedding.GmeEmbeddingProvider",
+                    "Core.provider.embedding.MultimodalEmbeddingProvider",
                     return_value=model,
                 ) as gme_factory,
                 patch(
@@ -349,7 +349,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.GmeEmbeddingProvider",
+                    "Core.provider.embedding.MultimodalEmbeddingProvider",
                     side_effect=RuntimeError("model unavailable"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "model unavailable"),
@@ -372,7 +372,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             self.seal_patch.start()
 
             with (
-                patch("Core.provider.embedding.GmeEmbeddingProvider") as model,
+                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -394,7 +394,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.GmeEmbeddingProvider",
+                    "Core.provider.embedding.MultimodalEmbeddingProvider",
                     return_value=model,
                 ),
                 patch("Core.provider.vdb.VectorStore", return_value=store),

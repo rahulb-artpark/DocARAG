@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from Core.configs.rag.mm_config import MMConfig
-from Core.provider.embedding import GmeEmbeddingProvider
+from Core.provider.embedding import MultimodalEmbeddingProvider
 from Core.provider.llm import LLM
 from Core.provider.vdb import VectorStore
 from Core.provider.vlm import VLM
@@ -313,8 +313,8 @@ class MMRAG(BaseRAG):
                 # cannot hide or retain the heavyweight provider.
                 store.embedding_model = None
             self._close_owned_resources(("vector embedder", embedding_model))
-            if isinstance(embedding_model, GmeEmbeddingProvider):
-                log.info("Closed GmeEmbeddingProvider and released model weights.")
+            if isinstance(embedding_model, MultimodalEmbeddingProvider):
+                log.info("Closed MultimodalEmbeddingProvider and released model weights.")
         finally:
             try:
                 self._close_owned_resources(("vector store", store))

@@ -271,18 +271,18 @@ class RemoteOnlyImportBoundaryTests(unittest.TestCase):
         self.assertIsNone(provider._torch_functional)
 
     def test_gme_cuda_cleanup_and_singleton_release_are_idempotent(self):
-        from Core.provider.embedding import GmeEmbeddingProvider
+        from Core.provider.embedding import MultimodalEmbeddingProvider
 
         cuda = Mock()
         cuda.is_available.return_value = True
-        provider = object.__new__(GmeEmbeddingProvider)
+        provider = object.__new__(MultimodalEmbeddingProvider)
         provider.model_name = "gme-model"
         provider.model = object()
         provider._initialized = True
         provider._torch = SimpleNamespace(cuda=cuda)
         provider._torch_functional = object()
-        previous_instance = GmeEmbeddingProvider._instance
-        GmeEmbeddingProvider._instance = provider
+        previous_instance = MultimodalEmbeddingProvider._instance
+        MultimodalEmbeddingProvider._instance = provider
         try:
             provider.close()
             provider.close()
@@ -290,9 +290,9 @@ class RemoteOnlyImportBoundaryTests(unittest.TestCase):
             cuda.empty_cache.assert_called_once_with()
             self.assertIsNone(provider._torch)
             self.assertIsNone(provider._torch_functional)
-            self.assertIsNone(GmeEmbeddingProvider._instance)
+            self.assertIsNone(MultimodalEmbeddingProvider._instance)
         finally:
-            GmeEmbeddingProvider._instance = previous_instance
+            MultimodalEmbeddingProvider._instance = previous_instance
 
 
 if __name__ == "__main__":

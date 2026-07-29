@@ -14,7 +14,7 @@ from Core.provider.vdb import (
     VectorStore,
     stable_vector_record_id,
 )
-from Core.provider.embedding import GmeEmbeddingProvider
+from Core.provider.embedding import MultimodalEmbeddingProvider
 from Core.rag.mm_rag import MMRAG, NO_USABLE_EVIDENCE_ANSWER
 from tests.qdrant_fakes import FakeModels, FakeQdrantClient, qdrant_store
 
@@ -594,8 +594,8 @@ class MultimodalRetrievalMetadataTests(unittest.TestCase):
                 {item["vector_record_id"] for item in saved},
             )
 
-    def test_close_unloads_owned_gme_provider_once(self):
-        provider = object.__new__(GmeEmbeddingProvider)
+    def test_close_unloads_owned_mm_provider_once(self):
+        provider = object.__new__(MultimodalEmbeddingProvider)
         provider.close = Mock()
         provider.clear_cache = Mock()
         rag = object.__new__(MMRAG)

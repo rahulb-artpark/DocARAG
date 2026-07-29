@@ -109,7 +109,7 @@ class EquationVisualPipelineTests(unittest.TestCase):
             )
 
             with (
-                patch.object(vdb_index, "GmeEmbeddingProvider", return_value=embedding),
+                patch.object(vdb_index, "MultimodalEmbeddingProvider", return_value=embedding),
                 patch.object(vdb_index, "VectorStore", return_value=store),
             ):
                 vdb_index.build_vdb_index(tree, cfg)
@@ -170,7 +170,7 @@ class EquationVisualPipelineTests(unittest.TestCase):
             )
 
             with patch.object(
-                vdb_index, "GmeEmbeddingProvider", return_value=embedding
+                vdb_index, "MultimodalEmbeddingProvider", return_value=embedding
             ):
                 vdb_index.compute_mm_embedding(cfg, tree)
 

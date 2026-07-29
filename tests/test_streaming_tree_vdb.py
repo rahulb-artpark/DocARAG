@@ -135,7 +135,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             store.count.return_value = 9
 
             with (
-                patch.object(vdb_index, "GmeEmbeddingProvider", return_value=embedder),
+                patch.object(vdb_index, "MultimodalEmbeddingProvider", return_value=embedder),
                 patch.object(vdb_index, "VectorStore", return_value=store),
             ):
                 vdb_index.build_vdb_index(
@@ -405,7 +405,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             store.add_texts.side_effect = RuntimeError("write failed")
 
             with (
-                patch.object(vdb_index, "GmeEmbeddingProvider", return_value=embedder),
+                patch.object(vdb_index, "MultimodalEmbeddingProvider", return_value=embedder),
                 patch.object(vdb_index, "VectorStore", return_value=store),
                 self.assertRaisesRegex(RuntimeError, "write failed"),
             ):
@@ -422,7 +422,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             embedder = Mock()
 
             with (
-                patch.object(vdb_index, "GmeEmbeddingProvider", return_value=embedder),
+                patch.object(vdb_index, "MultimodalEmbeddingProvider", return_value=embedder),
                 patch.object(
                     vdb_index, "VectorStore", side_effect=RuntimeError("open failed")
                 ),

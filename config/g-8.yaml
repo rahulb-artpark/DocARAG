@@ -60,7 +60,7 @@ vdb:
   timeout_seconds: 10.0
   collection_name: "TreeVDB"
   embedding_config:
-    model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+    model_name: Qwen/Qwen3-VL-Embedding-2B
     device: "cuda:1"
 
 rag_force_reprocess: True
@@ -78,5 +78,5 @@ rag:
     backend: vllm
     api_base: "http://localhost:8011/v1"
   mm_reranker_config:
-    model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+    model_name: Qwen/Qwen3-VL-Embedding-2B
     device: "cuda:2"

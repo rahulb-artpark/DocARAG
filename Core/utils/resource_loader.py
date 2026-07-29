@@ -235,9 +235,9 @@ def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
     try:
         embed_cfg: EmbeddingConfig = vdb_cfg.embedding_config
         if vdb_cfg.mm_embedding:
-            from Core.provider.embedding import GmeEmbeddingProvider
+            from Core.provider.embedding import MultimodalEmbeddingProvider
 
-            embed_model = GmeEmbeddingProvider(
+            embed_model = MultimodalEmbeddingProvider(
                 model_name=embed_cfg.model_name,
                 device=embed_cfg.device,
                 **_gme_dtype(embed_cfg),
@@ -504,9 +504,9 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
             # embedding ``type`` field is redundant and can otherwise open a
             # text embedder against a GME collection (or vice versa).
             if vdb_cfg.mm_embedding:
-                from Core.provider.embedding import GmeEmbeddingProvider
+                from Core.provider.embedding import MultimodalEmbeddingProvider
 
-                embed_model = GmeEmbeddingProvider(
+                embed_model = MultimodalEmbeddingProvider(
                     model_name=embed_cfg.model_name,
                     device=embed_cfg.device,
                     **_gme_dtype(embed_cfg),

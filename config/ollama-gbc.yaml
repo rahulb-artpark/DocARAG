@@ -97,7 +97,7 @@ vdb:
   timeout_seconds: 10.0
   # Named for the embedder and its width: a collection built at one dimension
   # cannot accept vectors of another, and _validate_existing_collection raises
-  # rather than mixing them. A distinct name means the 1536d gme collection
+  # rather than mixing them. A distinct name means the old 1536d collection
   # stays queryable while this one is rebuilt.
   collection_name: "TreeVDB-qwen3vl-2048"
   embedding_config:
@@ -124,7 +124,6 @@ rag:
     backend: local
     api_base: ""
   mm_reranker_config:
-    model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+    model_name: Qwen/Qwen3-VL-Embedding-2B
     device: "cuda:0"
-    # The checkpoint ships float32 and costs 8.3GB; bfloat16 halves it.
-    torch_dtype: bfloat16
+    torch_dtype: float16
