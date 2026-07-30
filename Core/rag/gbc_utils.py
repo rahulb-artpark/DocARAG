@@ -77,6 +77,42 @@ class GBCRAGContext(BaseModel):
 # --- Pydantic Models for Structured Output (已更新) ---
 
 
+# A whole-document scope has to fit in the answer model's context *alongside*
+# the space reserved for the answer itself. Sizing that by hand is how the first
+# attempt went wrong: 240,000 characters is roughly 60,000 tokens, and the
+# configured model declares num_ctx 16384 with 5,000 reserved for output -- about
+# five times the whole window. Ollama would have truncated the prompt silently,
+# which is the sampled answer this budget exists to prevent, only invisible.
+#
+# So the ceiling is read from the model rather than guessed, and the configured
+# value can only lower it.
+CHARS_PER_TOKEN = 4
+# System prompt, the question, and the per-node formatting around the evidence.
+ANSWER_PROMPT_HEADROOM_TOKENS = 1500
+
+
+def answer_input_char_budget(llm, configured_chars: int) -> int:
+    """How much evidence text can be sent, given what the model can hold.
+
+    Falls back to the configured value when the backend does not declare a
+    context window -- a hosted API model may not -- because a wrong guess in that
+    direction is the caller's stated intent rather than this function's invention.
+    """
+
+    config = getattr(llm, "config", None)
+    num_ctx = getattr(config, "num_ctx", None)
+    if not isinstance(num_ctx, int) or isinstance(num_ctx, bool) or num_ctx <= 0:
+        return configured_chars
+    reserved = getattr(config, "max_tokens", None)
+    if not isinstance(reserved, int) or isinstance(reserved, bool) or reserved < 0:
+        reserved = 0
+    usable_tokens = num_ctx - reserved - ANSWER_PROMPT_HEADROOM_TOKENS
+    if usable_tokens <= 0:
+        # The window cannot hold a question and an answer, let alone evidence.
+        return 0
+    return min(configured_chars, usable_tokens * CHARS_PER_TOKEN)
+
+
 def global_scope_chars(nodes: List[TreeNode]) -> int:
     """How much evidence text a global scope actually carries.
 

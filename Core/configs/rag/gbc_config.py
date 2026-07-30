@@ -72,15 +72,16 @@ class GBCRAGConfig(BaseRAGStrategyConfig):
         ),
     )
     global_evidence_char_budget: int = Field(
-        default=240_000,
+        default=48_000,
         ge=1_000,
         le=4_000_000,
         description=(
-            "Maximum characters of evidence text a non-COUNT global query may "
-            "send in one synchronous request. This is the real constraint on a "
-            "whole-document question: node count is a poor proxy for it, since "
-            "a scope's cost is what it says, not how many pieces it is cut "
-            "into. Roughly four characters per token."
+            "Ceiling on the characters of evidence text a non-COUNT global "
+            "query may send in one synchronous request, at roughly four "
+            "characters per token. This is only a ceiling: the effective budget "
+            "is derived from the answer model's own num_ctx minus the tokens "
+            "reserved for the answer, and the lower of the two wins. It applies "
+            "on its own only when the backend declares no context window."
         ),
     )
     planner_max_query_chars: int = Field(

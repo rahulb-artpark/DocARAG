@@ -43,6 +43,7 @@ from docarag.evidence_hydration import CanonicalEvidenceHydrator
 from Core.rag.gbc_utils import (
     GBCRAGContext,
     SubStep,
+    answer_input_char_budget,
     filter_tree_nodes,
     global_scope_chars,
 )
@@ -1652,7 +1653,16 @@ class GBCRAG(BaseRAG):
             filtered_count = len(filtered_nodes)
             current_step.global_filtered_count = filtered_count
             current_step.global_evidence_limit = self.cfg.global_evidence_limit
-            log.info("Global filter resulted in %d nodes.", filtered_count)
+            # Read from the answer model, so the scope can never be larger than
+            # the window that has to hold it plus the answer.
+            char_budget = answer_input_char_budget(
+                self.llm, self.cfg.global_evidence_char_budget
+            )
+            log.info(
+                "Global filter resulted in %d nodes; evidence budget %d chars.",
+                filtered_count,
+                char_budget,
+            )
 
             # 2. Perform the specified operation
             if operation == "COUNT":
@@ -1678,8 +1688,7 @@ class GBCRAG(BaseRAG):
                 self._notify_retrieval_ready(context, current_step)
             elif (
                 filtered_count > self.cfg.global_evidence_limit
-                or global_scope_chars(filtered_nodes)
-                > self.cfg.global_evidence_char_budget
+                or global_scope_chars(filtered_nodes) > char_budget
             ):
                 # A silent prefix/sample is inaccurate, while one model call
                 # per item is an unbounded latency and cost failure. Until the
@@ -1702,7 +1711,7 @@ class GBCRAG(BaseRAG):
                     if filtered_count > self.cfg.global_evidence_limit
                     else (
                         f"{scope_chars:,} characters of evidence, exceeding the "
-                        f"budget of {self.cfg.global_evidence_char_budget:,}"
+                        f"budget of {char_budget:,}"
                     )
                 )
                 final_answer = (
@@ -1716,7 +1725,7 @@ class GBCRAG(BaseRAG):
                         "matched_count": filtered_count,
                         "evidence_limit": self.cfg.global_evidence_limit,
                         "matched_chars": scope_chars,
-                        "char_budget": self.cfg.global_evidence_char_budget,
+                        "char_budget": char_budget,
                         "budget_exhausted": True,
                     }
                 ]

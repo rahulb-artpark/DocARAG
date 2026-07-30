@@ -10,7 +10,12 @@ from Core.Index.Tree import NodeType
 from Core.configs.rag.gbc_config import GBCRAGConfig
 from Core.rag.gbc_plan import Filter, PlanResult
 from Core.rag.gbc_rag import GBCRAG
-from Core.rag.gbc_utils import GBCRAGContext, filter_tree_nodes, global_scope_chars
+from Core.rag.gbc_utils import (
+    GBCRAGContext,
+    answer_input_char_budget,
+    filter_tree_nodes,
+    global_scope_chars,
+)
 
 
 def _global_plan(operation: str) -> PlanResult:
@@ -22,13 +27,16 @@ def _global_plan(operation: str) -> PlanResult:
     )
 
 
-def _rag(*, limit: int, tree, char_budget: int = 10_000_000) -> GBCRAG:
+def _rag(*, limit: int, tree, char_budget: int = 10_000_000, num_ctx=None) -> GBCRAG:
     rag = object.__new__(GBCRAG)
     # The char budget defaults out of the way so a test that is about the item
     # limit is not silently also testing the size gate.
     rag.cfg = SimpleNamespace(
         global_evidence_limit=limit, global_evidence_char_budget=char_budget
     )
+    # num_ctx defaults to undeclared, so the configured ceiling is what applies
+    # and a test states its own budget rather than inheriting a model's.
+    rag.llm = SimpleNamespace(config=SimpleNamespace(num_ctx=num_ctx, max_tokens=0))
     rag.gbc_index = SimpleNamespace(TreeIndex=tree)
     rag.answer = Mock()
     rag.evidence_hydrator = None
@@ -45,7 +53,7 @@ class GlobalQueryBoundTests(unittest.TestCase):
             GBCRAGConfig(global_evidence_limit=4097)
 
     def test_char_budget_is_strictly_validated(self):
-        self.assertEqual(240_000, GBCRAGConfig().global_evidence_char_budget)
+        self.assertEqual(48_000, GBCRAGConfig().global_evidence_char_budget)
         with self.assertRaises(ValidationError):
             GBCRAGConfig(global_evidence_char_budget=999)
         with self.assertRaises(ValidationError):
@@ -326,6 +334,49 @@ class ScopeSizeIsMeasuredFromWhatIsSent(unittest.TestCase):
     def test_a_node_with_no_text_does_not_raise(self):
         node = SimpleNamespace(summary=None, meta_info=None)
         self.assertEqual(global_scope_chars([node]), 0)
+
+class TheBudgetCannotExceedWhatTheModelHolds(unittest.TestCase):
+    """The evidence has to fit beside the answer, not just somewhere.
+
+    The first version of this budget was a hand-picked 240,000 characters --
+    about 60,000 tokens -- against a model configured with num_ctx 16384 and
+    5,000 tokens reserved for output. That is five times the whole window.
+    Ollama truncates a prompt that does not fit, silently, which is precisely the
+    sampled answer this budget exists to prevent. So the ceiling is read from the
+    model and the configured value can only lower it.
+    """
+
+    @staticmethod
+    def _llm(num_ctx, max_tokens):
+        return SimpleNamespace(config=SimpleNamespace(num_ctx=num_ctx, max_tokens=max_tokens))
+
+    def test_it_is_derived_from_the_window_minus_the_reserved_answer(self):
+        # 16384 - 5000 - 1500 headroom = 9884 tokens, at 4 chars each.
+        self.assertEqual(answer_input_char_budget(self._llm(16384, 5000), 240_000), 39_536)
+
+    def test_a_configured_ceiling_can_only_lower_it(self):
+        self.assertEqual(answer_input_char_budget(self._llm(16384, 5000), 10_000), 10_000)
+
+    def test_a_generous_config_cannot_raise_it_past_the_window(self):
+        derived = answer_input_char_budget(self._llm(16384, 5000), 4_000_000)
+        self.assertEqual(derived, 39_536)
+
+    def test_a_backend_with_no_declared_window_keeps_the_configured_value(self):
+        # A hosted API model may not declare one; the configured intent stands
+        # rather than this inventing a number for it.
+        self.assertEqual(
+            answer_input_char_budget(SimpleNamespace(config=SimpleNamespace()), 48_000),
+            48_000,
+        )
+        self.assertEqual(answer_input_char_budget(SimpleNamespace(), 48_000), 48_000)
+
+    def test_a_window_too_small_to_answer_in_admits_nothing(self):
+        self.assertEqual(answer_input_char_budget(self._llm(2048, 5000), 48_000), 0)
+
+    def test_a_bigger_window_earns_a_bigger_budget(self):
+        small = answer_input_char_budget(self._llm(16384, 5000), 4_000_000)
+        large = answer_input_char_budget(self._llm(131072, 5000), 4_000_000)
+        self.assertGreater(large, small)
 
 
 if __name__ == "__main__":
