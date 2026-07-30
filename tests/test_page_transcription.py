@@ -14,6 +14,7 @@ from docarag.page_transcription import (
     transcription_lines,
     _LEXICON,
     _alignment_units,
+    _unit_max_spans,
 )
 
 _MINERU = [
@@ -229,3 +230,31 @@ class BandsAreMergedAtTheirSeam(unittest.TestCase):
 
     def test_no_bands_is_empty(self):
         self.assertEqual(merge_band_lines([]), [])
+
+
+class ABlockCannotAbsorbMoreLinesThanItHas(unittest.TestCase):
+    def test_the_cap_comes_from_the_parser_line_count(self):
+        one_line = {"middle_json": {"lines": [{"bbox": [54, 170, 249, 201]}]}}
+        six_lines = {"middle_json": {"lines": [{} for _ in range(6)]}}
+        self.assertEqual(_unit_max_spans(one_line, 1), [2])
+        self.assertEqual(_unit_max_spans(six_lines, 1), [7])
+
+    def test_a_list_item_gets_a_list_item_cap(self):
+        block = {"list_items": ["a", "b"]}
+        self.assertEqual(_unit_max_spans(block, 2), [3, 3])
+
+    def test_no_line_geometry_falls_back_to_the_uniform_default(self):
+        self.assertEqual(_unit_max_spans({"text": "x"}, 1), [4])
+
+    def test_a_one_line_block_cannot_claim_a_paragraph(self):
+        lines = [
+            "Basic Events due to Scattering",
+            "When a light ray passes through the air, the particles of dust",
+            "and smoke present in air make the path of the light ray visible.",
+            "Such a phenomenon is known as the Tyndall Effect.",
+        ]
+        claimed = align_transcription(
+            ["Basic Events du to Scattering X"], lines, max_spans=[2], as_lines=True
+        )[0]
+        self.assertLessEqual(len(claimed), 2)
+        self.assertIn("Basic Events", claimed[0])

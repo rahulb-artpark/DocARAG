@@ -291,6 +291,7 @@ def align_transcription(
     min_score: float = 0.55,
     lookahead: int | None = None,
     max_span: int = 4,
+    max_spans: Sequence[int] | None = None,
     as_lines: bool = False,
 ) -> list[str | None] | list[tuple[str, ...] | None]:
     """Match each block, in reading order, to the lines that re-read it.
@@ -306,6 +307,14 @@ def align_transcription(
     ``max_span`` lines are tried and the best-scoring one wins.  A block that
     finds nothing convincing returns ``None`` and keeps the parser's own text.
 
+    ``max_spans`` gives a per-block cap, which is what stops a short block from
+    absorbing the paragraph beneath it.  The parser already knows how many lines
+    it put in each block, and a one-line block allowed four lines is how
+    "Basic Events due to Scattering" and "Some Natural Phenomenon Based on
+    Atmospheric Refraction" -- both single-line heading blocks -- came back with
+    the body of the next paragraph glued on, which then disqualified them as
+    headings.  A uniform ``max_span`` cannot express that.
+
     ``lookahead`` searches to the end of the page by default.  A narrow window
     fails here: the transcription reads lines MinerU dropped altogether, and an
     unmatched line does not advance the cursor, so a run of them wider than the
@@ -316,12 +325,13 @@ def align_transcription(
 
     matched: list[str | None] = []
     cursor = 0
-    for text in block_texts:
+    for index, text in enumerate(block_texts):
         best: tuple[float, int, int] | None = None
+        span_limit = max_span if max_spans is None else max_spans[index]
         if _alignment_key(text):
             limit = len(lines) if lookahead is None else min(len(lines), cursor + lookahead)
             for start in range(cursor, limit):
-                for span in range(1, max_span + 1):
+                for span in range(1, span_limit + 1):
                     if start + span > len(lines):
                         break
                     candidate = " ".join(lines[start : start + span])
@@ -397,6 +407,26 @@ def merge_band_lines(bands: Sequence[Sequence[str]]) -> list[str]:
                 merged = merged[: len(merged) - best[1]]
         merged.extend(incoming)
     return merged
+
+
+# A transcription may break one parser line into two, so a block is allowed its
+# own line count plus this much slack. Without any bound a one-line heading
+# block claims four lines and swallows the paragraph under it.
+_SPAN_SLACK = 1
+_LIST_ITEM_MAX_SPAN = 3
+
+
+def _unit_max_spans(block: dict, units: int) -> list[int]:
+    """How many transcribed lines each of a block's units may claim."""
+
+    if isinstance(block.get("list_items"), list) and units:
+        return [_LIST_ITEM_MAX_SPAN] * units
+    lines = block.get("middle_json", {}).get("lines")
+    if isinstance(lines, list) and lines:
+        return [len(lines) + _SPAN_SLACK] * units
+    # No line geometry to go on: fall back to the uniform default rather than
+    # inventing a bound tighter than the evidence supports.
+    return [4] * units
 
 
 def _alignment_units(block: dict) -> tuple[str, ...]:
@@ -525,12 +555,16 @@ def retranscribe_scanned_pages(
         # One unit per list item, one per ordinary block, all in reading order
         # so the alignment stays monotonic across the whole page.
         units: list[str] = []
+        unit_spans: list[int] = []
         spans: list[tuple[int, int]] = []
         for block in page_blocks:
             block_units = _alignment_units(block)
             spans.append((len(units), len(units) + len(block_units)))
             units.extend(block_units)
-        matches = align_transcription(units, lines, as_lines=True)
+            unit_spans.extend(_unit_max_spans(block, len(block_units)))
+        matches = align_transcription(
+            units, lines, max_spans=unit_spans, as_lines=True
+        )
         replaced = 0
         for block, (start, end) in zip(page_blocks, spans):
             claimed = matches[start:end]
