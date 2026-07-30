@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from html import unescape
 import math
 import mimetypes
 import re
@@ -395,19 +396,55 @@ def _add_text_representation(
 # which had been taught the same fact separately, read them correctly.
 _TEXT_BEARING_KEYS = ("text", "list_items", "code_body")
 
+# MinerU wraps a listing in how it wants the listing displayed: an algorithm
+# arrives inside a styled <div>, with its angle brackets HTML-escaped, and a code
+# block inside a fenced Markdown span. Both wrappers reached the tree verbatim,
+# so what got embedded, summarised and rendered for
+# "If N < 1 / Then print('Empty Vector') / Exit" was
+#   <div class="mineru-algorithm" style="white-space: pre-wrap; ...">
+#   If $N &lt; 1$ ... </div>
+# Stripping it here rather than at each reader keeps one owner for MinerU's
+# layout, the same reason this module owns which key the text lives under. The
+# listing's own line breaks are what is left behind, because a listing without
+# them is not a listing.
+_ALGORITHM_WRAPPER = re.compile(
+    r"^\s*<div\b[^>]*>(?P<body>.*?)</div>\s*$", re.DOTALL | re.IGNORECASE
+)
+_CODE_FENCE = re.compile(
+    r"^\s*```[^\n`]*\n(?P<body>.*?)\n?```\s*$", re.DOTALL
+)
+
+
+def unwrap_presentation(text: str) -> str:
+    """A listing's own text, without the markup MinerU wrapped it in."""
+
+    for pattern in (_ALGORITHM_WRAPPER, _CODE_FENCE):
+        match = pattern.match(text)
+        if match:
+            # Only a wrapper is removed, never nested markup: the body of a
+            # <div> is unescaped because MinerU escaped it to put it there, but
+            # a fenced block was never escaped and must not be touched.
+            body = match.group("body")
+            if pattern is _ALGORITHM_WRAPPER:
+                body = unescape(body)
+            return body.strip("\n")
+    return text
+
 
 def content_block_text_parts(block: Mapping[str, object]) -> tuple[str, ...]:
     """The text pieces a raw MinerU content-list block carries, in reading order.
 
     One piece per list item, so callers can join them the way their own
     representation needs without knowing which key they came from.
+
+    A listing is returned unwrapped -- see ``unwrap_presentation``.
     """
 
     for key in _TEXT_BEARING_KEYS:
         value = block.get(key)
         if isinstance(value, str):
             if value.strip():
-                return (value,)
+                return (unwrap_presentation(value),)
             continue
         if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
             parts = tuple(

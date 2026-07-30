@@ -459,6 +459,25 @@ _VISUAL_SUBTYPES = frozenset(
         "workflow",
     }
 )
+# MinerU reports an algorithm as a code block carrying sub_type "algorithm", so
+# the distinction arrives as a subtype and the block type alone cannot express
+# it. Keying the node type on block type only meant every algorithm reached the
+# tree as code: Basics-of-Algorithm.pdf produced 7 code nodes and no algorithm
+# node, from 4 code blocks and 3 algorithm blocks. NodeType.ALGORITHM and its
+# summariser prompt already existed and nothing ever reached them.
+_NODE_TYPE_BY_SUBTYPE = {"algorithm": "algorithm"}
+
+
+def _node_type_for(block: CanonicalBlock) -> str:
+    """The node type, taking the subtype into account where it is finer."""
+
+    subtype = (block.semantic_subtype or "").strip().casefold()
+    refined = _NODE_TYPE_BY_SUBTYPE.get(subtype)
+    if refined is not None:
+        return refined
+    return _NODE_TYPE_BY_BLOCK.get(block.block_type, "text")
+
+
 _MARKDOWN_SEPARATOR = re.compile(r"^:?-{3,}:?$")
 _IMAGE_SUFFIXES = frozenset(
     {".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
@@ -1319,7 +1338,7 @@ def _project_text(block: CanonicalBlock, row: dict[str, object]) -> None:
         )
     row.update(
         {
-            "type": _NODE_TYPE_BY_BLOCK.get(block.block_type, "text"),
+            "type": _node_type_for(block),
             "text": selected.content,
             "text_format": selected.kind.value,
             "selected_representation_id": selected.representation_id,
