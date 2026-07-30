@@ -304,6 +304,7 @@ _EVIDENCE_TRACE_FIELDS = (
     "transformations",
     "semantic_subtype",
     "title_level",
+    "code_language",
     "parser_provenance",
     "quality_status",
     "reconciliation_method",

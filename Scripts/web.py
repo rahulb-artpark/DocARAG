@@ -827,6 +827,8 @@ class AppState:
                     "type": view.type if view.type == "root" else view.type.upper(),
                     "page": page + 1 if isinstance(page, int) else None,
                     "titleLevel": evidence.get("title_level"),
+                    "codeLanguage": evidence.get("code_language")
+                    or getattr(meta, "code_language", None),
                     # A node's display text is its evidence content -- caption
                     # and footnotes for a table, the description for an image.
                     # The retrieval feed prefers html/ocr channels and is for

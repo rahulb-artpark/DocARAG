@@ -220,6 +220,12 @@ class MetaInfo(BaseModel):
         description="the level of the title, 0 is the root", default=-1
     )
 
+    # listing info
+    code_language: str | None = Field(
+        description="the language MinerU named on a listing's fence, if any",
+        default=None,
+    )
+
     @field_validator("semantic_substructures", mode="before")
     @classmethod
     def _validate_semantic_substructures(cls, value):

@@ -16,6 +16,9 @@ import re
 import logging
 from bs4 import BeautifulSoup
 
+from statistics import median
+
+from docarag.adapters.mineru_compat import unwrap_presentation
 from docarag.derived_identity import (
     derived_evidence_id,
     derived_identity_payload,
@@ -1382,6 +1385,193 @@ def table_merger(pdf_list: list[Optional[str]], llm: LLM) -> list[Optional[str]]
     return pdf_list
 
 
+# A pseudocode listing reaches us in pieces. MinerU labels only the part it is
+# sure about -- a code block carrying sub_type "algorithm" -- and emits the
+# surrounding step lines as ordinary text blocks, so "Algorithm 6.2: Binary
+# Search" arrived as a 114-character fragment starting mid-sentence at
+# 'PRINT "Element found at position"' with Steps 1-5 scattered beside it as
+# prose. Two documents shred it two different ways (one splits on the lines
+# carrying maths, the other on indentation depth), so the run is rebuilt from
+# layout rather than from what the step labels look like: keying on "Step N:" or
+# "N.M. [annotation]" would fit these two books and break on the next one.
+#
+# The pass only ever grows outward from a block MinerU itself called an
+# algorithm. That is what keeps it away from real code: a Python or C++ listing
+# has no algorithm anchor, arrives whole with its indentation already intact,
+# and is never a candidate here.
+_LISTING_MERGEABLE_TYPES = frozenset({"text", "code"})
+# A neighbour further from the run than this is a new block of content rather
+# than the listing's next line. Expressed as a multiple of the run's own line
+# pitch so it scales with the page, with a floor for a run too short to have
+# established one.
+_LISTING_GAP_MULTIPLE = 2.0
+_LISTING_GAP_FLOOR = 14
+
+
+def _listing_bbox(content: dict) -> Optional[tuple[float, float, float, float]]:
+    bbox = content.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        left, top, right, bottom = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return None
+    return left, top, right, bottom
+
+
+def _visual_line_count(content: dict) -> int:
+    """How many lines on the page this block occupies, as MinerU counted them."""
+
+    middle = content.get("middle_json")
+    lines = middle.get("lines") if isinstance(middle, dict) else None
+    return len(lines) if isinstance(lines, list) else 0
+
+
+def _listing_reject_reason(content: Optional[dict]) -> Optional[str]:
+    """Why this block is not part of a listing, or None if it could be."""
+
+    if content is None or content.get("invalid"):
+        return "already merged"
+    if content.get("type") not in _LISTING_MERGEABLE_TYPES:
+        return f"type {content.get('type')!r}"
+    if content.get("text_level") is not None:
+        # A levelled heading both ends the listing and stays its own node: it is
+        # the caption ("Algorithm 6.2: Binary Search") or the next section
+        # ("2.3 Format Convention of algorithm"), never a step.
+        return "heading"
+    if content.get("type") == "text" and _visual_line_count(content) > 1:
+        # A step is one line on the page; a paragraph wraps. This is the only
+        # thing separating the listing from the prose that follows it when both
+        # sit at the same left margin, which is how one of the two documents
+        # lays the page out.
+        return f"wrapped over {_visual_line_count(content)} lines"
+    if _listing_bbox(content) is None:
+        return "no bbox"
+    return None
+
+
+def _listing_run_indices(page: list[dict], anchor: int, taken: set[int]) -> list[int]:
+    """Grow a listing outward from an anchor, in both directions, while it holds."""
+
+    run = [anchor]
+    for step in (-1, 1):
+        index = anchor + step
+        while 0 <= index < len(page) and index not in taken:
+            candidate = page[index]
+            if _listing_reject_reason(candidate) is not None:
+                break
+            boxes = [_listing_bbox(page[i]) for i in run]
+            boxes = [box for box in boxes if box is not None]
+            box = _listing_bbox(candidate)
+            if not boxes or box is None:
+                break
+            left = min(item[0] for item in boxes)
+            right = max(item[2] for item in boxes)
+            # A neighbouring column is next to the listing, not inside it.
+            if min(right, box[2]) - max(left, box[0]) <= 0:
+                break
+            tops = sorted(boxes, key=lambda item: item[1])
+            pitches = [
+                max(0.0, later[1] - earlier[3])
+                for earlier, later in zip(tops, tops[1:])
+            ]
+            if box[1] >= tops[-1][3]:
+                gap = box[1] - tops[-1][3]
+            elif box[3] <= tops[0][1]:
+                gap = tops[0][1] - box[3]
+            else:
+                gap = 0.0
+            if pitches:
+                limit = max(_LISTING_GAP_MULTIPLE * median(pitches), _LISTING_GAP_FLOOR)
+            else:
+                limit = float(_LISTING_GAP_FLOOR)
+            if gap > limit:
+                break
+            run.append(index)
+            index += step
+    return sorted(run)
+
+
+def merge_listing_and_mark_invalid(anchor: dict, contributors: list[dict]) -> None:
+    """Rebuild one listing from its pieces, keeping every line break.
+
+    Unlike ``merge_text_and_mark_invalid`` the pieces are joined with newlines
+    and every contributor is invalidated, not only the text ones: a listing's
+    line breaks and indentation are its meaning, and the code pieces here are
+    listing lines rather than equations to be preserved separately.
+    """
+
+    if not contributors:
+        return
+    ordered = sorted([anchor, *contributors], key=lambda item: item.get("_listing_seq", 0))
+    parts: list[str] = []
+    for content in ordered:
+        raw = content.get("text")
+        if not isinstance(raw, str) or not raw.strip():
+            raw = content.get("code_body")
+        if not isinstance(raw, str):
+            continue
+        piece = unwrap_presentation(raw).strip("\n")
+        if piece.strip():
+            parts.append(piece)
+    if not parts:
+        return
+    for content in contributors:
+        content["invalid"] = True
+
+    anchor["text"] = "\n".join(parts)
+    # The listing now lives in "text" like any other block's content. Leaving a
+    # stale wrapped code_body behind would give the block two readings, and
+    # every reader prefers "text", so the losing one is removed rather than
+    # left as a trap.
+    anchor.pop("code_body", None)
+    boxes = [_listing_bbox(content) for content in ordered]
+    boxes = [box for box in boxes if box is not None]
+    if boxes:
+        anchor["bbox"] = [
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        ]
+    _mark_derived_evidence(anchor, contributors, "bookrag.listing_merge.v1")
+    log.info(
+        "Merged a %d-piece listing on page %d",
+        len(ordered),
+        anchor.get("page_idx", -1) + 1,
+    )
+
+
+def listing_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
+    """Rejoin pseudocode listings that arrived split across blocks."""
+
+    pages: Dict[object, list[dict]] = {}
+    for content in pdf_list:
+        if content is None:
+            continue
+        pages.setdefault(content.get("page_idx"), []).append(content)
+
+    for page in pages.values():
+        for position, content in enumerate(page):
+            content["_listing_seq"] = position
+        taken: set[int] = set()
+        for position, content in enumerate(page):
+            if position in taken or content.get("sub_type") != "algorithm":
+                continue
+            if _listing_reject_reason(content) is not None:
+                continue
+            run = _listing_run_indices(page, position, taken)
+            taken.update(run)
+            if len(run) < 2:
+                continue
+            merge_listing_and_mark_invalid(
+                content, [page[i] for i in run if i != position]
+            )
+        for content in page:
+            content.pop("_listing_seq", None)
+    return pdf_list
+
+
 def dash_line_refiner(pdf_list: list[Optional[str]]):
     for content in pdf_list:
         if content is None:
@@ -1480,6 +1670,13 @@ def pdf_info_refiner(
 
     # we first enumerate the pdf_list to ensure each content has a unique index
     pdf_list = enumerate_pdf_list(pdf_list, start=start_pdf_id)
+
+    # Rejoin a split pseudocode listing before any prose-oriented pass sees it.
+    # Its step lines are single-line text blocks, which is exactly what
+    # text_merger and label_merger hunt for -- run after them and the listing
+    # has already been absorbed into the paragraph beside it, space-joined and
+    # stripped of the line breaks that make it a listing.
+    pdf_list = listing_merger(pdf_list)
 
     # Then we refine the PDF information by merging incomplete paragraphs and tables
     pdf_list = text_merger(pdf_list, llm)

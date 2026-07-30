@@ -77,10 +77,6 @@ class TheAdapterUnwrapsWhereverTheTextLives(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TheCanonicalRepresentationIsUnwrapped(unittest.TestCase):
     """The representation is what downstream selects, so it must be clean.
 
@@ -118,10 +114,15 @@ class TheCanonicalRepresentationIsUnwrapped(unittest.TestCase):
 
 
 class TheFenceLanguageIsKept(unittest.TestCase):
-    """MinerU names the language, and the name separates code from output.
+    """MinerU names the language on the fence, and the name is worth keeping.
 
-    On lecs106.pdf the ```python blocks are the programs and the ```txt blocks
-    are their console transcripts, which were reaching the tree as code.
+    A named language identifies a program: on lecs106.pdf every ```python block
+    is one of the book's Programs. The absence of a name means only that MinerU
+    could not name the language -- it is deliberately not read as "this is not a
+    program". On lecs106 the three untagged blocks are console transcripts, but
+    on Basics-of-Algorithm.pdf all four untagged blocks are pseudocode, so
+    retyping an untagged listing on the strength of the missing tag would be
+    wrong on one of the only two documents that exercise it.
     """
 
     def test_a_named_language_is_returned(self):
@@ -144,3 +145,51 @@ class TheFenceLanguageIsKept(unittest.TestCase):
 
     def test_an_algorithm_div_has_no_language(self):
         self.assertIsNone(fence_language(_ALGORITHM))
+
+
+class TheLanguageReachesTheProjection(unittest.TestCase):
+    """The fence is stripped before projection, so the name has to be carried.
+
+    It travels in the representation's metadata rather than in
+    Representation.language, which is the natural language of the text.
+    """
+
+    def _representations(self, block):
+        from docarag.adapters.mineru_compat import _representations
+        from docarag.domain.evidence import BlockType
+
+        return _representations(block, BlockType.CODE, confidence=None, language="en")
+
+    def _listing_language(self, block):
+        for representation in self._representations(block):
+            name = representation.metadata.get("listing_language")
+            if name is not None:
+                return name
+        return None
+
+    def test_a_named_language_is_carried_on_the_representation(self):
+        block = {"type": "code", "code_body": "```python\nx = 1\n```"}
+        self.assertEqual(self._listing_language(block), "python")
+
+    def test_the_natural_language_field_is_not_overloaded(self):
+        block = {"type": "code", "code_body": "```python\nx = 1\n```"}
+        for representation in self._representations(block):
+            self.assertEqual(representation.language, "en")
+
+    def test_an_untagged_listing_carries_no_language(self):
+        block = {"type": "code", "code_body": _CODE}
+        self.assertIsNone(self._listing_language(block))
+
+    def test_an_algorithm_carries_no_language(self):
+        block = {"type": "code", "sub_type": "algorithm", "code_body": _ALGORITHM}
+        self.assertIsNone(self._listing_language(block))
+
+    def test_a_merged_listing_carries_no_language(self):
+        # listing_merger writes the rejoined listing into "text" and drops the
+        # code_body, so there is no fence left to read a language off.
+        block = {"type": "code", "sub_type": "algorithm", "text": "Step 1\nStep 2"}
+        self.assertIsNone(self._listing_language(block))
+
+
+if __name__ == "__main__":
+    unittest.main()

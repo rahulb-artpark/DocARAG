@@ -1346,6 +1346,17 @@ def _project_text(block: CanonicalBlock, row: dict[str, object]) -> None:
             "selected_asset_ids": [],
         }
     )
+    # The language MinerU named on the listing's fence, carried on the
+    # representation because by this point the fence itself has been stripped.
+    # Representation.language is the natural language of the text and means
+    # something else, so the listing's language travels in metadata instead.
+    listing_language = None
+    if isinstance(selected.metadata, Mapping):
+        candidate = selected.metadata.get("listing_language")
+        if isinstance(candidate, str) and candidate.strip():
+            listing_language = candidate.strip()
+    if listing_language is not None:
+        row["code_language"] = listing_language
     if block.block_type is BlockType.DOC_TITLE:
         # A document title is a title, and outranks every section heading.
         # Without a level it reaches the tree as ordinary body text and the

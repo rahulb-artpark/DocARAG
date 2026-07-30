@@ -366,9 +366,16 @@ def _add_text_representation(
     confidence: float | None,
     language: str | None,
     source_field: str | None = None,
+    extra_metadata: Mapping[str, object] | None = None,
 ) -> None:
     text = _joined_text(value)
     if text is not None:
+        metadata: dict[str, object] = {}
+        if source_field is not None:
+            metadata["assertion_origin"] = "mineru_explicit_normalized_field"
+            metadata["source_field"] = source_field
+        if extra_metadata:
+            metadata.update(extra_metadata)
         destination.append(
             Representation(
                 kind=kind,
@@ -376,14 +383,7 @@ def _add_text_representation(
                 media_type=media_type,
                 confidence=confidence,
                 language=language,
-                metadata=(
-                    {}
-                    if source_field is None
-                    else {
-                        "assertion_origin": "mineru_explicit_normalized_field",
-                        "source_field": source_field,
-                    }
-                ),
+                metadata=metadata,
             )
         )
 
@@ -582,6 +582,19 @@ def _representations(
     # ordinary pages, and all three landed here.
     if block_type in _TEXT_REPRESENTED_BLOCKS:
         is_list = block_type == BlockType.LIST_ITEM and block.get("text") is None
+        wraps_a_listing = (
+            block_type == BlockType.CODE
+            and block.get("text") is None
+            and isinstance(block.get("code_body"), str)
+        )
+        # The fence tag is the parser's own answer to "what language is this",
+        # and it is the only thing separating a program from an untagged
+        # listing. It is recorded rather than acted on here: an untagged listing
+        # is a listing whose language MinerU could not name, which is not the
+        # same claim as "this is not a program".
+        listing_language = (
+            fence_language(block["code_body"]) if wraps_a_listing else None
+        )
         _add_text_representation(
             result,
             kind=(
@@ -595,9 +608,7 @@ def _representations(
                 # content_block_text_parts -- stripping it there alone left the
                 # <div> in the canonical text and changed nothing in the tree.
                 unwrap_presentation(block["code_body"])
-                if block_type == BlockType.CODE
-                and block.get("text") is None
-                and isinstance(block.get("code_body"), str)
+                if wraps_a_listing
                 else _list_markdown(block.get("list_items"))
                 if is_list
                 else block.get("text")
@@ -606,6 +617,9 @@ def _representations(
             confidence=confidence,
             language=language,
             source_field="list_items" if is_list else None,
+            extra_metadata=(
+                {"listing_language": listing_language} if listing_language else None
+            ),
         )
     if block_type == BlockType.TABLE:
         _add_text_representation(

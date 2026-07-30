@@ -40,6 +40,7 @@ def _evidence_meta(pdf_content: dict) -> dict:
             "geometry", pdf_content.get("source_geometry")
         ),
         "semantic_subtype": pdf_content.get("semantic_subtype"),
+        "code_language": pdf_content.get("code_language"),
         "parser_provenance": pdf_content.get("parser_provenance"),
         "quality_status": pdf_content.get("quality_status"),
         "reconciliation_method": pdf_content.get("reconciliation_method"),
