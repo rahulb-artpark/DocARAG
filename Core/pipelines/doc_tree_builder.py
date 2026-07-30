@@ -1,3 +1,4 @@
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 import hashlib
 from importlib import metadata as importlib_metadata
@@ -1310,13 +1311,20 @@ def _validate_cached_provider_tree(
 
 
 def construct_tree_index(
-    tree_index: DocumentTree, pdf_list: list[dict], title_outline: list[dict]
+    tree_index: DocumentTree,
+    pdf_list: list[dict],
+    title_outline: list[dict],
+    rejected_title_ids: Collection[int] = (),
 ) -> DocumentTree:
     """Attach every normalized source block exactly once in document order.
 
     ``pdf_list`` is the evidence-bearing source of truth.  The outline may only
     contribute hierarchy (``text_level`` and ``parent_id``); it cannot replace
     text, geometry, or canonical provenance copied from the source block.
+
+    ``rejected_title_ids`` are the blocks the outline pass read and explicitly
+    ruled out as section headings.  Without them the pass can only ever add
+    headings, so a verdict of "this is not a heading" is silently discarded.
 
     Identity corruption is rejected because silently guessing would break
     traceability.  Semantic hierarchy errors are recoverable: a title with an
@@ -1394,14 +1402,18 @@ def construct_tree_index(
     title_ids: set[int] = set()
     title_levels: dict[int, int] = {}
 
-    # The parser's own headings are headings.  The outline pass is an LLM
-    # reading the prose; when it and the parser disagree about whether a block
-    # is a heading, the parser saw the page and it did not.  Seeding from the
-    # parser first means a document keeps the structure MinerU already found --
-    # previously a heading existed only if the LLM independently renominated
-    # it, so a five-page chapter whose parser reported 14 headings was built
-    # from the 4 the outline pass happened to agree on, and one mid-document
-    # heading adopted three quarters of the document.
+    # The parser's own headings are headings unless the outline pass read one
+    # and said otherwise.  Seeding from the parser first means a document keeps
+    # the structure MinerU already found -- previously a heading existed only if
+    # the LLM independently renominated it, so a five-page chapter whose parser
+    # reported 14 headings was built from the 4 the outline pass happened to
+    # agree on, and one mid-document heading adopted three quarters of the
+    # document.  Seeding *unconditionally* has the opposite failure: the pass
+    # marked "↓ Correction" and "atmospheric refraction." invalid and both
+    # headed sections anyway, the second dragging a later page's content into
+    # an earlier page's section.  Only an explicit verdict overrides the parser;
+    # a pass that stayed silent about a block leaves it exactly as it was.
+    rejected = frozenset(rejected_title_ids)
     for pdf_id, source_block in blocks_by_id.items():
         if source_block.get("type", "unknown") not in _TITLE_CAPABLE_TYPES:
             continue
@@ -1410,10 +1422,25 @@ def construct_tree_index(
             continue
         if parser_level < 0:
             continue
+        if pdf_id in rejected:
+            log.info(
+                "Outline pass ruled out parser heading pdf_id=%d; keeping it as body text",
+                pdf_id,
+            )
+            continue
         title_ids.add(pdf_id)
         title_levels[pdf_id] = parser_level
 
     for pdf_id, outline_entry in outline_by_id.items():
+        if pdf_id in rejected:
+            # A rejection and a hierarchy entry for the same block contradict
+            # each other; the rejection is the narrower, later claim.
+            log.warning(
+                "Outline pass both rejected and levelled pdf_id=%d; honouring "
+                "the rejection",
+                pdf_id,
+            )
+            continue
         if blocks_by_id[pdf_id].get("type", "unknown") in _TITLE_CAPABLE_TYPES:
             title_ids.add(pdf_id)
             raw_level = outline_entry.get(
@@ -1922,10 +1949,15 @@ def build_tree_from_pdf(
         with timings.time("layout_recheck"):
             pdf_list = pdf_info_refiner(pdf_list, llm)
         with timings.time("outline"):
-            title_outline = extract_pdf_outline_in_chunks(pdf_list, llm)
+            title_outline, rejected_title_ids = extract_pdf_outline_in_chunks(
+                pdf_list, llm
+            )
         with timings.time("construct"):
             tree_index = construct_tree_index(
-                tree_index=tree_index, pdf_list=pdf_list, title_outline=title_outline
+                tree_index=tree_index,
+                pdf_list=pdf_list,
+                title_outline=title_outline,
+                rejected_title_ids=rejected_title_ids,
             )
         token_tracker = TokenTracker.get_instance()
         tree_index_cost = token_tracker.record_stage("tree_index_construction")

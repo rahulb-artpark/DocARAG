@@ -8,8 +8,63 @@ import logging
 log = logging.getLogger(__name__)
 import json
 import math
+import re
 
 SELECT_COLS = ["pdf_id", "text", "page_idx", "height"]
+
+# The outline pass is a second opinion on the parser's headings, and the
+# parser's judgement stands unless the pass explicitly overrules it. Silence --
+# a dropped chunk, an unparseable response, a pdf_id the model failed to echo
+# back -- must never change a block's kind, in either direction.
+#
+# Which way the burden of proof runs depends on what the parser said:
+#   parser labelled a heading -> stays a heading unless the pass returns -1
+#   parser labelled body text -> stays body text unless the pass returns a level
+#
+# Only heading-shaped body blocks are offered for promotion. Sending every
+# paragraph would cost chunks of prompt for candidates no reader would mistake
+# for a heading, and give the model that many more chances to promote a
+# sentence. A block missed by the parser looks like a heading to the eye: it is
+# short, it names a topic, it starts like a name, and it is not a sentence.
+#
+# The shape rules below are each here because a looser version of this filter
+# offered a block the model then promoted, and the promotion was wrong:
+#   "Power of accomodation of eye decreases. ↓ Causes"  -> a sentence plus a
+#       label, which headed a section holding the next two blocks
+#   "Conditions for its formation →"  -> a label pointing at the list beneath
+#       it, which the model made a top-level section owning half the chapter
+_HEADING_SHAPE_MAX_WORDS = 12
+_SENTENCE_TERMINATORS = (".", "?", "!")
+# A period that ends a sentence is followed by a space; one inside "2.1" or
+# "Fig.3" is not, so section numbers survive this.
+_MID_SENTENCE_BREAK = re.compile(r"[.?!]\s")
+# In handwritten notes an arrow points from a label at the content it labels.
+# A heading names its section instead of pointing at it.
+_ANNOTATION_ARROWS = ("→", "←", "↓", "↑", "⇒", "⇐", "=>", "->")
+
+
+def heading_shaped(text: object) -> bool:
+    """Whether a body block is worth offering to the outline pass as a heading."""
+
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # "www.notesd" and "owrof th Sun at Sunvise" are OCR debris, not headings;
+    # a heading starts with a capital or a section number.
+    first = stripped[0]
+    if not (first.isdigit() or (first.isalpha() and first.isupper())):
+        return False
+    if stripped.endswith(_SENTENCE_TERMINATORS):
+        return False
+    if _MID_SENTENCE_BREAK.search(stripped):
+        return False
+    if stripped.startswith(_ANNOTATION_ARROWS) or stripped.endswith(
+        _ANNOTATION_ARROWS
+    ):
+        return False
+    return 1 <= len(stripped.split()) <= _HEADING_SHAPE_MAX_WORDS
 
 
 def outline_refine(outline_list: List[Optional[str]]) -> List[Optional[str]]:
@@ -200,10 +255,16 @@ def calculate_effective_height(entry: dict) -> float:
 
 def extract_pdf_outline_in_chunks(
     pdf_list: List[Optional[str]], llm: LLM
-) -> List[Optional[str]]:
-    """
-    Extracts the PDF outline by processing titles in chunks with improved, stateful
-    context building to ensure accurate hierarchical structure.
+) -> tuple[List[Optional[str]], frozenset[int]]:
+    """Extract the outline in chunks, with stateful context between chunks.
+
+    Returns the hierarchy and the pdf_ids the pass explicitly rejected as
+    non-headings.  The rejections are returned rather than dropped because the
+    tree seeds its titles from the parser: a rejection that is merely absent
+    from the hierarchy is indistinguishable from a heading the pass never
+    looked at, and the block opens a section anyway.  That is how "↓ Correction"
+    and "atmospheric refraction." came to head sections of a scanned chapter
+    after this pass had correctly marked both invalid.
     """
     # 1. More precise token budget calculation (Your Point 1 & 4)
     prompt_template_tokens = num_tokens(OUTLINE_EXTRACTION_PROMPT.format(json_title=""))
@@ -219,28 +280,48 @@ def extract_pdf_outline_in_chunks(
     original_title_outline = []
     pdf_list_enumerated = enumerate_pdf_list(pdf_list)
     stack = []
+    # pdf_ids the parser itself labelled headings. Everything else in the
+    # candidate list is a promotion offer the parser did not make.
+    parser_title_ids = set()
     for content in pdf_list_enumerated:
-        if "text" in content and "text_level" in content:
-            level = content["text_level"]
-            pdf_id = content.get("pdf_id", -1)
+        if "text" not in content:
+            continue
+        level = content.get("text_level")
+        is_parser_title = isinstance(level, int) and not isinstance(level, bool)
+        if not is_parser_title:
+            # Only prose is offered for promotion. A list item, a page header
+            # and a footer are all title-capable once promoted, and none of
+            # them is a section heading worth the risk of offering.
+            if content.get("type") != "text":
+                continue
+            if not heading_shaped(content.get("text")):
+                continue
+        pdf_id = content.get("pdf_id", -1)
 
+        if is_parser_title:
             while stack and stack[-1][0] >= level:
                 stack.pop()
-            parent_id = stack[-1][1] if stack else 0
+        parent_id = stack[-1][1] if stack else 0
 
-            content_copy = content.copy()
-            content_copy["parent_id"] = parent_id
+        content_copy = content.copy()
+        content_copy["parent_id"] = parent_id
 
-            bbox = content.get("middle_json", {}).get("bbox")
-            height_calculation_input = {"text": content.get("text", ""), "bbox": bbox}
-            effective_height = calculate_effective_height(height_calculation_input)
-            content_copy["height"] = effective_height
+        bbox = content.get("middle_json", {}).get("bbox")
+        height_calculation_input = {"text": content.get("text", ""), "bbox": bbox}
+        effective_height = calculate_effective_height(height_calculation_input)
+        content_copy["height"] = effective_height
 
-            original_title_outline.append(content_copy)
+        original_title_outline.append(content_copy)
+        # A candidate the parser did not level owns no depth, so it cannot
+        # reparent the headings that follow it if the pass declines to promote
+        # it.
+        if is_parser_title:
+            parser_title_ids.add(pdf_id)
             stack.append((level, pdf_id))
 
     # --- Main processing loop ---
     final_outline = []
+    rejected_title_ids: set[int] = set()
     processed_titles_count = 0
 
     while processed_titles_count < len(original_title_outline):
@@ -343,9 +424,17 @@ def extract_pdf_outline_in_chunks(
 
                         if tmp_outline["text_level"] != -1:
                             newly_processed_items.append(tmp_outline)
-                        else:
+                        elif pdf_id in parser_title_ids:
+                            # An explicit verdict on a heading the parser found.
+                            # Carried out of this function so the tree can stop
+                            # seeding a section from it.
+                            rejected_title_ids.add(pdf_id)
                             log.info(
-                                f"Skipping invalid outline entry from LLM for pdf_id {pdf_id}"
+                                f"Outline pass rejected parser heading pdf_id {pdf_id}"
+                            )
+                        else:
+                            log.debug(
+                                f"Outline pass declined to promote pdf_id {pdf_id}"
                             )
 
             final_outline.extend(newly_processed_items)
@@ -354,13 +443,24 @@ def extract_pdf_outline_in_chunks(
             log.error(
                 f"Error processing chunk: {e}. Falling back to original outline for this chunk."
             )
-            final_outline.extend(new_titles_for_chunk)
+            # A failed chunk is silence, not a verdict: the parser's headings
+            # keep their levels and nothing gets promoted off the back of a
+            # response that never arrived.
+            final_outline.extend(
+                title
+                for title in new_titles_for_chunk
+                if title["pdf_id"] in parser_title_ids
+            )
 
         # 6. Run outline_refine IN-LOOP to ensure context for the next iteration is valid (Your Point 5)
         final_outline = outline_refine(outline_list=final_outline)
         processed_titles_count += len(new_titles_for_chunk)
 
-    log.info(f"--- All {len(original_title_outline)} titles processed in chunks ---")
+    log.info(
+        f"--- All {len(original_title_outline)} candidates processed in chunks "
+        f"({len(parser_title_ids)} parser headings, "
+        f"{len(original_title_outline) - len(parser_title_ids)} promotion offers) ---"
+    )
 
     # 7. Final post-processing for end_id calculation
     max_level = 0
@@ -373,8 +473,15 @@ def extract_pdf_outline_in_chunks(
         outline["end_id"] = next_item_pdf_id
         max_level = max(max_level, outline["text_level"])
 
+    promoted = sum(
+        1 for entry in final_outline if entry["pdf_id"] not in parser_title_ids
+    )
     log.info("Outline extraction completed.")
     log.info(f"Total {len(final_outline)} outline entries extracted.")
     log.info(f"Max level in outline: {max_level}")
+    log.info(
+        f"Promoted {promoted} block(s) the parser missed; "
+        f"rejected {len(rejected_title_ids)} parser heading(s)."
+    )
 
-    return final_outline
+    return final_outline, frozenset(rejected_title_ids)

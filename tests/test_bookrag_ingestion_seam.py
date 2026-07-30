@@ -163,11 +163,12 @@ class BookRAGIngestionSeamTests(unittest.TestCase):
 
         def outline(pdf_list, llm):
             captured["outline_input"] = pdf_list
-            return []
+            return [], frozenset()
 
-        def construct(*, tree_index, pdf_list, title_outline):
+        def construct(*, tree_index, pdf_list, title_outline, rejected_title_ids):
             captured["tree_input"] = pdf_list
             captured["title_outline"] = title_outline
+            captured["rejected_title_ids"] = rejected_title_ids
             return tree_index
 
         tracker = mock.Mock()
