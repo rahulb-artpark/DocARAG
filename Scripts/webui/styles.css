@@ -233,9 +233,20 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 
 /* The sidebar collapses to nothing but its toggle, so a narrow screen can give
    the whole width to the conversation without losing the way back. */
+/* grid-template-rows must bound the row, and the two items must be allowed to
+   shrink below their content. Without both, this grid sizes its row to the
+   tallest item: .chatShell grows to fit every message, .messages never
+   overflows so it shows no scrollbar, and the composer is pushed below the
+   viewport where the Ask button cannot be reached -- which reads as the chat
+   freezing after the first long answer. .chatShell used to be a direct flex
+   child of #chatView and got its definite height from align-items: stretch;
+   introducing this wrapper is what broke that chain. */
 .chatLayout {
-  flex: 1; display: grid; grid-template-columns: 288px 1fr;
-  min-width: 0; min-height: 0; transition: grid-template-columns .18s ease;
+  flex: 1; display: grid;
+  grid-template-columns: 288px 1fr;
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0; min-height: 0; overflow: hidden;
+  transition: grid-template-columns .18s ease;
 }
 .chatLayout.sidebarCollapsed { grid-template-columns: 44px 1fr; }
 
@@ -306,8 +317,16 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .sidebarCollapsed .chatSidebarFoot { display: none; }
 .sidebarCollapsed .chatSidebarHead { padding: 14px 10px; justify-content: center; }
 
-.chatShell { flex: 1; display: flex; flex-direction: column; min-width: 0; max-width: 1080px; margin: 0 auto; width: 100%; }
-.messages { flex: 1; overflow: auto; padding: 22px 22px 8px; display: flex; flex-direction: column; gap: 16px; }
+.chatShell {
+  flex: 1; display: flex; flex-direction: column;
+  /* min-height: 0 is what lets this shrink below its content as a grid
+     item, so the overflow lands on .messages instead of on the page. */
+  min-width: 0; min-height: 0; max-width: 1080px; margin: 0 auto; width: 100%;
+}
+.messages {
+  flex: 1; min-height: 0; overflow: auto; padding: 22px 22px 8px;
+  display: flex; flex-direction: column; gap: 16px;
+}
 .msg { display: flex; }
 .msg.user { justify-content: flex-end; }
 .bubble { max-width: 80%; padding: 12px 15px; border-radius: 14px; box-shadow: var(--shadow); }
