@@ -187,3 +187,66 @@ class AppStateCacheInvalidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnswerTimeBudgetsComeFromTheCurrentConfig(unittest.TestCase):
+    """A run's config is authoritative for what was built, not for how it is read.
+
+    Embedder, collection and graph variant must come from the run: they describe
+    artifacts on disk. An evidence budget does not -- it bounds what the answer
+    model reads now. Freezing it meant a 43-node section query kept being refused
+    against a limit of 32 pinned into the run long before that limit was found to
+    be the wrong measure, and no correction could ever reach an indexed document.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.web = load_web_module()
+
+    @staticmethod
+    def _cfg(limit, char_budget):
+        return SimpleNamespace(
+            rag=SimpleNamespace(
+                strategy_config=SimpleNamespace(
+                    global_evidence_limit=limit,
+                    global_evidence_char_budget=char_budget,
+                    topk=7,
+                )
+            )
+        )
+
+    def test_a_stale_pinned_budget_is_replaced(self):
+        cfg = self._cfg(32, 1000)
+        current = self._cfg(512, 48_000)
+        # Patch where it is imported from: the helper imports it inside the
+        # function, so patching the web module would be a no-op that still
+        # passes whenever the real config happens to match.
+        with patch("Core.configs.system_config.load_system_config", return_value=current):
+            self.web.refresh_answer_time_budgets(cfg)
+        self.assertEqual(cfg.rag.strategy_config.global_evidence_limit, 512)
+        self.assertEqual(cfg.rag.strategy_config.global_evidence_char_budget, 48_000)
+
+    def test_nothing_else_in_the_run_config_is_touched(self):
+        # Only the answer-time budgets travel; the rest of the run's config
+        # describes what was built and must survive untouched.
+        cfg = self._cfg(32, 1000)
+        current = self._cfg(512, 48_000)
+        current.rag.strategy_config.topk = 999
+        # Patch where it is imported from: the helper imports it inside the
+        # function, so patching the web module would be a no-op that still
+        # passes whenever the real config happens to match.
+        with patch("Core.configs.system_config.load_system_config", return_value=current):
+            self.web.refresh_answer_time_budgets(cfg)
+        self.assertEqual(cfg.rag.strategy_config.topk, 7)
+
+    def test_an_unreadable_current_config_leaves_the_run_s_values(self):
+        cfg = self._cfg(32, 1000)
+        with patch(
+            "Core.configs.system_config.load_system_config", side_effect=OSError("gone")
+        ):
+            self.web.refresh_answer_time_budgets(cfg)
+        self.assertEqual(cfg.rag.strategy_config.global_evidence_limit, 32)
+
+    def test_a_config_without_a_strategy_section_is_ignored(self):
+        cfg = SimpleNamespace(rag=None)
+        self.web.refresh_answer_time_budgets(cfg)  # must not raise

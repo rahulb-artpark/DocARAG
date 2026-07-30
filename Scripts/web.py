@@ -510,6 +510,49 @@ def runs_root():
     return configured.resolve()
 
 
+# Budgets that describe how a question is answered now, rather than what was
+# built. Everything else in a run's config is authoritative because it describes
+# artifacts on disk -- the embedder that made the vectors, the collection they
+# went into, the graph variant. These do not: they bound what the answer model
+# reads at query time, and freezing them means a correction can never reach a
+# document that is already indexed. A section query on a 43-node scope kept
+# being refused against a limit of 32 that had been pinned into the run long
+# before that limit was found to be the wrong measure.
+_ANSWER_TIME_BUDGET_FIELDS = (
+    "global_evidence_limit",
+    "global_evidence_char_budget",
+)
+
+
+def refresh_answer_time_budgets(cfg):
+    """Take answer-time budgets from the current config, not the run's copy."""
+
+    from Core.configs.system_config import load_system_config
+
+    strategy = getattr(getattr(cfg, "rag", None), "strategy_config", None)
+    if strategy is None:
+        return
+    try:
+        current = load_system_config(str(Path(DEFAULT_CONFIG).expanduser()))
+    except (OSError, ValueError, yaml.YAMLError):
+        # An unreadable or invalid current config is not a reason to refuse to
+        # answer; the run's own values still apply. Narrow on purpose -- a bare
+        # except here swallowed a NameError and made this function a silent
+        # no-op that still looked like it was working.
+        logging.warning(
+            "Could not read %s for answer-time budgets; using the run's own",
+            DEFAULT_CONFIG,
+        )
+        return
+    fresh = getattr(getattr(current, "rag", None), "strategy_config", None)
+    if fresh is None:
+        return
+    for name in _ANSWER_TIME_BUDGET_FIELDS:
+        value = getattr(fresh, name, None)
+        if value is not None and hasattr(strategy, name):
+            setattr(strategy, name, value)
+
+
 def read_run_config(run_dir):
     path = Path(run_dir) / "run_config.yaml"
     if not path.is_file():
@@ -1228,6 +1271,7 @@ class AppState:
         run_config = self.run_dir / "run_config.yaml"
         cfg = load_system_config(str(run_config if run_config.is_file() else DEFAULT_CONFIG))
         cfg.save_path = str(self.run_dir)
+        refresh_answer_time_budgets(cfg)
         # cfg.graph.refine_type, loaded above from this run's own frozen
         # run_config.yaml, is already exactly what was used to build this
         # run -- graph_artifact_variant(cfg.graph) (Core/configs/graph_config.py)
