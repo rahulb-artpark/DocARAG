@@ -16,6 +16,24 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 
+# The evidence-persistence stage reads DOCARAG_DATABASE_URL from the
+# environment, and .env is where that lives -- unsourced, every run reached the
+# tree and then failed at persistence, leaving graph and vdb pending and the
+# revision unviewable. Already-exported values win, so an explicit override on
+# the command line still takes precedence.
+if [[ -f "$REPO/.env" ]]; then
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# || -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    name="${BASH_REMATCH[1]}"
+    [[ -n "${!name:-}" ]] && continue
+    value="${BASH_REMATCH[2]}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    export "$name=$value"
+  done < "$REPO/.env"
+fi
+
 file_identity() {
   python3 - "$1" <<'PY'
 from datetime import datetime, timezone
@@ -1028,7 +1046,10 @@ PY
   if [[ -n "${DOCARAG_PYTHON:-}" ]]; then
     python_runner=("$DOCARAG_PYTHON")
   else
-    python_runner=(conda run --no-capture-output -n "${DOCARAG_ENV:-gbc-rag}" python)
+    # gbc-rag pins MinerU 2.1.11, whose cli.common has no
+    # convert_pdf_bytes_to_bytes; the parser stage cannot import there at all
+    # since the 3.4.4 migration. docarag is the only env that can run this.
+    python_runner=(conda run --no-capture-output -n "${DOCARAG_ENV:-docarag}" python)
   fi
 
   if run_tracked "runtime fingerprint" "${python_runner[@]}" "$repo/docarag/runtime_probe.py" \
