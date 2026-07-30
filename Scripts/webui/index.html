@@ -11,7 +11,10 @@
       window.MathJax = {
         tex: { inlineMath: [["$", "$"], ["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] },
         svg: { fontCache: "global" },
-        options: { skipHtmlTags: ["script", "noscript", "style", "textarea", "pre"] },
+        // "code" joins the list so inline `$x$` in an answer stays source: a
+        // dollar sign inside code is a dollar sign. Display listings are
+        // already covered by "pre".
+        options: { skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"] },
         startup: { typeset: false },
       };
     </script>

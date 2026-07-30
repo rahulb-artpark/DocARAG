@@ -89,19 +89,65 @@ function nodeLabel(n) {
 
 const LISTING_TYPES = new Set(["CODE", "ALGORITHM"]);
 
+// One numbered line of a listing. The number comes from a CSS counter rather
+// than the text so that selecting the listing copies the code and not the
+// gutter.
+const listingLines = (text) =>
+  String(text)
+    .replace(/\n+$/, "")
+    .split(/\r?\n/)
+    .map((line) => `<span class="listingLine">${escapeHtml(line) || " "}</span>`)
+    .join("");
+
+// A program is reproduced exactly: its indentation is its syntax, and a "$" in
+// it belongs to the program. <pre> is in MathJax's skipHtmlTags, so nothing
+// inside here is ever mistaken for mathematics.
+function renderProgram(text, language) {
+  const tag = language
+    ? `<div class="codeLang">${escapeHtml(language)}</div>`
+    : "";
+  return `${tag}<pre class="contentCode listingNums"><code>${listingLines(text)}</code></pre>`;
+}
+
+// Pseudocode is not a program. Its lines carry real mathematics -- "If $N < 1$",
+// "Do while $I <= N$", "$I = I + I$" -- and inside a <pre> MathJax skips it, so
+// every one of those was displayed as literal dollar-sign source. This keeps the
+// line-per-line layout and the leading whitespace in CSS instead of in a <pre>,
+// which is what lets the maths be typeset.
+function renderPseudocode(text) {
+  return `<div class="contentCode listingNums pseudocode">${listingLines(text)}</div>`;
+}
+
+// MathJax scans a container's whole text, not one line at a time, so a single
+// unpaired "$" could pair with another line's and swallow every line between
+// them. A listing only gets the maths treatment when every line closes the
+// dollars it opens; anything else is reproduced verbatim, which is the safe
+// direction to fail in.
+const listingMathIsBalanced = (text) =>
+  String(text)
+    .split(/\r?\n/)
+    .every((line) => ((line.match(/\$/g) || []).length % 2) === 0);
+
+// Pseudocode when it reads as pseudocode, verbatim otherwise.
+function renderListing(text, nodeType, language) {
+  return nodeType === "ALGORITHM" && listingMathIsBalanced(text)
+    ? renderPseudocode(text)
+    : renderProgram(text, language);
+}
+
 function renderContent(n) {
   const c = (n && n.content) || "";
   if (!c.trim()) return "—";
   // A listing's line breaks and leading whitespace are what make it readable,
   // and for Python they are what make it mean anything. Prose rendering
-  // collapses both, so every listing type goes through <pre>, not only CODE --
-  // ALGORITHM was falling through and being shown as a single wrapped line.
-  if (LISTING_TYPES.has(String((n && n.type) || "").toUpperCase())) {
-    const lang = n && n.codeLanguage;
-    const tag = lang
-      ? `<div class="codeLang">${escapeHtml(lang)}</div>`
-      : "";
-    return `${tag}<pre class="contentCode"><code>${escapeHtml(c)}</code></pre>`;
+  // collapses both, so every listing type is laid out line by line -- ALGORITHM
+  // was falling through and being shown as a single wrapped line.
+  const nodeType = String((n && n.type) || "").toUpperCase();
+  if (LISTING_TYPES.has(nodeType)) {
+    // ALGORITHM is exactly the pseudocode type, and CODE is exactly the type
+    // whose text must survive byte-for-byte. That is the whole distinction, so
+    // it decides which of the two renderings applies.
+    return renderListing(c, nodeType, n && n.codeLanguage);
   }
   if (n && String(n.type).toUpperCase() === "LIST") {
     const items = c.split(/\r?\n/)
@@ -136,12 +182,144 @@ function typesetMath(el) {
 
 // Post-process rendered content: mark formula-like table cells as monospace.
 function enhanceContent(root) {
-  root.querySelectorAll(".prose td, .prose th").forEach((cell) => {
+  root.querySelectorAll(".prose td, .prose th, .answer td, .answer th").forEach((cell) => {
     const t = cell.textContent.trim();
     const words = t.split(/\s+/).length;
     const looksFormula = (/=|≈|≤|≥|→|∑|Σ|θ|∇/.test(t) || /\b\w+_[a-z0-9{]/i.test(t));
     if (t && words <= 10 && looksFormula) cell.classList.add("cellformula");
   });
+}
+
+// --- Rich text: markdown, mathematics and code in one answer ---------------
+// Markdown and LaTeX fight each other. marked reads "\\" as a hard line break,
+// "_" and "*" as emphasis and "[...]" as a link, so a formula parsed as markdown
+// first comes back mangled and MathJax can no longer read it: an answer
+// containing \begin{array}{l} ... \\ ... \end{array} lost its row separators
+// before it was ever typeset. Code has the same conflict in reverse -- a "$" in
+// a program is a dollar sign, not the start of mathematics.
+//
+// So mathematics is lifted out of the text before markdown runs and put back
+// after. Code spans are lifted first and restored before markdown, purely so
+// the maths patterns cannot match inside them; marked itself still renders the
+// fences, and because <pre> is in MathJax's skipHtmlTags a formula printed
+// inside a code block correctly stays source.
+// Written as escapes because the characters themselves are invisible: these
+// are private-use code points, which no markdown rule gives meaning to and
+// which cannot occur in a real answer.
+const CODE_MARK = ["\uE000", "\uE001"];
+const MATH_MARK = ["\uE002", "\uE003"];
+
+const CODE_PATTERNS = [/```[\s\S]*?```/g, /~~~[\s\S]*?~~~/g, /`[^`\n]+`/g];
+const MATH_PATTERNS = [
+  /\$\$[\s\S]+?\$\$/g,
+  /\\\[[\s\S]+?\\\]/g,
+  /\\\([\s\S]+?\\\)/g,
+  // Inline $...$ on a single line. The closing "$" may not be followed by a
+  // digit so that "$5 and $6" stays two amounts of money rather than becoming
+  // one formula.
+  /\$(?!\s)[^$\n]*[^\s$]\$(?!\d)/g,
+];
+
+function liftSpans(text, patterns, mark, store) {
+  let out = String(text);
+  for (const pattern of patterns) {
+    out = out.replace(pattern, (match) => {
+      store.push(match);
+      return `${mark[0]}${store.length - 1}${mark[1]}`;
+    });
+  }
+  return out;
+}
+
+function restoreSpans(text, mark, store, transform) {
+  const pattern = new RegExp(`${mark[0]}(\\d+)${mark[1]}`, "g");
+  return String(text).replace(pattern, (whole, index) => {
+    const original = store[Number(index)];
+    return original === undefined ? whole : transform(original);
+  });
+}
+
+// Elements dropped with everything inside them. Anything else unrecognised is
+// unwrapped instead, so unexpected markup loses its tag but never its text.
+const RICH_TEXT_DROP = new Set([
+  "SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "NOSCRIPT", "TEMPLATE",
+  "FORM", "INPUT", "BUTTON", "SELECT", "TEXTAREA", "LINK", "META", "BASE",
+]);
+const RICH_TEXT_TAGS = new Set([
+  "P", "BR", "HR", "SPAN", "DIV", "STRONG", "EM", "B", "I", "U", "S", "DEL",
+  "SUP", "SUB", "CODE", "PRE", "BLOCKQUOTE", "UL", "OL", "LI", "A", "IMG",
+  "H1", "H2", "H3", "H4", "H5", "H6",
+  "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TD", "TH", "CAPTION",
+]);
+
+// A same-origin path or a fragment. An answer that echoes document text could
+// carry "javascript:" or an off-site URL, and neither may be followed.
+const localUrl = (value) => {
+  const v = String(value ?? "").trim();
+  return /^[/#][^\s"']*$/.test(v) ? v : null;
+};
+
+function sanitizeRichText(html) {
+  const parsed = new DOMParser().parseFromString(String(html || ""), "text/html");
+  const build = (node, into) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        into.appendChild(document.createTextNode(child.nodeValue));
+        continue;
+      }
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      const tag = child.tagName.toUpperCase();
+      if (RICH_TEXT_DROP.has(tag)) continue;
+      if (!RICH_TEXT_TAGS.has(tag)) {
+        build(child, into); // unwrap: keep the text, discard the tag
+        continue;
+      }
+      const el = document.createElement(tag.toLowerCase());
+      if (tag === "A") {
+        const href = localUrl(child.getAttribute("href"));
+        if (href) el.setAttribute("href", href);
+      } else if (tag === "IMG") {
+        const src = localUrl(child.getAttribute("src"));
+        if (!src) continue; // an image we cannot vouch for is not shown at all
+        el.setAttribute("src", src);
+        el.setAttribute("loading", "lazy");
+        el.setAttribute("alt", String(child.getAttribute("alt") || ""));
+      }
+      if (tag === "TD" || tag === "TH") {
+        for (const name of ["colspan", "rowspan"]) {
+          const value = child.getAttribute(name);
+          if (value && /^[1-9]\d{0,2}$/.test(value)) el.setAttribute(name, value);
+        }
+      }
+      // Only the language hint markdown puts on a fence survives, because it is
+      // the one class the stylesheet reads.
+      const cls = String(child.getAttribute("class") || "");
+      const language = cls.split(/\s+/).find((name) => /^language-[\w+#.-]+$/.test(name));
+      if (language) el.setAttribute("class", language);
+      build(child, el);
+      into.appendChild(el);
+    }
+  };
+  const root = document.createElement("div");
+  build(parsed.body, root);
+  return root.innerHTML;
+}
+
+// Markdown + LaTeX + code, rendered safely. Callers must still run typesetMath
+// on the container afterwards: this leaves the formulas as source for MathJax.
+function renderRichText(text) {
+  const source = String(text ?? "");
+  if (!source.trim()) return "";
+  const code = [];
+  const math = [];
+  let staged = liftSpans(source, CODE_PATTERNS, CODE_MARK, code);
+  staged = liftSpans(staged, MATH_PATTERNS, MATH_MARK, math);
+  staged = restoreSpans(staged, CODE_MARK, code, (original) => original);
+  const parsed = window.marked ? marked.parse(staged) : escapeHtml(staged).replace(/\n/g, "<br>");
+  // Mathematics goes back escaped. MathJax reads text, and the browser decodes
+  // "&lt;" to "<" before it does, so "$a &lt; b$" typesets as a < b while the
+  // markup itself stays well-formed.
+  return restoreSpans(sanitizeRichText(parsed), MATH_MARK, math, escapeHtml);
 }
 
 // Click-to-zoom image lightbox
@@ -1773,6 +1951,8 @@ async function submitChat(event) {
     pending.querySelector(".bubble").innerHTML =
       `<div class="who">BookRAG</div>` + renderAnswer(data);
     linkifyCitations(pending, data.citations);
+    wrapAnswerTables(pending);
+    enhanceContent(pending);
     wireEvidenceLinks(pending);
     typesetMath(pending);
   } catch (err) {
@@ -1786,8 +1966,7 @@ async function submitChat(event) {
 }
 
 function renderAnswer(data) {
-  const md = window.marked ? marked.parse(data.answer || "") : escapeHtml(data.answer || "");
-  let html = `<div class="answer">${md}</div>`;
+  let html = `<div class="answer">${renderRichText(data.answer)}</div>`;
   html += `<div class="meta">${(data.nodeIds || []).length} nodes retrieved · ${data.elapsedSec}s</div>`;
   html += renderReferences(data.citations);
   html += renderRetrievedEntities(data.retrieval);
@@ -1796,6 +1975,44 @@ function renderAnswer(data) {
 
 // The answer's own [E1] / [Q1-E1] markers are what the model actually cited;
 // they are the reference list, not a separate summary of everything fetched.
+// A cited listing or formula has to keep its shape. clip() collapses every run
+// of whitespace, which showed a cited algorithm as one unreadable line and left
+// a cited formula as source with its line structure gone.
+const SNIPPET_MAX_LINES = 12;
+
+function renderSnippet(citation) {
+  const text = String((citation && citation.snippet) || "");
+  if (!text.trim()) return "";
+  const type = String((citation && citation.type) || "").toUpperCase();
+  if (LISTING_TYPES.has(type)) {
+    const lines = text.replace(/\n+$/, "").split(/\r?\n/);
+    const shown = lines.slice(0, SNIPPET_MAX_LINES);
+    const hidden = lines.length - shown.length;
+    const body = renderListing(shown.join("\n"), type, null);
+    const more = hidden > 0 ? `<div class="snipMore">+${hidden} more lines</div>` : "";
+    return `<div class="refSnippet">${body}${more}</div>`;
+  }
+  if (/\$\$|\\\[|\$[^$\n]+\$/.test(text)) {
+    // Keep the delimiters on one line so MathJax can find them, as the tree
+    // panel's own equation rendering does.
+    return `<div class="refSnippet mathblock">${escapeHtml(text.replace(/\s*\n\s*/g, " "))}</div>`;
+  }
+  return `<div class="refSnippet">${escapeHtml(clip(text, 260))}</div>`;
+}
+
+// marked emits a bare <table>, which cannot scroll on a narrow panel and pushed
+// the whole conversation sideways. Wrapping it after the fact keeps the table a
+// real table and gives the overflow to its own container.
+function wrapAnswerTables(scope) {
+  scope.querySelectorAll(".answer table").forEach((table) => {
+    if (table.parentElement && table.parentElement.classList.contains("tableWrap")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "tableWrap";
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+  });
+}
+
 function renderReferences(citations) {
   if (!citations || !citations.length) return "";
   const cards = citations.map((c) => {
@@ -1812,7 +2029,7 @@ function renderReferences(citations) {
         ${c.page ? `<span class="refPage">p${escapeHtml(c.page)}</span>` : ""}
       </div>
       ${img}
-      ${c.snippet ? `<div class="refSnippet">${escapeHtml(clip(c.snippet, 260))}</div>` : ""}
+      ${renderSnippet(c)}
       ${jump}
     </div>`;
   }).join("");
@@ -1881,6 +2098,13 @@ function linkifyCitations(scope, citations) {
 }
 
 function wireEvidenceLinks(scope) {
+  // A figure, chart or table crop cited in an answer is thumbnail-sized, which
+  // is too small to read. The tree panel already zooms its crop on click; an
+  // answer's evidence now does the same rather than being a dead image.
+  scope.querySelectorAll(".refThumb, .answer img").forEach((img) => {
+    img.classList.add("zoomable");
+    img.onclick = () => openLightbox(img.src);
+  });
   scope.querySelectorAll("[data-tree]").forEach((a) =>
     a.onclick = () => { activateView("tree"); selectTreeNode(Number(a.dataset.tree)); });
   scope.querySelectorAll("[data-entity]").forEach((a) =>

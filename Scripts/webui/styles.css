@@ -412,6 +412,50 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
   margin: 4px 0 -2px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+/* Pseudocode is laid out like a listing but is not inside a <pre>, which is what
+   lets MathJax typeset the mathematics its lines carry. pre-wrap keeps the
+   indentation while still letting a long step wrap instead of scrolling. */
+.pseudocode { white-space: pre-wrap; }
+.pseudocode mjx-container { margin: 0; }
+.pseudocode .listingLine { padding-right: 4px; }
+
+/* Line numbers come from a counter so that selecting a listing copies the code
+   and not the gutter. */
+.listingNums { counter-reset: listingline; }
+.listingNums .listingLine { display: block; counter-increment: listingline; }
+.listingNums .listingLine::before {
+  content: counter(listingline);
+  display: inline-block; width: 2.2em; margin-right: 12px;
+  text-align: right; opacity: .38; font-variant-numeric: tabular-nums;
+  user-select: none; -webkit-user-select: none;
+}
+/* A one-line listing needs no gutter at all. */
+.listingNums .listingLine:only-child::before { content: none; margin: 0; width: 0; }
+
+.snipMore { font-size: 11px; opacity: .55; margin-top: 2px; }
+.refSnippet .contentCode { margin: 2px 0; padding: 8px 10px; font-size: 11.5px; }
+
+/* Chat answers: code, formulas, tables and figures all arrive in one stream. */
+.answer pre {
+  margin: 8px 0; padding: 10px 12px; overflow-x: auto; border-radius: 8px;
+  background: #0f172a; color: #d7e0ea; tab-size: 4;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.answer pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+.answer .tableWrap { overflow-x: auto; margin: 8px 0; }
+.answer .tableWrap table { width: auto; min-width: 100%; }
+.answer blockquote {
+  margin: 8px 0; padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--line, #e2e8f0); opacity: .85;
+}
+.answer ul, .answer ol { margin: 6px 0; padding-left: 22px; }
+.answer li { margin: 3px 0; }
+.answer img { max-width: 100%; height: auto; border-radius: 6px; margin: 6px 0; }
+/* A display formula can be wider than the bubble; it scrolls on its own rather
+   than widening the conversation. */
+.answer mjx-container[display="true"] { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
+.zoomable { cursor: zoom-in; }
+
 .structBlock { margin: 6px 0 10px; }
 .structKind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .65; margin-bottom: 4px; }
 .flowCanvas { height: 200px; border: 1px solid var(--line, #e2e8f0); border-radius: 8px; background: #fbfdff; }
