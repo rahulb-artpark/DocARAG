@@ -572,8 +572,14 @@ def _representations(
                 else RepresentationKind.TEXT
             ),
             value=(
-                block.get("code_body")
-                if block_type == BlockType.CODE and block.get("text") is None
+                # The representation is what every downstream reader selects,
+                # so the wrapper has to come off here and not only in
+                # content_block_text_parts -- stripping it there alone left the
+                # <div> in the canonical text and changed nothing in the tree.
+                unwrap_presentation(block["code_body"])
+                if block_type == BlockType.CODE
+                and block.get("text") is None
+                and isinstance(block.get("code_body"), str)
                 else _list_markdown(block.get("list_items"))
                 if is_list
                 else block.get("text")

@@ -78,3 +78,39 @@ class TheAdapterUnwrapsWhereverTheTextLives(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheCanonicalRepresentationIsUnwrapped(unittest.TestCase):
+    """The representation is what downstream selects, so it must be clean.
+
+    Stripping the wrapper in content_block_text_parts alone left the <div> in
+    the canonical text and changed nothing in the tree -- the reader was patched
+    and the producer was not.
+    """
+
+    def _text_representation(self, block):
+        from docarag.adapters.mineru_compat import _representations
+
+        from docarag.domain.evidence import BlockType
+
+        return [
+            r
+            for r in _representations(
+                block, BlockType.CODE, confidence=None, language="en"
+            )
+            if isinstance(getattr(r, "content", None), str)
+        ]
+
+    def test_an_algorithm_representation_has_no_div(self):
+        block = {"type": "code", "sub_type": "algorithm", "code_body": _ALGORITHM}
+        contents = [r.content for r in self._text_representation(block)]
+        self.assertTrue(contents, "a code block must produce a representation")
+        for content in contents:
+            self.assertNotIn("<div", content)
+            self.assertNotIn("&lt;", content)
+
+    def test_a_code_representation_keeps_its_newlines(self):
+        block = {"type": "code", "sub_type": "code", "code_body": _CODE}
+        content = self._text_representation(block)[0].content
+        self.assertNotIn("```", content)
+        self.assertIn("\n", content)
