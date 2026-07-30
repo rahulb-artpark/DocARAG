@@ -13,11 +13,12 @@ the remedy is the same in every case, the question asked here is only *was this
 page scanned, and did the recogniser do badly on it*, which needs no script
 classification and no second model.
 
-A page is transcribed once, whole, rather than block by block.  Measured on
-10P_CH11 page 2 that is one inference against roughly twenty, and it is also the
-more accurate of the two: the surrounding words are what disambiguate a doubtful
-glyph, and a three-word crop gives the model room to invent.  The cost is that
-transcribed lines must be matched back onto MinerU's blocks.
+A page is transcribed in horizontal bands rather than block by block.  Measured
+on 10P_CH11 page 2 that is two inferences against roughly twenty, and banding is
+also the more accurate: the surrounding words are what disambiguate a doubtful
+glyph, so a three-word crop gives the model room to invent, while a whole dense
+sheet lets it stop early.  The cost is that transcribed lines must be matched
+back onto MinerU's blocks.
 """
 
 from __future__ import annotations
@@ -170,22 +171,51 @@ def page_has_text_layer(pdf_path: str, page_index: int, *, min_chars: int = 24) 
     return len(extracted.strip()) >= min_chars
 
 
-def render_page_png(pdf_path: str, page_index: int, *, dpi: int = _RENDER_DPI) -> bytes:
-    """Render one page for the VLM, bounded so a 300dpi scan is not sent whole."""
+def render_page_png(
+    pdf_path: str,
+    page_index: int,
+    *,
+    dpi: int = _RENDER_DPI,
+    bands: int = 1,
+    overlap: float = 0.06,
+) -> list[bytes]:
+    """Render a page for the VLM as horizontal bands, top to bottom.
+
+    One image per page is not reliable on a dense page: asked for a whole sheet
+    of two-column notes the model transcribed the upper two thirds and stopped
+    at ``Astigmatism.``, well short of any token limit -- and non-deterministically,
+    since an earlier call on the same page had reached the bottom. Bands bound
+    how much it can decide it has finished with.
+
+    Bands overlap slightly so a line falling on a cut is whole in one of them.
+    The duplicate lines that produces need no removal: alignment is monotonic
+    and advances past a line once claimed, so a repeat is simply never used.
+    """
 
     import pypdfium2 as pdfium
     from PIL import Image
 
     document = pdfium.PdfDocument(pdf_path)
     try:
-        image = document[page_index].render(scale=dpi / 72).to_pil()
+        image = document[page_index].render(scale=dpi / 72).to_pil().convert("RGB")
     finally:
         document.close()
-    if max(image.size) > _MAX_EDGE:
-        image.thumbnail((_MAX_EDGE, _MAX_EDGE), Image.LANCZOS)
-    buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, format="JPEG", quality=92)
-    return buffer.getvalue()
+
+    width, height = image.size
+    count = max(1, bands)
+    step = height / count
+    margin = step * max(0.0, overlap)
+    rendered: list[bytes] = []
+    for index in range(count):
+        top = max(0, int(index * step - margin))
+        bottom = min(height, int((index + 1) * step + margin))
+        crop = image.crop((0, top, width, bottom))
+        if max(crop.size) > _MAX_EDGE:
+            crop.thumbnail((_MAX_EDGE, _MAX_EDGE), Image.LANCZOS)
+        buffer = io.BytesIO()
+        crop.save(buffer, format="JPEG", quality=92)
+        rendered.append(buffer.getvalue())
+    return rendered
 
 
 def transcribe_page_image(
@@ -355,6 +385,7 @@ def retranscribe_scanned_pages(
     min_validity: float = 0.90,
     min_words: int = 12,
     dpi: int = _RENDER_DPI,
+    bands: int = 2,
     timeout: float = 600.0,
 ) -> TranscriptionOutcome:
     """Re-read every scanned page whose text the recogniser got wrong.
@@ -406,9 +437,13 @@ def retranscribe_scanned_pages(
             continue
 
         try:
-            image = render_page_png(pdf_path, page_index, dpi=dpi)
-            transcript = transcribe_page_image(
-                image, model=model, api_base=api_base, timeout=timeout
+            transcript = "\n".join(
+                transcribe_page_image(
+                    band, model=model, api_base=api_base, timeout=timeout
+                )
+                for band in render_page_png(
+                    pdf_path, page_index, dpi=dpi, bands=bands
+                )
             )
         except Exception as error:
             message = f"page {page_index}: {type(error).__name__}: {error}"
