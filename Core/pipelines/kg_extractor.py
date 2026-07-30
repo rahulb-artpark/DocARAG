@@ -71,6 +71,32 @@ _VISUAL_KG_NODE_TYPES = frozenset(
     {NodeType.IMAGE, NodeType.CHART, NodeType.DIAGRAM}
 )
 
+# Reachable node types deliberately kept out of entity extraction. A type in
+# neither KG set is skipped in silence, exactly as in the index, so the omissions
+# are named here and a test holds the two lists together.
+#
+# The furniture reasons were decided when furniture got its own node type. The
+# other three were not written down at the time and are recorded here from the
+# behaviour, so that changing them is a decision rather than an accident.
+_NOT_EXTRACTED_NODE_TYPES = frozenset(
+    {
+        # Page furniture names no entity the document is about: a running header
+        # would contribute the publisher's name to every page it appears on.
+        NodeType.HEADER,
+        NodeType.FOOTER,
+        NodeType.ASIDE,
+        NodeType.DISCARDED,
+        # A table's evidence is its cells and an equation's is LaTeX. Neither
+        # reads as prose naming entities, and the paragraph that introduces them
+        # is extracted in their place.
+        NodeType.TABLE,
+        NodeType.EQUATION,
+        # A heading names the section its children discuss, so extracting from it
+        # duplicates entities those children already yield.
+        NodeType.TITLE,
+    }
+)
+
 _SENSITIVE_CONFIG_FIELDS = frozenset(
     {
         "api_key",

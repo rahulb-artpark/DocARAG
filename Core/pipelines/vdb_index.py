@@ -989,6 +989,26 @@ _TEXT_NODE_TYPES = frozenset(
         NodeType.REFERENCE,
     }
 )
+# Reachable node types deliberately kept out of the index. The dispatch below is
+# an if/elif chain with no final else, so a type absent from every branch is
+# simply never indexed -- no error, no log, and nothing downstream can tell the
+# difference between "not in this document" and "silently dropped". Declaring the
+# intentional omissions lets a test assert that every reachable type is one or the
+# other, rather than leaving the chain to be read carefully by whoever adds the
+# next type.
+_NOT_INDEXED_NODE_TYPES = frozenset(
+    {
+        # Page furniture: a running header, a footer, a page number, marginal
+        # aside or discarded block. Embedding it puts "Scanned with CamScanner"
+        # into retrieval competing with the document's own prose, which is what
+        # giving furniture its own node type was for.
+        NodeType.HEADER,
+        NodeType.FOOTER,
+        NodeType.ASIDE,
+        NodeType.DISCARDED,
+    }
+)
+
 # Types that may carry a materialized crop alongside their text.
 _CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {
     NodeType.TABLE,

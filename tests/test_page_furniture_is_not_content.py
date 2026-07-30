@@ -150,3 +150,116 @@ class EveryProjectedNodeTypeCanBeHydrated(unittest.TestCase):
             with self.subTest(node_type=node_type):
                 self.assertIn(node_type, HYDRATABLE_TEXT)
                 self.assertNotIn(node_type, _TEXT_NODE_TYPES)
+
+
+def _reachable_node_types():
+    """Every node type that can actually appear in a built tree.
+
+    The projection's outputs, plus "title": the outline pass promotes a
+    text-carrying node to a heading after projection, so it exists in trees
+    without ever being a projected type. NodeType.UNKNOWN is not reachable --
+    create_node_by_type's fallback logs and assigns TEXT rather than UNKNOWN --
+    and ROOT is the synthetic document root, not a projected block.
+    """
+
+    from docarag.bookrag_projection import (
+        _NODE_TYPE_BY_BLOCK,
+        _NODE_TYPE_BY_SUBTYPE,
+        _VISUAL_NODE_TYPE_BY_BLOCK,
+    )
+
+    return (
+        set(_NODE_TYPE_BY_BLOCK.values())
+        | set(_VISUAL_NODE_TYPE_BY_BLOCK.values())
+        | set(_NODE_TYPE_BY_SUBTYPE.values())
+        | {"text", "image", "table", "equation", "title"}
+    )
+
+
+def _values(node_types):
+    return {getattr(t, "value", t) for t in node_types}
+
+
+class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
+    """Both of these seams drop an unknown type in silence.
+
+    vdb_index dispatches on an if/elif chain with no final else, and kg_extractor
+    tests membership of two sets. A node type in neither is never indexed and
+    never yields an entity, with no error and no log -- indistinguishable from a
+    document that simply has none of that type. That is how page furniture came
+    to be missing from hydration for as long as it was: an omission that looked
+    exactly like a decision.
+
+    So each seam now names what it deliberately leaves out, and these tests hold
+    the lists together. Adding a node type without deciding about indexing or
+    extraction fails here rather than quietly costing retrieval.
+    """
+
+    def test_the_index_handles_or_declares_every_reachable_type(self):
+        from Core.pipelines.vdb_index import (
+            _CROP_BEARING_NODE_TYPES,
+            _NOT_INDEXED_NODE_TYPES,
+            _TEXT_NODE_TYPES as INDEXED_TEXT,
+            _VISUAL_NODE_TYPES as INDEXED_VISUAL,
+        )
+        from Core.Index.Tree import NodeType
+
+        # Mirrors the dispatch: visual, then table/list, then equation, then text.
+        indexed = _values(
+            set(INDEXED_VISUAL)
+            | {NodeType.TABLE, NodeType.LIST, NodeType.EQUATION}
+            | set(INDEXED_TEXT)
+        )
+        undecided = _reachable_node_types() - indexed - _values(_NOT_INDEXED_NODE_TYPES)
+        self.assertEqual(
+            sorted(undecided),
+            [],
+            "these reachable node types are neither indexed nor declared skipped, "
+            "so they would vanish from retrieval silently",
+        )
+
+    def test_extraction_handles_or_declares_every_reachable_type(self):
+        from Core.pipelines.kg_extractor import (
+            _NOT_EXTRACTED_NODE_TYPES,
+            _TEXTUAL_KG_NODE_TYPES,
+            _VISUAL_KG_NODE_TYPES,
+        )
+
+        extracted = _values(set(_TEXTUAL_KG_NODE_TYPES) | set(_VISUAL_KG_NODE_TYPES))
+        undecided = (
+            _reachable_node_types() - extracted - _values(_NOT_EXTRACTED_NODE_TYPES)
+        )
+        self.assertEqual(sorted(undecided), [])
+
+    def test_a_type_is_not_both_indexed_and_declared_skipped(self):
+        from Core.pipelines.vdb_index import (
+            _NOT_INDEXED_NODE_TYPES,
+            _TEXT_NODE_TYPES as INDEXED_TEXT,
+            _VISUAL_NODE_TYPES as INDEXED_VISUAL,
+        )
+
+        both = _values(set(INDEXED_TEXT) | set(INDEXED_VISUAL)) & _values(
+            _NOT_INDEXED_NODE_TYPES
+        )
+        self.assertEqual(sorted(both), [])
+
+    def test_a_type_is_not_both_extracted_and_declared_skipped(self):
+        from Core.pipelines.kg_extractor import (
+            _NOT_EXTRACTED_NODE_TYPES,
+            _TEXTUAL_KG_NODE_TYPES,
+            _VISUAL_KG_NODE_TYPES,
+        )
+
+        both = _values(set(_TEXTUAL_KG_NODE_TYPES) | set(_VISUAL_KG_NODE_TYPES)) & _values(
+            _NOT_EXTRACTED_NODE_TYPES
+        )
+        self.assertEqual(sorted(both), [])
+
+    def test_furniture_is_declared_skipped_by_both_seams(self):
+        from Core.pipelines.kg_extractor import _NOT_EXTRACTED_NODE_TYPES
+        from Core.pipelines.vdb_index import _NOT_INDEXED_NODE_TYPES
+
+        for node_type in FURNITURE_NODE_TYPES:
+            with self.subTest(node_type=node_type):
+                self.assertIn(node_type, _values(_NOT_INDEXED_NODE_TYPES))
+                self.assertIn(node_type, _values(_NOT_EXTRACTED_NODE_TYPES))
