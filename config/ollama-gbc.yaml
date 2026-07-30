@@ -52,6 +52,10 @@ mineru:
   # same 3 titles the pipeline backend finds, and a document with 3 headings
   # has no hierarchy to build -- one of them ends up parenting most of it.
   effort: high
+  # Scanned pages whose recognised text is largely not words are re-read with
+  # the VLM above. Costs one vision call per failing page; typed PDFs pay none.
+  retranscribe_scanned: true
+  retranscribe_min_validity: 0.90
   server_url: http://localhost:30000   # unused with a local *-engine backend
   lang: en
 

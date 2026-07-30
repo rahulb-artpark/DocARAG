@@ -34,10 +34,21 @@ class MinerU:
     # Tune down for tighter memory budgets, up for fewer (faster) MinerU calls.
     shard_pages: int = 10
     effort: str = "medium"
+    # Re-read scanned pages whose recognised text is largely not words, with the
+    # configured VLM. MinerU's layout is kept; only the characters are replaced.
+    # Costs one vision call per failing page and nothing on a page whose text
+    # comes from the PDF's own character layer.
+    retranscribe_scanned: bool = False
+    retranscribe_min_validity: float = 0.90
 
     def __post_init__(self):
         if self.shard_pages < 1:
             raise ValueError(f"shard_pages must be positive: {self.shard_pages}")
+        if not 0.0 <= self.retranscribe_min_validity <= 1.0:
+            raise ValueError(
+                "retranscribe_min_validity must be a fraction: "
+                f"{self.retranscribe_min_validity}"
+            )
         if self.backend not in BACKENDS:
             raise ValueError(
                 f"Unsupported backend: {self.backend}. "

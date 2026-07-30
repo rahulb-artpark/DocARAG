@@ -45,6 +45,7 @@ from Core.utils.phase_timing import PhaseTimings
 #: and the interesting total is across all of them.
 _BIND_TIMINGS = PhaseTimings("canonical bind")
 from Core.provider.extract_pdf_info import merge_middle_content, parse_doc
+from docarag.page_transcription import retranscribe_scanned_pages
 from Core.provider.llm import LLM
 from Core.provider.vlm import VLM
 from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
@@ -1700,6 +1701,8 @@ def build_tree_from_pdf(
                 page_count = pdf_page_count(cfg.pdf_path)
                 shards = list(shard_ranges(page_count, cfg.mineru.shard_pages))
                 pdf_list = []
+                transcription_pages: list[dict] = []
+                transcription_failures: list[str] = []
                 for shard_index, (start_page_id, end_page_id) in enumerate(shards):
                     with timings.time("mineru_parse"):
                         middle_json, content_list = parse_doc(
@@ -1734,6 +1737,29 @@ def build_tree_from_pdf(
                             save_dir=save_dir,
                             file_name=f"{file_name}_shard{shard_index:03d}",
                         )
+                    # Re-read scanned pages the recogniser got wrong. After
+                    # reconciliation, never before: the two parser views are
+                    # matched by text, so rewriting one and not the other would
+                    # stop them matching and emit every block on the page twice.
+                    if cfg.mineru.retranscribe_scanned:
+                        with timings.time("page_transcription"):
+                            outcome = retranscribe_scanned_pages(
+                                shard_pdf_list,
+                                pdf_path=cfg.pdf_path,
+                                model=cfg.vlm.model_name,
+                                api_base=cfg.vlm.api_base,
+                                min_validity=cfg.mineru.retranscribe_min_validity,
+                            )
+                        transcription_pages.extend(outcome.pages)
+                        transcription_failures.extend(outcome.failures)
+                        if outcome.pages_transcribed:
+                            log.info(
+                                "shard %d: re-transcribed %d/%d pages, "
+                                "%d blocks replaced, %d left as parsed",
+                                shard_index, outcome.pages_transcribed,
+                                outcome.pages_examined, outcome.blocks_replaced,
+                                outcome.blocks_unmatched,
+                            )
                     pdf_list.extend(shard_pdf_list)
                     log.info(
                         "shard %d/%d (pages %d-%d): %d items (%d total so far)",

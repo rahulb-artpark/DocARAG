@@ -260,7 +260,8 @@ def align_transcription(
     min_score: float = 0.55,
     lookahead: int | None = None,
     max_span: int = 4,
-) -> list[str | None]:
+    as_lines: bool = False,
+) -> list[str | None] | list[tuple[str, ...] | None]:
     """Match each block, in reading order, to the lines that re-read it.
 
     Both sequences describe the same page in the same order, so the alignment is
@@ -298,7 +299,12 @@ def align_transcription(
                         best = (score, start, span)
         if best is not None and best[0] >= min_score:
             _, start, span = best
-            matched.append(" ".join(lines[start : start + span]))
+            claimed = tuple(lines[start : start + span])
+            # A list block keeps its items separate: its text lives in
+            # list_items, and the adapter decides to build Markdown from that
+            # by checking that "text" is absent. Handing back a joined string
+            # would flip that check and cost the list its structure.
+            matched.append(claimed if as_lines else " ".join(claimed))
             cursor = start + span
         else:
             matched.append(None)
@@ -317,3 +323,126 @@ def transcription_lines(text: str) -> list[str]:
         if line:
             lines.append(line)
     return lines
+
+
+def _block_text(block: dict) -> str:
+    """A reconciled block's current text, wherever the parser put it."""
+
+    from docarag.adapters.mineru_compat import content_block_text_parts
+
+    return " ".join(content_block_text_parts(block))
+
+
+def _replace_block_text(block: dict, lines: tuple[str, ...]) -> None:
+    """Install a re-read of this block, keeping what the parser said."""
+
+    block.setdefault("parser_text", _block_text(block))
+    block["text_source"] = "vlm_page_transcription"
+    if isinstance(block.get("list_items"), list):
+        block["list_items"] = list(lines)
+    elif isinstance(block.get("code_body"), str):
+        block["code_body"] = "\n".join(lines)
+    else:
+        block["text"] = " ".join(lines)
+
+
+def retranscribe_scanned_pages(
+    blocks: list[dict],
+    *,
+    pdf_path: str,
+    model: str,
+    api_base: str,
+    min_validity: float = 0.90,
+    min_words: int = 12,
+    dpi: int = _RENDER_DPI,
+    timeout: float = 600.0,
+) -> TranscriptionOutcome:
+    """Re-read every scanned page whose text the recogniser got wrong.
+
+    Operates on reconciled blocks, after middle-json and content-list have been
+    paired.  Doing it earlier would mean rewriting one view and not the other,
+    and reconciliation matches the two by text -- the rewritten view would stop
+    matching and every block on the page would be emitted twice, which is the
+    duplication this pipeline just finished removing.
+
+    Blocks are mutated in place.  A block whose line cannot be found keeps the
+    parser's text untouched, so a partial transcription degrades rather than
+    blanks the page.
+    """
+
+    outcome = TranscriptionOutcome()
+    by_page: dict[int, list[dict]] = {}
+    for block in blocks:
+        page = block.get("page_idx")
+        if isinstance(page, int):
+            by_page.setdefault(page, []).append(block)
+
+    for page_index in sorted(by_page):
+        page_blocks = [b for b in by_page[page_index] if _block_text(b).strip()]
+        if not page_blocks:
+            continue
+        outcome.pages_examined += 1
+        try:
+            has_layer = page_has_text_layer(pdf_path, page_index)
+        except Exception as error:  # a render/parse problem must not fail the run
+            log.warning("page %d text-layer probe failed: %s", page_index, error)
+            has_layer = True
+        quality = page_text_quality(
+            page_index,
+            parsed_text=" ".join(_block_text(b) for b in page_blocks),
+            has_text_layer=has_layer,
+            min_validity=min_validity,
+            min_words=min_words,
+        )
+        record: dict[str, object] = {
+            "page_index": page_index,
+            "lexicon_validity": quality.lexicon_validity,
+            "word_count": quality.word_count,
+            "needs_transcription": quality.needs_transcription,
+            "reason": quality.reason,
+        }
+        if not quality.needs_transcription:
+            outcome.pages.append(record)
+            continue
+
+        try:
+            image = render_page_png(pdf_path, page_index, dpi=dpi)
+            transcript = transcribe_page_image(
+                image, model=model, api_base=api_base, timeout=timeout
+            )
+        except Exception as error:
+            message = f"page {page_index}: {type(error).__name__}: {error}"
+            log.warning("page transcription failed, keeping parser text: %s", message)
+            outcome.failures.append(message)
+            record["failed"] = message
+            outcome.pages.append(record)
+            continue
+
+        lines = transcription_lines(transcript)
+        matches = align_transcription(
+            [_block_text(b) for b in page_blocks], lines, as_lines=True
+        )
+        replaced = 0
+        for block, claimed in zip(page_blocks, matches):
+            if claimed:
+                _replace_block_text(block, claimed)
+                replaced += 1
+        after = " ".join(_block_text(b) for b in page_blocks)
+        outcome.pages_transcribed += 1
+        outcome.blocks_replaced += replaced
+        outcome.blocks_unmatched += len(page_blocks) - replaced
+        record.update(
+            {
+                "transcribed_lines": len(lines),
+                "blocks": len(page_blocks),
+                "blocks_replaced": replaced,
+                "lexicon_validity_after": round(lexicon_validity(after)[1], 4),
+            }
+        )
+        outcome.pages.append(record)
+        log.info(
+            "page %d re-transcribed: %d/%d blocks replaced, validity %.2f -> %.2f",
+            page_index, replaced, len(page_blocks),
+            quality.lexicon_validity, lexicon_validity(after)[1],
+        )
+    return outcome
