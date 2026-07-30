@@ -317,14 +317,21 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .sidebarCollapsed .chatSidebarFoot { display: none; }
 .sidebarCollapsed .chatSidebarHead { padding: 14px 10px; justify-content: center; }
 
+/* The reading column is centred by insetting the content, not by narrowing the
+   panes. Putting max-width on .chatShell made the scrolling element itself a
+   centred 1080px box, so its scrollbar sat in the middle of the window with a
+   dead gutter to its right. The panes now fill the column -- scrollbar hard
+   against the right edge -- and the padding places the text where the
+   max-width used to. */
 .chatShell {
   flex: 1; display: flex; flex-direction: column;
   /* min-height: 0 is what lets this shrink below its content as a grid
      item, so the overflow lands on .messages instead of on the page. */
-  min-width: 0; min-height: 0; max-width: 1080px; margin: 0 auto; width: 100%;
+  min-width: 0; min-height: 0; width: 100%;
 }
 .messages {
-  flex: 1; min-height: 0; overflow: auto; padding: 22px 22px 8px;
+  flex: 1; min-height: 0; overflow: auto;
+  padding: 22px max(22px, calc((100% - 1080px) / 2)) 8px;
   display: flex; flex-direction: column; gap: 16px;
 }
 .msg { display: flex; }
@@ -381,7 +388,13 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .refThumb { max-width: 100%; max-height: 120px; border-radius: 6px; margin: 4px 0; display: block; }
 .refJump { display: inline-block; font-size: 11.5px; margin-top: 4px; }
 
-.composer { display: flex; gap: 10px; padding: 14px 22px 20px; border-top: 1px solid var(--line); background: var(--panel); }
+/* Same inset, so the composer stays aligned with the messages above it while
+   its border and background still span the whole column. */
+.composer {
+  display: flex; gap: 10px;
+  padding: 14px max(22px, calc((100% - 1080px) / 2)) 20px;
+  border-top: 1px solid var(--line); background: var(--panel);
+}
 .composer textarea {
   flex: 1; resize: none; border: 1px solid var(--line); border-radius: 10px;
   padding: 11px 13px; font: inherit; max-height: 160px;

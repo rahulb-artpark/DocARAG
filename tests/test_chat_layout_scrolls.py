@@ -76,6 +76,35 @@ class TheMessageListOwnsTheOverflow(unittest.TestCase):
         self.assertTrue(declares(".chatSidebar", "min-height", "0"))
 
 
+class TheScrollbarSitsAtTheEdgeOfTheColumn(unittest.TestCase):
+    """A centred scrolling box puts its scrollbar in the middle of the window.
+
+    .chatShell used to carry max-width: 1080px with auto margins, which made the
+    scrolling element itself a centred 1080px box: the scrollbar rendered at that
+    box's right edge with a dead gutter beside it. The reading width is now an
+    inset on the content instead, so the panes fill their grid column.
+    """
+
+    def test_the_chat_pane_is_not_narrowed(self):
+        self.assertFalse(
+            re.search(r"max-width\s*:", rule_body(".chatShell")),
+            ".chatShell must fill its column; inset the content instead",
+        )
+
+    def test_the_chat_pane_is_not_centred_by_margins(self):
+        self.assertFalse(
+            re.search(r"margin\s*:\s*0\s+auto", rule_body(".chatShell")),
+            "auto margins on .chatShell re-centre the scrolling box",
+        )
+
+    def test_the_reading_width_is_an_inset_on_the_message_list(self):
+        self.assertIn("1080px", rule_body(".messages"))
+
+    def test_the_composer_uses_the_same_inset(self):
+        # Otherwise the input stops lining up with the messages above it.
+        self.assertIn("1080px", rule_body(".composer"))
+
+
 class TheComposerStaysReachable(unittest.TestCase):
     def test_the_composer_is_not_inside_the_scrolling_region(self):
         # The Ask button must not scroll away with the transcript.
