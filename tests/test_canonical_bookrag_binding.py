@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from Core.Index.Tree import DocumentTree
+from Core.Index.Tree import DocumentTree, NodeType
 from Core.configs.figure_config import FigureConfig
 from Core.pipelines.doc_tree_builder import (
     CANONICAL_EVIDENCE_FILE,
@@ -132,6 +132,60 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
                 list(projected["image_footnote"]), blocks[0]["image_footnote"]
             )
 
+    def test_native_visual_types_keep_text_channels_and_tree_types(self):
+        cases = (
+            (
+                "image_body",
+                {
+                    "image_caption": ["Figure 1: eye anatomy"],
+                    "image_footnote": ["Retina highlighted"],
+                },
+                NodeType.IMAGE,
+                "Figure 1: eye anatomy Retina highlighted",
+            ),
+            (
+                "chart_body",
+                {
+                    "content": "Myopia: 40%\nHypermetropia: 25%",
+                    "chart_caption": ["Prevalence by condition"],
+                    "chart_footnote": ["Illustrative values"],
+                },
+                NodeType.CHART,
+                (
+                    "Prevalence by condition Myopia: 40%\n"
+                    "Hypermetropia: 25% Illustrative values"
+                ),
+            ),
+        )
+        for block_type, channels, expected_type, expected_content in cases:
+            with self.subTest(block_type=block_type), tempfile.TemporaryDirectory() as tmp:
+                blocks = [
+                    {
+                        "type": block_type,
+                        **channels,
+                        "page_idx": 0,
+                        "middle_json": {
+                            "type": block_type,
+                            "bbox": [10, 10, 300, 200],
+                            "index": 1,
+                        },
+                        "_reconciliation": {
+                            "status": "unmatched_content",
+                            "reason": "native visual type fixture",
+                        },
+                    }
+                ]
+                _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+                projected = project_canonical_blocks(request.document, canonical)[0]
+                self.assertEqual(expected_type.value, projected["type"])
+                self.assertEqual(projected["image_caption"], blocks[0]["image_caption"])
+                self.assertEqual(projected["image_footnote"], blocks[0]["image_footnote"])
+
+                node = create_node_by_type(blocks[0], isTitle=False)
+                self.assertEqual(expected_type, node.type)
+                self.assertEqual(expected_content, node.meta_info.content)
+
     def test_equation_row_text_follows_the_projection_selection(self):
         # When a vision transcription is preferred over the recognizer output,
         # a tree built from the recognizer text would fail hydration.
@@ -154,6 +208,110 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             projected = project_canonical_blocks(request.document, canonical)[0]
             self.assertEqual(projected["text"], blocks[0]["text"])
             self.assertEqual(projected["text_format"], blocks[0]["text_format"])
+
+    def test_native_interline_equation_becomes_an_equation_node(self):
+        blocks = [
+            {
+                "type": "interline_equation",
+                "text": r"E=mc^2",
+                "text_format": "latex",
+                "page_idx": 0,
+                "middle_json": {
+                    "type": "interline_equation",
+                    "bbox": [10, 10, 200, 60],
+                    "index": 1,
+                },
+                "_reconciliation": {
+                    "status": "unmatched_content",
+                    "reason": "native equation type fixture",
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+            projected = project_canonical_blocks(request.document, canonical)[0]
+            self.assertEqual("equation", projected["type"])
+            self.assertEqual("equation", blocks[0]["type"])
+            node = create_node_by_type(blocks[0], isTitle=False)
+            self.assertEqual(NodeType.EQUATION, node.type)
+            self.assertEqual(r"E=mc^2", node.meta_info.content)
+
+    def test_list_items_reach_the_tree_as_renderable_markdown(self):
+        blocks = [
+            {
+                "type": "list",
+                "sub_type": "text",
+                "list_items": [
+                    "• Cannot see nearby objects distinctly.",
+                    "Can see distant objects clearly.",
+                    "3. Image forms behind the retina.",
+                ],
+                "page_idx": 0,
+                "middle_json": {
+                    "type": "list",
+                    "bbox": [10, 10, 300, 100],
+                    "index": 1,
+                },
+                "_reconciliation": {
+                    "status": "unmatched_content",
+                    "reason": "fixture models MinerU list-only content",
+                },
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+            projected = project_canonical_blocks(request.document, canonical)[0]
+            expected = (
+                "- Cannot see nearby objects distinctly.\n"
+                "- Can see distant objects clearly.\n"
+                "- Image forms behind the retina."
+            )
+            self.assertEqual(expected, projected["text"])
+            self.assertEqual("markdown", projected["text_format"])
+            self.assertEqual(expected, blocks[0]["text"])
+
+            node = create_node_by_type(blocks[0], isTitle=False)
+            self.assertEqual(NodeType.LIST, node.type)
+            self.assertEqual(expected, node.meta_info.content)
+
+    def test_specialized_text_blocks_reach_their_typed_tree_nodes(self):
+        cases = (
+            ("code_body", {"code_body": "def answer():\n    return 42"}, NodeType.CODE),
+            ("algorithm", {"text": "1. Read input\n2. Return output"}, NodeType.ALGORITHM),
+            ("abstract", {"text": "This paper presents a bounded method."}, NodeType.ABSTRACT),
+            ("ref_text", {"text": "Doe, J. Example Systems, 2026."}, NodeType.REFERENCE),
+        )
+        for block_type, payload, expected_type in cases:
+            with self.subTest(block_type=block_type), tempfile.TemporaryDirectory() as tmp:
+                blocks = [
+                    {
+                        "type": block_type,
+                        **payload,
+                        "page_idx": 0,
+                        "middle_json": {
+                            "type": block_type,
+                            "bbox": [10, 10, 300, 100],
+                            "index": 1,
+                        },
+                        "_reconciliation": {
+                            "status": "unmatched_content",
+                            "reason": "typed textual block fixture",
+                        },
+                    }
+                ]
+                _cfg, request, canonical = self.bind(Path(tmp), blocks)
+
+                projected = project_canonical_blocks(request.document, canonical)[0]
+                expected_content = payload.get("text", payload.get("code_body"))
+                self.assertEqual(expected_type.value, projected["type"])
+                self.assertEqual(expected_content, projected["text"])
+                self.assertEqual(expected_content, blocks[0]["text"])
+
+                node = create_node_by_type(blocks[0], isTitle=False)
+                self.assertEqual(expected_type, node.type)
+                self.assertEqual(expected_content, node.meta_info.content)
 
     def test_table_row_channels_follow_the_projection(self):
         # MinerU's raw caption and footnote strings differ from the canonical

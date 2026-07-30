@@ -88,6 +88,15 @@ function nodeLabel(n) {
 function renderContent(n) {
   const c = (n && n.content) || "";
   if (!c.trim()) return "—";
+  if (n && String(n.type).toUpperCase() === "CODE")
+    return `<pre class="contentCode"><code>${escapeHtml(c)}</code></pre>`;
+  if (n && String(n.type).toUpperCase() === "LIST") {
+    const items = c.split(/\r?\n/)
+      .map((line) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim())
+      .filter(Boolean);
+    if (items.length)
+      return `<ul class="contentList">${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`;
+  }
   if (/^\s*<table/i.test(c)) {
     const table = renderTableBody(c);
     return table
@@ -187,8 +196,9 @@ async function boot() {
   enableWheelPan("treeNet", () => state.treeNet);
   enableWheelPan("graphNet", () => state.graphNet);
   try {
-    await loadRuns();
-    await loadData();
+    const hasRun = await loadRuns();
+    if (hasRun) await loadData();
+    else activateView("library");
   } catch (err) {
     console.error("BookRAG load failed:", err);
     alert("Failed to load index: " + err.message);
@@ -324,7 +334,7 @@ function stageHeadline(stage) {
   return stage.status;
 }
 
-function stageRows(stage) {
+function stageRows(stage, waitingOn) {
   const rows = [];
   const add = (k, v) => { if (v !== null && v !== undefined && v !== "") rows.push([k, v]); };
   add("Status", stage.status);
@@ -340,6 +350,8 @@ function stageRows(stage) {
     if (stage.etaSeconds != null)
       add("Remaining", `~${fmtDuration(stage.etaSeconds)} (${stage.etaBasis})`);
   }
+  if (stage.status === "pending")
+    add("Waiting", waitingOn || "Pipeline start");
   if (stage.typicalSeconds != null) add("Typical", fmtDuration(stage.typicalSeconds));
   for (const [key, total] of Object.entries(stage.tokens || {}))
     add(key.replace(/_/g, " "), `${fmtTokens(total)} tokens`);
@@ -352,28 +364,35 @@ function stageRows(stage) {
     : `<p class="prose">Nothing recorded for this stage yet.</p>`;
 }
 
-function stageStepHtml(stage) {
+function stageStepHtml(stage, waitingOn) {
   const pct = stage.progress
     ? Math.round((stage.progress.done / stage.progress.total) * 100)
     : null;
-  return `<details class="stageStep ${escapeHtml(stage.status)}">
-    <summary>
+  const statusLabel = stage.status === "running"
+    ? "In progress"
+    : stage.status.charAt(0).toUpperCase() + stage.status.slice(1);
+  return `<section class="stageStep ${escapeHtml(stage.status)}" aria-label="${escapeHtml(stage.name)} stage: ${escapeHtml(stage.status)}">
+    <div class="stageSummary">
       <span class="nm">${escapeHtml(stage.name)}</span>
+      <span class="stageStatus">${escapeHtml(statusLabel)}</span>
       <span class="st">${escapeHtml(stageHeadline(stage))}</span>
       <span class="bar"><i${pct != null ? ` style="width:${pct}%"` : ""}></i></span>
-    </summary>
+    </div>
     <div class="stageBody">
-      ${stageRows(stage)}
+      ${stageRows(stage, waitingOn)}
       ${stage.error ? `<div class="runError">${escapeHtml(String(stage.error))}</div>` : ""}
     </div>
-  </details>`;
+  </section>`;
 }
 
 function runCardHtml(run) {
   const status = run.overallStatus || (run.viewable ? "succeeded" : "pending");
   const isCurrent = run.runDir === state.currentRun;
   const canOpen = run.viewable && !isCurrent;
-  const stages = run.stages.map(stageStepHtml).join("");
+  const stages = run.stages
+    .map((stage, index) =>
+      stageStepHtml(stage, index ? run.stages[index - 1].name : null))
+    .join("");
   const total = run.stages.reduce((a, s) => a + (s.seconds || 0), 0);
   return `<article class="runCard ${isCurrent ? "current" : ""}" data-run="${escapeHtml(run.runDir)}">
     <div class="runCardTop">
@@ -524,8 +543,16 @@ function wireLibrary() {
 /* ============================== run picker =============================== */
 async function loadRuns() {
   const data = await api("/api/runs");
+  state.currentRun = data.current || null;
   const sel = $("runSelect");
   sel.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = data.runs.length
+    ? "Select a document…"
+    : "No indexed documents";
+  placeholder.selected = !state.currentRun;
+  sel.appendChild(placeholder);
   for (const run of data.runs) {
     const opt = document.createElement("option");
     opt.value = run.path;
@@ -533,15 +560,19 @@ async function loadRuns() {
     if (run.path === data.current) opt.selected = true;
     sel.appendChild(opt);
   }
-  sel.disabled = data.runs.length <= 1;
+  setDocumentViewsEnabled(Boolean(state.currentRun));
+  sel.disabled = data.runs.length === 0;
   sel.onchange = async () => {
+    if (!sel.value) return;
     sel.disabled = true;
     try {
-      await api("/api/run", {
+      const result = await api("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ runDir: sel.value }),
       });
+      state.currentRun = result.runDir;
+      setDocumentViewsEnabled(true);
       resetForNewRun();
       await loadData();
     } catch (err) {
@@ -550,6 +581,12 @@ async function loadRuns() {
       sel.disabled = false;
     }
   };
+  return Boolean(state.currentRun);
+}
+
+function setDocumentViewsEnabled(enabled) {
+  document.querySelectorAll('.tab[data-view="graph"], .tab[data-view="tree"], .tab[data-view="chat"]')
+    .forEach((tab) => { tab.disabled = !enabled; });
 }
 
 function resetForNewRun() {
@@ -1148,7 +1185,7 @@ function selectTreeNode(id) {
     : `<p class="prose">No entities were extracted from this node.</p>`;
 
   const parent = n.parentId != null ? state.treeNodesById.get(n.parentId) : null;
-  const img = (n.meta && n.meta.img_path)
+  const img = (n.meta && (n.meta.crop_uri || n.meta.img_path))
     ? `<div class="section-h">Image</div><img class="nodeimg" src="/api/tree-image?id=${id}" alt="node image" />` : "";
 
   $("treeDetail").innerHTML = `

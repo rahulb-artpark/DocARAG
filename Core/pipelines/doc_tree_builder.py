@@ -918,6 +918,13 @@ def bind_canonical_evidence(
         attachment["semantic_substructures"] = projected.get(
             "semantic_substructures"
         )
+        # The parser's native label is not always the tree's normalized type:
+        # MinerU emits ``code_body`` and ``ref_text``, while the canonical
+        # projection deliberately maps them to ``code`` and ``reference``.
+        # Keeping the native label here makes create_node_by_type downgrade
+        # both to generic TEXT even though canonical evidence is correctly
+        # typed.
+        attachment["type"] = projected.get("type", attachment.get("type"))
         # BookRAG builds its tree nodes from these legacy rows while the
         # evidence hydrator re-derives node content from the canonical
         # projection.  MinerU leaves a figure's caption list empty, so without
@@ -933,15 +940,25 @@ def bind_canonical_evidence(
         if projected.get("is_document_title"):
             attachment["is_document_title"] = True
 
-        if projected.get("type") == "image":
+        if projected.get("type") in {"image", "chart", "diagram"}:
             attachment["image_caption"] = list(projected.get("image_caption", []))
             attachment["image_footnote"] = list(
                 projected.get("image_footnote", [])
             )
-        # An equation row's text must follow the projection's selection: when
-        # the vision transcription is preferred over the recognizer output,
-        # a tree built from the recognizer text would fail hydration.
-        if projected.get("type") == "equation":
+        # Every text-bearing row must follow the canonical projection's
+        # selection. MinerU list blocks carry ``list_items`` but no ``text``;
+        # without this handoff they become empty LIST nodes even though their
+        # canonical Markdown representation is populated. Equations likewise
+        # may prefer a vision transcription over recognizer output.
+        if projected.get("type") in {
+            "text",
+            "list",
+            "code",
+            "algorithm",
+            "abstract",
+            "reference",
+            "equation",
+        }:
             attachment["text"] = projected.get("text", "")
             attachment["text_format"] = projected.get("text_format", "")
         # A table row's channels must follow the projection for the same

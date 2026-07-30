@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
 import mimetypes
+import re
 from time import perf_counter
 
 from docarag.domain.base import (
@@ -386,6 +387,24 @@ def _add_text_representation(
         )
 
 
+def _list_markdown(value: object) -> str | None:
+    """Preserve MinerU list-item boundaries in a textual representation."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return _joined_text(value)
+    items: list[str] = []
+    for raw in value:
+        text = _joined_text(raw)
+        if not text:
+            continue
+        # MinerU may retain a visual bullet in the OCR text. The Markdown
+        # marker carries that structure, so keeping both would render two.
+        text = re.sub(r"^\s*(?:[•●▪◦‣⁃*-]|\d+[.)])\s*", "", text).strip()
+        if text:
+            items.append(f"- {text}")
+    return "\n".join(items) or None
+
+
 def _add_structured_representation(
     destination: list[Representation],
     *,
@@ -476,19 +495,25 @@ def _representations(
     # degrading. MinerU 3.x emits aside_text, page_number and doc_title on
     # ordinary pages, and all three landed here.
     if block_type in _TEXT_REPRESENTED_BLOCKS:
+        is_list = block_type == BlockType.LIST_ITEM and block.get("text") is None
         _add_text_representation(
             result,
-            kind=RepresentationKind.TEXT,
+            kind=(
+                RepresentationKind.MARKDOWN
+                if is_list
+                else RepresentationKind.TEXT
+            ),
             value=(
                 block.get("code_body")
                 if block_type == BlockType.CODE and block.get("text") is None
-                else block.get("list_items")
-                if block_type == BlockType.LIST_ITEM and block.get("text") is None
+                else _list_markdown(block.get("list_items"))
+                if is_list
                 else block.get("text")
             ),
-            media_type="text/plain",
+            media_type="text/markdown" if is_list else "text/plain",
             confidence=confidence,
             language=language,
+            source_field="list_items" if is_list else None,
         )
     if block_type == BlockType.TABLE:
         _add_text_representation(
@@ -528,6 +553,14 @@ def _representations(
             result,
             kind=RepresentationKind.CAPTION,
             value=block.get("image_caption"),
+            media_type="text/plain",
+            confidence=confidence,
+            language=language,
+        )
+        _add_text_representation(
+            result,
+            kind=RepresentationKind.FOOTNOTE,
+            value=block.get("image_footnote"),
             media_type="text/plain",
             confidence=confidence,
             language=language,

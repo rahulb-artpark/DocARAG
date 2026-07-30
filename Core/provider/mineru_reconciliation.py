@@ -46,6 +46,9 @@ _ASSET_KEYS = frozenset({"img_path", "image_path"})
 _PAGE_KEYS = ("page_idx", "page_index", "page_no", "page_number")
 _SPACE_RE = re.compile(r"\s+")
 _MARKDOWN_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+.!~$<>|\-])")
+#: A list marker at the start of a line or after whitespace. Anchored so a
+#: hyphen inside a word ("Near-Sightedness") is never touched.
+_LIST_MARKER_RE = re.compile(r"(?:^|(?<=\s))[•·▪◦‣∙*\-–—]+(?=\s)", re.MULTILINE)
 
 
 class MinerUReconciliationError(ValueError):
@@ -222,6 +225,12 @@ def _format_insensitive_text(value: str) -> str:
     # Markdown-escaped currency markers in the other.  The surrounding formula
     # or amount remains intact; all other operators and punctuation are kept.
     normalized = normalized.replace("$", "")
+    # MinerU 3.x writes the same list item as "• item" in middle JSON and
+    # "- item" through its content renderer.  Unmatched observations are
+    # retained rather than dropped, so an unfolded marker does not lose the
+    # list -- it emits the list twice, once per representation, at two
+    # different coordinate scales.
+    normalized = _LIST_MARKER_RE.sub("", normalized)
     return "".join(character for character in normalized if not character.isspace())
 
 

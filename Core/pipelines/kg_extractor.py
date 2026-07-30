@@ -57,6 +57,20 @@ logger = logging.getLogger(__name__)
 
 KG_CHECKPOINT_SCHEMA_VERSION = "docarag.kg-extraction-checkpoint.v1"
 
+_TEXTUAL_KG_NODE_TYPES = frozenset(
+    {
+        NodeType.TEXT,
+        NodeType.LIST,
+        NodeType.CODE,
+        NodeType.ALGORITHM,
+        NodeType.ABSTRACT,
+        NodeType.REFERENCE,
+    }
+)
+_VISUAL_KG_NODE_TYPES = frozenset(
+    {NodeType.IMAGE, NodeType.CHART, NodeType.DIAGRAM}
+)
+
 _SENSITIVE_CONFIG_FIELDS = frozenset(
     {
         "api_key",
@@ -880,9 +894,9 @@ class LLMExtractor(BaseExtractor):
         try:
             if node.type not in NodeType:
                 raise ValueError(f"Unsupported node type: {node.type}")
-            if node.type == NodeType.TEXT:
+            if node.type in _TEXTUAL_KG_NODE_TYPES:
                 entities, relations = self._extract_kg_from_text(node)
-            elif node.type == NodeType.IMAGE:
+            elif node.type in _VISUAL_KG_NODE_TYPES:
                 entities, relations = self._extract_kg_from_image(node)
             elif node.type == NodeType.TABLE:
                 entities, relations = self._extract_kg_from_table(node)
@@ -1283,7 +1297,7 @@ class KGExtractor:
                 "footnote": cls._value_digest(meta.footnote),
             },
         }
-        if cls._node_type(node) == NodeType.IMAGE.value:
+        if cls._node_type(node) in {item.value for item in _VISUAL_KG_NODE_TYPES}:
             identity["evidence"]["image"] = cls._file_identity(meta.img_path)
         return identity
 
@@ -1309,7 +1323,7 @@ class KGExtractor:
 
         if kind == "title":
             templates = {"SECTION_ENTITY_EXTRACTION": SECTION_ENTITY_EXTRACTION}
-        elif node_type == NodeType.TEXT.value:
+        elif node_type in {item.value for item in _TEXTUAL_KG_NODE_TYPES}:
             templates = {
                 "ENTITY_EXTRACTION": ENTITY_EXTRACTION,
                 "ENTITY_CONTINUE_EXTRACTION": ENTITY_CONTINUE_EXTRACTION,
@@ -1320,7 +1334,7 @@ class KGExtractor:
                 "TABLE_DESCRIPTION_EXTRACTION": TABLE_DESCRIPTION_EXTRACTION,
                 "TABLE_BODY_EXTRACTION": TABLE_BODY_EXTRACTION,
             }
-        elif node_type == NodeType.IMAGE.value:
+        elif node_type in {item.value for item in _VISUAL_KG_NODE_TYPES}:
             templates = {"IMAGE_ENTITY_EXTRACTION": IMAGE_ENTITY_EXTRACTION}
         elif node_type == NodeType.EQUATION.value:
             templates = {"EQUATION_ENTITY_EXTRACTION": EQUATION_ENTITY_EXTRACTION}

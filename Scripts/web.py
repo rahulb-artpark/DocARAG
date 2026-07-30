@@ -706,7 +706,7 @@ def bind_server(host, port, handler, attempts=20):
 
 
 class AppState:
-    def __init__(self, run_dir):
+    def __init__(self, run_dir=None):
         self.run_dir = run_dir
         self.chat_lock = threading.Lock()
         self.rag_agent = None
@@ -722,11 +722,19 @@ class AppState:
     def store(self):
         """The document store for this run; evidence is immutable per revision."""
 
+        self.require_run()
         if self._store is None:
             from docarag.document_store import DocumentStore
 
             self._store = DocumentStore.open(self.run_dir)
         return self._store
+
+    def require_run(self):
+        """Return the selected run or reject document-scoped operations."""
+
+        if self.run_dir is None:
+            raise RunNotReadyError("Select a document from the Library first")
+        return self.run_dir
 
     def switch_run(self, run_dir):
         """Rebind every cache and release the agent held for the old run."""
@@ -754,6 +762,7 @@ class AppState:
     def chat_readiness(self):
         """Cache readiness until a query-loaded artifact/store identity changes."""
 
+        self.require_run()
         key = query_readiness_stat_key(self.run_dir)
         if self._readiness_cache_key != key or self._readiness_cache is None:
             self._readiness_cache = inspect_run_readiness(
@@ -764,6 +773,7 @@ class AppState:
 
     @property
     def doc_name(self):
+        self.require_run()
         return Handler._safe_doc_name(self.run_dir)
 
     def tree_payload(self):
@@ -772,6 +782,7 @@ class AppState:
         # persisted) must not be served forever afterward as if it were
         # complete. See the matching note on graph_payload for the incident
         # this fixes.
+        self.require_run()
         key = query_readiness_stat_key(self.run_dir)
         if self._tree_cache is not None and self._tree_cache_key == key:
             return self._tree_cache
@@ -839,6 +850,7 @@ class AppState:
         # empty payload and keep serving it forever, even long after the
         # real data existed in Postgres: the graph panel would show
         # "not loading" permanently for a run that actually finished fine.
+        self.require_run()
         key = query_readiness_stat_key(self.run_dir)
         if self._graph_cache is not None and self._graph_cache_key == key:
             return self._graph_cache
@@ -1128,7 +1140,11 @@ class Handler(SimpleHTTPRequestHandler):
             # stage failed still publishes a tree, so it looks selectable while
             # its chat cannot answer anything.
             runs = []
-            current = self.state.run_dir.resolve()
+            current = (
+                self.state.run_dir.resolve()
+                if self.state.run_dir is not None
+                else None
+            )
             for run in find_runs():
                 if not run_completed(run) and run.resolve() != current:
                     continue
@@ -1140,7 +1156,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "mtime": run.stat().st_mtime,
                     }
                 )
-            self.send_json({"current": str(self.state.run_dir), "runs": runs})
+            self.send_json(
+                {
+                    "current": None if current is None else str(current),
+                    "runs": runs,
+                }
+            )
             return
         if parsed.path == "/api/tree":
             self.send_view_payload(self.state.tree_payload)
@@ -1152,14 +1173,27 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_tree_image(parsed)
             return
         if parsed.path == "/api/health":
-            self.send_json({"ok": True, "runDir": str(self.state.run_dir)})
+            self.send_json(
+                {
+                    "ok": True,
+                    "runDir": (
+                        None
+                        if self.state.run_dir is None
+                        else str(self.state.run_dir)
+                    ),
+                }
+            )
             return
         if parsed.path == "/api/library":
             runs = find_run_dirs()
             history = _stage_history(runs)
             self.send_json(
                 {
-                    "current": str(self.state.run_dir),
+                    "current": (
+                        None
+                        if self.state.run_dir is None
+                        else str(self.state.run_dir)
+                    ),
                     "stageHistory": history,
                     "runs": [run_summary(item, history) for item in runs],
                 }
@@ -1199,6 +1233,8 @@ class Handler(SimpleHTTPRequestHandler):
     def send_view_payload(self, build):
         try:
             self.send_json(build())
+        except RunNotReadyError as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:
             self.send_error_json(
                 HTTPStatus.CONFLICT,
@@ -1219,6 +1255,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(run_summary(run_dir, _stage_history(find_run_dirs())))
 
     def send_tree_image(self, parsed):
+        if self.state.run_dir is None:
+            self.send_error_json(
+                HTTPStatus.CONFLICT, "Select a document from the Library first"
+            )
+            return
         query = parse_qs(parsed.query)
         try:
             node_id = int((query.get("id") or [""])[0])
@@ -1230,7 +1271,8 @@ class Handler(SimpleHTTPRequestHandler):
             (item for item in self.state.tree_payload()["nodes"] if item["id"] == node_id),
             None,
         )
-        img_path = ((node or {}).get("meta") or {}).get("img_path")
+        node_meta = (node or {}).get("meta") or {}
+        img_path = node_meta.get("crop_uri") or node_meta.get("img_path")
         if not img_path:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Node has no image")
             return
@@ -1303,7 +1345,10 @@ class Handler(SimpleHTTPRequestHandler):
                 "Run must be a directory below the configured runs directory",
             )
             return
-        if run_dir == self.state.run_dir.resolve():
+        if (
+            self.state.run_dir is not None
+            and run_dir == self.state.run_dir.resolve()
+        ):
             self.send_error_json(
                 HTTPStatus.CONFLICT,
                 "This document is open; open another one before deleting it",
@@ -1375,6 +1420,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def edit_summary(self):
         try:
+            self.state.require_run()
             payload = self.read_json_body()
             node_id = payload.get("nodeId")
             text = payload.get("text")
@@ -1484,8 +1530,8 @@ def main():
     if not 1 <= args.port <= 65535:
         raise SystemExit("Web port must be between 1 and 65535")
 
-    run_dir = pick_run(args.run_dir)
-    if not (run_dir / "run-manifest.json").exists():
+    run_dir = pick_run(args.run_dir) if args.run_dir else None
+    if run_dir is not None and not (run_dir / "run-manifest.json").exists():
         raise SystemExit(f"Missing run-manifest.json in run directory: {run_dir}")
 
     Handler.state = AppState(run_dir)
@@ -1493,7 +1539,9 @@ def main():
     if actual_port != args.port:
         print(f"Port {args.port} is busy; using {actual_port} instead.")
     print(f"BookRAG web UI: http://{args.host}:{actual_port}")
-    print(f"Run directory: {run_dir}")
+    print(f"Runs directory: {runs_root()}")
+    if run_dir is not None:
+        print(f"Initially selected run: {run_dir}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

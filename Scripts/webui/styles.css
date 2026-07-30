@@ -289,30 +289,51 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .runMeta { margin-top: 4px; font-size: 12px; color: var(--muted); }
 
 .stages { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; align-items: start; }
-.stageStep { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd; }
-.stageStep > summary {
-  list-style: none; cursor: pointer; padding: 8px 10px; display: block;
+.stageStep {
+  border: 1px solid var(--line); border-radius: 8px; background: #fbfcfd;
+  min-width: 0; overflow: hidden;
 }
-.stageStep > summary::-webkit-details-marker { display: none; }
-.stageStep > summary:hover .nm { text-decoration: underline; }
+.stageSummary {
+  padding: 9px 10px 8px; display: grid;
+  grid-template-columns: 1fr auto; align-items: center; gap: 2px 8px;
+}
 .stageStep .nm { font-size: 12px; font-weight: 700; text-transform: capitalize; }
-.stageStep .st { font-size: 11.5px; color: var(--muted); display: block; }
-.stageStep .bar { display: block; height: 3px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
+.stageStatus {
+  justify-self: end; font-size: 9.5px; line-height: 1;
+  font-weight: 800; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); background: #eef1f4; padding: 4px 6px; border-radius: 999px;
+}
+.stageStep .st { grid-column: 1 / -1; font-size: 11.5px; color: var(--muted); display: block; }
+.stageStep .bar {
+  grid-column: 1 / -1; display: block; height: 4px; border-radius: 2px;
+  background: var(--line); margin-top: 5px; overflow: hidden;
+}
 .stageStep .bar i { display: block; height: 100%; width: 0; background: var(--line); }
 .stageStep.succeeded .bar i { width: 100%; background: var(--accent); }
 .stageStep.succeeded .st { color: var(--accent); }
+.stageStep.succeeded .stageStatus { color: var(--accent); background: var(--accent-soft); }
 .stageStep.running { border-color: #fcd34d; background: #fffbeb; }
 .stageStep.running .bar i { background: #f59e0b; }
 .stageStep.running .bar i:not([style]) { width: 45%; animation: slide 1.2s ease-in-out infinite; }
 .stageStep.running .st { color: #92400e; }
+.stageStep.running .stageStatus { color: #92400e; background: #fef3c7; }
 .stageStep.failed { border-color: #f3c9c9; background: #fef4f4; }
 .stageStep.failed .bar i { width: 100%; background: #b91c1c; }
 .stageStep.failed .st { color: #b91c1c; }
-.stageBody { padding: 2px 10px 10px; border-top: 1px dashed var(--line); margin-top: 2px; }
+.stageStep.failed .stageStatus { color: #b91c1c; background: #fde8e8; }
+.stageBody {
+  min-height: 86px; padding: 2px 10px 10px;
+  border-top: 1px dashed var(--line); margin-top: 2px;
+}
 .stageFacts { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 8px 0 0; font-size: 11.5px; }
 .stageFacts dt { color: var(--muted); }
 .stageFacts dd { margin: 0; font-weight: 600; word-break: break-word; }
 @keyframes slide { 0% { margin-left: 0; } 50% { margin-left: 55%; } 100% { margin-left: 0; } }
+
+@media (max-width: 760px) {
+  .stages { grid-template-columns: 1fr; }
+  .stageBody { min-height: 0; }
+}
 
 .runStats { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--line); }
 .runStat .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
@@ -330,6 +351,14 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
   border: 1px solid var(--line); padding: 5px 7px; text-align: left; vertical-align: top;
 }
 .tableWrap tr:first-child td, .tableWrap th { background: #f6f8f9; font-weight: 700; }
+.contentList { margin: 4px 0; padding-left: 22px; }
+.contentList li { margin: 4px 0; line-height: 1.45; }
+.contentCode {
+  margin: 4px 0; padding: 12px 14px; overflow-x: auto;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: #f6f8fa; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre; tab-size: 4;
+}
 
 .structBlock { margin: 6px 0 10px; }
 .structKind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .65; margin-bottom: 4px; }

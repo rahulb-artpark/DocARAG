@@ -165,6 +165,35 @@ class FigureEnrichmentTest(unittest.TestCase):
         self.assertIn(RepresentationKind.VISUAL_DESCRIPTION, kinds)
         self.assertIn(RepresentationKind.OCR_TEXT, kinds)
 
+    def test_mineru_description_does_not_suppress_richer_vlm_enrichment(self) -> None:
+        parser_description = Representation(
+            kind=RepresentationKind.VISUAL_DESCRIPTION,
+            content="Labels: cornea, retina, iris.",
+            media_type="text/plain",
+            metadata={"producer": "mineru", "source_field": "image_content"},
+        )
+        block = make_block(
+            self.document,
+            "figure-1",
+            representations=(parser_description,),
+            assets=(self.asset,),
+        )
+        describer = RecordingDescriber(
+            "A labelled cross-section of the human eye showing its optical path."
+        )
+
+        enriched, stats = self.enrich((block,), describer=describer)
+
+        self.assertEqual(1, len(describer.calls))
+        self.assertEqual(1, stats.described_blocks)
+        descriptions = [
+            item
+            for item in enriched[0].representations
+            if item.kind is RepresentationKind.VISUAL_DESCRIPTION
+        ]
+        self.assertEqual(2, len(descriptions))
+        self.assertEqual("vlm", descriptions[-1].metadata["producer"])
+
     def test_photograph_without_text_is_described_but_gains_no_ocr_text(self) -> None:
         block = make_block(self.document, "photo-1", assets=(self.asset,))
         describer = RecordingDescriber(reply="A photograph of a factory floor.")

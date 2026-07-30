@@ -27,16 +27,16 @@
         <select id="runSelect"></select>
       </label>
       <nav class="tabs" aria-label="Views">
-        <button class="tab" data-view="library">Library</button>
-        <button class="tab active" data-view="graph">Graph</button>
-        <button class="tab" data-view="tree">Tree</button>
-        <button class="tab" data-view="chat">Chat</button>
+        <button class="tab active" data-view="library">Library</button>
+        <button class="tab" data-view="graph" disabled>Graph</button>
+        <button class="tab" data-view="tree" disabled>Tree</button>
+        <button class="tab" data-view="chat" disabled>Chat</button>
       </nav>
     </header>
 
     <main>
       <!-- =========================== LIBRARY =========================== -->
-      <section id="libraryView" class="view">
+      <section id="libraryView" class="view active">
         <div class="library">
           <form id="uploadForm" class="uploader" aria-label="Add a document">
             <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
@@ -57,7 +57,7 @@
       </section>
 
       <!-- ============================ GRAPH ============================ -->
-      <section id="graphView" class="view active">
+      <section id="graphView" class="view">
         <aside class="rail">
           <input id="graphSearch" class="search" type="search" placeholder="Search entities…" />
           <select id="entityTypeFilter" class="select">

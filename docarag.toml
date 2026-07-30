@@ -1,0 +1,13 @@
+schema_version = 1
+profile = "compatibility"
+
+[runtime]
+project_root = "/home/rahul/DocARAG"
+system_config = "config/ollama-gbc.yaml"
+runs_dir = "runs"
+conda_environment = "docarag"
+database_url_env = "DOCARAG_DATABASE_URL"
+
+[storage]
+tenant_id = "default"
+corpus_id = "default"

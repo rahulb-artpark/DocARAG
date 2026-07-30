@@ -1461,6 +1461,7 @@ def _project_visual(
         (
             RepresentationKind.CAPTION,
             RepresentationKind.VISUAL_DESCRIPTION,
+            RepresentationKind.MARKDOWN,
             RepresentationKind.OCR_TEXT,
             RepresentationKind.TEXT,
         ),

@@ -85,9 +85,24 @@ def _verified_image_asset(block: CanonicalBlock) -> AssetRef | None:
 
 
 def _already_enriched(block: CanonicalBlock) -> bool:
+    """True only for evidence produced by this enrichment pass.
+
+    MinerU 3.4.x may emit its own short ``VISUAL_DESCRIPTION``. That is useful
+    parser evidence, but it is not the richer Qwen description requested by
+    ``figures.describe``. Treating any visual description as an idempotence
+    marker skipped the VLM entirely for every image in a document.
+    """
+
     return any(
-        representation.kind
-        in (RepresentationKind.OCR_TEXT, RepresentationKind.VISUAL_DESCRIPTION)
+        (
+            representation.kind is RepresentationKind.OCR_TEXT
+            and representation.metadata.get("producer")
+            == "mineru.pytorch_paddle_ocr"
+        )
+        or (
+            representation.kind is RepresentationKind.VISUAL_DESCRIPTION
+            and representation.metadata.get("producer") == "vlm"
+        )
         for representation in block.representations
     )
 

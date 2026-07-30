@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from Core.Index.Graph import Entity, Relationship
+from Core.Index.Tree import NodeType
 from Core.configs.graph_config import GraphConfig
 from Core.pipelines.kg_extractor import KGExtractor, LLMExtractor, LocalExtractor
 from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
@@ -37,6 +38,71 @@ class GraphConfigValidationTests(unittest.TestCase):
 
 
 class KGExtractionCorrectnessTests(unittest.TestCase):
+    def test_chart_and_diagram_nodes_use_visual_entity_extraction(self):
+        extractor = object.__new__(LLMExtractor)
+        expected = (
+            [
+                Entity(
+                    entity_name="vision chart",
+                    entity_type="IMAGE",
+                    description="A chart of vision conditions.",
+                    source_ids={23},
+                )
+            ],
+            [],
+        )
+        extractor._extract_kg_from_image = lambda _node: expected
+        for node_type in (NodeType.IMAGE, NodeType.CHART, NodeType.DIAGRAM):
+            with self.subTest(node_type=node_type):
+                node = SimpleNamespace(
+                    index_id=23,
+                    type=node_type,
+                    meta_info=SimpleNamespace(
+                        content="Prevalence of vision conditions.",
+                        img_path="chart.png",
+                    ),
+                )
+
+                result = extractor.extract(node)
+
+                self.assertEqual(expected[0], result["entities"])
+                self.assertEqual(23, result["node_idx"])
+
+    def test_specialized_text_nodes_use_text_entity_extraction(self):
+        extractor = object.__new__(LLMExtractor)
+        expected = (
+            [
+                Entity(
+                    entity_name="retina",
+                    entity_type="ANATOMY",
+                    description="Part of the eye.",
+                    source_ids={25},
+                )
+            ],
+            [],
+        )
+        extractor._extract_kg_from_text = lambda _node: expected
+        for node_type in (
+            NodeType.LIST,
+            NodeType.CODE,
+            NodeType.ALGORITHM,
+            NodeType.ABSTRACT,
+            NodeType.REFERENCE,
+        ):
+            with self.subTest(node_type=node_type):
+                node = SimpleNamespace(
+                    index_id=25,
+                    type=node_type,
+                    meta_info=SimpleNamespace(
+                        content="- Image forms behind the retina."
+                    ),
+                )
+
+                result = extractor.extract(node)
+
+                self.assertEqual(expected[0], result["entities"])
+                self.assertEqual(25, result["node_idx"])
+
     def test_local_extractor_returns_graph_models_accepted_by_repair(self):
         local = object.__new__(LocalExtractor)
         local.nlp = lambda _text: object()

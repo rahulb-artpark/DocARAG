@@ -93,6 +93,31 @@ class AppStateCacheInvalidationTests(unittest.TestCase):
         state._store = _FakeStore(tree)
         return state
 
+    def test_global_state_rejects_document_scoped_operations_until_selection(self):
+        state = self.web.AppState()
+
+        self.assertIsNone(state.run_dir)
+        with self.assertRaisesRegex(
+            self.web.RunNotReadyError, "Select a document from the Library"
+        ):
+            state.tree_payload()
+        with self.assertRaisesRegex(
+            self.web.RunNotReadyError, "Select a document from the Library"
+        ):
+            state.graph_payload()
+        with self.assertRaisesRegex(
+            self.web.RunNotReadyError, "Select a document from the Library"
+        ):
+            state.ensure_rag()
+
+    def test_global_state_can_bind_to_a_run_after_startup(self):
+        state = self.web.AppState()
+        selected = Path("/a/selected/run")
+
+        state.switch_run(selected)
+
+        self.assertEqual(selected, state.run_dir)
+
     def test_tree_payload_is_not_reused_after_the_runs_state_changes(self):
         tree = _FakeTree(node_count=1, entity_count=0)
         state = self._state_with_store(tree)

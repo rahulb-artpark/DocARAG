@@ -108,7 +108,9 @@ def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
             "img_path": pdf_content.get("img_path", ""),
             "caption": caption_str,
             "footnote": footnote_str,
-            "content": caption_str + footnote_str,
+            "content": " ".join(
+                part for part in (caption_str, footnote_str) if part
+            ),
             "pdf_id": pdf_content.get("pdf_id", -1),
             "page_idx": pdf_content.get("page_idx", -1),
             "pdf_para_block": pdf_content.get("middle_json", {}),
@@ -126,7 +128,9 @@ def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
             "img_path": pdf_content.get("img_path", ""),
             "caption": caption_str,
             "footnote": footnote_str,
-            "content": caption_str + footnote_str,
+            "content": " ".join(
+                part for part in (caption_str, footnote_str) if part
+            ),
             "table_body": pdf_content.get("table_body", ""),
             "pdf_id": pdf_content.get("pdf_id", -1),
             "page_idx": pdf_content.get("page_idx", -1),
