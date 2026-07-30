@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
+from docarag.adapters.mineru_compat import content_block_text_parts
+
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +193,10 @@ def _semantic_text(value: dict[str, Any], family: str, *, middle: bool) -> str:
             for key in ("image_caption", "image_footnote", "text"):
                 values.extend(_flatten_strings(value.get(key)))
         else:
-            values = _flatten_strings(value.get("text"))
+            # Not value.get("text"): a MinerU 3.x list or code block has no
+            # such key. Joined the same way the middle-json walk below joins
+            # its spans, so the two views of one block compare as equal text.
+            values = list(content_block_text_parts(value))
         return " ".join(part for part in values if part.strip())
 
     if family == "table":

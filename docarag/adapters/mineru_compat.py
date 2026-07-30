@@ -387,6 +387,37 @@ def _add_text_representation(
         )
 
 
+# MinerU 3.x keeps a list's text in ``list_items`` and a code block's in
+# ``code_body``; a block of either kind carries no ``text`` key at all. Anything
+# reading text out of a raw MinerU content-list block goes through the accessor
+# below, so this layout is known here and nowhere else. Re-deriving it per
+# consumer is what let reconciliation read every list as empty while recovery,
+# which had been taught the same fact separately, read them correctly.
+_TEXT_BEARING_KEYS = ("text", "list_items", "code_body")
+
+
+def content_block_text_parts(block: Mapping[str, object]) -> tuple[str, ...]:
+    """The text pieces a raw MinerU content-list block carries, in reading order.
+
+    One piece per list item, so callers can join them the way their own
+    representation needs without knowing which key they came from.
+    """
+
+    for key in _TEXT_BEARING_KEYS:
+        value = block.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return (value,)
+            continue
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            parts = tuple(
+                item for item in value if isinstance(item, str) and item.strip()
+            )
+            if parts:
+                return parts
+    return ()
+
+
 def _list_markdown(value: object) -> str | None:
     """Preserve MinerU list-item boundaries in a textual representation."""
 
