@@ -404,6 +404,10 @@ _TEXT_BLOCKS = frozenset(
         BlockType.HEADER,
         BlockType.FOOTER,
         BlockType.ASIDE,
+        # A discarded block reached no projection set at all, so the first one to
+        # arrive raised UNREPRESENTABLE_TEXT. Its text is projected like any
+        # other page furniture; the node type is what keeps it out of retrieval.
+        BlockType.DISCARDED,
         BlockType.UNKNOWN,
     }
 )
@@ -419,6 +423,13 @@ _NODE_TYPE_BY_BLOCK = {
     BlockType.ALGORITHM: "algorithm",
     BlockType.ABSTRACT: "abstract",
     BlockType.REFERENCE: "reference",
+    # Page furniture kept its own canonical type but projected as "text", so a
+    # page number and a "Scanned with CamScanner" footer were embedded and
+    # summarised as document prose -- 9 of this scan's 85 nodes.
+    BlockType.HEADER: "header",
+    BlockType.FOOTER: "footer",
+    BlockType.ASIDE: "aside",
+    BlockType.DISCARDED: "discarded",
 }
 # Visual blocks already project as "image"; chart and diagram are separated
 # because a chart's values and a diagram's topology are read differently from

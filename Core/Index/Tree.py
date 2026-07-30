@@ -31,7 +31,22 @@ class NodeType(str, Enum):
     ALGORITHM = "algorithm"
     ABSTRACT = "abstract"
     REFERENCE = "reference"
+    # Page furniture. A running header, a page number and a scanner watermark
+    # are printed on the page but say nothing about the document, so they carry
+    # their own types rather than passing as prose: the canonical record keeps
+    # them for provenance while the tree stops answering questions out of them.
+    HEADER = "header"
+    FOOTER = "footer"
+    ASIDE = "aside"
+    DISCARDED = "discarded"
     UNKNOWN = "unknown"
+
+
+# Nodes that exist for traceability only -- never embedded, never summarised,
+# never a section heading, never quoted in an answer.
+FURNITURE_NODE_TYPES = frozenset(
+    {NodeType.HEADER, NodeType.FOOTER, NodeType.ASIDE, NodeType.DISCARDED}
+)
 
 
 class MetaInfo(BaseModel):

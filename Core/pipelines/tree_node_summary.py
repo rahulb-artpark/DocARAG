@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
-from Core.Index.Tree import TreeNode, NodeType, DocumentTree
+from Core.Index.Tree import FURNITURE_NODE_TYPES, TreeNode, NodeType, DocumentTree
 from Core.pipelines.node_context import nearest_prose, parent_title
 from Core.prompts.summary_prompt import NODE_SUMMARY_PROMPT, SEC_SUMMARY_PROMPT
 from Core.provider.llm import CompletionRequest, CompletionResult, LLM
@@ -314,7 +314,12 @@ def generate_tree_node_summary(
     stack = [(tree_index.root_node, 0)]
     while stack:
         node, level = stack.pop()
-        level_dict.setdefault(level, []).append(node)
+        # Page furniture carries no summary and needs none. It has to be skipped
+        # here rather than left to prompt_for, which treats an unsummarisable
+        # node as a fatal error rather than as nothing to do. Children are still
+        # walked, so a node is never orphaned by its parent being furniture.
+        if node.type not in FURNITURE_NODE_TYPES:
+            level_dict.setdefault(level, []).append(node)
         stack.extend((child, level + 1) for child in reversed(node.children))
 
     log.info(f"Processing tree with {len(level_dict)} levels")

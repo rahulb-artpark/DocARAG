@@ -9,7 +9,7 @@ import stat
 import tempfile
 from typing import Protocol
 
-from Core.Index.Tree import DocumentTree
+from Core.Index.Tree import FURNITURE_NODE_TYPES, DocumentTree
 from Core.configs.llm_config import indexing_llm_config
 from Core.configs.system_config import SystemConfig
 from Core.pipelines.outline_extractor import extract_pdf_outline_in_chunks
@@ -28,8 +28,14 @@ from Core.pipelines.tree_node_builder import (
 
 # Projected types that may become a heading. Restricting this to "text" meant
 # a code listing or an abstract could never open a section, and every type
-# added to the projection silently lost the ability to be a title.
-_TITLE_CAPABLE_TYPES = frozenset(_TEXT_CONTENT_TYPES)
+# added to the projection silently lost the ability to be a title. Page
+# furniture is excluded: a running header sits where a heading sits and reads
+# like one, so left eligible it would open a section on every page.
+_TITLE_CAPABLE_TYPES = frozenset(
+    name
+    for name, node_type in _TEXT_CONTENT_TYPES.items()
+    if node_type not in FURNITURE_NODE_TYPES
+)
 from Core.pipelines.tree_node_summary import generate_tree_node_summary
 from Core.provider.TokenTracker import TokenTracker
 from Core.utils.phase_timing import PhaseTimings

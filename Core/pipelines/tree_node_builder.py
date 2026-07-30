@@ -58,6 +58,10 @@ _TEXT_CONTENT_TYPES = {
     "algorithm": NodeType.ALGORITHM,
     "abstract": NodeType.ABSTRACT,
     "reference": NodeType.REFERENCE,
+    "header": NodeType.HEADER,
+    "footer": NodeType.FOOTER,
+    "aside": NodeType.ASIDE,
+    "discarded": NodeType.DISCARDED,
 }
 _VISUAL_CONTENT_TYPES = {
     "image": NodeType.IMAGE,
