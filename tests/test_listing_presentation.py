@@ -168,7 +168,9 @@ class TheLanguageReachesTheProjection(unittest.TestCase):
         return None
 
     def test_a_named_language_is_carried_on_the_representation(self):
-        block = {"type": "code", "code_body": "```python\nx = 1\n```"}
+        # Multi-line, because a one-line fragment reports no language at all --
+        # see AOneLineListingClaimsNoLanguage below.
+        block = {"type": "code", "code_body": "```python\nx = 1\ny = 2\n```"}
         self.assertEqual(self._listing_language(block), "python")
 
     def test_the_natural_language_field_is_not_overloaded(self):
@@ -193,3 +195,38 @@ class TheLanguageReachesTheProjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AOneLineListingClaimsNoLanguage(unittest.TestCase):
+    """MinerU's language guess needs more than one line to be worth anything.
+
+    The twelve single-line fragments of one Python insertion sort in
+    016.0 SORTING.pdf were tagged javascript, lua, txt and python. Reporting any
+    of those would have labelled `print("Original list is ", aList)` as Lua, so
+    only a listing carrying its own line breaks is taken to have a language.
+    """
+
+    def _language(self, code_body):
+        from docarag.adapters.mineru_compat import _representations
+        from docarag.domain.evidence import BlockType
+
+        for representation in _representations(
+            {"type": "code", "code_body": code_body},
+            BlockType.CODE,
+            confidence=None,
+            language="en",
+        ):
+            name = representation.metadata.get("listing_language")
+            if name is not None:
+                return name
+        return None
+
+    def test_a_one_line_fragment_reports_nothing(self):
+        self.assertIsNone(self._language("```javascript\naList = [21,8,15,27,2,80,1]\n```"))
+        self.assertIsNone(self._language('```lua\nprint("Original list is ", aList)\n```'))
+
+    def test_a_whole_program_still_reports_its_language(self):
+        self.assertEqual(
+            self._language("```python\ndef f():\n    return 1\n```"),
+            "python",
+        )

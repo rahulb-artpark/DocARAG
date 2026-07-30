@@ -1465,6 +1465,36 @@ def _is_listing_anchor(content: dict) -> bool:
     )
 
 
+def _listing_continues(run: list[dict], candidate: dict) -> bool:
+    """Whether a block sits close enough, and in the same column, to belong."""
+
+    boxes = [box for box in (_listing_bbox(item) for item in run) if box is not None]
+    box = _listing_bbox(candidate)
+    if not boxes or box is None:
+        return False
+    left = min(item[0] for item in boxes)
+    right = max(item[2] for item in boxes)
+    # A neighbouring column is next to the listing, not inside it.
+    if min(right, box[2]) - max(left, box[0]) <= 0:
+        return False
+    tops = sorted(boxes, key=lambda item: item[1])
+    pitches = [
+        max(0.0, later[1] - earlier[3]) for earlier, later in zip(tops, tops[1:])
+    ]
+    if box[1] >= tops[-1][3]:
+        gap = box[1] - tops[-1][3]
+    elif box[3] <= tops[0][1]:
+        gap = tops[0][1] - box[3]
+    else:
+        gap = 0.0
+    limit = (
+        max(_LISTING_GAP_MULTIPLE * median(pitches), _LISTING_GAP_FLOOR)
+        if pitches
+        else float(_LISTING_GAP_FLOOR)
+    )
+    return gap <= limit
+
+
 def _listing_run_indices(page: list[dict], anchor: int, taken: set[int]) -> list[int]:
     """Grow a listing outward from an anchor, in both directions, while it holds."""
 
@@ -1475,52 +1505,96 @@ def _listing_run_indices(page: list[dict], anchor: int, taken: set[int]) -> list
             candidate = page[index]
             if _listing_reject_reason(candidate) is not None:
                 break
-            boxes = [_listing_bbox(page[i]) for i in run]
-            boxes = [box for box in boxes if box is not None]
-            box = _listing_bbox(candidate)
-            if not boxes or box is None:
-                break
-            left = min(item[0] for item in boxes)
-            right = max(item[2] for item in boxes)
-            # A neighbouring column is next to the listing, not inside it.
-            if min(right, box[2]) - max(left, box[0]) <= 0:
-                break
-            tops = sorted(boxes, key=lambda item: item[1])
-            pitches = [
-                max(0.0, later[1] - earlier[3])
-                for earlier, later in zip(tops, tops[1:])
-            ]
-            if box[1] >= tops[-1][3]:
-                gap = box[1] - tops[-1][3]
-            elif box[3] <= tops[0][1]:
-                gap = tops[0][1] - box[3]
-            else:
-                gap = 0.0
-            if pitches:
-                limit = max(_LISTING_GAP_MULTIPLE * median(pitches), _LISTING_GAP_FLOOR)
-            else:
-                limit = float(_LISTING_GAP_FLOOR)
-            if gap > limit:
+            if not _listing_continues([page[i] for i in run], candidate):
                 break
             run.append(index)
             index += step
     return sorted(run)
 
 
-def merge_listing_and_mark_invalid(anchor: dict, contributors: list[dict]) -> None:
+# MinerU also splits a real program, one line per block, with no algorithm
+# anchor anywhere to grow from: 016.0 SORTING.pdf emits the twelve lines of one
+# insertion sort as twelve code blocks, so no node held the program and the
+# answer correctly reported the document did not contain it. Earlier work here
+# assumed a program always arrives whole. That held for one book and not for
+# this one.
+#
+# A fragment is a code block holding a single line. A code block that carries
+# its own line breaks is already a complete listing and is never merged -- which
+# is what keeps a program and the console transcript printed under it, adjacent
+# on the page, from collapsing into one node.
+def _listing_body(content: dict) -> str:
+    for key in ("text", "code_body"):
+        value = content.get(key)
+        if isinstance(value, str) and value.strip():
+            return unwrap_presentation(value)
+    return ""
+
+
+def _is_code_fragment(content: Optional[dict]) -> bool:
+    if content is None or content.get("invalid"):
+        return False
+    if content.get("type") not in {"code", "algorithm"}:
+        return False
+    if content.get("text_level") is not None:
+        return False
+    if _listing_bbox(content) is None:
+        return False
+    return "\n" not in _listing_body(content).strip()
+
+
+# A fragment was cropped on its own, so its leading whitespace is gone and its
+# indentation survives only in its left edge. In Python that indentation is the
+# control flow, so it is rebuilt: the distinct left edges are clustered into
+# levels and each level re-emitted as four spaces. On the insertion sort above,
+# left edges 52/56, 152/155/156 and 255/256 become levels 0, 1 and 2.
+_INDENT_CLUSTER_PX = 24
+_INDENT_WIDTH = 4
+
+
+def _indent_prefixes(boxes: list[tuple[float, float, float, float]]) -> list[str]:
+    starts: list[float] = []
+    for left in sorted({box[0] for box in boxes}):
+        if not starts or left - starts[-1] > _INDENT_CLUSTER_PX:
+            starts.append(left)
+    prefixes: list[str] = []
+    for box in boxes:
+        level = 0
+        for index, start in enumerate(starts):
+            if box[0] >= start - _INDENT_CLUSTER_PX / 2:
+                level = index
+            else:
+                break
+        prefixes.append(" " * (_INDENT_WIDTH * level))
+    return prefixes
+
+
+def merge_listing_and_mark_invalid(
+    anchor: dict, contributors: list[dict], *, reindent: bool = False
+) -> None:
     """Rebuild one listing from its pieces, keeping every line break.
 
     Unlike ``merge_text_and_mark_invalid`` the pieces are joined with newlines
     and every contributor is invalidated, not only the text ones: a listing's
     line breaks and indentation are its meaning, and the code pieces here are
     listing lines rather than equations to be preserved separately.
+
+    ``reindent`` rebuilds each piece's leading whitespace from its left edge, for
+    a run of separately-cropped fragments that no longer carry any. It must stay
+    off for pieces that kept their own indentation, which would otherwise be
+    indented twice.
     """
 
     if not contributors:
         return
     ordered = sorted([anchor, *contributors], key=lambda item: item.get("_listing_seq", 0))
+    prefixes: list[str] = [""] * len(ordered)
+    if reindent:
+        boxes = [_listing_bbox(content) for content in ordered]
+        if all(box is not None for box in boxes):
+            prefixes = _indent_prefixes([box for box in boxes if box is not None])
     parts: list[str] = []
-    for content in ordered:
+    for content, prefix in zip(ordered, prefixes):
         raw = content.get("text")
         if not isinstance(raw, str) or not raw.strip():
             raw = content.get("code_body")
@@ -1528,11 +1602,22 @@ def merge_listing_and_mark_invalid(anchor: dict, contributors: list[dict]) -> No
             continue
         piece = unwrap_presentation(raw).strip("\n")
         if piece.strip():
-            parts.append(piece)
+            parts.append(prefix + piece if prefix else piece)
     if not parts:
         return
     for content in contributors:
         content["invalid"] = True
+    if reindent:
+        # MinerU guesses a language per block, and on a single line it has too
+        # little to go on: one Python program's twelve fragments were tagged
+        # javascript, lua, txt and python. Only a language every piece agrees on
+        # is claimed for the whole.
+        languages = {content.get("code_language") for content in ordered}
+        languages.discard(None)
+        if len(languages) == 1:
+            anchor["code_language"] = languages.pop()
+        else:
+            anchor.pop("code_language", None)
 
     anchor["text"] = "\n".join(parts)
     # The listing now lives in "text" like any other block's content. Leaving a
@@ -1558,7 +1643,15 @@ def merge_listing_and_mark_invalid(anchor: dict, contributors: list[dict]) -> No
 
 
 def listing_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
-    """Rejoin pseudocode listings that arrived split across blocks."""
+    """Rejoin a listing that arrived split across blocks.
+
+    Two passes, because a split listing arrives in two forms. An algorithm MinerU
+    labelled is grown outward from that label, absorbing the step lines it emitted
+    as prose. A program with no label anywhere is recovered from its own
+    fragments: a run of code blocks each holding a single line.
+
+    The labelled pass runs first, so a block it claims is not reconsidered.
+    """
 
     pages: Dict[object, list[dict]] = {}
     for content in pdf_list:
@@ -1582,6 +1675,29 @@ def listing_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
             merge_listing_and_mark_invalid(
                 content, [page[i] for i in run if i != position]
             )
+
+        position = 0
+        while position < len(page):
+            if position in taken or not _is_code_fragment(page[position]):
+                position += 1
+                continue
+            run = [position]
+            index = position + 1
+            while (
+                index < len(page)
+                and index not in taken
+                and _is_code_fragment(page[index])
+                and _listing_continues([page[i] for i in run], page[index])
+            ):
+                run.append(index)
+                index += 1
+            taken.update(run)
+            if len(run) >= 2:
+                merge_listing_and_mark_invalid(
+                    page[run[0]], [page[i] for i in run[1:]], reindent=True
+                )
+            position = max(index, position + 1)
+
         for content in page:
             content.pop("_listing_seq", None)
     return pdf_list

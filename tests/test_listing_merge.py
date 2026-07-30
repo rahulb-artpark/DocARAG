@@ -1,16 +1,23 @@
-"""A pseudocode listing split across blocks is rebuilt from the page layout.
+"""A listing split across blocks is rebuilt from the page layout.
 
-Fixtures are the real geometry of the two documents that shred a listing two
-different ways: lecs106.pdf page 6 splits Algorithm 6.2 on the lines carrying
-maths, leaving one sub_type "algorithm" block between Step 4 and Step 5 with
-everything else as single-line text; Basics-of-Algorithm.pdf page 2 splits on
-indentation depth, alternating "algorithm" and "code" blocks with the step
-labels as text between them.
+Fixtures are the real geometry of three documents that each shred a listing a
+different way:
 
-The two stopping cases are what the rule has to get right, and each document
-only exhibits one of them: lecs106's prose follows at the same left margin as
-the listing (so only its wrapping separates it), and Basics' next section
-heading is a single line (so only its level separates it).
+  - lecs106.pdf page 6 splits Algorithm 6.2 on the lines carrying maths, leaving
+    one sub_type "algorithm" block between Step 4 and Step 5 and everything else
+    as single-line text.
+  - Basics-of-Algorithm.pdf page 2 splits on indentation depth, alternating
+    "algorithm" and "code" blocks with the step labels as text between them.
+  - 016.0 SORTING.pdf page 11 splits a real Python program one line per block,
+    with no algorithm label anywhere and no leading whitespace left in any piece.
+
+The first two are grown outward from the label MinerU gave them; the third has no
+label and is recovered from the fragments themselves. Each stopping case appears
+in only one document, which is why all of them are needed here: lecs106's prose
+follows at the same left margin as the listing, so only its wrapping separates
+it; Basics' next section heading is a single line, so only its level separates
+it; and lecs106's program and console transcript sit adjacent, so only the fact
+that both are already whole keeps them apart.
 """
 
 import unittest
@@ -270,13 +277,29 @@ class RealCodeIsNeverTouched(unittest.TestCase):
         listing_merger(page)
         self.assertEqual(page, before)
 
-    def test_two_adjacent_programs_are_not_joined(self):
+    def test_two_adjacent_whole_programs_are_not_joined(self):
+        # Both carry their own line breaks, so both are already complete and
+        # neither is a fragment.
+        page = [
+            _code("print('a')\nprint('b')", top=89, height=90, page=8, language="python"),
+            _code("print('c')\nprint('d')", top=200, height=90, page=8, language="python"),
+        ]
+        listing_merger(page)
+        self.assertEqual(len(_survivors(page)), 2)
+
+    def test_two_adjacent_single_line_blocks_do_join(self):
+        # Deliberate, and the opposite of what this file asserted before
+        # 016.0 SORTING.pdf: two adjacent one-line code blocks are exactly what
+        # one two-line program split in two looks like, and nothing distinguishes
+        # them. Assuming otherwise is what left an insertion sort spread over
+        # twelve nodes with no node holding the program.
         page = [
             _code("print('a')", top=89, height=40, page=8, language="python"),
             _code("print('b')", top=140, height=40, page=8, language="python"),
         ]
         listing_merger(page)
-        self.assertEqual(len(_survivors(page)), 2)
+        self.assertEqual(len(_survivors(page)), 1)
+        self.assertEqual(_survivors(page)[0]["text"], "print('a')\nprint('b')")
 
 
 class TheRunStopsWhereTheListingDoes(unittest.TestCase):
@@ -339,3 +362,143 @@ class TheRunStopsWhereTheListingDoes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _fragment(line, *, top, left, page=10, language=None, height=46):
+    """One line of a program, cropped on its own.
+
+    This is the shape 016.0 SORTING.pdf produces: a code block per line, with no
+    leading whitespace left in the text at all -- the indentation survives only
+    in the left edge.
+    """
+
+    block = {
+        "type": "code",
+        "sub_type": "code",
+        "text": line,
+        "code_body": f"```{language or 'txt'}\n{line}\n```",
+        "bbox": [left, top, left + 300, top + height],
+        "page_idx": page,
+        "middle_json": {"blocks": []},
+    }
+    if language:
+        block["code_language"] = language
+    return block
+
+
+# The real geometry of the insertion sort on page 11 of 016.0 SORTING.pdf, whose
+# twelve lines reached the tree as twelve separate code nodes -- so no node held
+# the program and the answer correctly said the document did not contain it.
+_INSERTION_SORT = [
+    ("aList = [21,8,15,27,2,80,1]", 238, 52, "javascript"),
+    ('print("Original list is ", aList)', 296, 56, "lua"),
+    ("n = len(aList)", 359, 56, "lua"),
+    ("for i in range(1,n):", 418, 56, None),
+    ("key = aList[i]", 475, 152, None),
+    ("j=i-1", 535, 155, None),
+    ("while j>=0 and aList[j]>key:", 592, 155, None),
+    ("aList[j+1]=aList[j]", 651, 256, None),
+    ("j=j-1", 712, 255, None),
+    ("aList[j+1]=key", 770, 156, "python"),
+    ('print("After pass", i,":",aList)', 825, 156, None),
+    ('print("Sorted List is ",aList)', 883, 56, "lua"),
+]
+
+
+class AProgramIsRecoveredFromItsFragments(unittest.TestCase):
+    """A split program has no algorithm label anywhere to grow a run from."""
+
+    def _page(self):
+        return [
+            _text("Python Code - Insertion Sorting", top=131, left=56, page=10),
+            *[_fragment(line, top=top, left=left, language=lang)
+              for line, top, left, lang in _INSERTION_SORT],
+        ]
+
+    def test_every_line_ends_up_in_one_listing(self):
+        page = self._page()
+        listing_merger(page)
+        survivors = _survivors(page)
+        listings = [b for b in survivors if b["type"] == "code"]
+        self.assertEqual(len(listings), 1)
+        self.assertEqual(len(listings[0]["text"].splitlines()), 12)
+
+    def test_the_indentation_is_rebuilt_from_the_left_edges(self):
+        # A fragment is cropped on its own, so no leading whitespace reaches us.
+        # Joining the pieces as-is produces Python that cannot run, which is the
+        # whole reason the left edge has to be read.
+        page = self._page()
+        listing_merger(page)
+        listing = [b for b in _survivors(page) if b["type"] == "code"][0]
+        compile(listing["text"], "<merged>", "exec")  # raises if indentation is wrong
+        lines = listing["text"].splitlines()
+        self.assertEqual(lines[3], "for i in range(1,n):")
+        self.assertEqual(lines[4], "    key = aList[i]")
+        self.assertEqual(lines[7], "        aList[j+1]=aList[j]")
+        self.assertEqual(lines[11], 'print("Sorted List is ",aList)')
+
+    def test_a_language_the_fragments_disagree_on_is_dropped(self):
+        # MinerU tagged these twelve lines of one program javascript, lua, txt
+        # and python. Reporting any single one of those would be a wrong answer.
+        page = self._page()
+        listing_merger(page)
+        listing = [b for b in _survivors(page) if b["type"] == "code"][0]
+        self.assertIsNone(listing.get("code_language"))
+
+    def test_a_language_every_fragment_agrees_on_is_kept(self):
+        page = [
+            _fragment("x = 1", top=100, left=56, language="python"),
+            _fragment("y = 2", top=150, left=56, language="python"),
+        ]
+        listing_merger(page)
+        self.assertEqual(_survivors(page)[0]["code_language"], "python")
+
+    def test_the_caption_above_the_program_stays_its_own_node(self):
+        page = self._page()
+        listing_merger(page)
+        self.assertIn(page[0], _survivors(page))
+
+
+class AWholeListingIsNeverMerged(unittest.TestCase):
+    """What keeps a program and the output printed under it apart.
+
+    On lecs106.pdf a ```python program and the ```txt transcript of its console
+    output sit adjacent on the page. Both arrive whole, so neither is a fragment
+    and the run never starts -- verified against that document, where the pass
+    leaves all nine listings exactly as they were.
+    """
+
+    def test_a_program_and_its_transcript_stay_separate(self):
+        page = [
+            _code("def binarySearch(list, key):\n    first = 0\n    return -1",
+                  top=89, height=200, page=8, language="python"),
+            _code("How many elements in your list? 4\nThe List contents are:",
+                  top=300, height=60, page=8),
+        ]
+        before = [dict(b) for b in page]
+        listing_merger(page)
+        self.assertEqual(page, before)
+
+    def test_one_lone_fragment_is_not_a_listing(self):
+        page = [
+            _text("A heading", top=60, level=2, page=10),
+            _fragment("print('hi')", top=100, left=56),
+            _text("Wrapped prose after it", top=200, lines=3, page=10),
+        ]
+        before = dict(page[1])
+        listing_merger(page)
+        self.assertEqual(page[1], before)
+
+    def test_a_heading_between_fragments_splits_them(self):
+        page = [
+            _fragment("x = 1", top=100, left=56),
+            _fragment("y = 2", top=150, left=56),
+            _text("Second Program", top=210, left=56, level=2, page=10),
+            _fragment("z = 3", top=260, left=56),
+            _fragment("w = 4", top=310, left=56),
+        ]
+        listing_merger(page)
+        listings = [b for b in _survivors(page) if b["type"] == "code"]
+        self.assertEqual(len(listings), 2)
+        for listing in listings:
+            self.assertEqual(len(listing["text"].splitlines()), 2)

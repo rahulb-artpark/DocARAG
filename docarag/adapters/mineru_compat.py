@@ -587,14 +587,20 @@ def _representations(
             and block.get("text") is None
             and isinstance(block.get("code_body"), str)
         )
-        # The fence tag is the parser's own answer to "what language is this",
-        # and it is the only thing separating a program from an untagged
-        # listing. It is recorded rather than acted on here: an untagged listing
-        # is a listing whose language MinerU could not name, which is not the
-        # same claim as "this is not a program".
-        listing_language = (
-            fence_language(block["code_body"]) if wraps_a_listing else None
-        )
+        # The fence tag is the parser's own answer to "what language is this".
+        # It is recorded rather than acted on here: an untagged listing is a
+        # listing whose language MinerU could not name, which is not the same
+        # claim as "this is not a program".
+        #
+        # Only a listing carrying its own line breaks is taken to have a
+        # language. On one line MinerU has too little to go on, and it shows:
+        # the twelve single-line fragments of one Python insertion sort in
+        # 016.0 SORTING.pdf were tagged javascript, lua, txt and python, so the
+        # panel would have labelled `print("Original list is ", aList)` as Lua.
+        # No tag is better than a wrong one.
+        listing_language = None
+        if wraps_a_listing and "\n" in unwrap_presentation(block["code_body"]).strip():
+            listing_language = fence_language(block["code_body"])
         _add_text_representation(
             result,
             kind=(
