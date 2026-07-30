@@ -73,7 +73,26 @@ def _fail(message: str) -> NoReturn:
 # a type added there without being added here hydrates as "unsupported node
 # type" rather than degrading quietly.
 _TEXT_NODE_TYPES = frozenset(
-    {"text", "list", "code", "algorithm", "abstract", "reference"}
+    {
+        "text",
+        "list",
+        "code",
+        "algorithm",
+        "abstract",
+        "reference",
+        # Page furniture. It gained its own projected node type so a page number
+        # or a "Scanned with CamScanner" footer would stop being embedded and
+        # summarised as document prose, but was never added here -- and its
+        # evidence still lives in the same "text" channel as any other of these.
+        # The gap stayed hidden because the only path that hydrates a whole
+        # section was refusing on its evidence budget before it ever reached
+        # hydration; a section containing two footers and two asides then failed
+        # with "unsupported node type" the moment that budget was corrected.
+        "header",
+        "footer",
+        "aside",
+        "discarded",
+    }
 )
 _VISUAL_NODE_TYPES = frozenset({"image", "chart", "diagram"})
 # Types that may carry a materialized crop whose path must match the

@@ -99,3 +99,54 @@ class FurnitureIsNeverAnswerable(unittest.TestCase):
         for node_type in FURNITURE_NODE_TYPES:
             with self.subTest(node_type=node_type):
                 self.assertNotIn(node_type, _TEXTUAL_KG_NODE_TYPES)
+
+
+class EveryProjectedNodeTypeCanBeHydrated(unittest.TestCase):
+    """Hydration must accept every node type the projection can produce.
+
+    These two lists are kept in step by hand, and were not: page furniture gained
+    its own projected node type and hydration was never told about it. Nothing
+    noticed, because the only path that hydrates a whole section -- a global
+    query -- was refusing on its evidence budget before hydration ran. Correcting
+    that budget made a section holding two footers and two asides fail with
+    "canonical projection produced an unsupported node type".
+
+    Indexing is the opposite case and stays that way: furniture is deliberately
+    absent from vdb_index's own _TEXT_NODE_TYPES, because it must never be
+    embedded. Hydration has to *validate* what indexing declines to *index*.
+    """
+
+    def _projected_types(self):
+        from docarag.bookrag_projection import _VISUAL_NODE_TYPE_BY_BLOCK
+
+        return (
+            set(_NODE_TYPE_BY_BLOCK.values())
+            | set(_VISUAL_NODE_TYPE_BY_BLOCK.values())
+            | {"text", "image"}
+        )
+
+    def _hydratable_types(self):
+        from docarag.evidence_hydration import (
+            _TEXT_NODE_TYPES as HYDRATABLE_TEXT,
+            _VISUAL_NODE_TYPES as HYDRATABLE_VISUAL,
+        )
+
+        # table and equation are matched by their own branches rather than a set.
+        return HYDRATABLE_TEXT | HYDRATABLE_VISUAL | {"table", "equation"}
+
+    def test_no_projected_type_is_unhydratable(self):
+        missing = sorted(self._projected_types() - self._hydratable_types())
+        self.assertEqual(
+            missing,
+            [],
+            "these node types are projected but would fail hydration as "
+            "'unsupported node type'",
+        )
+
+    def test_furniture_is_hydratable_even_though_it_is_not_indexed(self):
+        from docarag.evidence_hydration import _TEXT_NODE_TYPES as HYDRATABLE_TEXT
+
+        for node_type in FURNITURE_NODE_TYPES:
+            with self.subTest(node_type=node_type):
+                self.assertIn(node_type, HYDRATABLE_TEXT)
+                self.assertNotIn(node_type, _TEXT_NODE_TYPES)
