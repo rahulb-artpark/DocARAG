@@ -9,9 +9,11 @@ import unittest
 from docarag.page_transcription import (
     align_transcription,
     lexicon_validity,
+    merge_band_lines,
     page_text_quality,
     transcription_lines,
     _LEXICON,
+    _alignment_units,
 )
 
 _MINERU = [
@@ -138,3 +140,92 @@ class AlignmentIsMonotonicAndSafe(unittest.TestCase):
 
     def test_an_empty_block_is_never_matched(self):
         self.assertEqual(align_transcription(["", "   "], self.lines), [None, None])
+
+
+class AListIsMatchedItemByItem(unittest.TestCase):
+    """MinerU keeps a whole list in one block; the page reads it as many lines."""
+
+    def test_each_item_is_its_own_unit(self):
+        block = {"list_items": ["first item", "second item", "  "]}
+        self.assertEqual(_alignment_units(block), ("first item", "second item"))
+
+    def test_an_ordinary_block_stays_one_unit(self):
+        self.assertEqual(_alignment_units({"text": "a paragraph"}), ("a paragraph",))
+
+    def test_an_empty_block_has_no_units(self):
+        self.assertEqual(_alignment_units({"text": "   "}), ())
+
+    def test_a_long_list_matches_where_one_joined_blob_cannot(self):
+        # The real 10P_CH11 page 1 list, which spans far more transcribed lines
+        # than any single span the aligner will try.
+        items = [
+            "lornea A Thin membrane covering the swrfau of eyball.",
+            "Dus Adark nuscular diaphragm located just luhind the Corner",
+            "o. Pupil A black opening lutween the aqueous humour",
+            "Cilliary lontrols the foul length of the eye lens",
+            "Crystalline lens A tvansparent double convex lens",
+            "Retina A light sensitive screen at the buck of eye",
+        ]
+        lines = [
+            "1. Cornea A Thin membrane covering the surface of eyeball.",
+            "2. Iris A dark muscular diaphragm located just behind the Cornea.",
+            "3. Pupil A black opening between the aqueous humour",
+            "4. Ciliary Controls the focal length of the eye lens",
+            "5. Crystalline lens A transparent double convex lens",
+            "6. Retina A light sensitive screen at the back of eye",
+        ]
+        # Six items need six lines, past the span cap the aligner will try, so
+        # the joined block either misses or wins on a partial overlap and
+        # replaces the whole list with the few lines it matched.
+        joined = align_transcription([" ".join(items)], lines, as_lines=True)
+        self.assertNotEqual(
+            list(joined[0] or ()), lines, "the joined list cannot claim every line"
+        )
+        per_item = align_transcription(list(items), lines, as_lines=True)
+        self.assertEqual([m[0] for m in per_item], lines)
+
+    def test_an_unmatched_item_does_not_cost_the_list_its_siblings(self):
+        items = ["lornea A Thin membrane", "utterly unrelated marginalia", "o. Pupil"]
+        lines = ["1. Cornea A Thin membrane", "3. Pupil"]
+        matches = align_transcription(list(items), lines, as_lines=True)
+        rebuilt = []
+        for parser_text, claimed in zip(items, matches):
+            rebuilt.extend(claimed or (parser_text,))
+        self.assertEqual(
+            rebuilt,
+            ["1. Cornea A Thin membrane", "utterly unrelated marginalia", "3. Pupil"],
+        )
+
+
+class BandsAreMergedAtTheirSeam(unittest.TestCase):
+    def test_a_reflowed_overlap_is_dropped_once(self):
+        # The bands disagree on line breaks, which is why the seam is matched on
+        # text and not line-for-line.
+        upper = [
+            "3. Pupil A black opening between the aqueous humour and the eye lens.",
+            "Regulates and controls the amount of light entering",
+        ]
+        lower = [
+            "3. Pupil",
+            "A black opening between the aqueous humour and the eye lens.",
+            "Regulates and controls the amount of light entering the eye.",
+            "4. Ciliary Muscles",
+        ]
+        merged = merge_band_lines([upper, lower])
+        self.assertEqual(merged, lower, "the lower band's fuller reading wins")
+
+    def test_unrelated_bands_are_concatenated_untouched(self):
+        upper = ["Presbyopia", "Near point of the eye reduces with aging."]
+        lower = ["Tyndall Effect", "Colour of the sky is blue."]
+        self.assertEqual(merge_band_lines([upper, lower]), upper + lower)
+
+    def test_a_legitimately_repeated_line_survives(self):
+        upper = ["Some prose about the eye lens.", "Scanned with CamScanner"]
+        lower = ["A different paragraph entirely.", "Scanned with CamScanner"]
+        self.assertEqual(merge_band_lines([upper, lower]), upper + lower)
+
+    def test_one_band_is_returned_as_is(self):
+        self.assertEqual(merge_band_lines([["only", "band"]]), ["only", "band"])
+
+    def test_no_bands_is_empty(self):
+        self.assertEqual(merge_band_lines([]), [])

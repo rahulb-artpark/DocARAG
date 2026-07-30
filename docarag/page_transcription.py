@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -355,6 +356,71 @@ def transcription_lines(text: str) -> list[str]:
     return lines
 
 
+# Bands are rendered overlapping so no line is cut in half at the seam, which
+# means the lines inside the overlap are transcribed once per band. Monotonic
+# alignment tolerates a duplicate -- the cursor only advances on a claim -- but
+# tolerance is not immunity: a duplicate sitting next to a genuine match can win
+# the wrong span. On 10P_CH11 that put the figure legend "R → Red O → Orange"
+# inside the Astigmatism paragraph, and gave the Ciliary-Muscles list item a
+# second copy of a Pupil line.
+_BAND_SEAM_MAX_LINES = 8
+_BAND_SEAM_MIN_SCORE = 0.75
+
+
+def merge_band_lines(bands: Sequence[Sequence[str]]) -> list[str]:
+    """Join per-band transcriptions, dropping what the overlap read twice.
+
+    The seam is matched on text rather than line-for-line, because the two bands
+    do not agree on where the lines break: on 10P_CH11 page 1 the upper band read
+    a list item as one line and the lower band split the same item across three.
+    So every (tail, head) size pair is scored on its joined text and the best
+    overlap wins, which a run of per-line comparisons cannot find.
+
+    The lower band's rendition is the one kept.  A line sitting on the upper
+    band's bottom edge is the one at risk of being clipped -- that band ended
+    mid-clause at "the amount of light entering", where the lower band read
+    "the amount of light entering the eye." in full.
+    """
+
+    merged: list[str] = []
+    for band in bands:
+        incoming = list(band)
+        if merged and incoming:
+            best: tuple[float, int] | None = None
+            for tail in range(1, min(_BAND_SEAM_MAX_LINES, len(merged)) + 1):
+                tail_text = " ".join(merged[-tail:])
+                for head in range(1, min(_BAND_SEAM_MAX_LINES, len(incoming)) + 1):
+                    score = _score(tail_text, " ".join(incoming[:head]))
+                    if best is None or score > best[0]:
+                        best = (score, tail)
+            if best is not None and best[0] >= _BAND_SEAM_MIN_SCORE:
+                merged = merged[: len(merged) - best[1]]
+        merged.extend(incoming)
+    return merged
+
+
+def _alignment_units(block: dict) -> tuple[str, ...]:
+    """The pieces of a block that are matched against the page independently.
+
+    A list is matched one item at a time.  MinerU groups a whole list into one
+    block -- the eye-parts list on 10P_CH11 page 1 is a single 504-character
+    block spanning sixteen transcribed lines -- and no span of ``max_span``
+    lines can score against that.  Matched as one unit it either finds nothing
+    and keeps the misread text, or wins on a partial overlap and replaces the
+    whole list with the four lines it happened to match.  Per item, each unit
+    is a line or two long, so it scores cleanly and an item the transcription
+    never reached keeps its own text instead of costing the list its siblings.
+    """
+
+    items = block.get("list_items")
+    if isinstance(items, list):
+        parts = tuple(item for item in items if isinstance(item, str) and item.strip())
+        if parts:
+            return parts
+    text = _block_text(block)
+    return (text,) if text.strip() else ()
+
+
 def _block_text(block: dict) -> str:
     """A reconciled block's current text, wherever the parser put it."""
 
@@ -437,14 +503,16 @@ def retranscribe_scanned_pages(
             continue
 
         try:
-            transcript = "\n".join(
-                transcribe_page_image(
-                    band, model=model, api_base=api_base, timeout=timeout
+            band_lines = [
+                transcription_lines(
+                    transcribe_page_image(
+                        band, model=model, api_base=api_base, timeout=timeout
+                    )
                 )
                 for band in render_page_png(
                     pdf_path, page_index, dpi=dpi, bands=bands
                 )
-            )
+            ]
         except Exception as error:
             message = f"page {page_index}: {type(error).__name__}: {error}"
             log.warning("page transcription failed, keeping parser text: %s", message)
@@ -453,15 +521,30 @@ def retranscribe_scanned_pages(
             outcome.pages.append(record)
             continue
 
-        lines = transcription_lines(transcript)
-        matches = align_transcription(
-            [_block_text(b) for b in page_blocks], lines, as_lines=True
-        )
+        lines = merge_band_lines(band_lines)
+        # One unit per list item, one per ordinary block, all in reading order
+        # so the alignment stays monotonic across the whole page.
+        units: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for block in page_blocks:
+            block_units = _alignment_units(block)
+            spans.append((len(units), len(units) + len(block_units)))
+            units.extend(block_units)
+        matches = align_transcription(units, lines, as_lines=True)
         replaced = 0
-        for block, claimed in zip(page_blocks, matches):
-            if claimed:
-                _replace_block_text(block, claimed)
-                replaced += 1
+        for block, (start, end) in zip(page_blocks, spans):
+            claimed = matches[start:end]
+            if not any(claimed):
+                continue
+            # An item the transcription never reached keeps the parser's
+            # reading, so a partial match improves the list without dropping
+            # the items it could not place.
+            parser_units = _alignment_units(block)
+            rebuilt: list[str] = []
+            for parser_text, lines_for_unit in zip(parser_units, claimed):
+                rebuilt.extend(lines_for_unit or (parser_text,))
+            _replace_block_text(block, tuple(rebuilt))
+            replaced += 1
         after = " ".join(_block_text(b) for b in page_blocks)
         outcome.pages_transcribed += 1
         outcome.blocks_replaced += replaced
