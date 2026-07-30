@@ -95,7 +95,43 @@ def find_run_dirs():
                 continue
             if relative != Path(".") and run_dir.is_dir():
                 runs.add(run_dir)
-    return sorted(runs, key=lambda item: item.stat().st_mtime, reverse=True)
+    return sorted(runs, key=run_created_at, reverse=True)
+
+
+def _epoch(value):
+    """Epoch seconds from an ISO timestamp, or None if it is not one."""
+
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed.timestamp()
+
+
+def run_created_at(run_dir):
+    """When this run was created, taken from its own record, not the filesystem.
+
+    A directory's mtime changes whenever anything is written inside it, and the
+    run directory is written to long after indexing: a saved conversation, a
+    library tag. Ordering by it sent a document to the top of the library the
+    moment it was tagged. The indexer records when it started, and that never
+    moves.
+
+    The fallbacks are files the indexer wrote and nothing since touches -- never
+    the directory itself, which is the thing that moves.
+    """
+
+    started = _epoch(
+        _read_json_if_present(run_dir / "index-state.json").get("started_at")
+    )
+    if started is not None:
+        return started
+    for name in ("index-state.json", "run-manifest.json"):
+        try:
+            return (run_dir / name).stat().st_mtime
+        except OSError:
+            continue
+    return 0.0
 
 
 def _iso_seconds(start, end):
@@ -321,6 +357,9 @@ def run_summary(run_dir, history=None):
     name = source_name or run_dir.name
     progress["name"] = name
     progress["tag"] = read_run_tag(run_dir)
+    progress["createdAt"] = run_created_at(run_dir)
+    # Kept for callers that still read it, but nothing orders by it: writing a
+    # tag or saving a chat moves it, and neither changes when the run was made.
     progress["mtime"] = run_dir.stat().st_mtime
     return progress
 

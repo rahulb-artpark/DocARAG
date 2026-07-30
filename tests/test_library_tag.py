@@ -143,5 +143,69 @@ class TheTagSitsBeforeTheStatus(unittest.TestCase):
         self.assertIn("flex: 1", rule)
 
 
+class TaggingDoesNotReorderTheLibrary(LibraryTagTest):
+    """Writing inside a run directory moves its mtime; creation time never moves.
+
+    The library used to be ordered by the run directory's own mtime, so tagging a
+    document -- which writes a file into that directory -- sent it to the top of
+    the list. Saving a conversation would have done the same.
+    """
+
+    def _run(self, name, started):
+        run_dir = self.run_dir / name
+        run_dir.mkdir()
+        (run_dir / "index-state.json").write_text(
+            json.dumps({"started_at": started}), encoding="utf-8"
+        )
+        return run_dir
+
+    def test_creation_time_comes_from_the_run_s_own_record(self):
+        # The trailing Z is UTC, so the expectation is derived rather than
+        # written out as an epoch in whatever zone this machine happens to be.
+        from datetime import datetime, timezone
+
+        started = "2026-07-30T11:39:19.861538Z"
+        expected = datetime(2026, 7, 30, 11, 39, 19, 861538, tzinfo=timezone.utc)
+        run_dir = self._run("a", started)
+        self.assertAlmostEqual(
+            self.web.run_created_at(run_dir), expected.timestamp(), places=3
+        )
+
+    def test_tagging_does_not_change_the_creation_time(self):
+        run_dir = self._run("a", "2026-07-30T11:39:19.861538Z")
+        before = self.web.run_created_at(run_dir)
+        self.web.write_run_tag(run_dir, "Class XI")
+        self.assertEqual(self.web.run_created_at(run_dir), before)
+
+    def test_tagging_moves_the_directory_mtime_it_no_longer_sorts_by(self):
+        # The reason the bug existed: this is genuinely unstable.
+        run_dir = self._run("a", "2026-07-30T11:39:19.861538Z")
+        import os
+
+        os.utime(run_dir, (1_000_000, 1_000_000))
+        self.web.write_run_tag(run_dir, "Class XI")
+        self.assertNotEqual(run_dir.stat().st_mtime, 1_000_000)
+
+    def test_a_run_with_no_recorded_start_falls_back_to_a_file_not_the_directory(self):
+        run_dir = self.run_dir / "b"
+        run_dir.mkdir()
+        (run_dir / "run-manifest.json").write_text("{}", encoding="utf-8")
+        import os
+
+        os.utime(run_dir / "run-manifest.json", (1_000_000, 1_000_000))
+        os.utime(run_dir, (9_000_000, 9_000_000))
+        self.assertEqual(self.web.run_created_at(run_dir), 1_000_000)
+
+    def test_an_unreadable_start_time_does_not_raise(self):
+        run_dir = self._run("c", "not a timestamp")
+        self.assertIsInstance(self.web.run_created_at(run_dir), float)
+
+    def test_newest_first(self):
+        old = self._run("old", "2026-07-30T08:00:00Z")
+        new = self._run("new", "2026-07-30T13:00:00Z")
+        ordered = sorted([old, new], key=self.web.run_created_at, reverse=True)
+        self.assertEqual(ordered, [new, old])
+
+
 if __name__ == "__main__":
     unittest.main()
