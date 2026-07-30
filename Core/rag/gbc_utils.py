@@ -77,6 +77,29 @@ class GBCRAGContext(BaseModel):
 # --- Pydantic Models for Structured Output (已更新) ---
 
 
+def global_scope_chars(nodes: List[TreeNode]) -> int:
+    """How much evidence text a global scope actually carries.
+
+    The cost of answering a whole-document question is what the scope says, not
+    how many nodes it was cut into. Counting nodes refused a 44-node chapter
+    whose entire text is about 5,200 tokens while admitting a scope of half as
+    many but far larger nodes, so the budget is measured here instead.
+    """
+
+    total = 0
+    for node in nodes:
+        meta = getattr(node, "meta_info", None)
+        for value in (
+            getattr(meta, "content", None),
+            getattr(meta, "caption", None),
+            getattr(meta, "table_body", None),
+            getattr(node, "summary", None),
+        ):
+            if isinstance(value, str):
+                total += len(value)
+    return total
+
+
 def filter_tree_nodes(
     tree_index: DocumentTree,
     filters: List[Filter],

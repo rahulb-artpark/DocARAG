@@ -44,6 +44,7 @@ from Core.rag.gbc_utils import (
     GBCRAGContext,
     SubStep,
     filter_tree_nodes,
+    global_scope_chars,
 )
 
 
@@ -1675,17 +1676,37 @@ class GBCRAG(BaseRAG):
                 }
                 current_step.retrieval_nodes = []
                 self._notify_retrieval_ready(context, current_step)
-            elif filtered_count > self.cfg.global_evidence_limit:
+            elif (
+                filtered_count > self.cfg.global_evidence_limit
+                or global_scope_chars(filtered_nodes)
+                > self.cfg.global_evidence_char_budget
+            ):
                 # A silent prefix/sample is inaccurate, while one model call
                 # per item is an unbounded latency and cost failure. Until the
                 # durable asynchronous hierarchical Map/Reduce worker lands,
                 # fail explicitly and preserve the full scope in the trace.
+                #
+                # What is measured here is the scope's size, not how many pieces
+                # it was cut into. Counting items alone refused "what are all the
+                # defects in vision and causes" on a 44-node chapter whose entire
+                # text is about 5,200 tokens -- a scope any answer model reads
+                # without effort -- while letting through a scope of half as many
+                # but far larger nodes. A question about a whole short document is
+                # a reasonable question and now gets an answer.
+                scope_chars = global_scope_chars(filtered_nodes)
                 current_step.global_budget_exhausted = True
                 current_step.retrieval_nodes = []
+                exceeded = (
+                    f"{filtered_count} evidence items, exceeding the limit of "
+                    f"{self.cfg.global_evidence_limit}"
+                    if filtered_count > self.cfg.global_evidence_limit
+                    else (
+                        f"{scope_chars:,} characters of evidence, exceeding the "
+                        f"budget of {self.cfg.global_evidence_char_budget:,}"
+                    )
+                )
                 final_answer = (
-                    "This global query matched "
-                    f"{filtered_count} evidence items, exceeding the synchronous "
-                    f"limit of {self.cfg.global_evidence_limit}. Narrow the page, "
+                    f"This global query matched {exceeded}. Narrow the page, "
                     "section, or modality filter; no partial answer was generated."
                 )
                 current_step.partial_answers = [
@@ -1694,6 +1715,8 @@ class GBCRAG(BaseRAG):
                         "content": final_answer,
                         "matched_count": filtered_count,
                         "evidence_limit": self.cfg.global_evidence_limit,
+                        "matched_chars": scope_chars,
+                        "char_budget": self.cfg.global_evidence_char_budget,
                         "budget_exhausted": True,
                     }
                 ]

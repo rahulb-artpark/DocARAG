@@ -60,13 +60,27 @@ class GBCRAGConfig(BaseRAGStrategyConfig):
         ),
     )
     global_evidence_limit: int = Field(
-        default=32,
+        default=512,
         ge=1,
-        le=64,
+        le=4096,
         description=(
             "Maximum evidence nodes that a non-COUNT global query may map in "
-            "one synchronous request. Larger scopes fail explicitly instead "
-            "of producing a silently sampled or unbounded answer."
+            "one synchronous request. This bounds per-node work -- hydration, "
+            "store reads -- rather than the answer model's context, which "
+            "global_evidence_char_budget bounds. Larger scopes fail explicitly "
+            "instead of producing a silently sampled or unbounded answer."
+        ),
+    )
+    global_evidence_char_budget: int = Field(
+        default=240_000,
+        ge=1_000,
+        le=4_000_000,
+        description=(
+            "Maximum characters of evidence text a non-COUNT global query may "
+            "send in one synchronous request. This is the real constraint on a "
+            "whole-document question: node count is a poor proxy for it, since "
+            "a scope's cost is what it says, not how many pieces it is cut "
+            "into. Roughly four characters per token."
         ),
     )
     planner_max_query_chars: int = Field(
