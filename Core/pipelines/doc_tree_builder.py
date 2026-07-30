@@ -1776,6 +1776,9 @@ def build_tree_from_pdf(
                                 model=cfg.vlm.model_name,
                                 api_base=cfg.vlm.api_base,
                                 min_validity=cfg.mineru.retranscribe_min_validity,
+                                transcripts_dir=os.path.join(
+                                    cfg.save_path, "transcripts"
+                                ),
                             )
                         transcription_pages.extend(outcome.pages)
                         transcription_failures.extend(outcome.failures)

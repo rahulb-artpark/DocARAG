@@ -4,7 +4,11 @@ Fixtures are the real readings of 10P_CH11 page 2: MinerU's text on one side,
 qwen3.6:35b's transcription of the same pixels on the other.
 """
 
+import json
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
 from docarag.page_transcription import (
     align_transcription,
@@ -15,6 +19,7 @@ from docarag.page_transcription import (
     _LEXICON,
     _alignment_units,
     _unit_max_spans,
+    _write_transcript,
 )
 
 _MINERU = [
@@ -258,3 +263,63 @@ class ABlockCannotAbsorbMoreLinesThanItHas(unittest.TestCase):
         )[0]
         self.assertLessEqual(len(claimed), 2)
         self.assertIn("Basic Events", claimed[0])
+
+
+class ThePageReadingIsPersisted(unittest.TestCase):
+    """Without this file, a misread line and a misplaced line look the same."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _read(self, page=2):
+        return json.loads((self.dir / f"page_{page:04d}.json").read_text())
+
+    def test_the_model_reply_is_kept_verbatim_per_band(self):
+        _write_transcript(
+            self.dir, 2, {"page_index": 2},
+            band_replies=["- upper band\n- second line", "- lower band"],
+            merged_lines=["upper band", "second line", "lower band"],
+        )
+        bands = self._read()["bands"]
+        self.assertEqual([b["band"] for b in bands], [0, 1])
+        self.assertEqual(bands[0]["reply"], "- upper band\n- second line")
+        self.assertEqual(bands[0]["lines"], ["upper band", "second line"])
+
+    def test_each_unit_records_what_it_was_allowed_and_what_it_took(self):
+        _write_transcript(
+            self.dir, 2, {"page_index": 2},
+            units=[
+                {"parser_text": "Basic Events du to Scattering X",
+                 "max_span": 2, "claimed": ["Basic Events due to Scattering"]},
+                {"parser_text": "www.notesd", "max_span": 2, "claimed": []},
+            ],
+        )
+        units = self._read()["units"]
+        self.assertEqual(units[0]["max_span"], 2)
+        self.assertEqual(units[0]["claimed"], ["Basic Events due to Scattering"])
+        self.assertEqual(units[1]["claimed"], [], "an unmatched unit is recorded too")
+
+    def test_a_failed_page_is_written_as_well(self):
+        _write_transcript(self.dir, 5, {"page_index": 5, "failed": "TimeoutError"})
+        written = self._read(5)
+        self.assertEqual(written["failed"], "TimeoutError")
+        self.assertEqual(written["bands"], [])
+
+    def test_no_directory_means_no_file_and_no_error(self):
+        _write_transcript(None, 2, {"page_index": 2})
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_an_unwritable_directory_never_fails_the_run(self):
+        blocked = self.dir / "file-not-a-dir"
+        blocked.write_text("occupied")
+        _write_transcript(blocked, 2, {"page_index": 2})  # must not raise
+
+    def test_the_file_is_replaced_not_appended_on_a_rerun(self):
+        _write_transcript(self.dir, 2, {"page_index": 2, "blocks_replaced": 1})
+        _write_transcript(self.dir, 2, {"page_index": 2, "blocks_replaced": 9})
+        self.assertEqual(self._read()["blocks_replaced"], 9)
+        self.assertEqual(
+            [p.name for p in self.dir.iterdir()], ["page_0002.json"],
+            "no temporary file may be left behind",
+        )

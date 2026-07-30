@@ -29,8 +29,9 @@ import json
 import logging
 import re
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -472,6 +473,46 @@ def _replace_block_text(block: dict, lines: tuple[str, ...]) -> None:
         block["text"] = " ".join(lines)
 
 
+def _write_transcript(
+    transcripts_dir: str | Path | None,
+    page_index: int,
+    record: Mapping[str, object],
+    *,
+    band_replies: Sequence[str] = (),
+    merged_lines: Sequence[str] = (),
+    units: Sequence[Mapping[str, object]] = (),
+) -> None:
+    """Write one page's re-reading next to the run it belongs to.
+
+    Never raises.  This is a debugging record, and losing it must not cost the
+    document its index -- a full disk while writing a transcript would otherwise
+    fail a parse that had already succeeded.
+    """
+
+    if transcripts_dir is None:
+        return
+    try:
+        directory = Path(transcripts_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            **dict(record),
+            "bands": [
+                {"band": index, "reply": reply, "lines": transcription_lines(reply)}
+                for index, reply in enumerate(band_replies)
+            ],
+            "merged_lines": list(merged_lines),
+            "units": [dict(unit) for unit in units],
+        }
+        target = directory / f"page_{page_index:04d}.json"
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(target)
+    except Exception as error:  # a debugging record is never worth a failed run
+        log.warning("could not write transcript for page %d: %s", page_index, error)
+
+
 def retranscribe_scanned_pages(
     blocks: list[dict],
     *,
@@ -483,6 +524,7 @@ def retranscribe_scanned_pages(
     dpi: int = _RENDER_DPI,
     bands: int = 2,
     timeout: float = 600.0,
+    transcripts_dir: str | Path | None = None,
 ) -> TranscriptionOutcome:
     """Re-read every scanned page whose text the recogniser got wrong.
 
@@ -495,6 +537,15 @@ def retranscribe_scanned_pages(
     Blocks are mutated in place.  A block whose line cannot be found keeps the
     parser's text untouched, so a partial transcription degrades rather than
     blanks the page.
+
+    ``transcripts_dir`` writes one JSON file per re-read page holding what the
+    model returned and what was done with it.  Without it the only evidence of
+    this stage is the text that reached the tree, which is not enough to tell a
+    model that misread a line from a matcher that put a good line on the wrong
+    block -- two failures that need opposite fixes and that cost real time to
+    tell apart by re-running pages by hand.  Each band's raw reply is kept
+    alongside the merged lines and each unit's claim, so a score can be
+    recomputed offline instead of having to be logged here.
     """
 
     outcome = TranscriptionOutcome()
@@ -533,11 +584,9 @@ def retranscribe_scanned_pages(
             continue
 
         try:
-            band_lines = [
-                transcription_lines(
-                    transcribe_page_image(
-                        band, model=model, api_base=api_base, timeout=timeout
-                    )
+            replies = [
+                transcribe_page_image(
+                    band, model=model, api_base=api_base, timeout=timeout
                 )
                 for band in render_page_png(
                     pdf_path, page_index, dpi=dpi, bands=bands
@@ -548,8 +597,14 @@ def retranscribe_scanned_pages(
             log.warning("page transcription failed, keeping parser text: %s", message)
             outcome.failures.append(message)
             record["failed"] = message
+            # A failed page is written too. "The model returned nothing" and
+            # "the model was never asked" look identical in the tree, and only
+            # one of them is a bug worth chasing.
+            _write_transcript(transcripts_dir, page_index, record)
             outcome.pages.append(record)
             continue
+
+        band_lines = [transcription_lines(reply) for reply in replies]
 
         lines = merge_band_lines(band_lines)
         # One unit per list item, one per ordinary block, all in reading order
@@ -565,6 +620,12 @@ def retranscribe_scanned_pages(
         matches = align_transcription(
             units, lines, max_spans=unit_spans, as_lines=True
         )
+        # Captured before the blocks are mutated, so the file shows what the
+        # matcher was given rather than what it produced.
+        unit_records = [
+            {"parser_text": text, "max_span": cap, "claimed": list(claim or ())}
+            for text, cap, claim in zip(units, unit_spans, matches)
+        ]
         replaced = 0
         for block, (start, end) in zip(page_blocks, spans):
             claimed = matches[start:end]
@@ -590,6 +651,14 @@ def retranscribe_scanned_pages(
                 "blocks_replaced": replaced,
                 "lexicon_validity_after": round(lexicon_validity(after)[1], 4),
             }
+        )
+        _write_transcript(
+            transcripts_dir,
+            page_index,
+            record,
+            band_replies=replies,
+            merged_lines=lines,
+            units=unit_records,
         )
         outcome.pages.append(record)
         log.info(
