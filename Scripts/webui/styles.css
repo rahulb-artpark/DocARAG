@@ -407,6 +407,11 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
   white-space: pre; tab-size: 4;
 }
 
+.codeLang {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .07em; opacity: .6;
+  margin: 4px 0 -2px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 .structBlock { margin: 6px 0 10px; }
 .structKind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .65; margin-bottom: 4px; }
 .flowCanvas { height: 200px; border: 1px solid var(--line, #e2e8f0); border-radius: 8px; background: #fbfdff; }

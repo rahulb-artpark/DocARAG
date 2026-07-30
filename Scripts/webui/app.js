@@ -87,11 +87,22 @@ function nodeLabel(n) {
   return n.type;
 }
 
+const LISTING_TYPES = new Set(["CODE", "ALGORITHM"]);
+
 function renderContent(n) {
   const c = (n && n.content) || "";
   if (!c.trim()) return "—";
-  if (n && String(n.type).toUpperCase() === "CODE")
-    return `<pre class="contentCode"><code>${escapeHtml(c)}</code></pre>`;
+  // A listing's line breaks and leading whitespace are what make it readable,
+  // and for Python they are what make it mean anything. Prose rendering
+  // collapses both, so every listing type goes through <pre>, not only CODE --
+  // ALGORITHM was falling through and being shown as a single wrapped line.
+  if (LISTING_TYPES.has(String((n && n.type) || "").toUpperCase())) {
+    const lang = n && n.codeLanguage;
+    const tag = lang
+      ? `<div class="codeLang">${escapeHtml(lang)}</div>`
+      : "";
+    return `${tag}<pre class="contentCode"><code>${escapeHtml(c)}</code></pre>`;
+  }
   if (n && String(n.type).toUpperCase() === "LIST") {
     const items = c.split(/\r?\n/)
       .map((line) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim())

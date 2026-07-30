@@ -9,6 +9,7 @@ import unittest
 
 from docarag.adapters.mineru_compat import (
     content_block_text_parts,
+    fence_language,
     unwrap_presentation,
 )
 
@@ -114,3 +115,32 @@ class TheCanonicalRepresentationIsUnwrapped(unittest.TestCase):
         content = self._text_representation(block)[0].content
         self.assertNotIn("```", content)
         self.assertIn("\n", content)
+
+
+class TheFenceLanguageIsKept(unittest.TestCase):
+    """MinerU names the language, and the name separates code from output.
+
+    On lecs106.pdf the ```python blocks are the programs and the ```txt blocks
+    are their console transcripts, which were reaching the tree as code.
+    """
+
+    def test_a_named_language_is_returned(self):
+        self.assertEqual(fence_language("```python\ndef f():\n    pass\n```"), "python")
+        self.assertEqual(fence_language("```cpp\nint main() {}\n```"), "cpp")
+
+    def test_a_placeholder_language_is_not_a_language(self):
+        for fence in ("txt", "text", "plain", "plaintext", "none", ""):
+            self.assertIsNone(
+                fence_language(f"```{fence}\nHow many elements in your list? 4\n```"),
+                f"'{fence}' names no language",
+            )
+
+    def test_case_and_padding_do_not_matter(self):
+        self.assertEqual(fence_language("```  Python  \nx = 1\n```"), "python")
+
+    def test_unfenced_text_has_no_language(self):
+        self.assertIsNone(fence_language("def f(): pass"))
+        self.assertIsNone(fence_language(None))
+
+    def test_an_algorithm_div_has_no_language(self):
+        self.assertIsNone(fence_language(_ALGORITHM))

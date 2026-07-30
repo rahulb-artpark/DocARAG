@@ -411,8 +411,26 @@ _ALGORITHM_WRAPPER = re.compile(
     r"^\s*<div\b[^>]*>(?P<body>.*?)</div>\s*$", re.DOTALL | re.IGNORECASE
 )
 _CODE_FENCE = re.compile(
-    r"^\s*```[^\n`]*\n(?P<body>.*?)\n?```\s*$", re.DOTALL
+    r"^\s*```(?P<language>[^\n`]*)\n(?P<body>.*?)\n?```\s*$", re.DOTALL
 )
+# MinerU names the language on the fence, and the name is worth keeping: on
+# lecs106.pdf the ```python blocks are the programs and the ```txt blocks are
+# their console transcripts -- "How many elements in your list? 4 ..." was
+# stored as code because the tag was the only thing separating them and it was
+# being discarded. It is also what a frontend needs to highlight a listing.
+_NO_LANGUAGE = frozenset({"", "txt", "text", "plain", "plaintext", "none"})
+
+
+def fence_language(text: object) -> str | None:
+    """The language MinerU named on a listing's fence, if it named one."""
+
+    if not isinstance(text, str):
+        return None
+    match = _CODE_FENCE.match(text)
+    if match is None:
+        return None
+    language = match.group("language").strip().casefold()
+    return None if language in _NO_LANGUAGE else language
 
 
 def unwrap_presentation(text: str) -> str:
