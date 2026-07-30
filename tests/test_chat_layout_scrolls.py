@@ -116,5 +116,50 @@ class TheComposerStaysReachable(unittest.TestCase):
         self.assertNotIn("<div class=\"messages\"", between)
 
 
+class ACitedImageIsShownInTheAnswer(unittest.TestCase):
+    """An answer that says "here is the diagram" must show the diagram.
+
+    The crop was only reachable in the References fold, so a question answered
+    entirely by a figure gave the reader a description of a picture instead of
+    the picture. There is no browser or jsdom here to assert on the resulting
+    DOM, so these check the wiring the behaviour depends on -- in particular the
+    ordering, which is silent when wrong.
+    """
+
+    APP = (REPO / "Scripts" / "webui" / "app.js").read_text(encoding="utf-8")
+
+    def test_figures_are_inlined_for_a_live_answer(self):
+        self.assertIn("inlineCitedFigures(pending, data.citations)", self.APP)
+
+    def test_figures_are_inlined_for_a_replayed_answer(self):
+        # A saved conversation must look like the answer did when it arrived.
+        self.assertIn("inlineCitedFigures(bubble, message.citations)", self.APP)
+
+    def test_figures_are_placed_after_the_citation_markers_exist(self):
+        # inlineCitedFigures finds the marker linkifyCitations created, so it
+        # cannot run first or every figure lands at the end of the answer.
+        for scope in ("pending, data.citations", "bubble, message.citations"):
+            link_at = self.APP.index(f"linkifyCitations({scope})")
+            figure_at = self.APP.index(f"inlineCitedFigures({scope})")
+            self.assertLess(link_at, figure_at, scope)
+
+    def test_figures_are_placed_before_the_lightbox_is_wired(self):
+        # wireEvidenceLinks makes .answer img zoomable; a figure added after it
+        # would render but not open.
+        for scope, wired in (("pending, data.citations", "pending"), ("bubble, message.citations", "bubble")):
+            figure_at = self.APP.index(f"inlineCitedFigures({scope})")
+            wire_at = self.APP.index(f"wireEvidenceLinks({wired})")
+            self.assertLess(figure_at, wire_at, scope)
+
+    def test_a_crop_that_cannot_be_served_removes_its_own_figure(self):
+        self.assertIn('img.addEventListener("error"', self.APP)
+
+    def test_the_figure_is_height_bounded(self):
+        # A full-page anatomical plate must not push the answer off the screen.
+        css = (REPO / "Scripts" / "webui" / "styles.css").read_text(encoding="utf-8")
+        rule = css[css.index(".answerFigure img {") :]
+        self.assertIn("max-height", rule[: rule.index("}")])
+
+
 if __name__ == "__main__":
     unittest.main()

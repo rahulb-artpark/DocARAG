@@ -193,10 +193,6 @@ class TheLanguageReachesTheProjection(unittest.TestCase):
         self.assertIsNone(self._listing_language(block))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AOneLineListingClaimsNoLanguage(unittest.TestCase):
     """MinerU's language guess needs more than one line to be worth anything.
 
@@ -230,3 +226,7 @@ class AOneLineListingClaimsNoLanguage(unittest.TestCase):
             self._language("```python\ndef f():\n    return 1\n```"),
             "python",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

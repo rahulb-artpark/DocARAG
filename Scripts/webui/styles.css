@@ -568,6 +568,23 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .snipMore { font-size: 11px; opacity: .55; margin-top: 2px; }
 .refSnippet .contentCode { margin: 2px 0; padding: 8px 10px; font-size: 11.5px; }
 
+/* A cited figure, shown where the answer first mentions it. Bounded in height so
+   a tall anatomical plate cannot push the rest of the answer off the screen; the
+   lightbox is there for reading it properly. */
+.answerFigure {
+  margin: 10px 0; padding: 8px; border: 1px solid var(--line); border-radius: 10px;
+  background: #fbfcfd; text-align: center;
+}
+.answerFigure img {
+  display: block; margin: 0 auto; max-width: 100%; max-height: 420px;
+  height: auto; border-radius: 6px; background: #fff; cursor: zoom-in;
+}
+.answerFigure figcaption {
+  margin-top: 6px; font-size: 11.5px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.answerFigure figcaption .linkish { text-transform: none; letter-spacing: 0; }
+
 /* Chat answers: code, formulas, tables and figures all arrive in one stream. */
 .answer pre {
   margin: 8px 0; padding: 10px 12px; overflow-x: auto; border-radius: 8px;

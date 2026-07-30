@@ -360,10 +360,6 @@ class TheRunStopsWhereTheListingDoes(unittest.TestCase):
         self.assertEqual(len(_survivors(page)), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def _fragment(line, *, top, left, page=10, language=None, height=46):
     """One line of a program, cropped on its own.
 
@@ -502,3 +498,7 @@ class AWholeListingIsNeverMerged(unittest.TestCase):
         self.assertEqual(len(listings), 2)
         for listing in listings:
             self.assertEqual(len(listing["text"].splitlines()), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

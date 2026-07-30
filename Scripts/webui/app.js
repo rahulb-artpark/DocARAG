@@ -2118,6 +2118,7 @@ async function openConversation(conversationId) {
     // would drift from it.
     const bubble = addMessage("assistant", renderAnswer(message));
     linkifyCitations(bubble, message.citations);
+    inlineCitedFigures(bubble, message.citations);
     wrapAnswerTables(bubble);
     enhanceContent(bubble);
     wireEvidenceLinks(bubble);
@@ -2169,6 +2170,7 @@ async function submitChat(event) {
     pending.querySelector(".bubble").innerHTML =
       `<div class="who">${ASSISTANT_NAME}</div>` + renderAnswer(data);
     linkifyCitations(pending, data.citations);
+    inlineCitedFigures(pending, data.citations);
     wrapAnswerTables(pending);
     enhanceContent(pending);
     wireEvidenceLinks(pending);
@@ -2230,6 +2232,63 @@ function wrapAnswerTables(scope) {
     table.replaceWith(wrap);
     wrap.appendChild(table);
   });
+}
+
+// An answer that says "here is the diagram" should show the diagram. The crop
+// was only ever reachable in the References fold, so a question answered
+// entirely by a figure showed the reader a description of a picture and not the
+// picture. Each cited image is placed after the block that first mentions it, so
+// it reads as that paragraph's figure rather than as an attachment.
+const INLINE_FIGURE_BLOCKS = "P, LI, H1, H2, H3, H4, H5, H6, BLOCKQUOTE, PRE, TABLE";
+
+function inlineFigureHtml(citation) {
+  const caption = [citation.label, citation.type, citation.page ? `p${citation.page}` : ""]
+    .filter(Boolean)
+    .map((part) => escapeHtml(String(part)))
+    .join(" · ");
+  return `<figure class="answerFigure" data-figure="${escapeHtml(citation.label)}">
+    <img src="${treeImageUrl(citation.nodeId)}" alt="${escapeHtml(citation.label)}" loading="lazy" />
+    <figcaption>${caption}${
+      citation.nodeId != null
+        ? ` · <a class="linkish" data-tree="${escapeHtml(citation.nodeId)}">view in tree →</a>`
+        : ""
+    }</figcaption>
+  </figure>`;
+}
+
+function inlineCitedFigures(scope, citations) {
+  const root = scope.querySelector(".answer");
+  if (!root) return;
+  const withImages = (citations || []).filter((c) => c.hasImage && c.nodeId != null);
+  if (!withImages.length) return;
+
+  for (const citation of withImages) {
+    if (root.querySelector(`[data-figure="${CSS.escape(citation.label)}"]`)) continue;
+    // linkifyCitations has already turned the marker into an anchor, so the
+    // first mention is exactly where the reader met this evidence.
+    const marker = root.querySelector(`a.cite[data-cite="${CSS.escape(citation.label)}"]`);
+    const figure = document.createElement("div");
+    figure.innerHTML = inlineFigureHtml(citation);
+    const node = figure.firstElementChild;
+    // hasImage says the node owns a crop, not that the crop can still be
+    // served. A figure frame around a broken-image icon is worse than no
+    // figure, and the reference card still offers the evidence either way.
+    const img = node.querySelector("img");
+    if (img) img.addEventListener("error", () => node.remove());
+    if (!marker) {
+      // Cited as an image but never named in the prose: still show it, at the
+      // end, rather than silently dropping it.
+      root.appendChild(node);
+      continue;
+    }
+    let block = marker.closest(INLINE_FIGURE_BLOCKS);
+    // A figure after an <li> would be a direct child of the <ul>, which is not
+    // valid markup. Place it after the whole list instead.
+    if (block && block.tagName === "LI") block = block.closest("ul, ol") || block;
+    if (!block || !root.contains(block)) block = root.lastElementChild;
+    if (block && block.parentNode) block.parentNode.insertBefore(node, block.nextSibling);
+    else root.appendChild(node);
+  }
 }
 
 function renderReferences(citations) {
