@@ -209,6 +209,41 @@ class CanonicalBookRAGBindingTests(unittest.TestCase):
             self.assertEqual(projected["text"], blocks[0]["text"])
             self.assertEqual(projected["text_format"], blocks[0]["text_format"])
 
+    def test_a_listing_carries_the_language_mineru_named_on_its_fence(self):
+        # The attachment bind writes back onto the legacy block is a closed set
+        # of fields, so a projected field nobody copies is silently dropped.
+        # code_language was: the projection set it, the tree read None, and the
+        # frontend showed no language tag for a ```python listing.
+        blocks = [
+            {
+                "type": "code",
+                "code_body": "```python\ndef binarySearch(list, key):\n    first = 0\n```",
+                "page_idx": 0,
+                "middle_json": {"type": "code", "bbox": [10, 10, 200, 60], "index": 1},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.bind(Path(tmp), blocks)
+
+            self.assertEqual(blocks[0]["code_language"], "python")
+            node = create_node_by_type(blocks[0], isTitle=False)
+            self.assertEqual(node.meta_info.code_language, "python")
+            self.assertIn("    first = 0", node.meta_info.content)
+
+    def test_an_untagged_listing_claims_no_language(self):
+        blocks = [
+            {
+                "type": "code",
+                "code_body": "```txt\nMAX=A[1]\nI=2\n```",
+                "page_idx": 0,
+                "middle_json": {"type": "code", "bbox": [10, 10, 200, 60], "index": 1},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.bind(Path(tmp), blocks)
+
+            self.assertIsNone(blocks[0].get("code_language"))
+
     def test_native_interline_equation_becomes_an_equation_node(self):
         blocks = [
             {

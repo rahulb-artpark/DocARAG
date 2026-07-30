@@ -969,6 +969,13 @@ def bind_canonical_evidence(
         }:
             attachment["text"] = projected.get("text", "")
             attachment["text_format"] = projected.get("text_format", "")
+            # The language MinerU named on a listing's fence. This attachment is
+            # a closed set of fields, so a projected field nobody copies here is
+            # simply dropped -- which is what happened to code_language: the
+            # projection set it, the tree read None, and the frontend showed no
+            # tag for a ```python listing.
+            if projected.get("code_language") is not None:
+                attachment["code_language"] = projected["code_language"]
         # A table row's channels must follow the projection for the same
         # reason: MinerU's raw caption and footnote strings differ from the
         # canonical ones in whitespace, and the hydrator compares exactly.
