@@ -130,6 +130,23 @@ class AppStateCacheInvalidationTests(unittest.TestCase):
             state.tree_payload()
         self.assertEqual(2, tree.nodes_calls, "a changed key must trigger a fresh query")
 
+    def test_tree_payload_advertises_crop_published_only_in_tree_json(self):
+        tree = _FakeTree(node_count=1, entity_count=0)
+        state = self._state_with_store(tree)
+        published = {
+            "nodes": [
+                {"index_id": 1, "meta_info": {"img_path": "vlm/images/crop.jpg"}}
+            ]
+        }
+        with (
+            patch.object(self.web, "query_readiness_stat_key", return_value=("key",)),
+            patch.object(self.web, "_read_json_if_present", return_value=published),
+        ):
+            payload = state.tree_payload()
+
+        node = next(item for item in payload["nodes"] if item["id"] == 1)
+        self.assertTrue(node["hasImage"])
+
     def test_graph_payload_reflects_data_that_only_appeared_after_the_first_query(self):
         # Simulates the actual incident: the first request lands while the
         # graph stage is still running (no entities persisted yet), the

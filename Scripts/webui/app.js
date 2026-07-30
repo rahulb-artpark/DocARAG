@@ -14,6 +14,8 @@ const state = {
   chatBusy: false,
   currentRun: null,
   libraryTimer: null,
+  selectedTreeId: null,
+  treeFilteredIds: [],
 };
 
 const LIBRARY_POLL_MS = 4000;
@@ -150,6 +152,12 @@ function openLightbox(src) {
   lb.classList.add("open");
 }
 
+function treeImageUrl(nodeId) {
+  // Node ids repeat in every document. Include the selected run in the URL so
+  // the browser cannot reuse a crop cached for node #3 from a previous PDF.
+  return `/api/tree-image?id=${encodeURIComponent(nodeId)}&run=${encodeURIComponent(state.currentRun || "")}`;
+}
+
 // vis-network measures its container once at creation; if that happens before
 // the flex/grid layout has painted, the canvas is stuck at 0x0 (blank). A
 // ResizeObserver re-sizes it whenever the container actually gets dimensions
@@ -211,24 +219,86 @@ function wireTabs() {
   });
 }
 
-// Make the mouse wheel PAN the view (vertical), Shift+wheel = horizontal,
-// Ctrl/Cmd+wheel = zoom. Requires the network's zoomView to be off.
+// A viewport gesture is in progress. Two things watch this: a programmatic
+// focus scheduled before the gesture must not yank the view back afterwards
+// (compare the sequence you captured), and the tree drops its glow for the
+// duration, because canvas shadowBlur is redrawn on every frame of a pan.
+const GESTURE_IDLE_MS = 150;
+const gestureWatchers = new Set();
+let gestureSeq = 0;
+let gestureIdle = null;
+
+// Watchers are told the view has settled (true) or is moving (false). The
+// settle is timer-driven rather than tied to a gesture-end event, so a wheel
+// that never reports an end still restores whatever was suspended.
+function markGesture() {
+  gestureSeq += 1;
+  if (gestureIdle === null) gestureWatchers.forEach((watch) => watch(false));
+  else clearTimeout(gestureIdle);
+  gestureIdle = setTimeout(() => {
+    gestureIdle = null;
+    gestureWatchers.forEach((watch) => watch(true));
+  }, GESTURE_IDLE_MS);
+}
+
+const gestureActive = () => gestureIdle !== null;
+
+const ZOOM_MIN = 0.05;
+const ZOOM_MAX = 4;
+
+// Wheel PANS the view, Shift+wheel = horizontal, Ctrl/Cmd+wheel = zoom.
+// Requires the network's zoomView to be off.
 function enableWheelPan(containerId, getNet) {
   const el = document.getElementById(containerId);
   if (!el) return;
+  let wheelFrame = null;
+  let pendingX = 0;
+  let pendingY = 0;
+  let pendingZoom = 0;
+  let pointerX = 0;
+  let pointerY = 0;
   el.addEventListener("wheel", (e) => {
     const net = getNet();
     if (!net) return;
     e.preventDefault();
-    const scale = net.getScale() || 1;
+    markGesture();
+    pointerX = e.clientX;
+    pointerY = e.clientY;
     if (e.ctrlKey || e.metaKey) {
-      net.moveTo({ scale: scale * (e.deltaY < 0 ? 1.12 : 0.89) });
-      return;
+      pendingZoom += e.deltaY;
+    } else {
+      let dx = e.deltaX, dy = e.deltaY;
+      if (e.shiftKey && dx === 0) { dx = e.deltaY; dy = 0; }
+      pendingX += dx;
+      pendingY += dy;
     }
-    const pos = net.getViewPosition();
-    let dx = e.deltaX, dy = e.deltaY;
-    if (e.shiftKey && dx === 0) { dx = e.deltaY; dy = 0; } // shift+wheel → horizontal
-    net.moveTo({ position: { x: pos.x + dx / scale, y: pos.y + dy / scale } });
+    if (wheelFrame !== null) return;
+    wheelFrame = requestAnimationFrame(() => {
+      wheelFrame = null;
+      const current = getNet();
+      if (!current) return;
+      const from = current.getScale() || 1;
+      const to = pendingZoom
+        ? Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, from * Math.exp(-pendingZoom * 0.0015)))
+        : from;
+      // Anchor the zoom on the cursor: the graph point under it keeps its
+      // screen position, which is what makes zooming feel like it tracks the
+      // mouse instead of dragging the viewport centre around.
+      const box = el.getBoundingClientRect();
+      const offX = pointerX - box.left - box.width / 2;
+      const offY = pointerY - box.top - box.height / 2;
+      const anchor = 1 / from - 1 / to;
+      const pos = current.getViewPosition();
+      current.moveTo({
+        scale: to,
+        position: {
+          x: pos.x + offX * anchor + pendingX / to,
+          y: pos.y + offY * anchor + pendingY / to,
+        },
+        animation: false,
+      });
+      pendingX = pendingY = pendingZoom = 0;
+    });
   }, { passive: false });
 }
 
@@ -294,7 +364,11 @@ function activateView(name) {
   }
   if (name === "tree" && state.tree) {
     if (!state.treeBuilt) buildTreeNetwork();
-    else { state.treeNet.redraw(); state.treeNet.fit(); }
+    else {
+      state.treeNet.redraw();
+      if (state.selectedTreeId != null) focusTreeNode(state.selectedTreeId, { rebuild: "never" });
+      else state.treeNet.fit();
+    }
   }
   if (name === "chat") $("question").focus();
   if (name === "library") loadLibrary();
@@ -593,6 +667,11 @@ function resetForNewRun() {
   if (state.graphNet) { state.graphNet.destroy(); state.graphNet = null; }
   if (state.treeNet) { state.treeNet.destroy(); state.treeNet = null; }
   state.graphBuilt = state.treeBuilt = false;
+  state.selectedTreeId = null;
+  state.treeFilteredIds = [];
+  state.treeMatchCount = 0;
+  state.treeHighlit = null;
+  treeHighlightType = null;
   $("messages").innerHTML = "";
 }
 
@@ -603,6 +682,7 @@ async function loadData() {
   state.graph = graph;
 
   state.treeNodesById = new Map(tree.nodes.map((n) => [n.id, n]));
+  state.treeDepthById = computeTreeDepths(tree.nodes);
   state.graphNodesById = new Map((graph.nodes || []).map((n) => [n.id, n]));
   state.treeLevelById = computeTreeLevels(tree.nodes);
 
@@ -905,10 +985,34 @@ function wireTreeJumpLinks(root) {
 
 /* =============================== TREE ==================================== */
 function wireTreeControls() {
-  $("treeSearch").addEventListener("input", () => renderTreeList());
-  $("treeTypeFilter").addEventListener("change", () => renderTreeList());
+  $("treeSearch").addEventListener("input", renderTreeList);
+  $("treeSearch").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && state.treeFilteredIds.length) {
+      event.preventDefault();
+      selectTreeNode(state.treeFilteredIds[0]);
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      stepTreeResult(event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Escape") {
+      $("treeSearchClear").click();
+    }
+  });
+  $("treeTypeFilter").addEventListener("change", () =>
+    applyTreeTypeSelection($("treeTypeFilter").value, false));
+  $("treeSearchClear").addEventListener("click", () => {
+    $("treeSearch").value = "";
+    $("treeTypeFilter").value = "";
+    clearTreeHighlight();
+    renderTreeList();
+    $("treeSearch").focus();
+  });
+  $("treePrevResult").addEventListener("click", () => stepTreeResult(-1));
+  $("treeNextResult").addEventListener("click", () => stepTreeResult(1));
   $("treeLabels").addEventListener("change", () => { if (state.treeBuilt) rebuildTreeLabels(); });
   $("treeFit").addEventListener("click", () => state.treeNet && state.treeNet.fit({ animation: true }));
+  $("treeFocus").addEventListener("click", () => {
+    if (state.selectedTreeId != null) focusTreeNode(state.selectedTreeId, { rebuild: "never" });
+  });
 }
 
 // Hierarchical layout is superlinear in node count, so a 16k-node document
@@ -968,16 +1072,53 @@ function treeRenderSubset(all, focusId) {
   return [...keep.values()];
 }
 
+function treeTypeRenderSubset(all, type, focusId) {
+  const byId = new Map(all.map((node) => [node.id, node]));
+  const matches = all.filter((node) => node.type === type);
+  if (!matches.length) return treeRenderSubset(all, focusId);
+
+  const focusIndex = Math.max(0, matches.findIndex((node) => node.id === focusId));
+  const ordered = [];
+  for (let distance = 0; ordered.length < matches.length; distance += 1) {
+    const after = focusIndex + distance;
+    const before = focusIndex - distance;
+    if (after < matches.length) ordered.push(matches[after]);
+    if (distance && before >= 0) ordered.push(matches[before]);
+  }
+
+  const keep = new Map();
+  for (const match of ordered) {
+    const chain = [];
+    const seen = new Set();
+    for (let current = match; current && !seen.has(current.id); current = byId.get(current.parentId)) {
+      seen.add(current.id);
+      if (!keep.has(current.id)) chain.push(current);
+    }
+    if (keep.size && keep.size + chain.length > TREE_RENDER_BUDGET) continue;
+    for (const node of chain.reverse()) keep.set(node.id, node);
+    if (keep.size >= TREE_RENDER_BUDGET) break;
+  }
+  return [...keep.values()];
+}
+
 // Refill the drawn slice in place. Replacing the network instead loses the
 // canvas, and vis re-runs the hierarchical layout on a DataSet change anyway.
+// The scoped styling is folded into the add: recolouring afterwards was a
+// second DataSet mutation, so a legend click drew the slice unstyled and then
+// restyled it a frame later -- the flicker.
 function populateTreeNetwork() {
   const labelsOn = $("treeLabels").checked;
-  const shown = treeRenderSubset(state.tree.nodes, state.selectedTreeId);
+  const shown = treeHighlightType
+    ? treeTypeRenderSubset(state.tree.nodes, treeHighlightType, state.selectedTreeId)
+    : treeRenderSubset(state.tree.nodes, state.selectedTreeId);
   const shownIds = new Set(shown.map((n) => n.id));
   state.treeShownCount = shown.length;
+  state.treeHighlit = treeHighlightType
+    ? new Set(shown.filter((n) => n.type === treeHighlightType).map((n) => n.id))
+    : null;
   state.treeNodes.clear();
   state.treeEdges.clear();
-  state.treeNodes.add(shown.map((n) => toVisTreeNode(n, labelsOn)));
+  state.treeNodes.add(shown.map((n) => toVisTreeNode(n, labelsOn, state.treeHighlit)));
   state.treeEdges.add(
     shown.filter((n) => n.parentId !== null && shownIds.has(n.parentId)).map((n) => ({
       from: n.parentId, to: n.id, arrows: "to",
@@ -1010,9 +1151,17 @@ function buildTreeNetwork() {
   });
 
   state.treeNet.on("click", (params) => {
-    if (params.nodes.length) selectTreeNode(params.nodes[0]);
-    else clearTreeHighlight(); // click empty space -> revert to default view
+    if (params.nodes.length) { selectTreeNode(params.nodes[0]); return; }
+    // Empty space clears the legend scope and returns to the whole tree. The
+    // selection and its detail panel are kept -- only the scope is dropped.
+    // Ignored right after a gesture: vis reports a tap for a drag that barely
+    // moved, which would throw the scope away mid-pan.
+    if (!treeHighlightType || gestureActive()) return;
+    clearTreeHighlight(true);
   });
+  state.treeNet.on("dragStart", markGesture);
+  state.treeNet.on("dragging", markGesture);
+  gestureWatchers.add(setTreeGlow);
   observeSize(() => state.treeNet, container, () => state.treeNet.fit());
   state.treeBuilt = true;
 }
@@ -1047,17 +1196,80 @@ function computeTreeLevels(nodes) {
   return level;
 }
 
-function toVisTreeNode(n, labelsOn) {
-  const c = colorForType(n.type);
+function computeTreeDepths(nodes) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const depths = new Map();
+  const depthOf = (node, seen = new Set()) => {
+    if (!node || node.parentId == null) return 0;
+    if (depths.has(node.id)) return depths.get(node.id);
+    if (seen.has(node.id)) return 0;
+    seen.add(node.id);
+    const depth = 1 + depthOf(byId.get(node.parentId), seen);
+    depths.set(node.id, depth);
+    return depth;
+  };
+  for (const node of nodes) depths.set(node.id, depthOf(node));
+  return depths;
+}
+
+const TREE_GLOW_SIZE = 16;
+// shadowBlur is re-rasterised on every frame of a pan, and the cost scales with
+// how many nodes carry it. A scope this small is free to keep glowing while the
+// view moves; suspending it would only make the glow blink between scroll
+// bursts, which is worse than the frames it would save.
+const TREE_GLOW_ALWAYS_UNDER = 60;
+
+function glowShadow(type) {
+  return { enabled: true, color: hexA(colorForType(type), 0.5), size: TREE_GLOW_SIZE, x: 0, y: 0 };
+}
+
+function treeGlowOn(highlit) {
+  return !gestureActive() || !highlit || highlit.size < TREE_GLOW_ALWAYS_UNDER;
+}
+
+// Every partial update to a drawn node must go through this. vis decides
+// between a repaint and a full hierarchical relayout by comparing the incoming
+// `level` against the stored one -- an update that omits the field compares a
+// number against undefined, so it always reads as a layout change and the whole
+// tree is re-laid out. Restating the unchanged level keeps it a repaint.
+function treeNodePatch(id, fields) {
+  return {
+    id,
+    level: state.treeLevelById ? state.treeLevelById.get(id) : undefined,
+    ...fields,
+  };
+}
+
+// The one place a tree node's paint is decided, so an add and a recolour cannot
+// disagree. `highlit` null means no type is scoped and every node paints
+// normally; otherwise members glow and the rest are gently dimmed.
+function treeNodeStyle(n, highlit, glow) {
+  const fill = {
+    background: n.type === "TITLE" ? "#eef6ff" : "#ffffff",
+    border: colorForType(n.type),
+    highlight: { background: "#fff7ed", border: "#111" },
+  };
+  if (!highlit) {
+    return { opacity: 1, borderWidth: 1.5, color: fill,
+      font: { color: "#1c2430" }, shadow: { enabled: false } };
+  }
+  if (highlit.has(n.id)) {
+    return { opacity: 1, borderWidth: 2, color: fill, font: { color: "#1c2430" },
+      shadow: glow ? glowShadow(n.type) : { enabled: false } };
+  }
+  return { opacity: 0.5, borderWidth: 1,
+    color: { background: "#f7f9fb", border: "#e6eaee" },
+    font: { color: "#9aa4ad" }, shadow: { enabled: false } };
+}
+
+function toVisTreeNode(n, labelsOn, highlit) {
   const short = clip(nodeLabel(n), 40);
   return {
     id: n.id,
     level: state.treeLevelById ? state.treeLevelById.get(n.id) : undefined,
     label: labelsOn ? `#${n.id} ${short}` : `#${n.id}`,
     title: `#${n.id} · ${n.type}${n.page ? " · p" + n.page : ""}\n${clip(n.content, 160)}`,
-    color: { background: n.type === "TITLE" ? "#eef6ff" : "#ffffff", border: c,
-      highlight: { background: "#fff7ed", border: "#111" } },
-    font: { color: "#1c2430" },
+    ...treeNodeStyle(n, highlit, treeGlowOn(highlit)),
   };
 }
 
@@ -1067,9 +1279,29 @@ function rebuildTreeLabels() {
   // otherwise toggling labels would quietly restore the whole tree.
   state.treeNodes.update(state.tree.nodes
     .filter((n) => state.treeNodes.get(n.id))
-    .map((n) => ({
-      id: n.id, label: labelsOn ? `#${n.id} ${clip(nodeLabel(n), 40)}` : `#${n.id}`,
+    .map((n) => treeNodePatch(n.id, {
+      label: labelsOn ? `#${n.id} ${clip(nodeLabel(n), 40)}` : `#${n.id}`,
     })));
+}
+
+function renderTreeStats() {
+  const total = state.tree.nodes.length;
+  const drawn = state.treeShownCount || 0;
+  $("treeStats").textContent = `${state.treeMatchCount || 0} matching · ${total} total`
+    + (drawn && drawn < total ? ` · ${drawn} on canvas` : "");
+}
+
+// Selection moves one class. Re-running renderTreeList would rebuild up to a
+// thousand rail buttons in the same frame as a canvas click, which is what made
+// clicking a node feel like the canvas had stalled.
+function markTreeListSelection(id) {
+  const root = $("treeList");
+  const previous = root.querySelector(".treeRailItem.active");
+  if (previous) previous.classList.remove("active");
+  const current = root.querySelector(`[data-node-id="${id}"]`);
+  if (!current) return;
+  current.classList.add("active");
+  current.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
 function renderTreeList() {
@@ -1078,26 +1310,44 @@ function renderTreeList() {
   const list = state.tree.nodes.filter((n) => {
     if (n.type === "root") return false;
     const okType = !type || n.type === type;
-    const hay = `${n.content} ${n.type} ${n.summary}`.toLowerCase();
+    const hay = `#${n.id} ${n.id} ${n.content} ${n.type} ${n.summary} ${n.caption || ""}`.toLowerCase();
     return okType && (!q || hay.includes(q));
   });
-  const drawn = state.treeShownCount || 0;
-  $("treeStats").textContent = `${list.length} of ${state.tree.nodes.length} tree nodes`
-    + (drawn && drawn < state.tree.nodes.length
-        ? ` · ${drawn} drawn; click a node to redraw around it` : "");
+  state.treeFilteredIds = list.map((n) => n.id);
+  state.treeMatchCount = list.length;
+  renderTreeStats();
+  $("treePrevResult").disabled = list.length === 0;
+  $("treeNextResult").disabled = list.length === 0;
   const root = $("treeList");
   root.innerHTML = "";
-  for (const n of list.slice(0, 500)) {
+  for (const n of list.slice(0, 1000)) {
     const btn = document.createElement("button");
-    btn.className = "railItem";
-    const indent = Math.min((n.titleLevel || 0), 4) * 10;
+    btn.className = "railItem treeRailItem";
+    btn.dataset.nodeId = n.id;
+    btn.classList.toggle("active", n.id === state.selectedTreeId);
+    const indent = Math.min(state.treeDepthById?.get(n.id) || 0, 6) * 9;
     btn.style.paddingLeft = 10 + indent + "px";
-    btn.innerHTML = `<span class="t">#${n.id} ${escapeHtml(clip(n.content || "(no text)", 60))}</span>
-      <span class="s" style="color:${colorForType(n.type)}">${escapeHtml(n.type)}</span>
-      <span class="s">${n.page ? " · page " + n.page : ""}</span>`;
-    btn.onclick = () => { activateView("tree"); selectTreeNode(n.id); };
+    btn.innerHTML = `<span class="treeItemTop"><span class="nodeId">#${n.id}</span>
+      <span class="typeDot" style="background:${colorForType(n.type)}"></span>
+      <span class="nodeType">${escapeHtml(n.type)}</span>
+      ${n.page ? `<span class="nodePage">p.${n.page}</span>` : ""}</span>
+      <span class="t">${escapeHtml(clip(nodeLabel(n) || "(no text)", 84))}</span>`;
+    btn.onclick = () => selectTreeNode(n.id);
     root.appendChild(btn);
   }
+  if (!list.length) {
+    root.innerHTML = `<div class="treeNoResults">No nodes match this search and type filter.</div>`;
+  } else if (list.length > 1000) {
+    root.insertAdjacentHTML("beforeend", `<div class="treeNoResults">Showing the first 1,000 matches. Refine the search to narrow the list.</div>`);
+  }
+}
+
+function stepTreeResult(direction) {
+  const ids = state.treeFilteredIds || [];
+  if (!ids.length) return;
+  let at = ids.indexOf(state.selectedTreeId);
+  if (at < 0) at = direction > 0 ? -1 : 0;
+  selectTreeNode(ids[(at + direction + ids.length) % ids.length]);
 }
 
 let treeHighlightType = null;
@@ -1106,7 +1356,7 @@ function renderTreeLegend() {
   $("treeLegend").innerHTML = types.map((t) =>
     `<span class="swatch" data-type="${escapeHtml(t)}"><span class="dot" style="background:${colorForType(t)}"></span>${escapeHtml(t)}</span>`).join("");
   $("treeLegend").querySelectorAll(".swatch").forEach((sw) =>
-    sw.onclick = () => highlightTreeType(sw.dataset.type));
+    sw.onclick = () => applyTreeTypeSelection(sw.dataset.type, true));
 }
 
 function hexA(hex, a) {
@@ -1116,63 +1366,156 @@ function hexA(hex, a) {
 }
 
 // Clear any legend highlight and restore the default tree styling.
-function clearTreeHighlight() {
-  if (!treeHighlightType) return;
+function clearTreeHighlight(clearFilter = false) {
+  const hadTypeScope = Boolean(treeHighlightType);
   treeHighlightType = null;
   const lg = $("treeLegend");
   if (lg) lg.querySelectorAll(".swatch").forEach((s) => s.classList.remove("active"));
-  if (state.treeBuilt) recolorTree(null);
+  if (clearFilter && $("treeTypeFilter")) {
+    $("treeTypeFilter").value = "";
+    renderTreeList();
+  }
+  if (!state.treeBuilt) return;
+  if (!hadTypeScope) { recolorTree(null); return; }
+  // Dropping the scope recomputes the slice, so every drawn node lands at new
+  // hierarchical coordinates. Settle the viewport back on the selection instead
+  // of leaving the reader looking at wherever the old layout used to be.
+  if (state.selectedTreeId != null) {
+    focusTreeNode(state.selectedTreeId, { rebuild: "force", animate: false });
+  } else {
+    populateTreeNetwork();
+    state.treeNet.once("afterDrawing", () => state.treeNet.fit());
+  }
+  renderTreeStats();
 }
 
-// Click a tree legend type -> soft-glow all nodes of that type, gently dim the rest.
-function highlightTreeType(type) {
-  activateView("tree");
+// Keep legend, type selector, result list, bounded canvas, and selection in one
+// state transition. Previously the legend affected only nodes that happened to
+// be drawn, so a valid type could appear to do nothing.
+function applyTreeTypeSelection(type, toggle) {
+  if (!$("treeView").classList.contains("active")) activateView("tree");
   if (!state.treeBuilt) buildTreeNetwork();
-  if (treeHighlightType === type) { clearTreeHighlight(); return; } // toggle off
+  if (toggle && treeHighlightType === type) {
+    $("treeTypeFilter").value = "";
+    clearTreeHighlight();
+    renderTreeList();
+    return;
+  }
+  if (!type) {
+    clearTreeHighlight();
+    renderTreeList();
+    return;
+  }
+
   treeHighlightType = type;
+  $("treeTypeFilter").value = type;
   $("treeLegend").querySelectorAll(".swatch").forEach((s) =>
     s.classList.toggle("active", s.dataset.type === type));
   const ids = state.tree.nodes.filter((n) => n.type === type).map((n) => n.id);
-  recolorTree(new Set(ids));
-  if (ids.length) state.treeNet.fit({ nodes: ids, animation: true });
+  renderTreeList();
+  if (!ids.length) {
+    recolorTree(new Set());
+    return;
+  }
+
+  // Select a real match when the current focus is a different type, and force
+  // the slice to be rebuilt around the requested type even if that node was
+  // already drawn under the previous scope.
+  const focusId = ids.includes(state.selectedTreeId) ? state.selectedTreeId : ids[0];
+  selectTreeNode(focusId, { rebuild: "force", animate: false });
 }
 
 function recolorTree(hlSet) {
-  state.treeNodes.update(state.tree.nodes.map((n) => {
-    const c = colorForType(n.type);
-    const base = {
-      background: n.type === "TITLE" ? "#eef6ff" : "#ffffff", border: c,
-      highlight: { background: "#fff7ed", border: "#111" },
-    };
-    if (!hlSet) { // default view
-      return { id: n.id, opacity: 1, borderWidth: 1.5, color: base,
-        font: { color: "#1c2430" }, shadow: { enabled: false } };
-    }
-    if (hlSet.has(n.id)) { // soft colored glow, normal fill kept
-      return { id: n.id, opacity: 1, borderWidth: 2, color: base,
-        font: { color: "#1c2430" },
-        shadow: { enabled: true, color: hexA(c, 0.5), size: 22, x: 0, y: 0 } };
-    }
-    return { id: n.id, opacity: 0.5, borderWidth: 1, // gently dimmed
-      color: { background: "#f7f9fb", border: "#e6eaee" }, font: { color: "#9aa4ad" },
-      shadow: { enabled: false } };
-  }));
+  // DataSet.update inserts unknown ids. Updating the full document here used
+  // to reinsert thousands of nodes outside the bounded canvas and destroy the
+  // hierarchical layout after filtering/highlighting.
+  const drawn = state.tree.nodes.filter((n) => state.treeNodes.get(n.id));
+  state.treeHighlit = hlSet && new Set([...hlSet].filter((id) => state.treeNodes.get(id)));
+  const glow = treeGlowOn(state.treeHighlit);
+  state.treeNodes.update(
+    drawn.map((n) => treeNodePatch(n.id, treeNodeStyle(n, state.treeHighlit, glow)))
+  );
 }
 
-function selectTreeNode(id) {
+// Carry the glow only while the view is still. Nothing else about the styling
+// moves, so this is one shadow-only update on the glowing nodes rather than a
+// restyle of the slice.
+function setTreeGlow(on) {
+  const highlit = state.treeHighlit;
+  if (!state.treeBuilt || !highlit || highlit.size < TREE_GLOW_ALWAYS_UNDER) return;
+  const updates = [];
+  for (const id of highlit) {
+    const n = state.treeNodesById.get(id);
+    if (n && state.treeNodes.get(id)) {
+      updates.push(treeNodePatch(id, {
+        shadow: on ? glowShadow(n.type) : { enabled: false },
+      }));
+    }
+  }
+  if (updates.length) state.treeNodes.update(updates);
+}
+
+// `rebuild`: "missing" refills the bounded slice when the node is not drawn,
+// "force" refills it even when it is (the scope changed, so the slice must be
+// recomputed), "never" leaves the slice alone.
+function focusTreeNode(id, { rebuild = "missing", animate = true } = {}) {
+  if (!state.treeBuilt) buildTreeNetwork();
+  const rebuilding = rebuild === "force"
+    || (rebuild === "missing" && !state.treeNodes.get(id));
+  const seq = gestureSeq;
+  const focus = () => {
+    // The user panned or zoomed after this focus was queued, so their gesture
+    // wins: vis finalises an in-flight animation on the next moveTo, and
+    // proceeding here would teleport the view out from under them. A rebuild is
+    // exempt -- the slice it replaced no longer exists at those coordinates, so
+    // there is no view of theirs left to protect and skipping would strand them
+    // on empty canvas.
+    if (!rebuilding && seq !== gestureSeq) return;
+    if (!state.treeNet || !state.treeNodes.get(id)) return;
+    state.treeNet.selectNodes([id]);
+    state.treeNet.focus(id, {
+      scale: 0.92,
+      // A rebuilt slice has entirely new coordinates, so easing from the old
+      // viewport animates between two unrelated views. Cut straight there.
+      animation: animate && !rebuilding
+        ? { duration: 280, easingFunction: "easeInOutQuad" }
+        : false,
+    });
+  };
+  // Hierarchical positions are recomputed asynchronously after a bounded
+  // slice is replaced. Focus only after the first completed paint.
+  if (rebuilding) {
+    state.treeNet.once("afterDrawing", () => requestAnimationFrame(focus));
+    populateTreeNetwork();
+  } else if (state.treeNodes.get(id)) {
+    requestAnimationFrame(focus);
+  }
+}
+
+function treeBreadcrumbs(node) {
+  const chain = [];
+  const seen = new Set();
+  for (let cur = node; cur && !seen.has(cur.id); cur = state.treeNodesById.get(cur.parentId)) {
+    seen.add(cur.id);
+    chain.unshift(cur);
+  }
+  return chain.map((item, index) => {
+    const current = index === chain.length - 1;
+    const label = item.type === "root" ? "Document" : clip(nodeLabel(item), 28);
+    return `${index ? '<span class="crumbSep">›</span>' : ""}${
+      current ? `<span class="crumb current">${escapeHtml(label)}</span>`
+        : `<button class="crumb" data-tree="${item.id}">${escapeHtml(label)}</button>`
+    }`;
+  }).join("");
+}
+
+function selectTreeNode(id, options = {}) {
   const n = state.treeNodesById.get(id);
   if (!n) return;
   state.selectedTreeId = id;
-  // Outside the drawn slice: refill it around this node so the reader can walk
-  // into parts of a large document the budget left out.
-  if (state.treeBuilt && !state.treeNodes.get(id)) {
-    populateTreeNetwork();
-    renderTreeList();
-  }
-  if (state.treeBuilt && state.treeNodes.get(id)) {
-    state.treeNet.selectNodes([id]);
-    state.treeNet.focus(id, { scale: 0.9, animation: true });
-  }
+  focusTreeNode(id, { rebuild: options.rebuild || "missing", animate: options.animate !== false });
+  markTreeListSelection(id);
+  renderTreeStats();
   const kids = (n.children || []).map((cid) => {
     const c = state.treeNodesById.get(cid);
     return c ? `<div class="card"><div class="h"><a class="linkish" data-tree="${cid}">#${cid} ${escapeHtml(clip(nodeLabel(c), 46))}</a></div>
@@ -1185,10 +1528,22 @@ function selectTreeNode(id) {
     : `<p class="prose">No entities were extracted from this node.</p>`;
 
   const parent = n.parentId != null ? state.treeNodesById.get(n.parentId) : null;
-  const img = (n.meta && (n.meta.crop_uri || n.meta.img_path))
-    ? `<div class="section-h">Image</div><img class="nodeimg" src="/api/tree-image?id=${id}" alt="node image" />` : "";
+  const siblings = parent
+    ? (parent.children || []).map((cid) => state.treeNodesById.get(cid)).filter(Boolean)
+    : [];
+  const siblingIndex = siblings.findIndex((item) => item.id === id);
+  const previousSibling = siblingIndex > 0 ? siblings[siblingIndex - 1] : null;
+  const nextSibling = siblingIndex >= 0 && siblingIndex < siblings.length - 1
+    ? siblings[siblingIndex + 1] : null;
+  const img = (n.hasImage || (n.meta && (n.meta.crop_uri || n.meta.img_path)))
+    ? `<div class="section-h">Image</div>
+       <img class="nodeimg" src="${treeImageUrl(id)}" alt="Source crop for node ${id}"
+            title="Click to view the full-resolution crop"
+            onerror="this.nextElementSibling.hidden=false" />
+       <p class="prose imageError" hidden>The source crop could not be loaded.</p>` : "";
 
   $("treeDetail").innerHTML = `
+    <nav class="treeBreadcrumbs" aria-label="Node path">${treeBreadcrumbs(n)}</nav>
     <h2>#${id} ${escapeHtml(clip(nodeLabel(n), 90))}</h2>
     <div class="kv">
       <dt>Type</dt><dd><span class="tag" style="background:${colorForType(n.type)}">${escapeHtml(n.type)}</span></dd>
@@ -1196,6 +1551,7 @@ function selectTreeNode(id) {
       <dt>Parent</dt><dd>${parent ? `<a class="linkish" data-tree="${parent.id}">#${parent.id} ${escapeHtml(clip(nodeLabel(parent), 40))}</a>` : "— (root)"}</dd>
       <dt>Children</dt><dd>${(n.children || []).length}</dd>
     </div>
+    ${img}
     ${n.tableBody ? `<div class="section-h">Table</div><div class="tableWrap" id="nodeTable"></div>` : ""}
     ${(n.content || "").trim() || !n.tableBody
       ? `<div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}</div>
@@ -1207,7 +1563,11 @@ function selectTreeNode(id) {
     <div class="prose">${entHtml}</div>
     <div class="section-h">Child nodes</div>
     ${kids}
-    ${img}`;
+    <div class="nodeNav" aria-label="Node navigation">
+      <button class="miniBtn" data-tree="${parent?.id ?? ""}" ${parent ? "" : "disabled"}>↑ Parent</button>
+      <button class="miniBtn" data-tree="${previousSibling?.id ?? ""}" ${previousSibling ? "" : "disabled"}>← Previous sibling</button>
+      <button class="miniBtn" data-tree="${nextSibling?.id ?? ""}" ${nextSibling ? "" : "disabled"}>Next sibling →</button>
+    </div>`;
   if (n.tableBody) {
     const table = renderTableBody(n.tableBody);
     const host = $("nodeTable");
@@ -1429,7 +1789,7 @@ function renderReferences(citations) {
   if (!citations || !citations.length) return "";
   const cards = citations.map((c) => {
     const img = c.hasImage && c.nodeId != null
-      ? `<img class="refThumb" src="/api/tree-image?id=${encodeURIComponent(c.nodeId)}" alt="" loading="lazy" />`
+      ? `<img class="refThumb" src="${treeImageUrl(c.nodeId)}" alt="" loading="lazy" />`
       : "";
     const jump = c.nodeId != null
       ? `<a class="linkish refJump" data-tree="${escapeHtml(c.nodeId)}">view in tree →</a>`

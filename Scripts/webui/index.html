@@ -92,19 +92,27 @@
       <!-- ============================ TREE ============================= -->
       <section id="treeView" class="view">
         <aside class="rail">
-          <input id="treeSearch" class="search" type="search" placeholder="Search sections / text…" />
+          <div class="treeSearchWrap">
+            <input id="treeSearch" class="search" type="search" placeholder="Search node id, text, summary…" />
+            <button id="treeSearchClear" class="iconBtn" type="button" title="Clear search" aria-label="Clear search">×</button>
+          </div>
           <select id="treeTypeFilter" class="select">
             <option value="">All node types</option>
           </select>
           <div class="railStats" id="treeStats"></div>
+          <div class="treeResultNav">
+            <button id="treePrevResult" class="miniBtn" type="button">← Previous</button>
+            <button id="treeNextResult" class="miniBtn" type="button">Next →</button>
+          </div>
           <div class="railList" id="treeList"></div>
         </aside>
 
         <section class="stage">
           <div class="stageBar">
             <button id="treeFit" class="btn">Fit</button>
+            <button id="treeFocus" class="btn">Focus selected</button>
             <label class="check"><input id="treeLabels" type="checkbox" checked /> Labels</label>
-            <span class="stageHint">Scroll to pan · Shift+scroll = sideways · Ctrl+scroll = zoom · click a node for details</span>
+            <span class="stageHint">Scroll to pan · Shift+scroll = sideways · Ctrl+scroll = zoom · click a node for details · click empty space to clear a legend scope</span>
           </div>
           <div id="treeNet" class="net"></div>
           <div id="treeLegend" class="legend"></div>

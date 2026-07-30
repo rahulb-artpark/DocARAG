@@ -792,6 +792,19 @@ class AppState:
         structures = store.tree.structures_for_nodes(
             [view.index_id for view in views]
         )
+        # The normalized SQL view may omit the legacy physical img_path while
+        # the published BookRAG tree still owns a valid MinerU crop. Advertise
+        # that crop explicitly so the frontend renders its Image section and
+        # lets /api/tree-image perform the safe physical-path resolution.
+        raw_image_node_ids = {
+            item.get("index_id")
+            for item in (
+                _read_json_if_present(self.run_dir / "tree.json").get("nodes")
+                or []
+            )
+            if isinstance((item.get("meta_info") or {}).get("img_path"), str)
+            and (item.get("meta_info") or {}).get("img_path").strip()
+        }
         children = {}
         for view in views:
             if view.parent_id is not None:
@@ -828,6 +841,8 @@ class AppState:
                     "footnote": meta.footnote or "",
                     "summary": view.summary or "",
                     "meta": evidence,
+                    "hasImage": bool(meta.img_path)
+                    or view.index_id in raw_image_node_ids,
                     "structures": structures.get(view.index_id, []),
                     "children": children.get(view.index_id, []),
                 }
@@ -1261,6 +1276,15 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
         query = parse_qs(parsed.query)
+        requested_run = (query.get("run") or [""])[0]
+        if requested_run:
+            resolved_run = self.resolve_run_argument(requested_run)
+            if resolved_run is None or resolved_run.resolve() != self.state.run_dir.resolve():
+                self.send_error_json(
+                    HTTPStatus.CONFLICT,
+                    "The selected document changed; reload the crop",
+                )
+                return
         try:
             node_id = int((query.get("id") or [""])[0])
         except ValueError:
@@ -1272,14 +1296,42 @@ class Handler(SimpleHTTPRequestHandler):
             None,
         )
         node_meta = (node or {}).get("meta") or {}
-        img_path = node_meta.get("crop_uri") or node_meta.get("img_path")
-        if not img_path:
-            self.send_error_json(HTTPStatus.NOT_FOUND, "Node has no image")
-            return
-
-        path = Path(img_path).resolve()
         run_dir = self.state.run_dir.resolve()
-        if not path.exists() or run_dir not in path.parents:
+        candidates = [
+            node_meta.get("crop_uri"),
+            node_meta.get("img_path"),
+        ]
+
+        # The SQL projection can retain a stale or logical crop URI even when
+        # the run's published tree.json contains the usable physical MinerU
+        # crop. Fall back to that source-of-record rather than removing the
+        # image from an otherwise valid IMAGE node.
+        raw_tree = _read_json_if_present(run_dir / "tree.json")
+        raw_node = next(
+            (
+                item
+                for item in (raw_tree.get("nodes") or [])
+                if item.get("index_id") == node_id
+            ),
+            None,
+        )
+        raw_meta = (raw_node or {}).get("meta_info") or {}
+        candidates.extend(
+            [raw_meta.get("img_path"), raw_meta.get("crop_uri")]
+        )
+
+        path = None
+        for raw_path in candidates:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = run_dir / candidate
+            candidate = candidate.resolve()
+            if candidate.is_file() and run_dir in candidate.parents:
+                path = candidate
+                break
+        if path is None:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Image is not available")
             return
 
@@ -1287,6 +1339,11 @@ class Handler(SimpleHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", ctype)
+        # `/api/tree-image?id=3` is document-scoped even though its old URL was
+        # not. Do not let a browser retain one PDF's crop for another PDF that
+        # happens to contain the same tree node id.
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
