@@ -226,6 +226,86 @@ main { flex: 1; min-height: 0; position: relative; }
 pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px; border-radius: 8px; overflow: auto; }
 
 /* ---------------- chat ---------------- */
+.srOnly {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* The sidebar collapses to nothing but its toggle, so a narrow screen can give
+   the whole width to the conversation without losing the way back. */
+.chatLayout {
+  flex: 1; display: grid; grid-template-columns: 288px 1fr;
+  min-width: 0; min-height: 0; transition: grid-template-columns .18s ease;
+}
+.chatLayout.sidebarCollapsed { grid-template-columns: 44px 1fr; }
+
+.chatSidebar {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  border-right: 1px solid var(--line); background: var(--panel);
+}
+.chatSidebarHead {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 8px; padding: 14px 10px 10px 16px;
+}
+.chatSidebarTitles { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.chatSidebarTitles .eyebrow {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .09em; opacity: .55;
+}
+.chatSidebarTitles strong { font-size: 15px; }
+.sidebarToggle {
+  flex: none; width: 24px; height: 24px; border: 1px solid var(--line);
+  border-radius: 6px; background: transparent; cursor: pointer;
+  font-size: 11px; line-height: 1; opacity: .7;
+}
+.sidebarToggle:hover { opacity: 1; background: rgba(0, 0, 0, .04); }
+
+.newChatBtn {
+  margin: 0 16px 12px; padding: 11px 14px; border: 0; border-radius: 10px;
+  background: var(--accent); color: #fff; font-size: 13.5px; font-weight: 600;
+  cursor: pointer; white-space: nowrap;
+}
+.newChatBtn:hover { filter: brightness(1.06); }
+
+.conversationList { flex: 1; overflow: auto; padding: 0 10px 10px; }
+.conversationEmpty {
+  padding: 26px 12px; text-align: center; font-size: 12.5px; line-height: 1.6; opacity: .55;
+}
+.conversationItem {
+  display: flex; align-items: stretch; gap: 2px; border-radius: 9px; margin-bottom: 2px;
+}
+.conversationItem:hover { background: rgba(0, 0, 0, .04); }
+.conversationItem.active { background: rgba(0, 0, 0, .07); }
+.conversationOpen {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;
+  padding: 9px 10px; border: 0; background: transparent; cursor: pointer; text-align: left;
+}
+.conversationTitle {
+  font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conversationPreview {
+  font-size: 11.5px; opacity: .6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conversationTime { font-size: 10.5px; opacity: .45; }
+.conversationDelete {
+  flex: none; width: 26px; border: 0; background: transparent; cursor: pointer;
+  font-size: 16px; line-height: 1; opacity: 0; border-radius: 7px; color: var(--danger, #b4232a);
+}
+.conversationItem:hover .conversationDelete,
+.conversationDelete:focus-visible { opacity: .75; }
+.conversationDelete:hover { opacity: 1; background: rgba(180, 35, 42, .12); }
+
+.chatSidebarFoot {
+  padding: 10px 16px 14px; font-size: 11px; opacity: .5;
+  border-top: 1px solid var(--line);
+}
+
+/* Collapsed: only the toggle survives, and it stays reachable. */
+.sidebarCollapsed .chatSidebarTitles,
+.sidebarCollapsed .newChatBtn,
+.sidebarCollapsed .conversationList,
+.sidebarCollapsed .chatSidebarFoot { display: none; }
+.sidebarCollapsed .chatSidebarHead { padding: 14px 10px; justify-content: center; }
+
 .chatShell { flex: 1; display: flex; flex-direction: column; min-width: 0; max-width: 1080px; margin: 0 auto; width: 100%; }
 .messages { flex: 1; overflow: auto; padding: 22px 22px 8px; display: flex; flex-direction: column; gap: 16px; }
 .msg { display: flex; }

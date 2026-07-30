@@ -12,6 +12,8 @@ const state = {
   treeNodesById: new Map(),
   entitiesBySourceNode: new Map(), // tree node id -> [entity, ...]
   chatBusy: false,
+  conversations: [],
+  activeConversationId: null,
   currentRun: null,
   libraryTimer: null,
   selectedTreeId: null,
@@ -397,7 +399,7 @@ async function boot() {
     if (hasRun) await loadData();
     else activateView("library");
   } catch (err) {
-    console.error("BookRAG load failed:", err);
+    console.error("NoeticsRAG load failed:", err);
     alert("Failed to load index: " + err.message);
   }
 }
@@ -861,6 +863,11 @@ function resetForNewRun() {
   state.treeMatchCount = 0;
   state.treeHighlit = null;
   treeHighlightType = null;
+  // History is stored per run directory, so a different PDF has a different
+  // set of conversations. Clearing the id here stops the next question being
+  // appended to the previous document's chat.
+  state.conversations = [];
+  state.activeConversationId = null;
   $("messages").innerHTML = "";
 }
 
@@ -895,6 +902,10 @@ async function loadData() {
   const active = document.querySelector(".tab.active").dataset.view;
   if (active === "graph") buildGraphNetwork();
   if (active === "tree") buildTreeNetwork();
+
+  // Saved history belongs to this run, so it loads with the run's data. The
+  // most recent conversation is reopened rather than leaving an empty pane.
+  await loadConversations();
 }
 
 function buildTypeFilter(sel, types) {
@@ -1908,6 +1919,12 @@ function beginSummaryEdit(nodeId, current) {
 }
 
 /* =============================== CHAT =================================== */
+const ASSISTANT_NAME = "Noetics-AI";
+const SIDEBAR_COLLAPSED_KEY = "noeticsrag.chatSidebarCollapsed";
+const CHAT_INTRO =
+  `<div class="answer">Ask a question about the indexed document. Your conversation ` +
+  `will be saved automatically, including the retrieved tree nodes and graph evidence.</div>`;
+
 function wireChat() {
   $("chatForm").addEventListener("submit", submitChat);
   const ta = $("question");
@@ -1915,17 +1932,176 @@ function wireChat() {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitChat(e); }
   });
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 160) + "px"; });
-  addMessage("assistant",
-    `<div class="answer">Ask a question about the indexed document. The retrieved tree nodes &amp; graph entities used to answer will appear under each response.</div>`);
+  $("newChatBtn").addEventListener("click", startNewChat);
+  $("sidebarToggle").addEventListener("click", toggleChatSidebar);
+  // The collapsed state is a workspace preference, not document state, so it
+  // outlives both the conversation and the selected PDF.
+  applySidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
+  showChatIntro();
+}
+
+function applySidebarCollapsed(collapsed) {
+  const layout = $("chatLayout");
+  const toggle = $("sidebarToggle");
+  if (!layout || !toggle) return;
+  layout.classList.toggle("sidebarCollapsed", collapsed);
+  toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  toggle.title = collapsed ? "Show conversation list" : "Collapse conversation list";
+  const label = toggle.querySelector(".srOnly");
+  if (label) label.textContent = toggle.title;
+  const chevron = toggle.querySelector("[aria-hidden]");
+  if (chevron) chevron.innerHTML = collapsed ? "&#10095;" : "&#10094;";
+}
+
+function toggleChatSidebar() {
+  const collapsed = !$("chatLayout").classList.contains("sidebarCollapsed");
+  applySidebarCollapsed(collapsed);
+  try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0"); } catch (e) {}
+}
+
+function showChatIntro() {
+  $("messages").innerHTML = "";
+  addMessage("assistant", CHAT_INTRO);
 }
 
 function addMessage(role, html) {
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
-  wrap.innerHTML = `<div class="bubble"><div class="who">${role === "user" ? "You" : "BookRAG"}</div>${html}</div>`;
+  wrap.innerHTML = `<div class="bubble"><div class="who">${role === "user" ? "You" : ASSISTANT_NAME}</div>${html}</div>`;
   $("messages").appendChild(wrap);
   $("messages").scrollTop = $("messages").scrollHeight;
   return wrap;
+}
+
+/* --------------------------- Saved conversations ------------------------- */
+// History lives in the run directory server-side, so it follows the document:
+// deleting the PDF deletes its chats with it.
+
+function conversationWhen(value) {
+  if (!value) return "";
+  const when = new Date(value);
+  if (isNaN(when)) return "";
+  const days = (Date.now() - when.getTime()) / 86400000;
+  return days < 1
+    ? when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : when.toLocaleDateString();
+}
+
+async function refreshConversations() {
+  try {
+    const data = await api("/api/conversations");
+    state.conversations = data.conversations || [];
+  } catch (err) {
+    state.conversations = [];
+  }
+  renderConversationList();
+}
+
+function renderConversationList() {
+  const list = $("conversationList");
+  if (!list) return;
+  if (!state.conversations.length) {
+    list.innerHTML =
+      `<div class="conversationEmpty">No previous chats yet.<br>Start a new conversation below.</div>`;
+    return;
+  }
+  list.innerHTML = state.conversations.map((c) => `
+    <div class="conversationItem${c.id === state.activeConversationId ? " active" : ""}" data-conversation="${escapeHtml(c.id)}">
+      <button class="conversationOpen" type="button" title="${escapeHtml(c.title || "")}">
+        <span class="conversationTitle">${escapeHtml(c.title || "New conversation")}</span>
+        <span class="conversationPreview">${escapeHtml(clip(c.preview || "No messages yet", 72))}</span>
+        <span class="conversationTime">${escapeHtml(conversationWhen(c.updatedAt))}</span>
+      </button>
+      <button class="conversationDelete" type="button" title="Delete conversation"
+              aria-label="Delete ${escapeHtml(c.title || "conversation")}">×</button>
+    </div>`).join("");
+  list.querySelectorAll(".conversationOpen").forEach((button) =>
+    button.addEventListener("click", () =>
+      openConversation(button.closest(".conversationItem").dataset.conversation)));
+  list.querySelectorAll(".conversationDelete").forEach((button) =>
+    button.addEventListener("click", () =>
+      deleteConversation(button.closest(".conversationItem").dataset.conversation)));
+}
+
+async function loadConversations() {
+  await refreshConversations();
+  if (state.conversations.length) await openConversation(state.conversations[0].id);
+  else resetChatPane(null);
+}
+
+function resetChatPane(conversationId) {
+  state.activeConversationId = conversationId;
+  showChatIntro();
+  renderConversationList();
+}
+
+async function startNewChat() {
+  if (state.chatBusy) return;
+  try {
+    const created = await api("/api/conversations", { method: "POST" });
+    state.activeConversationId = created.id;
+  } catch (err) {
+    // Without a saved draft the next question still opens its own conversation
+    // server-side, so the chat stays usable.
+    state.activeConversationId = null;
+  }
+  showChatIntro();
+  await refreshConversations();
+  $("question").focus();
+}
+
+async function openConversation(conversationId) {
+  if (state.chatBusy) return;
+  let conversation;
+  try {
+    conversation = await api(`/api/conversations/${encodeURIComponent(conversationId)}`);
+  } catch (err) {
+    await refreshConversations();
+    return;
+  }
+  state.activeConversationId = conversation.id;
+  const messages = conversation.messages || [];
+  $("messages").innerHTML = "";
+  if (!messages.length) addMessage("assistant", CHAT_INTRO);
+  for (const message of messages) {
+    if (message.role === "user") {
+      addMessage("user", `<div class="answer">${escapeHtml(message.content || "")}</div>`);
+      continue;
+    }
+    if (message.error) {
+      addMessage("assistant", `<p class="error">Error: ${escapeHtml(message.error)}</p>`);
+      continue;
+    }
+    // A stored answer carries the same shape the live response did, so it is
+    // replayed through exactly the same renderer rather than a second one that
+    // would drift from it.
+    const bubble = addMessage("assistant", renderAnswer(message));
+    linkifyCitations(bubble, message.citations);
+    wrapAnswerTables(bubble);
+    enhanceContent(bubble);
+    wireEvidenceLinks(bubble);
+    typesetMath(bubble);
+  }
+  renderConversationList();
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+
+async function deleteConversation(conversationId) {
+  const conversation = state.conversations.find((c) => c.id === conversationId);
+  const label = (conversation && conversation.title) || "this conversation";
+  if (!confirm(`Delete “${label}”? This cannot be undone.`)) return;
+  try {
+    await api(`/api/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+  } catch (err) {
+    alert("Could not delete the conversation: " + err.message);
+    return;
+  }
+  if (state.activeConversationId === conversationId) state.activeConversationId = null;
+  await refreshConversations();
+  if (state.activeConversationId === null) {
+    if (state.conversations.length) await openConversation(state.conversations[0].id);
+    else resetChatPane(null);
+  }
 }
 
 async function submitChat(event) {
@@ -1946,10 +2122,11 @@ async function submitChat(event) {
     const data = await api("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, conversationId: state.activeConversationId }),
     });
+    if (data.conversationId) state.activeConversationId = data.conversationId;
     pending.querySelector(".bubble").innerHTML =
-      `<div class="who">BookRAG</div>` + renderAnswer(data);
+      `<div class="who">${ASSISTANT_NAME}</div>` + renderAnswer(data);
     linkifyCitations(pending, data.citations);
     wrapAnswerTables(pending);
     enhanceContent(pending);
@@ -1957,11 +2134,12 @@ async function submitChat(event) {
     typesetMath(pending);
   } catch (err) {
     pending.querySelector(".bubble").innerHTML =
-      `<div class="who">BookRAG</div><p class="error">Error: ${escapeHtml(err.message)}</p>`;
+      `<div class="who">${ASSISTANT_NAME}</div><p class="error">Error: ${escapeHtml(err.message)}</p>`;
   } finally {
     state.chatBusy = false;
     $("askBtn").disabled = false;
     $("messages").scrollTop = $("messages").scrollHeight;
+    refreshConversations();
   }
 }
 

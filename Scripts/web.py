@@ -11,6 +11,7 @@ import argparse
 import errno
 import hashlib
 import ipaddress
+import copy
 import json
 import logging
 import mimetypes
@@ -22,7 +23,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -709,6 +710,10 @@ class AppState:
     def __init__(self, run_dir=None):
         self.run_dir = run_dir
         self.chat_lock = threading.Lock()
+        # Separate from chat_lock on purpose: a question holds chat_lock for the
+        # whole retrieval, and the sidebar must stay readable and writable while
+        # one is in flight.
+        self.history_lock = threading.Lock()
         self.rag_agent = None
         self._rag_identity_key = None
         self._store = None
@@ -735,6 +740,181 @@ class AppState:
         if self.run_dir is None:
             raise RunNotReadyError("Select a document from the Library first")
         return self.run_dir
+
+    # --- Conversation history ---------------------------------------------
+    # Stored inside the run directory, which is what makes a document's chats
+    # disappear with the document: delete_run_everywhere rmtree's the run, and
+    # this file goes with it. No cascade to write, and none to get wrong -- a
+    # separate store keyed by document id would leave orphans behind every
+    # deletion instead.
+
+    @property
+    def conversations_path(self):
+        return self.require_run() / "web_chat" / "conversations.json"
+
+    @staticmethod
+    def _now():
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _empty_history():
+        return {"version": 1, "conversations": []}
+
+    def _read_conversations(self):
+        path = self.conversations_path
+        if not path.exists():
+            return self._empty_history()
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            # A history we cannot parse must not take the chat down with it. The
+            # file is kept as-is so it can still be recovered by hand.
+            logging.exception("Could not read conversation history: %s", path)
+            return self._empty_history()
+        if not isinstance(data, dict) or not isinstance(data.get("conversations"), list):
+            return self._empty_history()
+        return data
+
+    def _write_conversations(self, data):
+        path = self.conversations_path
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _find_conversation(data, conversation_id):
+        return next(
+            (
+                conversation
+                for conversation in data["conversations"]
+                if conversation.get("id") == conversation_id
+            ),
+            None,
+        )
+
+    def list_conversations(self):
+        """Summaries for the sidebar, newest first, drafts omitted."""
+
+        with self.history_lock:
+            data = self._read_conversations()
+        summaries = []
+        for conversation in data["conversations"]:
+            messages = conversation.get("messages") or []
+            if not messages:
+                continue
+            preview = next(
+                (
+                    str(message.get("content") or message.get("answer") or "")
+                    for message in reversed(messages)
+                    if message.get("content") or message.get("answer")
+                ),
+                "",
+            )
+            summaries.append(
+                {
+                    "id": conversation.get("id"),
+                    "title": conversation.get("title") or "New conversation",
+                    "createdAt": conversation.get("createdAt"),
+                    "updatedAt": conversation.get("updatedAt"),
+                    "messageCount": len(messages),
+                    "preview": " ".join(preview.split())[:160],
+                }
+            )
+        summaries.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+        return {"conversations": summaries}
+
+    def get_conversation(self, conversation_id):
+        with self.history_lock:
+            data = self._read_conversations()
+            conversation = self._find_conversation(data, conversation_id)
+            return copy.deepcopy(conversation) if conversation else None
+
+    def create_conversation(self):
+        with self.history_lock:
+            data = self._read_conversations()
+            # An unused draft is not history. Dropping the empty ones keeps
+            # repeated "New chat" clicks from stacking up identical entries.
+            data["conversations"] = [
+                conversation
+                for conversation in data["conversations"]
+                if conversation.get("messages")
+            ]
+            now = self._now()
+            conversation = {
+                "id": str(uuid.uuid4()),
+                "title": "New conversation",
+                "createdAt": now,
+                "updatedAt": now,
+                "messages": [],
+            }
+            data["conversations"].append(conversation)
+            self._write_conversations(data)
+            return copy.deepcopy(conversation)
+
+    def delete_conversation(self, conversation_id):
+        with self.history_lock:
+            data = self._read_conversations()
+            before = len(data["conversations"])
+            data["conversations"] = [
+                conversation
+                for conversation in data["conversations"]
+                if conversation.get("id") != conversation_id
+            ]
+            if len(data["conversations"]) == before:
+                return False
+            self._write_conversations(data)
+            return True
+
+    def _record_message(self, conversation_id, message):
+        """Append one message to a stored conversation, titling it if it is the first."""
+
+        if not conversation_id:
+            return
+        with self.history_lock:
+            data = self._read_conversations()
+            conversation = self._find_conversation(data, conversation_id)
+            if conversation is None:
+                return
+            messages = conversation.setdefault("messages", [])
+            if message.get("role") == "user" and not any(
+                item.get("role") == "user" for item in messages
+            ):
+                conversation["title"] = (
+                    " ".join(str(message.get("content") or "").split())[:64]
+                    or "New conversation"
+                )
+            messages.append(message)
+            conversation["updatedAt"] = self._now()
+            self._write_conversations(data)
+
+    def open_conversation(self, conversation_id):
+        """The conversation a question belongs to, created if it does not exist."""
+
+        with self.history_lock:
+            data = self._read_conversations()
+            if conversation_id and self._find_conversation(data, conversation_id):
+                return conversation_id
+            now = self._now()
+            conversation = {
+                "id": conversation_id or str(uuid.uuid4()),
+                "title": "New conversation",
+                "createdAt": now,
+                "updatedAt": now,
+                "messages": [],
+            }
+            data["conversations"].append(conversation)
+            self._write_conversations(data)
+            return conversation["id"]
 
     def switch_run(self, run_dir):
         """Rebind every cache and release the agent held for the old run."""
@@ -1123,6 +1303,83 @@ class AppState:
                 "resultTrace": str(result_path),
             }
 
+    # The full retrieval payload is 181 KB of a 337 KB message on this corpus --
+    # 98% of it -- and the whole history file is read and rewritten on every
+    # message, so storing it inline makes a long conversation quadratic in I/O
+    # and forces the sidebar to parse megabytes to list a few titles. It is also
+    # already persisted per query at web_chat/<queryId>/retrieval_res.json, which
+    # the stored queryId still points at. Only the part the UI replays is kept.
+    @staticmethod
+    def _history_retrieval(retrieval):
+        if not isinstance(retrieval, dict):
+            return {}
+        iterations = []
+        for iteration in retrieval.get("iterations") or []:
+            if not isinstance(iteration, dict):
+                continue
+            entities = [
+                {"entity_name": node.get("entity_name")}
+                for node in (iteration.get("iteration_graph_nodes") or [])
+                if isinstance(node, dict) and node.get("entity_name")
+            ]
+            iterations.append(
+                {
+                    "sub_query": iteration.get("sub_query"),
+                    "iteration_graph_nodes": entities,
+                }
+            )
+        return {"iterations": iterations} if iterations else {}
+
+    def _history_message(self, response):
+        """The reply as it is stored: replayable by the same renderer, minus bulk."""
+
+        stored = dict(response)
+        stored["retrieval"] = self._history_retrieval(response.get("retrieval"))
+        return stored
+
+    def ask_in_conversation(self, question, conversation_id=None):
+        """Ask, and record both sides of the exchange in the stored history.
+
+        Wraps ``ask`` rather than threading history through it: persistence and
+        retrieval fail independently, and the question is recorded before
+        retrieval starts so a crash mid-answer still leaves the conversation
+        showing what was asked.
+        """
+
+        conversation_id = self.open_conversation(conversation_id)
+        self._record_message(
+            conversation_id,
+            {
+                "id": str(uuid.uuid4()),
+                "role": "user",
+                "content": question,
+                "createdAt": self._now(),
+            },
+        )
+        try:
+            response = self.ask(question)
+        except Exception as exc:
+            self._record_message(
+                conversation_id,
+                {
+                    "id": str(uuid.uuid4()),
+                    "role": "assistant",
+                    "createdAt": self._now(),
+                    "error": str(exc),
+                },
+            )
+            raise
+        self._record_message(
+            conversation_id,
+            {
+                "id": str(uuid.uuid4()),
+                "role": "assistant",
+                "createdAt": self._now(),
+                **self._history_message(response),
+            },
+        )
+        return {"conversationId": conversation_id, **response}
+
 
 class Handler(SimpleHTTPRequestHandler):
     state: AppState = None
@@ -1200,6 +1457,26 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                 }
             )
+            return
+        if parsed.path == "/api/conversations":
+            try:
+                self.send_json(self.state.list_conversations())
+            except RunNotReadyError:
+                # No document open yet is not an error for the sidebar; it just
+                # has nothing to show.
+                self.send_json({"conversations": []})
+            return
+        if parsed.path.startswith("/api/conversations/"):
+            conversation_id = unquote(parsed.path.rsplit("/", 1)[-1])
+            try:
+                conversation = self.state.get_conversation(conversation_id)
+            except RunNotReadyError as exc:
+                self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
+                return
+            if conversation is None:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "Conversation not found")
+            else:
+                self.send_json(conversation)
             return
         if parsed.path == "/api/library":
             runs = find_run_dirs()
@@ -1365,6 +1642,12 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/edit-summary":
             self.edit_summary()
             return
+        if parsed.path == "/api/conversations":
+            try:
+                self.send_json(self.state.create_conversation(), HTTPStatus.CREATED)
+            except RunNotReadyError as exc:
+                self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
+            return
         if parsed.path != "/api/chat":
             self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint")
             return
@@ -1372,10 +1655,11 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             payload = self.read_json_body()
             question = str(payload.get("question") or "").strip()
+            conversation_id = str(payload.get("conversationId") or "").strip() or None
             if not question:
                 self.send_error_json(HTTPStatus.BAD_REQUEST, "Question is required")
                 return
-            self.send_json(self.state.ask(question))
+            self.send_json(self.state.ask_in_conversation(question, conversation_id))
         except RequestBodyError as exc:
             self.send_error_json(exc.status, str(exc))
         except RunNotReadyError as exc:
@@ -1393,6 +1677,18 @@ class Handler(SimpleHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin and not is_loopback_host(urlparse(origin).hostname or ""):
             self.send_error_json(HTTPStatus.FORBIDDEN, "Cross-origin request denied")
+            return
+        if parsed.path.startswith("/api/conversations/"):
+            conversation_id = unquote(parsed.path.rsplit("/", 1)[-1])
+            try:
+                deleted = self.state.delete_conversation(conversation_id)
+            except RunNotReadyError as exc:
+                self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
+                return
+            if deleted:
+                self.send_json({"ok": True})
+            else:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "Conversation not found")
             return
         if parsed.path != "/api/run":
             self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown endpoint")

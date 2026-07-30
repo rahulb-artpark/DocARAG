@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>BookRAG Explorer</title>
+    <title>NoeticsRAG Explorer</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="/vendor/vis-network.min.js"></script>
     <script src="/vendor/marked.min.js"></script>
@@ -23,7 +23,7 @@
   <body>
     <header class="topbar">
       <div class="brand">
-        <h1>BookRAG&nbsp;Explorer</h1>
+        <h1>NoeticsRAG&nbsp;Explorer</h1>
       </div>
       <label class="runPicker">
         <span>PDF</span>
@@ -133,13 +133,34 @@
 
       <!-- ============================ CHAT ============================= -->
       <section id="chatView" class="view">
-        <section class="chatShell">
-          <div class="messages" id="messages"></div>
-          <form id="chatForm" class="composer">
-            <textarea id="question" rows="1" placeholder="Ask a question about this document… (Enter to send, Shift+Enter for newline)"></textarea>
-            <button type="submit" id="askBtn" class="btn primary">Ask</button>
-          </form>
-        </section>
+        <div class="chatLayout" id="chatLayout">
+          <aside class="chatSidebar" id="chatSidebar" aria-label="Conversation history">
+            <div class="chatSidebarHead">
+              <div class="chatSidebarTitles">
+                <span class="eyebrow">Your workspace</span>
+                <strong>Chats</strong>
+              </div>
+              <button id="sidebarToggle" class="sidebarToggle" type="button"
+                      aria-expanded="true" aria-controls="chatSidebar"
+                      title="Collapse conversation list">
+                <span aria-hidden="true">&#10094;</span>
+                <span class="srOnly">Collapse conversation list</span>
+              </button>
+            </div>
+            <button id="newChatBtn" class="newChatBtn" type="button" title="Start a new chat">
+              <span aria-hidden="true">+</span> New chat
+            </button>
+            <div class="conversationList" id="conversationList"></div>
+            <div class="chatSidebarFoot">Conversations are saved for this PDF.</div>
+          </aside>
+          <section class="chatShell">
+            <div class="messages" id="messages"></div>
+            <form id="chatForm" class="composer">
+              <textarea id="question" rows="1" placeholder="Ask a question about this document… (Enter to send, Shift+Enter for newline)"></textarea>
+              <button type="submit" id="askBtn" class="btn primary">Ask</button>
+            </form>
+          </section>
+        </div>
       </section>
     </main>
 
