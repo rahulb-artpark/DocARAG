@@ -32,9 +32,20 @@ def _text(text, *, top, left=95, right=480, lines=1, level=None, page=6):
 
 
 def _algorithm(body, *, top, left=202, right=582, height=131, page=6):
+    """An anchor in the shape the pass actually receives.
+
+    listing_merger runs after bind_canonical_evidence, which overwrites "type"
+    with the canonical projection's node type and fills "text" from the selected
+    representation. So an anchor arrives typed "algorithm" with its listing
+    already unwrapped into "text" -- not typed "code" with the text still inside
+    a wrapped code_body, which is MinerU's shape and is what the first version
+    of this pass looked for. It found nothing on every real document.
+    """
+
     return {
-        "type": "code",
+        "type": "algorithm",
         "sub_type": "algorithm",
+        "text": body,
         "code_body": (
             '<div class="mineru-algorithm" style="white-space: pre-wrap; '
             f'font-family:monospace;">\n{body}\n</div>'
@@ -49,6 +60,7 @@ def _code(body, *, top, left=199, right=520, height=43, page=2, language="txt"):
     return {
         "type": "code",
         "sub_type": "code",
+        "text": body,
         "code_body": f"```{language}\n{body}\n```",
         "bbox": [left, top, right, top + height],
         "page_idx": page,
@@ -64,6 +76,32 @@ def _listing(pdf_list):
     found = [b for b in _survivors(pdf_list) if b.get("sub_type") == "algorithm"]
     assert len(found) == 1, f"expected one listing, got {len(found)}"
     return found[0]
+
+
+class TheAnchorIsFoundInEitherShape(unittest.TestCase):
+    """The pass must not depend on where it sits relative to the bind step.
+
+    Typing the anchor "algorithm" is what bind_canonical_evidence does; typing
+    it "code" with sub_type "algorithm" is MinerU's own content list. Looking
+    for only the second made this pass a no-op in production while every unit
+    test passed, so both are covered.
+    """
+
+    def _page(self, anchor):
+        return [anchor, _text("Step 2: continue", top=135)]
+
+    def test_the_post_bind_shape_is_an_anchor(self):
+        page = self._page(_algorithm("Step 1", top=89, height=40))
+        listing_merger(page)
+        self.assertIn("Step 2: continue", _listing(page)["text"])
+
+    def test_the_raw_mineru_shape_is_an_anchor(self):
+        anchor = _algorithm("Step 1", top=89, height=40)
+        anchor["type"] = "code"
+        anchor.pop("text")
+        page = self._page(anchor)
+        listing_merger(page)
+        self.assertIn("Step 2: continue", _listing(page)["text"])
 
 
 class ASplitListingIsRejoined(unittest.TestCase):
@@ -273,10 +311,12 @@ class TheRunStopsWhereTheListingDoes(unittest.TestCase):
             _algorithm("If $N < 1$\nExit", top=200, height=40),
             _text("Wrapped prose follows", top=400, lines=4),
         ]
+        before = dict(page[1])
         listing_merger(page)
         listing = _listing(page)
-        self.assertNotIn("text", listing)
-        self.assertIn("code_body", listing)
+        # Nothing was rejoined, so nothing about the block may change -- in
+        # particular it keeps its code_body and earns no merge provenance.
+        self.assertEqual(listing, before)
         self.assertNotIn("transformations", listing)
 
     def test_a_block_without_a_bbox_does_not_stop_the_pass(self):

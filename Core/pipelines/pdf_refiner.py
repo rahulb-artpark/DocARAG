@@ -1399,7 +1399,14 @@ def table_merger(pdf_list: list[Optional[str]], llm: LLM) -> list[Optional[str]]
 # algorithm. That is what keeps it away from real code: a Python or C++ listing
 # has no algorithm anchor, arrives whole with its indentation already intact,
 # and is never a candidate here.
-_LISTING_MERGEABLE_TYPES = frozenset({"text", "code"})
+#
+# The pass runs after bind_canonical_evidence, which overwrites each block's
+# "type" with the canonical projection's node type. An anchor therefore arrives
+# typed "algorithm", not "code" carrying sub_type "algorithm" -- the shape it
+# has in MinerU's own content list, and the shape the first version of this pass
+# looked for, which made it a silent no-op on every real document. Both shapes
+# are accepted so the pass cannot be broken again by where it sits in the order.
+_LISTING_MERGEABLE_TYPES = frozenset({"text", "code", "algorithm"})
 # A neighbour further from the run than this is a new block of content rather
 # than the listing's next line. Expressed as a multiple of the run's own line
 # pitch so it scales with the page, with a floor for a run too short to have
@@ -1448,6 +1455,14 @@ def _listing_reject_reason(content: Optional[dict]) -> Optional[str]:
     if _listing_bbox(content) is None:
         return "no bbox"
     return None
+
+
+def _is_listing_anchor(content: dict) -> bool:
+    """A block MinerU itself called an algorithm, in either shape."""
+
+    return (
+        content.get("sub_type") == "algorithm" or content.get("type") == "algorithm"
+    )
 
 
 def _listing_run_indices(page: list[dict], anchor: int, taken: set[int]) -> list[int]:
@@ -1556,7 +1571,7 @@ def listing_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
             content["_listing_seq"] = position
         taken: set[int] = set()
         for position, content in enumerate(page):
-            if position in taken or content.get("sub_type") != "algorithm":
+            if position in taken or not _is_listing_anchor(content):
                 continue
             if _listing_reject_reason(content) is not None:
                 continue
