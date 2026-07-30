@@ -650,6 +650,42 @@ function stageStepHtml(stage, waitingOn) {
   </section>`;
 }
 
+// The reader's own label for a document, shown just before the status pill so
+// the eye reaches it on the way to the status rather than hunting for it. An
+// untagged document offers a quiet "+ tag" affordance instead of a chip, so the
+// row does not fill with placeholders.
+const MAX_TAG_LENGTH = 32;
+
+function runTagHtml(tag) {
+  const label = String(tag || "").trim();
+  return label
+    ? `<button class="runTag" type="button" title="Edit tag">${escapeHtml(label)}</button>`
+    : `<button class="runTag empty" type="button" title="Add a tag">+ tag</button>`;
+}
+
+async function editRunTag(card) {
+  const runDir = card.dataset.run;
+  const button = card.querySelector(".runTag");
+  const current = button.classList.contains("empty") ? "" : button.textContent.trim();
+  const entered = prompt(
+    `Tag for “${card.querySelector(".runName").textContent}”\n` +
+      `Up to ${MAX_TAG_LENGTH} characters. Leave empty to remove the tag.`,
+    current,
+  );
+  if (entered === null) return; // cancelled, not cleared
+  try {
+    await api("/api/run-tag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ runDir, tag: entered }),
+    });
+  } catch (err) {
+    alert("Could not save the tag: " + err.message);
+    return;
+  }
+  await loadLibrary();
+}
+
 function runCardHtml(run) {
   const status = run.overallStatus || (run.viewable ? "succeeded" : "pending");
   const isCurrent = run.runDir === state.currentRun;
@@ -662,6 +698,7 @@ function runCardHtml(run) {
   return `<article class="runCard ${isCurrent ? "current" : ""}" data-run="${escapeHtml(run.runDir)}">
     <div class="runCardTop">
       <span class="runName" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
+      ${runTagHtml(run.tag)}
       <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
       ${isCurrent ? '<span class="pill">open</span>' : ""}
       ${canOpen ? '<button class="btn openRun">Open</button>' : ""}
@@ -693,6 +730,10 @@ async function loadLibrary() {
   $("runGrid").innerHTML = runs.length
     ? runs.map(runCardHtml).join("")
     : '<div class="libraryEmpty">No documents yet. Drop a PDF above to index one.</div>';
+
+  $("runGrid").querySelectorAll(".runTag").forEach((btn) => {
+    btn.addEventListener("click", () => editRunTag(btn.closest(".runCard")));
+  });
 
   $("runGrid").querySelectorAll(".openRun").forEach((btn) => {
     btn.addEventListener("click", async () => {

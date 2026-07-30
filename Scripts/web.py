@@ -269,6 +269,49 @@ def run_completed(run_dir):
     )
 
 
+# A library tag is the reader's own label for a document -- "textbook", "to
+# read", a course code. It is kept in the run directory for the same reason the
+# chat history is: deleting the document rmtree's the run, so the label goes with
+# it and cannot outlive what it labels. run-manifest.json is provenance and is
+# hashed, so a user-editable field has no business in it.
+LIBRARY_TAG_FILE = "library-tag.json"
+MAX_TAG_LENGTH = 32
+
+
+def read_run_tag(run_dir):
+    data = _read_json_if_present(Path(run_dir) / LIBRARY_TAG_FILE)
+    tag = data.get("tag")
+    return tag if isinstance(tag, str) and tag.strip() else None
+
+
+def normalize_tag(raw):
+    """One short single-line label, or None to clear it."""
+
+    text = " ".join(str(raw or "").split())
+    return text[:MAX_TAG_LENGTH] or None
+
+
+def write_run_tag(run_dir, tag):
+    """Store or clear a run's tag; returns what was stored."""
+
+    path = Path(run_dir) / LIBRARY_TAG_FILE
+    tag = normalize_tag(tag)
+    if tag is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump({"version": 1, "tag": tag}, handle, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+    return tag
+
+
 def run_summary(run_dir, history=None):
     progress = run_progress(run_dir, history)
     source = _read_json_if_present(run_dir / "run-manifest.json").get("source") or {}
@@ -277,6 +320,7 @@ def run_summary(run_dir, history=None):
         source_name = Path(str(source["path"])).name
     name = source_name or run_dir.name
     progress["name"] = name
+    progress["tag"] = read_run_tag(run_dir)
     progress["mtime"] = run_dir.stat().st_mtime
     return progress
 
@@ -1642,6 +1686,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/edit-summary":
             self.edit_summary()
             return
+        if parsed.path == "/api/run-tag":
+            self.set_run_tag()
+            return
         if parsed.path == "/api/conversations":
             try:
                 self.send_json(self.state.create_conversation(), HTTPStatus.CREATED)
@@ -1772,6 +1819,34 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(
             {"ok": True, "name": name, "path": str(target), "runDir": run_dir}
         )
+
+    def set_run_tag(self):
+        """Label one document in the library, or clear its label."""
+
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        run_dir = self.resolve_run_argument(payload.get("runDir"))
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+            return
+        raw = payload.get("tag")
+        if raw is not None and not isinstance(raw, str):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "tag must be text")
+            return
+        try:
+            tag = write_run_tag(run_dir, raw)
+        except OSError as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not save the tag", str(exc)
+            )
+            return
+        self.send_json({"ok": True, "runDir": str(run_dir), "tag": tag})
 
     def edit_summary(self):
         try:

@@ -436,7 +436,28 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 }
 .runCard.current { border-color: var(--accent); }
 .runCardTop { display: flex; align-items: center; gap: 10px; }
-.runName { font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The name takes the slack so the tag, the status and the buttons all sit
+   against the right edge, and a long filename ellipsises instead of shoving
+   them off the card. */
+.runName {
+  flex: 1; min-width: 0;
+  font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* The reader's own label, immediately left of the status pill. Deliberately not
+   styled as a .pill: a status is reported by the system, a tag is chosen by the
+   reader, and they should not read as the same kind of thing. */
+.runTag {
+  flex: none; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px;
+  background: #fff; color: var(--ink);
+  font: 600 11px/1.5 inherit; letter-spacing: .02em; cursor: pointer;
+}
+.runTag:hover { border-color: var(--accent); color: var(--accent); }
+.runTag.empty {
+  border-style: dashed; color: var(--muted); font-weight: 600; opacity: .75;
+}
+.runTag.empty:hover { opacity: 1; color: var(--accent); }
 .runCardTop .btn { margin-left: auto; }
 .pill {
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
