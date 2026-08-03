@@ -8,49 +8,94 @@ the document, and the vectors are built from exactly what queries will read.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlparse
 
 from Core.Index.Tree import NodeType
 
 from docarag.document_store import DocumentStore
 
 
-def _openable_image(*candidates: object) -> str:
-    """The first candidate something can actually open.
+def asset_cas_root(run_dir: object) -> Path | None:
+    """The content-addressed store a run's crops were published into."""
 
-    Evidence carries an image as its canonical identity, ``cas://sha256/<digest>``,
-    while the materialized local path lives on the node's own meta. Preferring
-    evidence unconditionally meant a chart or diagram reached the graph stage
-    holding a URI where a filename belonged, and the VLM client posted the URI
-    itself as though it were the image -- the server answered "illegal base64
-    data at input byte 3", the 3 being the colon in ``cas:``. Every chart and
-    diagram in a document lost its entities that way, while plain figures, whose
-    evidence carried no URI, were unaffected.
+    configured = os.environ.get("DOCARAG_ASSET_CAS_ROOT")
+    if configured:
+        root = Path(configured).expanduser()
+        return root if root.is_dir() else None
+    if not isinstance(run_dir, (str, Path)) or not str(run_dir):
+        return None
+    root = Path(run_dir).expanduser().resolve() / "asset_cas"
+    return root if root.is_dir() else None
 
-    A URI names a thing; it does not open one. So identity never displaces a
-    path here.
+
+def _from_cas(uri: str, root: Path | None) -> str:
+    """Resolve ``cas://sha256/<digest>`` to the file the store published.
+
+    ``docarag.crop_materialization`` publishes every visual crop into the run's
+    content-addressed store and rewrites the block to carry the CAS URI, so for
+    a chart or diagram the URI is frequently the *only* image reference the tree
+    holds. The layout is ``<root>/<first-two-hex>/<digest>``.
     """
 
-    for candidate in candidates:
-        if not isinstance(candidate, str) or not candidate:
-            continue
-        if "://" in candidate:
-            continue
-        return candidate
+    if root is None:
+        return ""
+    parsed = urlparse(uri)
+    if parsed.scheme != "cas" or parsed.netloc != "sha256":
+        return ""
+    digest = parsed.path.lstrip("/")
+    if len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
+        return ""
+    published = root / digest[:2] / digest
+    return str(published) if published.is_file() else ""
+
+
+def openable_image(*candidates: object, cas_root: Path | None = None) -> str:
+    """The first candidate something can actually open.
+
+    An image reaches a node two ways: as a materialized local path, or as its
+    canonical identity ``cas://sha256/<digest>``. A URI names a thing; it does
+    not open one -- and ollama-python, handed one where a filename belonged,
+    posted the URI itself as though it were the image. The server answered
+    "illegal base64 data at input byte 3", the 3 being the colon in ``cas:``,
+    and every chart and diagram in a document lost its entities that way.
+
+    So a URI never passes through as a path. It is either resolved to the file
+    the content-addressed store actually holds, or it is not an image here --
+    because for a materialized crop the URI is often the only reference there
+    is, and refusing it outright leaves the same figures with no image at all.
+
+    A materialized path is preferred to a resolvable URI: both name the same
+    bytes, and identity resolving ahead of a path is what went wrong here once
+    already.
+    """
+
+    usable = [item for item in candidates if isinstance(item, str) and item]
+    for candidate in usable:
+        if "://" not in candidate:
+            return candidate
+    for candidate in usable:
+        resolved = _from_cas(candidate, cas_root)
+        if resolved:
+            return resolved
     return ""
 
 
 class _NodeMeta:
     """The meta surface the vector stage reads, backed by store channels."""
 
-    def __init__(self, view: Any, evidence: dict) -> None:
+    def __init__(self, view: Any, evidence: dict, cas_root: Path | None = None) -> None:
         meta = view.meta_info
         self.content = meta.content
         self.caption = meta.caption
         self.footnote = meta.footnote
         self.table_body = meta.table_body
-        self.img_path = _openable_image(evidence.get("img_path"), meta.img_path)
+        self.img_path = openable_image(
+            evidence.get("img_path"), meta.img_path, cas_root=cas_root
+        )
         self.page_idx = evidence.get("page")
         self.page_id = evidence.get("page_id")
         self.pdf_id = evidence.get("pdf_id")
@@ -78,7 +123,7 @@ class _NodeMeta:
 
 
 class _Node:
-    def __init__(self, view: Any, evidence: dict) -> None:
+    def __init__(self, view: Any, evidence: dict, cas_root: Path | None = None) -> None:
         self.index_id = view.index_id
         kind = str(view.type)
         try:
@@ -88,7 +133,7 @@ class _Node:
         self.depth = view.depth
         self.summary = view.summary
         self.outline_node = view.outline_node
-        self.meta_info = _NodeMeta(view, evidence)
+        self.meta_info = _NodeMeta(view, evidence, cas_root)
         self.parent: "_Node | None" = None
         self.children: list["_Node"] = []
 
@@ -98,9 +143,10 @@ class StoreTreeSource:
 
     def __init__(self, store: DocumentStore) -> None:
         views = store.tree.nodes()
+        cas_root = asset_cas_root(store.run_dir)
         by_id: dict[int, _Node] = {}
         for view in views:
-            by_id[view.index_id] = _Node(view, dict(view.evidence or {}))
+            by_id[view.index_id] = _Node(view, dict(view.evidence or {}), cas_root)
         self.root_node = None
         for view in views:
             node = by_id[view.index_id]
@@ -176,4 +222,4 @@ class StoreTreeSource:
             store.close()
 
 
-__all__ = ["StoreTreeSource"]
+__all__ = ["StoreTreeSource", "openable_image"]
