@@ -78,7 +78,16 @@ if args and args[0].endswith("docarag/runtime_probe.py"):
 if args[:2] == ["-m", "docarag.tree_integrity"]:
     from docarag.tree_integrity import _main
 
-    raise SystemExit(_main(args[2:]))
+    # Evidence persistence is stubbed above, so there is no store for the
+    # driver's store check to read. These tests exercise stage orchestration;
+    # the stored-tree gate is covered by tests/test_stored_tree_integrity.py.
+    integrity_args = args[2:]
+    if "--check" in integrity_args:
+        index = integrity_args.index("--check")
+        if integrity_args[index + 1] == "store":
+            raise SystemExit(0)
+        del integrity_args[index : index + 2]
+    raise SystemExit(_main(integrity_args))
 if args[:2] == ["-m", "docarag.provenance"]:
     from docarag.provenance import _main
 

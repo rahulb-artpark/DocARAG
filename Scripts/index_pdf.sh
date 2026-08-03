@@ -1286,6 +1286,20 @@ PY
         return "$status"
       fi
     fi
+    # The tree the graph and vector stages read is the stored one, so it is
+    # checked here -- once it exists, and before hours of extraction are spent
+    # on a tree whose figures nothing can open.
+    if [[ "$stage" == "tree" ]]; then
+      if ! run_tracked "stored tree integrity verification" \
+        "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir" --check store; then
+        status=1
+        error="the stored tree is unsound; see $run_dir/logs/index-driver.log"
+        update_index_state "$state_file" "$revision_id" "$$" stage_failed "$stage" "$status" "$error"
+        archive_attempt_state "$state_file" "$DRIVER_ATTEMPT_DIR" || true
+        DRIVER_FINALIZED=1
+        return "$status"
+      fi
+    fi
     echo "[driver] $(date) $stage done (exit 0)"
   done
 
@@ -1303,11 +1317,11 @@ PY
     return "$status"
   fi
   if run_tracked "final tree integrity verification" \
-    "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir"; then
+    "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir" --check all; then
     :
   else
     status=$?
-    error="tree pickle/JSON consistency or source identity failed before publication"
+    error="the stored tree or its source identity failed verification before publication"
     update_index_state "$state_file" "$revision_id" "$$" run_failed "" "$status" "$error"
     archive_attempt_state "$state_file" "$DRIVER_ATTEMPT_DIR" || true
     DRIVER_FINALIZED=1

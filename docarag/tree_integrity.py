@@ -1,8 +1,25 @@
-"""Validate that BookRAG's pickle and JSON trees describe one source tree.
+"""Verify the tree a run will actually be answered from.
 
-This helper intentionally runs with the indexing interpreter.  Loading a
-``DocumentTree`` pickle needs the same BookRAG/Pydantic environment that wrote
-it, while the controller itself remains dependency-light.
+Two things carry a tree out of the tree stage, and only one of them is read
+afterwards.  The run directory keeps ``tree.pkl`` and ``tree.json`` as build
+artifacts, while the graph and vector stages open the store
+(:class:`docarag.vdb_tree_source.StoreTreeSource`) and the query path opens
+:class:`docarag.rag.stored_index.StoredIndex`.  This module checks both, but
+they answer different questions:
+
+* ``artifacts`` -- the tree stage wrote a structurally sound tree and bound it
+  to the source it claims.  Cheap, and it runs before anything downstream has
+  consumed the tree.
+* ``store`` -- *the rows the next stage will read* are sound.  This is the
+  check that matters, because a legacy artifact is allowed to disagree with
+  the store and did: every chart and diagram in a document reached the graph
+  stage holding ``cas://sha256/<digest>`` where a filename belonged, lost all
+  of its entities, and nothing failed.  ``tree.pkl`` held a clean local path
+  the whole time, so comparing the two artifacts to each other said the tree
+  was fine.
+
+An artifact check can only ever prove the artifacts agree with each other.
+The store check proves the tree is usable.
 """
 
 from __future__ import annotations
@@ -13,6 +30,16 @@ from pathlib import Path
 import pickle
 import sys
 from typing import Any
+
+# Every import the store check needs is deferred into the functions that need
+# it: the artifact check runs under the controller's dependency-light
+# interpreter, which has no BookRAG on its path at all.
+#
+# The kinds MinerU always crops an image for.  A chart the store holds no
+# openable image for is the failure this module exists to catch, so their
+# absence is an error rather than a note; a table or an equation legitimately
+# carries only text.
+VISUAL_NODE_TYPES = frozenset({"image", "chart", "diagram"})
 
 
 class TreeIntegrityError(ValueError):
@@ -167,15 +194,123 @@ def verify_tree_pair(
             )
 
 
+def _stored_summaries(views: Any) -> list[dict[str, Any]]:
+    """The topology fields, taken from the rows rather than from a file."""
+
+    return [
+        {
+            "index_id": view.index_id,
+            "parent_id": view.parent_id,
+            "type": str(view.type) if view.type else None,
+        }
+        for view in views
+    ]
+
+
+def _resolve_image(path: str, run: Path) -> Path | None:
+    """Return the image ``path`` names, whether it is absolute or run-relative."""
+
+    candidate = Path(path).expanduser()
+    if candidate.is_file():
+        return candidate
+    if not candidate.is_absolute():
+        relative = (run / candidate).resolve()
+        if relative.is_file():
+            return relative
+    return None
+
+
+def _image_faults(views: Any, run: Path) -> list[str]:
+    """Name every visual node the next stage could not open an image for."""
+
+    from docarag.vdb_tree_source import asset_cas_root, openable_image
+
+    # Resolved exactly as the stages resolve it, so the gate passes a tree if
+    # and only if the next stage can open its figures.
+    cas_root = asset_cas_root(run)
+    faults: list[str] = []
+    for view in views:
+        kind = (str(view.type) if view.type else "").lower()
+        if kind not in VISUAL_NODE_TYPES:
+            continue
+        evidence = dict(getattr(view, "evidence", None) or {})
+        candidates = (evidence.get("img_path"), view.meta_info.img_path)
+        path = openable_image(*candidates, cas_root=cas_root)
+        if not path:
+            named = [item for item in candidates if isinstance(item, str) and item]
+            if named:
+                # An identifier reached the field a filename belongs in and the
+                # store does not hold it. This is the exact shape of the bug
+                # that cost a document its chart and diagram entities.
+                faults.append(
+                    f"node {view.index_id} ({kind}) carries an image reference "
+                    f"nothing can open: {named[0]!r}"
+                )
+            else:
+                faults.append(f"node {view.index_id} ({kind}) has no image at all")
+            continue
+        if _resolve_image(path, run) is None:
+            faults.append(f"node {view.index_id} ({kind}) names a missing image: {path}")
+    return faults
+
+
+def verify_stored_tree(run_dir: Path) -> None:
+    """Verify the tree as the store holds it, which is the tree that is read."""
+
+    from docarag.document_store import DocumentStore
+
+    run = run_dir.expanduser().resolve()
+    try:
+        store = DocumentStore.open(str(run))
+    except Exception as exc:
+        # A refused connection and an unbound revision both mean the same thing
+        # to this gate: the tree the next stage will read cannot be seen, so
+        # nothing about it has been verified. Reported, never passed over.
+        raise TreeIntegrityError(f"the stored tree cannot be opened: {exc}") from exc
+    try:
+        views = store.tree.nodes()
+    except Exception as exc:  # A store that cannot be read is an integrity failure.
+        raise TreeIntegrityError(f"the stored tree cannot be read: {exc}") from exc
+    finally:
+        store.close()
+
+    if not views:
+        raise TreeIntegrityError(
+            "the store holds no tree for this revision; the tree stage's output "
+            "was never persisted"
+        )
+    _validate_topology(_stored_summaries(views))
+    faults = _image_faults(views, run)
+    if faults:
+        raise TreeIntegrityError(
+            "the stored tree carries images no stage can open:\n  "
+            + "\n  ".join(faults)
+        )
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Verify BookRAG tree artifacts")
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument(
+        "--check",
+        choices=("artifacts", "store", "all"),
+        default="artifacts",
+        help=(
+            "artifacts: the tree stage's own output is sound. "
+            "store: the rows the next stage reads are sound. "
+            "all: both."
+        ),
+    )
     parser.add_argument("--source-sha256")
     parser.add_argument("--source-uri")
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--source-name")
     args = parser.parse_args(argv)
     try:
+        if args.check in ("store", "all"):
+            verify_stored_tree(args.run)
+        if args.check == "store":
+            return 0
         if not all(
             (args.source_sha256, args.source_uri, args.snapshot, args.source_name)
         ):
