@@ -225,7 +225,18 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
             _VISUAL_KG_NODE_TYPES,
         )
 
-        extracted = _values(set(_TEXTUAL_KG_NODE_TYPES) | set(_VISUAL_KG_NODE_TYPES))
+        from Core.Index.Tree import NodeType
+
+        # Mirrors the dispatch in _Extractor.extract: textual, then visual, then
+        # table, then equation -- plus title, which kg_builder routes to
+        # extract_title before extract() ever sees it. Listing table/equation/
+        # title as *not* extracted was wrong: every one of them produced a
+        # checkpoint on a real document.
+        extracted = _values(
+            set(_TEXTUAL_KG_NODE_TYPES)
+            | set(_VISUAL_KG_NODE_TYPES)
+            | {NodeType.TABLE, NodeType.EQUATION, NodeType.TITLE}
+        )
         undecided = (
             _reachable_node_types() - extracted - _values(_NOT_EXTRACTED_NODE_TYPES)
         )
@@ -250,9 +261,13 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
             _VISUAL_KG_NODE_TYPES,
         )
 
-        both = _values(set(_TEXTUAL_KG_NODE_TYPES) | set(_VISUAL_KG_NODE_TYPES)) & _values(
-            _NOT_EXTRACTED_NODE_TYPES
-        )
+        from Core.Index.Tree import NodeType
+
+        both = _values(
+            set(_TEXTUAL_KG_NODE_TYPES)
+            | set(_VISUAL_KG_NODE_TYPES)
+            | {NodeType.TABLE, NodeType.EQUATION, NodeType.TITLE}
+        ) & _values(_NOT_EXTRACTED_NODE_TYPES)
         self.assertEqual(sorted(both), [])
 
     def test_furniture_is_declared_skipped_by_both_seams(self):

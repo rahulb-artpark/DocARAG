@@ -1,6 +1,6 @@
 from Core.Index.Tree import DocumentTree, NodeType
 from Core.Index.Graph import Graph
-from Core.pipelines.kg_extractor import KGExtractor
+from Core.pipelines.kg_extractor import KGExtractor, is_extractable
 from Core.pipelines.kg_refiner import KGRefiner
 from Core.configs.system_config import SystemConfig
 from Core.configs.graph_config import graph_artifact_variant
@@ -26,7 +26,29 @@ from rich.logging import RichHandler
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from itertools import batched
+
+
+class IncompleteKnowledgeGraphError(RuntimeError):
+    """Raised when extraction lost nodes that the graph is supposed to cover.
+
+    Publishing anyway would leave those nodes unreachable through the graph with
+    nothing recording their absence, and clearing the refinement state would
+    make the loss permanent.  Failing keeps every committed checkpoint, so a
+    resumed graph stage re-attempts only the nodes that failed.
+    """
+
+    def __init__(self, failed_node_ids):
+        self.failed_node_ids = sorted(failed_node_ids)
+        preview = ", ".join(str(node_id) for node_id in self.failed_node_ids[:20])
+        if len(self.failed_node_ids) > 20:
+            preview += ", ..."
+        super().__init__(
+            f"KG extraction failed for {len(self.failed_node_ids)} node(s) "
+            f"after a retry: {preview}. Refusing to publish a graph that is "
+            f"missing them; resume the graph stage to re-attempt."
+        )
 
 # log_dir = "/home/wangshu/multimodal/GBC-RAG/test/index_qwen3/logs"
 # if not os.path.exists(log_dir):
@@ -159,14 +181,30 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
             batch_results.sort(key=lambda item: item.get("node_idx", -1))
             return batch_results
 
+        # Page furniture is excluded by decision, not by capability, so it is
+        # dropped here instead of being sent into extraction where the resulting
+        # error would be indistinguishable from a node that genuinely failed.
+        extractable_nodes = [
+            node
+            for node in tree.nodes
+            if node is not tree.root_node and is_extractable(node.type)
+        ]
+        skipped = max(0, len(tree.nodes) - 1 - len(extractable_nodes))
+        if skipped:
+            log.info(
+                "Skipping %d page-furniture node(s); %d node(s) are extractable",
+                skipped,
+                len(extractable_nodes),
+            )
+
         # Each successful node has its own durable extraction file before refinement,
         # so a failed later node can be resumed without publishing an incomplete KG.
         source_nodes = (
-            node
-            for node in tree.nodes
-            if node is not tree.root_node and node.index_id not in refined_node_ids
+            node for node in extractable_nodes if node.index_id not in refined_node_ids
         )
+        extractable_total = len(extractable_nodes)
         extracted_count = len(refined_node_ids)
+        failed_node_ids: set[int] = set()
         node_batches = batched(source_nodes, cfg.graph.extraction_batch_size)
 
         # Refinement is serial and holds one provider slot, leaving the rest of
@@ -174,41 +212,70 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         # being refined keeps them busy; the provider's own admission semaphore
         # still caps total concurrency, so this cannot oversubscribe the model.
         # At most two microbatches of extraction results are held at once.
-        with ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="kg-extraction"
-        ) as extraction_pump:
-            upcoming = next(node_batches, None)
-            pending = (
-                extraction_pump.submit(extract_batch, upcoming)
-                if upcoming is not None
-                else None
-            )
-            while pending is not None:
-                batch_results = pending.result()
-                upcoming = next(node_batches, None)
-                pending = (
-                    extraction_pump.submit(extract_batch, upcoming)
-                    if upcoming is not None
-                    else None
-                )
+        def commit_batches(batches):
+            nonlocal extracted_count
+            with ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kg-extraction"
+            ) as extraction_pump:
+                # The pump thread is where iter_bounded_ordered copies the context
+                # it hands to its own workers. Submitting bare would copy this
+                # thread's empty context instead of the run's, and every record
+                # the extractor emits would be filtered out of the run log --
+                # which is how a whole document's failed nodes once went unseen.
+                def submit(batch):
+                    return extraction_pump.submit(copy_context().run, extract_batch, batch)
 
-                for result in batch_results:
-                    refine_extraction(result)
-                    refined_node_ids.add(result.get("node_idx", -1))
-                    extracted_count += 1
-                save_refinement_state(
-                    cfg.save_path,
-                    graph=graph_index,
-                    alias_map=kg_refiner.entity_alias_map,
-                    refined_node_ids=refined_node_ids,
-                    variant=variant,
-                )
-                log.info(
-                    "Committed KG extraction/refinement for %d/%d tree nodes",
-                    extracted_count,
-                    max(0, len(tree.nodes) - 1),
-                )
-                kg_refiner.er_stats.log_snapshot(len(graph_index.kg.nodes))
+                upcoming = next(batches, None)
+                pending = submit(upcoming) if upcoming is not None else None
+                while pending is not None:
+                    batch_results = pending.result()
+                    upcoming = next(batches, None)
+                    pending = submit(upcoming) if upcoming is not None else None
+
+                    for result in batch_results:
+                        node_idx = result.get("node_idx", -1)
+                        if result.get("extraction_failed"):
+                            # Leaving it out of refined_node_ids is what lets a
+                            # retry re-attempt it; counting it as extracted here
+                            # is what used to hide the loss.
+                            failed_node_ids.add(node_idx)
+                            continue
+                        refine_extraction(result)
+                        refined_node_ids.add(node_idx)
+                        failed_node_ids.discard(node_idx)
+                        extracted_count += 1
+                    save_refinement_state(
+                        cfg.save_path,
+                        graph=graph_index,
+                        alias_map=kg_refiner.entity_alias_map,
+                        refined_node_ids=refined_node_ids,
+                        variant=variant,
+                    )
+                    log.info(
+                        "Committed KG extraction/refinement for %d/%d tree nodes",
+                        extracted_count,
+                        extractable_total,
+                    )
+                    kg_refiner.er_stats.log_snapshot(len(graph_index.kg.nodes))
+
+        commit_batches(node_batches)
+
+        if failed_node_ids:
+            # A transient provider failure is the common case, and re-running the
+            # whole stage to recover a handful of nodes is expensive, so retry
+            # them once here before deciding the graph cannot be published.
+            log.warning(
+                "Retrying KG extraction for %d node(s) that failed: %s",
+                len(failed_node_ids),
+                sorted(failed_node_ids),
+            )
+            retry_nodes = [
+                node for node in extractable_nodes if node.index_id in failed_node_ids
+            ]
+            commit_batches(batched(retry_nodes, cfg.graph.extraction_batch_size))
+
+        if failed_node_ids:
+            raise IncompleteKnowledgeGraphError(failed_node_ids)
 
         log.info("Knowledge graph extraction completed.")
         log.info("Extracted %d nodes from the document tree.", extracted_count)

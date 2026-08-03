@@ -71,13 +71,9 @@ _VISUAL_KG_NODE_TYPES = frozenset(
     {NodeType.IMAGE, NodeType.CHART, NodeType.DIAGRAM}
 )
 
-# Reachable node types deliberately kept out of entity extraction. A type in
-# neither KG set is skipped in silence, exactly as in the index, so the omissions
-# are named here and a test holds the two lists together.
-#
-# The furniture reasons were decided when furniture got its own node type. The
-# other three were not written down at the time and are recorded here from the
-# behaviour, so that changing them is a decision rather than an accident.
+# Reachable node types deliberately kept out of entity extraction.  Every other
+# reachable type must produce an extraction result, and a test holds this list
+# against what :meth:`_Extractor.extract` actually dispatches.
 _NOT_EXTRACTED_NODE_TYPES = frozenset(
     {
         # Page furniture names no entity the document is about: a running header
@@ -86,16 +82,19 @@ _NOT_EXTRACTED_NODE_TYPES = frozenset(
         NodeType.FOOTER,
         NodeType.ASIDE,
         NodeType.DISCARDED,
-        # A table's evidence is its cells and an equation's is LaTeX. Neither
-        # reads as prose naming entities, and the paragraph that introduces them
-        # is extracted in their place.
-        NodeType.TABLE,
-        NodeType.EQUATION,
-        # A heading names the section its children discuss, so extracting from it
-        # duplicates entities those children already yield.
-        NodeType.TITLE,
     }
 )
+
+
+def is_extractable(node_type: NodeType) -> bool:
+    """Whether a node of this type is expected to yield entities.
+
+    The excluded types are a decision, not a capability gap, so the caller skips
+    them outright rather than sending them into extraction and reading the
+    resulting error as if it were a failure.
+    """
+
+    return node_type not in _NOT_EXTRACTED_NODE_TYPES
 
 _SENSITIVE_CONFIG_FIELDS = frozenset(
     {
@@ -1659,9 +1658,11 @@ class KGExtractor:
     ) -> Iterator[Dict[str, Any]]:
         """Yield node results in input order with bounded submission.
 
-        A node whose extraction fails after retries is logged and skipped with an
-        empty result so one unreliable node cannot abort the whole document. Its
-        checkpoint is not committed, so a later run re-attempts it.
+        A node whose extraction fails after retries is logged and yielded as an
+        empty result carrying ``extraction_failed``, so one unreliable node does
+        not abort the batch mid-flight while the caller can still tell a failure
+        apart from a node that genuinely named no entity.  Its checkpoint is not
+        committed, so a retry re-attempts it.
         """
 
         worker_limit = max_workers or self.cfg_graph.extraction_max_workers
@@ -1685,7 +1686,12 @@ class KGExtractor:
                     node.index_id,
                     outcome.error,
                 )
-                yield {"entities": [], "relations": [], "node_idx": node.index_id}
+                yield {
+                    "entities": [],
+                    "relations": [],
+                    "node_idx": node.index_id,
+                    "extraction_failed": True,
+                }
                 continue
             yield outcome.unwrap()
 
@@ -1741,7 +1747,12 @@ class KGExtractor:
                     node.index_id,
                     outcome.error,
                 )
-                yield {"entities": [], "relations": [], "node_idx": node.index_id}
+                yield {
+                    "entities": [],
+                    "relations": [],
+                    "node_idx": node.index_id,
+                    "extraction_failed": True,
+                }
                 continue
             yield outcome.unwrap()
 

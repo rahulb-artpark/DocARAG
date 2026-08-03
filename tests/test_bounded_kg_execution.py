@@ -96,7 +96,18 @@ class BoundedKGExtractionTests(unittest.TestCase):
 
         self.assertEqual([r["node_idx"] for r in results], list(range(8)))
         skipped = next(r for r in results if r["node_idx"] == 2)
-        self.assertEqual(skipped, {"entities": [], "relations": [], "node_idx": 2})
+        # The empty result carries the failure so the builder can tell it apart
+        # from a node that simply named no entity; without that flag the loss is
+        # silent and the node is never re-attempted.
+        self.assertEqual(
+            skipped,
+            {
+                "entities": [],
+                "relations": [],
+                "node_idx": 2,
+                "extraction_failed": True,
+            },
+        )
 
 
 class BoundedKGRefinementTests(unittest.TestCase):
