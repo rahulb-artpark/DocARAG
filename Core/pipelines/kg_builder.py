@@ -31,47 +31,44 @@ from contextvars import copy_context
 from itertools import batched
 
 
-EXTRACTION_GAPS_FILE = "kg_extraction_gaps.json"
+EXTRACTION_GAPS_EVENT = "kg.extraction.gaps"
 
 
-def extraction_gaps_path(save_path) -> str:
-    return os.path.join(save_path, EXTRACTION_GAPS_FILE)
+def extraction_gaps_payload(tree, failed_node_ids, *, variant=None) -> dict:
+    """Which nodes the graph does not cover, as the stage's own record.
 
+    Stopping the stage instead was worse than the loss it guarded against: a
+    handful of figures a provider refused would leave a document with no index
+    at all, and resuming cannot help when the refusal is deterministic. So the
+    graph is published without them and the gap is stated rather than left for
+    a reader to notice.
 
-def record_extraction_gaps(save_path, tree, failed_node_ids, *, variant=None) -> None:
-    """Write down which nodes the graph does not cover, or clear the record.
-
-    Stopping the stage instead was worse than the loss it was guarding against:
-    a handful of figures that a provider refused would leave a document with no
-    index at all, and no amount of resuming helps when the refusal is
-    deterministic.  So the graph is published without them and the gap becomes
-    something the run states, in a file a later pass can read, rather than
-    something a reader has to notice.
+    It is stated in Postgres, on the graph stage's own event stream, because
+    that is where this run's state lives. An earlier version of this wrote a
+    JSON file beside the graph, which put run state back in exactly the place
+    the store exists to replace -- and a file beside a graph is free to
+    disagree with the database, which is how a whole class of these bugs
+    starts.
     """
 
-    path = extraction_gaps_path(save_path)
-    if not failed_node_ids:
-        # A clean run must not inherit an older run's gaps.
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        return
-
     by_id = {node.index_id: node for node in tree.nodes}
-    gaps = []
+    missing = []
     for node_id in sorted(failed_node_ids):
         node = by_id.get(node_id)
-        node_type = getattr(getattr(node, "type", None), "value", None)
-        gaps.append({"node_idx": node_id, "node_type": node_type})
-    payload = {
-        "schema_version": "docarag.kg-extraction-gaps.v1",
+        missing.append(
+            {
+                "node_idx": node_id,
+                "node_type": getattr(getattr(node, "type", None), "value", None),
+            }
+        )
+    return {
         "variant": variant,
-        "extractable_nodes": sum(1 for node in tree.nodes if node is not tree.root_node),
-        "missing": gaps,
+        "extractable_nodes": sum(
+            1 for node in tree.nodes if node is not tree.root_node
+        ),
+        "missing_count": len(missing),
+        "missing": missing,
     }
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 # log_dir = "/home/wangshu/multimodal/GBC-RAG/test/index_qwen3/logs"
 # if not os.path.exists(log_dir):
@@ -90,11 +87,12 @@ def record_extraction_gaps(save_path, tree, failed_node_ids, *, variant=None) ->
 # )
 
 
-def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
+def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig, stage=None):
     """
     Build a knowledge graph from the given document tree.
 
     :param tree: DocumentTree object containing the document structure.
+    :param stage: the durable stage whose event stream records this run's state.
     :param graph_config: GraphConfig object containing configuration for the graph.
     :return: A tuple containing the KGExtractor and KGRefiner instances.
     """
@@ -303,14 +301,18 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         if failed_node_ids:
             log.error(
                 "Knowledge graph is missing %d node(s) whose extraction failed twice: %s. "
-                "Recorded in %s; the graph is published without them.",
+                "Recorded on the graph stage as %s; the graph is published without them.",
                 len(failed_node_ids),
                 sorted(failed_node_ids),
-                EXTRACTION_GAPS_FILE,
+                EXTRACTION_GAPS_EVENT,
             )
-        record_extraction_gaps(
-            cfg.save_path, tree, failed_node_ids, variant=variant
-        )
+        if stage is not None:
+            # Recorded on every run, so "no gaps" is a statement the run made
+            # rather than the absence of one.
+            stage.checkpoint(
+                EXTRACTION_GAPS_EVENT,
+                extraction_gaps_payload(tree, failed_node_ids, variant=variant),
+            )
 
         log.info("Knowledge graph extraction completed.")
         log.info("Extracted %d nodes from the document tree.", extracted_count)

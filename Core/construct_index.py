@@ -134,7 +134,7 @@ def _construct_GBC_index(
             payload={"variant": _graph_variant(cfg)},
             source_sha256=source_sha256,
         ) as graph_stage:
-            graph_index = build_knowledge_graph(tree_index, cfg)
+            graph_index = build_knowledge_graph(tree_index, cfg, stage=graph_stage)
             # A queryable BookRAG graph is the graph artifact *and* its entity
             # lookup index. Persist the graph first, then publish its lookup in
             # a separately leased stage below.

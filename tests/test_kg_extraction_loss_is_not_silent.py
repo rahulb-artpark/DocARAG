@@ -22,8 +22,6 @@ These tests hold all three shut.
 from __future__ import annotations
 
 import contextvars
-import json
-import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -86,7 +84,17 @@ class _Extractor:
         return []
 
 
-def _run(config, tree, extractor, refiner=None):
+class _Stage:
+    """Stands in for the durable stage, capturing what it was told."""
+
+    def __init__(self):
+        self.checkpoints = []
+
+    def checkpoint(self, name, payload=None):
+        self.checkpoints.append((name, dict(payload or {})))
+
+
+def _run(config, tree, extractor, refiner=None, stage=None):
     scope = {
         "tenant_id": "test",
         "corpus_id": "test",
@@ -102,7 +110,7 @@ def _run(config, tree, extractor, refiner=None):
         patch.object(kg_builder, "KGRefiner", return_value=refiner),
         patch.object(kg_builder, "tree_vector_scope", return_value=scope),
     ):
-        return kg_builder.build_knowledge_graph(tree, config)
+        return kg_builder.build_knowledge_graph(tree, config, stage=stage)
 
 
 def _refiner_mock() -> Mock:
@@ -158,44 +166,51 @@ class AFailedNodeIsRetriedThenRecordedAsAGap(unittest.TestCase):
     unrecorded, which is the bug this file exists for.
     """
 
-    def _gaps(self, directory):
-        path = kg_builder.extraction_gaps_path(directory)
-        if not os.path.exists(path):
-            return None
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
+    def _gaps(self, stage):
+        """The gap record as the run states it: a graph-stage event payload."""
+        for name, payload in stage.checkpoints:
+            if name == kg_builder.EXTRACTION_GAPS_EVENT:
+                return payload
+        return None
 
     def test_a_node_that_fails_once_is_retried_and_succeeds(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART, NodeType.TEXT)
         extractor = _Extractor(fail_ids={2}, fail_times=1)
+        stage = _Stage()
         with tempfile.TemporaryDirectory() as directory:
-            _run(_config(directory), tree, extractor)
+            _run(_config(directory), tree, extractor, stage=stage)
             # A completed stage still clears its resume state.
             self.assertFalse(state_path(directory).exists())
-            self.assertIsNone(self._gaps(directory), "nothing was actually lost")
+        self.assertEqual(0, self._gaps(stage)["missing_count"])
         self.assertEqual([1, 2, 3, 2], extractor.seen)
 
     def test_a_node_that_keeps_failing_does_not_stop_the_stage(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART, NodeType.DIAGRAM)
+        stage = _Stage()
         with tempfile.TemporaryDirectory() as directory:
-            _run(_config(directory), tree, _Extractor(fail_ids={2, 3}))
-            self.assertIsNotNone(self._gaps(directory))
+            _run(_config(directory), tree, _Extractor(fail_ids={2, 3}), stage=stage)
+        self.assertEqual(2, self._gaps(stage)["missing_count"])
 
     def test_the_record_names_the_nodes_that_were_lost(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART, NodeType.DIAGRAM)
+        stage = _Stage()
         with tempfile.TemporaryDirectory() as directory:
-            _run(_config(directory), tree, _Extractor(fail_ids={2, 3}))
-            missing = self._gaps(directory)["missing"]
+            _run(_config(directory), tree, _Extractor(fail_ids={2, 3}), stage=stage)
+        missing = self._gaps(stage)["missing"]
         self.assertEqual([2, 3], [entry["node_idx"] for entry in missing])
         self.assertEqual(["chart", "diagram"], [entry["node_type"] for entry in missing])
 
-    def test_a_clean_run_does_not_inherit_an_older_runs_gaps(self):
+    def test_every_run_states_its_gaps_so_none_is_inherited(self):
+        # The record belongs to one stage run, so a later run cannot be read
+        # through an earlier run's leftovers -- which a file beside the graph
+        # allowed.
         tree = _tree(NodeType.TEXT, NodeType.CHART)
+        first, second = _Stage(), _Stage()
         with tempfile.TemporaryDirectory() as directory:
-            _run(_config(directory), tree, _Extractor(fail_ids={2}))
-            self.assertIsNotNone(self._gaps(directory))
-            _run(_config(directory), tree, _Extractor())
-            self.assertIsNone(self._gaps(directory))
+            _run(_config(directory), tree, _Extractor(fail_ids={2}), stage=first)
+            _run(_config(directory), tree, _Extractor(), stage=second)
+        self.assertEqual(1, self._gaps(first)["missing_count"])
+        self.assertEqual(0, self._gaps(second)["missing_count"])
 
     def test_the_loss_is_reported_at_error_level(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART)
@@ -204,7 +219,7 @@ class AFailedNodeIsRetriedThenRecordedAsAGap(unittest.TestCase):
             with patch.object(
                 kg_builder.log, "error", lambda msg, *a: errors.append(msg % a if a else msg)
             ):
-                _run(_config(directory), tree, _Extractor(fail_ids={2}))
+                _run(_config(directory), tree, _Extractor(fail_ids={2}), stage=_Stage())
         self.assertTrue(any("missing" in message for message in errors))
 
     def test_a_failed_node_is_not_recorded_as_refined(self):
