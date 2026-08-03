@@ -11,7 +11,10 @@ from Core.prompts.refiner_prompt import (
 )
 from Core.utils.utils import num_tokens, get_json_content, enumerate_pdf_list
 from Core.utils.bounded_executor import iter_bounded_ordered
+import hashlib
+import io
 import json
+import os
 import re
 import logging
 from bs4 import BeautifulSoup
@@ -1703,6 +1706,289 @@ def listing_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
     return pdf_list
 
 
+# A composite figure -- a matrix of panels sharing one caption and one meaning --
+# reaches us as one block per panel. Read alone each panel says almost nothing:
+# the fifteen cells of the EdgeHD spot-diagram matrix were each described as "a
+# scatter plot on a grid background", so the figure's actual subject (how three
+# telescope designs compare across five off-axis distances) existed nowhere, and
+# a question about it could match no node.
+#
+# Only an unmistakable composite is rejoined. Panels must tile a full rectangular
+# grid of at least two rows and two columns, at one size, with gaps small against
+# the panels themselves. A row of separate figures side by side stays separate,
+# because a single row is genuinely ambiguous and merging it would fuse things
+# the document kept apart.
+_FIGURE_MERGEABLE_TYPES = frozenset({"image", "chart", "diagram"})
+# A gap this small relative to the panel is interior to a figure, not the space
+# a layout leaves between two of them.
+_FIGURE_GAP_RATIO = 0.6
+# How much two panels must overlap across the axis they are neighbours on before
+# they count as sharing a row or a column.
+_FIGURE_OVERLAP_RATIO = 0.5
+# Panels of one matrix are cut to one size; this allows for rounding and for a
+# row whose panels are slightly taller.
+_FIGURE_SIZE_RATIO = 1.6
+_FIGURE_MIN_PANELS = 4
+
+
+def _figure_body_bbox(content: dict) -> Optional[tuple]:
+    """The panel's own box in the space its crop was cut from.
+
+    The block's top-level bbox is a different, non-uniform space that also spans
+    the caption, so it cannot place a crop. ``middle_json`` carries the image
+    body box that the crop's pixels actually correspond to.
+    """
+
+    middle = content.get("middle_json")
+    if not isinstance(middle, dict):
+        return None
+    box = middle.get("bbox")
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(value) for value in box)
+    except (TypeError, ValueError):
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _overlaps(a0: float, a1: float, b0: float, b1: float) -> bool:
+    span = min(a1, b1) - max(a0, b0)
+    return span >= _FIGURE_OVERLAP_RATIO * min(a1 - a0, b1 - b0)
+
+
+def _are_panel_neighbours(a: tuple, b: tuple) -> bool:
+    if _overlaps(a[1], a[3], b[1], b[3]):
+        gap = max(a[0], b[0]) - min(a[2], b[2])
+        return gap <= _FIGURE_GAP_RATIO * min(a[2] - a[0], b[2] - b[0])
+    if _overlaps(a[0], a[2], b[0], b[2]):
+        gap = max(a[1], b[1]) - min(a[3], b[3])
+        return gap <= _FIGURE_GAP_RATIO * min(a[3] - a[1], b[3] - b[1])
+    return False
+
+
+def _panel_components(boxes: list[tuple]) -> list[list[int]]:
+    """Group panels that touch, directly or through another panel."""
+
+    parent = list(range(len(boxes)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for left in range(len(boxes)):
+        for right in range(left + 1, len(boxes)):
+            if _are_panel_neighbours(boxes[left], boxes[right]):
+                parent[find(left)] = find(right)
+
+    groups: Dict[int, list[int]] = {}
+    for index in range(len(boxes)):
+        groups.setdefault(find(index), []).append(index)
+    return list(groups.values())
+
+
+def _cluster(values: list[float], tolerance: float) -> list[int]:
+    """Assign each value the index of the band it falls in."""
+
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    bands = [0] * len(values)
+    band = 0
+    for position, index in enumerate(order):
+        if position and values[index] - values[order[position - 1]] > tolerance:
+            band += 1
+        bands[index] = band
+    return bands
+
+
+def _is_full_grid(boxes: list[tuple]) -> bool:
+    """Whether these panels tile a complete rows x columns rectangle."""
+
+    if len(boxes) < _FIGURE_MIN_PANELS:
+        return False
+    widths = [box[2] - box[0] for box in boxes]
+    heights = [box[3] - box[1] for box in boxes]
+    if max(widths) > _FIGURE_SIZE_RATIO * min(widths):
+        return False
+    if max(heights) > _FIGURE_SIZE_RATIO * min(heights):
+        return False
+
+    rows = _cluster([box[1] for box in boxes], median(heights) / 2)
+    columns = _cluster([box[0] for box in boxes], median(widths) / 2)
+    row_count = len(set(rows))
+    column_count = len(set(columns))
+    if row_count < 2 or column_count < 2:
+        return False
+    if row_count * column_count != len(boxes):
+        return False
+    # Every (row, column) must be occupied exactly once, or the panels are not
+    # one rectangular figure however close together they sit.
+    return len(set(zip(rows, columns))) == len(boxes)
+
+
+def _compose_panels(members: list[dict], boxes: list[tuple]) -> Optional[str]:
+    """Paste the panel crops back into one image of the whole figure.
+
+    Re-cutting from a page render would be better, but the page image is not kept
+    and the panels tile the figure, so replaying them at their own offsets
+    reproduces it. Returning ``None`` leaves the panels alone: keeping fifteen
+    poor nodes beats losing the pixels entirely.
+    """
+
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - Pillow is a MinerU dependency
+        log.warning("Pillow is unavailable, so a composite figure was left split")
+        return None
+
+    paths = [member.get("img_path") for member in members]
+    if not all(isinstance(path, str) and os.path.isfile(path) for path in paths):
+        return None
+
+    try:
+        crops = [Image.open(path).convert("RGB") for path in paths]
+        scales = [
+            crop.width / (box[2] - box[0]) for crop, box in zip(crops, boxes)
+        ] + [crop.height / (box[3] - box[1]) for crop, box in zip(crops, boxes)]
+        scale = median(scales)
+        if not scale > 0:
+            return None
+        # One panel rendered at a different resolution means these crops do not
+        # share a coordinate space, and pasting them would misplace the figure.
+        if max(scales) > 1.05 * min(scales):
+            return None
+
+        x0 = min(box[0] for box in boxes)
+        y0 = min(box[1] for box in boxes)
+        x1 = max(box[2] for box in boxes)
+        y1 = max(box[3] for box in boxes)
+        canvas = Image.new(
+            "RGB", (max(1, round((x1 - x0) * scale)), max(1, round((y1 - y0) * scale))), "white"
+        )
+        for crop, box in zip(crops, boxes):
+            size = (max(1, round((box[2] - box[0]) * scale)), max(1, round((box[3] - box[1]) * scale)))
+            if crop.size != size:
+                crop = crop.resize(size, Image.LANCZOS)
+            canvas.paste(crop, (round((box[0] - x0) * scale), round((box[1] - y0) * scale)))
+
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="JPEG", quality=95)
+        payload = buffer.getvalue()
+    except (OSError, ValueError) as error:
+        log.warning("Could not compose a split figure, leaving it as panels: %s", error)
+        return None
+
+    directory = os.path.dirname(paths[0])
+    # Content-addressed like every other crop, so re-running writes the same file
+    # rather than a second copy.
+    path = os.path.join(directory, f"{hashlib.sha256(payload).hexdigest()}.jpg")
+    if not os.path.exists(path):
+        with open(path, "wb") as handle:
+            handle.write(payload)
+    return path
+
+
+def _figure_list_field(members: list[dict], field: str) -> list:
+    merged: list = []
+    for member in members:
+        value = member.get(field)
+        if isinstance(value, list):
+            merged.extend(item for item in value if item not in merged)
+    return merged
+
+
+def merge_figure_and_mark_invalid(
+    anchor: dict, contributors: list[dict], boxes: list[tuple]
+) -> bool:
+    """Make one figure of a grid of panels, or leave every panel untouched."""
+
+    members = [anchor, *contributors]
+    composed = _compose_panels(members, boxes)
+    if composed is None:
+        return False
+
+    for content in contributors:
+        content["invalid"] = True
+
+    anchor["img_path"] = composed
+    # Each panel's own caption is a row or column label, and together they are
+    # how the figure is read; dropping all but the anchor's would lose the axis.
+    anchor["image_caption"] = _figure_list_field(members, "image_caption")
+    anchor["image_footnote"] = _figure_list_field(members, "image_footnote")
+    # The panel descriptions describe panels. The merged figure is described
+    # again, as a figure, by the pass that fills this in.
+    anchor["content"] = ""
+    outer_boxes = [
+        box
+        for box in (_listing_bbox(content) for content in members)
+        if box is not None
+    ]
+    if outer_boxes:
+        anchor["bbox"] = [
+            min(box[0] for box in outer_boxes),
+            min(box[1] for box in outer_boxes),
+            max(box[2] for box in outer_boxes),
+            max(box[3] for box in outer_boxes),
+        ]
+    middle = anchor.get("middle_json")
+    if isinstance(middle, dict):
+        middle["bbox"] = [
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        ]
+    _mark_derived_evidence(anchor, contributors, "bookrag.figure_merge.v1")
+    log.info(
+        "Merged a %d-panel figure on page %d",
+        len(members),
+        anchor.get("page_idx", -1) + 1,
+    )
+    return True
+
+
+def figure_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
+    """Rejoin a composite figure that arrived as one block per panel."""
+
+    pages: Dict[object, list[dict]] = {}
+    for content in pdf_list:
+        if content is None or content.get("invalid"):
+            continue
+        if content.get("type") not in _FIGURE_MERGEABLE_TYPES:
+            continue
+        pages.setdefault(content.get("page_idx"), []).append(content)
+
+    for page in pages.values():
+        by_type: Dict[str, list[dict]] = {}
+        for content in page:
+            by_type.setdefault(content["type"], []).append(content)
+        for panels in by_type.values():
+            boxed = [
+                (content, _figure_body_bbox(content))
+                for content in panels
+            ]
+            boxed = [(content, box) for content, box in boxed if box is not None]
+            if len(boxed) < _FIGURE_MIN_PANELS:
+                continue
+            boxes = [box for _, box in boxed]
+            for component in _panel_components(boxes):
+                if len(component) < _FIGURE_MIN_PANELS:
+                    continue
+                # Reading order, so the anchor is the panel the document starts
+                # the figure with and the captions stay in the order they were
+                # laid out.
+                component.sort()
+                group_boxes = [boxes[index] for index in component]
+                if not _is_full_grid(group_boxes):
+                    continue
+                members = [boxed[index][0] for index in component]
+                merge_figure_and_mark_invalid(members[0], members[1:], group_boxes)
+    return pdf_list
+
+
 def dash_line_refiner(pdf_list: list[Optional[str]]):
     for content in pdf_list:
         if content is None:
@@ -1808,6 +2094,12 @@ def pdf_info_refiner(
     # has already been absorbed into the paragraph beside it, space-joined and
     # stripped of the line breaks that make it a listing.
     pdf_list = listing_merger(pdf_list)
+
+    # Rejoin a composite figure while its panels still carry the geometry that
+    # identifies them as one. Downstream every panel is an independent node with
+    # its own description, and nothing there can tell a matrix apart from a page
+    # that happens to hold several figures.
+    pdf_list = figure_merger(pdf_list)
 
     # Then we refine the PDF information by merging incomplete paragraphs and tables
     pdf_list = text_merger(pdf_list, llm)
