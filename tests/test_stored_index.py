@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from Core.rag.stored_index import (
+    StoredTreeMeta,
     StoredGraphIndex,
     StoredIndex,
     StoredTreeIndex,
@@ -249,7 +250,7 @@ class StoredIndexTests(unittest.TestCase):
 class _ScopedStore:
     """A store carrying the identity the entity scope is derived from."""
 
-    def __init__(self, run_dir):
+    def __init__(self, run_dir, source_sha256=None):
         self.tree = _FakeTree()
         self.run_dir = run_dir
         self.revision_id = "rev-1"
@@ -259,7 +260,26 @@ class _ScopedStore:
             corpus_id="corpus-a",
             document_version_id="docv_1",
         )
+        self._row = {
+            "canonical_artifact_sha256": "",
+            "source_sha256": source_sha256 or "",
+            "source_uri": f"file://{run_dir}/doc.pdf",
+        }
         self.closed = 0
+
+    def _borrow(self):
+        # The identity comes from index_revisions joined to document_versions;
+        # a run directory is not consulted.
+        row = self._row
+
+        class _Cursor:
+            def execute(self, _sql, _params=None):
+                return self
+
+            def fetchone(self):
+                return row
+
+        return _Cursor()
 
     def close(self):
         self.closed += 1
@@ -299,13 +319,7 @@ class StoredEntitySearchTests(unittest.TestCase):
         )
 
     def _open(self, directory):
-        (Path(directory) / "run-manifest.json").write_text(
-            json.dumps(
-                {"source": {"sha256": self.SHA, "path": str(Path(directory) / "doc.pdf")}}
-            ),
-            encoding="utf-8",
-        )
-        store = _ScopedStore(Path(directory))
+        store = _ScopedStore(Path(directory), source_sha256=self.SHA)
         opened = {}
 
         def vector_store(**kwargs):
@@ -345,3 +359,45 @@ class StoredEntitySearchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheQueryPathReadsIdentityFromTheStore(unittest.TestCase):
+    """A query must not need a run directory to know what it is answering about.
+
+    StoredTreeMeta.from_store opened run-manifest.json for the source's digest,
+    URI and path -- a file read on the query path for facts the ledger already
+    records at admission. document_versions holds the digest and the URI, and a
+    file:// URI is where a local path comes from.
+    """
+
+    SHA = "c" * 64
+
+    def _meta(self, uri):
+        with tempfile.TemporaryDirectory() as directory:
+            store = _ScopedStore(Path(directory), source_sha256=self.SHA)
+            store._row["source_uri"] = uri
+            return StoredTreeMeta.from_store(store)
+
+    def test_the_digest_comes_from_the_ledger(self):
+        self.assertEqual(self.SHA, self._meta("file:///docs/report.pdf").source_sha256)
+
+    def test_a_file_uri_yields_its_path_and_name(self):
+        meta = self._meta("file:///docs/report.pdf")
+        self.assertEqual("/docs/report.pdf", meta.file_path)
+        self.assertEqual("report.pdf", meta.file_name)
+
+    def test_a_non_file_uri_has_no_local_path(self):
+        meta = self._meta("s3://bucket/report.pdf")
+        self.assertEqual("", meta.file_path)
+        self.assertEqual("s3://bucket/report.pdf", meta.source_uri)
+
+    def test_a_percent_encoded_path_is_decoded(self):
+        self.assertEqual(
+            "/docs/annual report.pdf",
+            self._meta("file:///docs/annual%20report.pdf").file_path,
+        )
+
+    def test_no_manifest_is_ever_opened(self):
+        # The run directory is empty; the identity still resolves.
+        meta = self._meta("file:///docs/report.pdf")
+        self.assertEqual(self.SHA, meta.source_sha256)

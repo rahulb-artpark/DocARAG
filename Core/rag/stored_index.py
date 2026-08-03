@@ -13,12 +13,27 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 from typing import Any, Iterable, List, Sequence
 
 import networkx as nx
 
 from docarag.document_store import DocumentStore
 from docarag.tree_store import TreeNodeView
+
+
+def _local_path(source_uri: str) -> str:
+    """The filesystem path a file:// URI names, or nothing.
+
+    A document's canonical identity is its URI; the path is a convenience for
+    callers that want to show a filename. Any other scheme has no local path,
+    and saying so beats inventing one.
+    """
+
+    if not isinstance(source_uri, str) or not source_uri.startswith("file://"):
+        return ""
+    return url2pathname(urlparse(source_uri).path)
 
 MAX_SUBGRAPH_ENTITIES = 256
 
@@ -192,42 +207,49 @@ class StoredTreeMeta:
 
     @classmethod
     def from_store(cls, store: DocumentStore) -> "StoredTreeMeta":
-        run_dir = getattr(store, "run_dir", None)
-        manifest: dict = {}
-        if run_dir is not None:
-            try:
-                manifest = json.loads(
-                    (run_dir / "run-manifest.json").read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError):
-                manifest = {}
-        source = manifest.get("source") or {}
-        # The canonical identity was recorded at admission; the ledger is the
-        # source of truth, and no artifact file is opened at query time.
-        canonical_sha = ""
-        try:
-            row = store._borrow().execute(
-                "SELECT canonical_artifact_sha256 FROM docarag.index_revisions "
-                "WHERE revision_key = %s",
-                (store.revision_key,),
-            ).fetchone()
-            canonical_sha = str((row or {}).get("canonical_artifact_sha256") or "")
-        except Exception:
-            canonical_sha = ""
-        source_path = str(source.get("path") or "")
+        """Read the document's identity from the store, and only the store.
+
+        This used to open run-manifest.json to learn the source's digest, URI
+        and path -- a file read on the query path, for facts the ledger already
+        holds. ``document_versions`` records the digest and URI at admission,
+        and a ``file://`` URI is where the local path comes from, so no run
+        directory has to exist for a query to answer.
+        """
 
         scope = getattr(store, "scope", None)
+        canonical_sha = ""
+        source_sha256 = ""
+        source_uri = ""
+        try:
+            row = store._borrow().execute(
+                "SELECT r.canonical_artifact_sha256, v.source_sha256, v.source_uri "
+                "FROM docarag.index_revisions r "
+                "JOIN docarag.document_versions v "
+                "  ON v.tenant_id = r.tenant_id "
+                " AND v.corpus_id = r.corpus_id "
+                " AND v.document_id = r.document_id "
+                " AND v.document_version_id = r.document_version_id "
+                "WHERE r.revision_key = %s",
+                (store.revision_key,),
+            ).fetchone()
+            row = row or {}
+            canonical_sha = str(row.get("canonical_artifact_sha256") or "")
+            source_sha256 = str(row.get("source_sha256") or "")
+            source_uri = str(row.get("source_uri") or "")
+        except Exception:
+            pass
+
+        source_path = _local_path(source_uri)
         return cls(
             tenant_id=getattr(scope, "tenant_id", "") or "",
             corpus_id=getattr(scope, "corpus_id", "") or "",
             document_version_id=getattr(scope, "document_version_id", "") or "",
             index_revision_id=getattr(store, "revision_id", "") or "",
-            source_sha256=str(source.get("sha256") or ""),
-            source_uri=str(source.get("uri") or "")
-            or (Path(source_path).as_uri() if source_path else ""),
-            file_name=Path(source_path or "document.pdf").name,
+            source_sha256=source_sha256,
+            source_uri=source_uri,
+            file_name=Path(source_path).name if source_path else "document.pdf",
             file_path=source_path,
-            snapshot_path=str(manifest.get("source_snapshot") or ""),
+            snapshot_path="",
             canonical_artifact_path="",
             canonical_artifact_sha256=canonical_sha,
             canonical_artifact_size_bytes=0,
