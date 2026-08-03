@@ -297,10 +297,14 @@ class GBC:
         :param config: The configuration object containing the save path.
         :return: An instance of GBC with the loaded index.
         """
-        tree_index = DocumentTree.load_from_file(
-            DocumentTree.get_save_path(config.save_path)
-        )
-        
+        # The tree comes from the store, exactly as the graph and vector stages
+        # read it. A pickle beside the run is a build artifact that is allowed
+        # to disagree with the rows, and reading it here meant answering out of
+        # a tree no stage had used.
+        from docarag.vdb_tree_source import StoreTreeSource
+
+        tree_index = StoreTreeSource.open(config.save_path)
+
         variant = graph_artifact_variant(config.graph)
 
         graph_index = Graph.load_from_dir(config.save_path, variant=variant)

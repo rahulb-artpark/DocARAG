@@ -296,12 +296,12 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
     dependencies = {}
 
     if strategy_name == "traverse":
-        from Core.Index.Tree import DocumentTree
+        # TraverseAgent walks the same tree the other strategies answer from:
+        # the stored rows, not the run's pickle.
+        from docarag.vdb_tree_source import StoreTreeSource
 
-        # 加载 TraverseAgent 需要的 tree_index
-        tree_index_path = DocumentTree.get_save_path(cfg.save_path)
-        tree_index = DocumentTree.load_from_file(tree_index_path)
-        log.info(f"Successfully loaded tree index from {tree_index_path}")
+        tree_index = StoreTreeSource.open(cfg.save_path)
+        log.info("Successfully loaded tree index from the store at %s", cfg.save_path)
         dependencies["tree_index"] = tree_index
 
     elif strategy_name == "gbc":
