@@ -33,21 +33,6 @@ from Core.utils.bounded_executor import iter_bounded_ordered
 
 log = logging.getLogger(__name__)
 
-
-def _root_cause(error: BaseException) -> str:
-    """The message of the deepest cause, which is the one that says what broke.
-
-    Provider wrappers re-raise as RuntimeError("Could not get a JSON response
-    from Ollama model 'x'"), which names the model and not the fault. The
-    server's own text lives at the bottom of the __cause__ chain.
-    """
-
-    seen: set[int] = set()
-    while error.__cause__ is not None and id(error) not in seen:
-        seen.add(id(error))
-        error = error.__cause__
-    return str(error).strip() or type(error).__name__
-
 GenerationKeyT = TypeVar("GenerationKeyT")
 VLMInput = Union[str, List[Dict[str, Any]]]
 
@@ -809,18 +794,11 @@ class VLM:
                 return response
             except Exception as e:
                 last_exception = e
-                # The type alone says "RuntimeError" and nothing else. Six
-                # figures were lost to a provider 400 whose actual text --
-                # "illegal base64 data at input byte 3" -- was thrown away
-                # here, leaving the run with no way to say which payload the
-                # provider had refused.
                 log.warning(
-                    "VLM JSON generation attempt %d/%d failed (%s: %s) for image(s) %s",
+                    "VLM JSON generation attempt %d/%d failed (%s)",
                     attempt,
                     self.config.max_retries,
                     type(e).__name__,
-                    _root_cause(e),
-                    ", ".join(images or ()) or "none",
                 )
                 if (
                     attempt < self.config.max_retries
