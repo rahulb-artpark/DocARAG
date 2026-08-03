@@ -16,6 +16,31 @@ from Core.Index.Tree import NodeType
 from docarag.document_store import DocumentStore
 
 
+def _openable_image(*candidates: object) -> str:
+    """The first candidate something can actually open.
+
+    Evidence carries an image as its canonical identity, ``cas://sha256/<digest>``,
+    while the materialized local path lives on the node's own meta. Preferring
+    evidence unconditionally meant a chart or diagram reached the graph stage
+    holding a URI where a filename belonged, and the VLM client posted the URI
+    itself as though it were the image -- the server answered "illegal base64
+    data at input byte 3", the 3 being the colon in ``cas:``. Every chart and
+    diagram in a document lost its entities that way, while plain figures, whose
+    evidence carried no URI, were unaffected.
+
+    A URI names a thing; it does not open one. So identity never displaces a
+    path here.
+    """
+
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        if "://" in candidate:
+            continue
+        return candidate
+    return ""
+
+
 class _NodeMeta:
     """The meta surface the vector stage reads, backed by store channels."""
 
@@ -25,7 +50,7 @@ class _NodeMeta:
         self.caption = meta.caption
         self.footnote = meta.footnote
         self.table_body = meta.table_body
-        self.img_path = evidence.get("img_path") or meta.img_path
+        self.img_path = _openable_image(evidence.get("img_path"), meta.img_path)
         self.page_idx = evidence.get("page")
         self.page_id = evidence.get("page_id")
         self.pdf_id = evidence.get("pdf_id")
