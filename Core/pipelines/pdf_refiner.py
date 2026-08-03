@@ -1719,9 +1719,16 @@ def listing_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
 # because a single row is genuinely ambiguous and merging it would fuse things
 # the document kept apart.
 _FIGURE_MERGEABLE_TYPES = frozenset({"image", "chart", "diagram"})
-# A gap this small relative to the panel is interior to a figure, not the space
-# a layout leaves between two of them.
-_FIGURE_GAP_RATIO = 0.6
+# How far apart panels of one figure may sit, relative to the panel. A matrix
+# spot diagram sets its columns a clear margin apart -- on the EdgeHD pages the
+# panels are 46 wide on a 120 pitch, a gap of 1.6 panels -- so a tight bound
+# reads one figure as one separate figure per column. Regular pitch, checked
+# below, is what actually distinguishes a matrix from neighbouring figures;
+# this only rules out panels too far apart to be reading as one thing.
+_FIGURE_GAP_RATIO = 2.0
+# Column and row spacing must be even. A matrix is laid out on a pitch; things
+# that merely sit near each other are not.
+_FIGURE_PITCH_TOLERANCE = 0.25
 # How much two panels must overlap across the axis they are neighbours on before
 # they count as sharing a row or a column.
 _FIGURE_OVERLAP_RATIO = 0.5
@@ -1804,6 +1811,68 @@ def _cluster(values: list[float], tolerance: float) -> list[int]:
     return bands
 
 
+def _panels_of_one_size(boxed: list[tuple]) -> list[list[tuple]]:
+    """Split panels into size classes before looking for a figure among them.
+
+    A matrix usually shares its page with the figure it belongs to -- on the
+    EdgeHD pages, a 402x150 ray-trace diagram sits directly above a 5x3 grid of
+    46x46 spot panels, close enough to be its neighbour. Grouped together they
+    are not a grid, and the matrix went unmerged because of the one block that
+    was never part of it. Panels of one figure are cut to one size, so size is
+    what separates them.
+    """
+
+    def dimensions(item):
+        _content, box = item
+        return box[2] - box[0], box[3] - box[1]
+
+    classes: list[list[tuple]] = []
+    current: list[tuple] = []
+    for item in sorted(boxed, key=lambda item: dimensions(item)[0] * dimensions(item)[1]):
+        if not current:
+            current = [item]
+            continue
+        smallest_width, smallest_height = dimensions(current[0])
+        width, height = dimensions(item)
+        if (
+            width <= _FIGURE_SIZE_RATIO * smallest_width
+            and height <= _FIGURE_SIZE_RATIO * smallest_height
+        ):
+            current.append(item)
+        else:
+            classes.append(current)
+            current = [item]
+    if current:
+        classes.append(current)
+    # Reading order within each class, so the anchor is the panel the document
+    # starts the figure with and captions stay in the order they were laid out.
+    return [
+        sorted(members, key=lambda item: item[0].get("_figure_seq", 0))
+        for members in classes
+    ]
+
+
+def _is_evenly_pitched(positions: list[float], bands: list[int]) -> bool:
+    """Whether the bands are laid out on one repeating step.
+
+    With only two bands there is a single step and nothing to compare it
+    against, so spacing alone cannot argue either way and the other checks --
+    equal panel size, a fully occupied rectangle -- carry the decision.
+    """
+
+    edges = sorted(
+        median([position for position, band in zip(positions, bands) if band == value])
+        for value in set(bands)
+    )
+    steps = [later - earlier for earlier, later in zip(edges, edges[1:])]
+    if len(steps) < 2:
+        return True
+    smallest, largest = min(steps), max(steps)
+    if smallest <= 0:
+        return False
+    return (largest - smallest) / smallest <= _FIGURE_PITCH_TOLERANCE
+
+
 def _is_full_grid(boxes: list[tuple]) -> bool:
     """Whether these panels tile a complete rows x columns rectangle."""
 
@@ -1823,6 +1892,10 @@ def _is_full_grid(boxes: list[tuple]) -> bool:
     if row_count < 2 or column_count < 2:
         return False
     if row_count * column_count != len(boxes):
+        return False
+    if not _is_evenly_pitched([box[0] for box in boxes], columns):
+        return False
+    if not _is_evenly_pitched([box[1] for box in boxes], rows):
         return False
     # Every (row, column) must be occupied exactly once, or the panels are not
     # one rectangular figure however close together they sit.
@@ -1962,6 +2035,8 @@ def figure_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
         pages.setdefault(content.get("page_idx"), []).append(content)
 
     for page in pages.values():
+        for position, content in enumerate(page):
+            content["_figure_seq"] = position
         by_type: Dict[str, list[dict]] = {}
         for content in page:
             by_type.setdefault(content["type"], []).append(content)
@@ -1973,19 +2048,24 @@ def figure_merger(pdf_list: list[Optional[dict]]) -> list[Optional[dict]]:
             boxed = [(content, box) for content, box in boxed if box is not None]
             if len(boxed) < _FIGURE_MIN_PANELS:
                 continue
-            boxes = [box for _, box in boxed]
-            for component in _panel_components(boxes):
-                if len(component) < _FIGURE_MIN_PANELS:
+            for sized in _panels_of_one_size(boxed):
+                if len(sized) < _FIGURE_MIN_PANELS:
                     continue
-                # Reading order, so the anchor is the panel the document starts
-                # the figure with and the captions stay in the order they were
-                # laid out.
-                component.sort()
-                group_boxes = [boxes[index] for index in component]
-                if not _is_full_grid(group_boxes):
-                    continue
-                members = [boxed[index][0] for index in component]
-                merge_figure_and_mark_invalid(members[0], members[1:], group_boxes)
+                boxes = [box for _, box in sized]
+                for component in _panel_components(boxes):
+                    if len(component) < _FIGURE_MIN_PANELS:
+                        continue
+                    # Reading order, so the anchor is the panel the document
+                    # starts the figure with and the captions stay in the order
+                    # they were laid out.
+                    component.sort()
+                    group_boxes = [boxes[index] for index in component]
+                    if not _is_full_grid(group_boxes):
+                        continue
+                    members = [sized[index][0] for index in component]
+                    merge_figure_and_mark_invalid(members[0], members[1:], group_boxes)
+        for content in page:
+            content.pop("_figure_seq", None)
     return pdf_list
 
 

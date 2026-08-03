@@ -234,3 +234,43 @@ class ThingsThatAreNotOneFigureStaySeparate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ASpreadOutMatrixIsStillOneFigure(unittest.TestCase):
+    """Tightness was the wrong test; regular pitch is the right one.
+
+    The EdgeHD spot-diagram pages set 46-wide panels on a 120 pitch -- a gap of
+    1.6 panels. A tight bound read each column as its own figure, so four pages
+    of matrix diagrams stayed shattered while the one page whose columns
+    happened to sit closer was rejoined.
+    """
+
+    def test_widely_spaced_columns_still_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = _grid(directory, 5, 3, pitch=34)  # 14 wide, 20 of gap
+            figure_merger(blocks)
+            self.assertEqual(1, len(_live(blocks)))
+
+    def test_an_uneven_pitch_is_not_a_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = [
+                _panel(directory, 0, 100, 100),
+                _panel(directory, 1, 120, 100),
+                _panel(directory, 2, 155, 100),  # column 3 is out of step
+                _panel(directory, 3, 100, 120),
+                _panel(directory, 4, 120, 120),
+                _panel(directory, 5, 155, 120),
+            ]
+            figure_merger(blocks)
+            self.assertEqual(6, len(_live(blocks)))
+
+    def test_a_neighbouring_full_width_figure_is_not_dragged_in(self):
+        # A ray-trace diagram sits directly above the matrix on every EdgeHD
+        # page, close enough to be its neighbour. Grouped in, nothing is a grid.
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = _grid(directory, 3, 3, pitch=20)
+            banner = _panel(directory, 99, 100, 40, width=120, height=40)
+            figure_merger([banner] + blocks)
+            live = _live([banner] + blocks)
+            self.assertEqual(2, len(live))
+            self.assertFalse(banner.get("invalid"), "the ray diagram stays its own figure")
