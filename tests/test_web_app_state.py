@@ -347,3 +347,139 @@ class DeletingARunStopsTheWorkProducingIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ARunReportsWhetherItIsStillAlive(unittest.TestCase):
+    """A killed driver cannot write its own epitaph.
+
+    A reboot took a run down mid-graph. Its state file still said "running", so
+    the library showed a spinner for an hour with nothing offered but Delete --
+    no way to tell real work from a corpse. Liveness is now decided by whether
+    the recorded driver is still there, not by what the record last managed to
+    say before it died.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.web = load_web_module()
+
+    def setUp(self):
+        self.run_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.run_dir, ignore_errors=True)
+
+    def _state(self, **fields):
+        (self.run_dir / "index-state.json").write_text(json.dumps(fields), encoding="utf-8")
+
+    def test_running_with_a_dead_driver_reads_as_interrupted(self):
+        self._state(pid=999_999_999, overall_status="running",
+                    stages={"tree": {"status": "succeeded"}, "graph": {"status": "running"}})
+        progress = self.web.run_progress(self.run_dir)
+        self.assertEqual(progress["overallStatus"], "interrupted")
+        self.assertTrue(progress["interrupted"])
+
+    def test_a_stage_cannot_still_be_running_without_a_driver(self):
+        self._state(pid=999_999_999, overall_status="running",
+                    stages={"graph": {"status": "running"}})
+        stages = {s["name"]: s["status"] for s in self.web.run_progress(self.run_dir)["stages"]}
+        self.assertEqual(stages["graph"], "interrupted")
+
+    def test_a_live_driver_still_reads_as_running(self):
+        # This process is alive and its command line names this run dir.
+        proc = subprocess.Popen(
+            ["bash", "-c", f"sleep 30  # {self.run_dir}\nwait"], start_new_session=True)
+        self.addCleanup(proc.kill)
+        time.sleep(0.5)
+        self._state(pid=proc.pid, overall_status="running", stages={"tree": {"status": "running"}})
+        progress = self.web.run_progress(self.run_dir)
+        self.assertFalse(progress["interrupted"])
+        self.assertEqual(progress["overallStatus"], "running")
+
+    def test_a_finished_run_is_never_relabelled(self):
+        for status in ("succeeded", "failed"):
+            with self.subTest(status=status):
+                self._state(pid=999_999_999, overall_status=status, stages={})
+                self.assertEqual(self.web.run_progress(self.run_dir)["overallStatus"], status)
+
+
+class AnInterruptedRunCanBeRecorded(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.web = load_web_module()
+
+    def setUp(self):
+        self.run_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.run_dir, ignore_errors=True)
+
+    def _state(self, **fields):
+        (self.run_dir / "index-state.json").write_text(json.dumps(fields), encoding="utf-8")
+
+    def _read(self):
+        return json.loads((self.run_dir / "index-state.json").read_text())
+
+    def test_a_running_run_is_marked_and_its_stage_closed(self):
+        self._state(overall_status="running", stages={"graph": {"status": "running"}})
+        self.assertTrue(self.web.mark_run_interrupted(self.run_dir, "stopped"))
+        state = self._read()
+        self.assertEqual(state["overall_status"], "failed")
+        self.assertEqual(state["error"], "stopped")
+        self.assertEqual(state["stages"]["graph"]["status"], "failed")
+
+    def test_completed_stages_are_left_alone_so_the_run_can_resume(self):
+        self._state(overall_status="running",
+                    stages={"tree": {"status": "succeeded"}, "graph": {"status": "running"}})
+        self.web.mark_run_interrupted(self.run_dir, "stopped")
+        self.assertEqual(self._read()["stages"]["tree"]["status"], "succeeded")
+
+    def test_a_finished_run_is_not_rewritten(self):
+        self._state(overall_status="succeeded", stages={})
+        self.assertFalse(self.web.mark_run_interrupted(self.run_dir, "stopped"))
+        self.assertEqual(self._read()["overall_status"], "succeeded")
+
+    def test_a_run_with_no_state_is_not_an_error(self):
+        self.assertFalse(self.web.mark_run_interrupted(self.run_dir, "stopped"))
+
+
+class ARunKnowsWhetherItCanStillBeResumed(unittest.TestCase):
+    """Resuming is only resuming while the code that defines the run is unchanged.
+
+    A revision id is derived from main.py, Core, docarag and the controller.
+    Submitting the same document after any of those change computes a different
+    id, so "resume" would silently be a fresh index -- which is exactly what
+    happened after fixing the controller, an hour into a run.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.web = load_web_module()
+
+    def setUp(self):
+        self.run_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.run_dir, ignore_errors=True)
+
+    def _manifest(self, payload):
+        (self.run_dir / "run-manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_a_changed_fingerprint_is_reported(self):
+        self._manifest({"controller": {"code_fingerprint": {"sha256": "0" * 64}}})
+        self.assertIs(self.web.run_code_fingerprint_matches(self.run_dir), False)
+
+    def test_an_unrecorded_fingerprint_is_unknown_rather_than_changed(self):
+        # Unknown must not read as False, or an old run could never be started.
+        self._manifest({"controller": {}})
+        self.assertIsNone(self.web.run_code_fingerprint_matches(self.run_dir))
+
+    def test_the_source_document_is_found_for_restarting(self):
+        pdf = self.run_dir / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        self._manifest({"source": {"path": str(pdf)}})
+        self.assertEqual(self.web.run_source_pdf(self.run_dir), pdf)
+
+    def test_a_missing_source_document_reports_none(self):
+        self._manifest({"source": {"path": "/nonexistent/gone.pdf"}})
+        self.assertIsNone(self.web.run_source_pdf(self.run_dir))
+
+    def test_the_snapshot_is_used_when_the_original_is_gone(self):
+        snap = self.run_dir / "snap.pdf"
+        snap.write_bytes(b"%PDF-1.4\n")
+        self._manifest({"source": {"path": "/gone.pdf", "snapshot_path": str(snap)}})
+        self.assertEqual(self.web.run_source_pdf(self.run_dir), snap)

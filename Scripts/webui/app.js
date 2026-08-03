@@ -686,6 +686,33 @@ async function editRunTag(card) {
   await loadLibrary();
 }
 
+// Stop, and start again. Delete used to be the only way to end a run, so the
+// only way to stop something was to throw away the hours it had already spent --
+// and a run whose driver was killed kept claiming to be running with nothing
+// offered but Delete. A stopped or interrupted run keeps its finished stages.
+//
+// "Rebuild from" discards that stage and everything after it, because a vdb
+// built from the old graph cannot stand while the graph is rebuilt. Resuming
+// without choosing a stage keeps everything and simply continues.
+function runLifecycleHtml(run) {
+  if (run.isIndexing) {
+    return '<button class="btn stopRun" title="Stop indexing; finished stages are kept">Stop</button>';
+  }
+  if (run.codeChanged) {
+    return `<button class="btn" disabled title="The indexing code changed since this run started, so it cannot be resumed — starting would index from nothing under a new revision. Delete it and add the document again instead.">Resume</button>`;
+  }
+  if (!run.canResume) return "";
+  return `<label class="rebuildFrom" title="Resume continues where it stopped. Rebuilding discards that stage and everything after it.">
+      <select class="rebuildSelect">
+        <option value="">Resume</option>
+        <option value="tree">Rebuild from tree</option>
+        <option value="graph">Rebuild from graph</option>
+        <option value="vdb">Rebuild from vdb</option>
+      </select>
+    </label>
+    <button class="btn startRun">Start</button>`;
+}
+
 function runCardHtml(run) {
   const status = run.overallStatus || (run.viewable ? "succeeded" : "pending");
   const isCurrent = run.runDir === state.currentRun;
@@ -701,6 +728,7 @@ function runCardHtml(run) {
       ${runTagHtml(run.tag)}
       <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
       ${isCurrent ? '<span class="pill">open</span>' : ""}
+      ${runLifecycleHtml(run)}
       ${canOpen ? '<button class="btn openRun">Open</button>' : ""}
       <button class="btn danger deleteRun" ${isCurrent ? "disabled title='Open another document first'" : ""}>Delete</button>
     </div>
@@ -730,6 +758,48 @@ async function loadLibrary() {
   $("runGrid").innerHTML = runs.length
     ? runs.map(runCardHtml).join("")
     : '<div class="libraryEmpty">No documents yet. Drop a PDF above to index one.</div>';
+
+  $("runGrid").querySelectorAll(".stopRun").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const card = btn.closest(".runCard");
+      if (!confirm("Stop indexing this document? Finished stages are kept and it can be started again.")) return;
+      btn.disabled = true;
+      btn.textContent = "Stopping…";
+      try {
+        await api("/api/run-stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ runDir: card.dataset.run }),
+        });
+      } catch (err) {
+        alert("Could not stop this run: " + err.message);
+      }
+      await loadLibrary();
+    });
+  });
+
+  $("runGrid").querySelectorAll(".startRun").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const card = btn.closest(".runCard");
+      const select = card.querySelector(".rebuildSelect");
+      const fromStage = select && select.value ? select.value : null;
+      if (fromStage && !confirm(
+        `Rebuild from the ${fromStage} stage? That stage and every stage after it ` +
+        `will be discarded and built again.`)) return;
+      btn.disabled = true;
+      btn.textContent = "Starting…";
+      try {
+        await api("/api/run-start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ runDir: card.dataset.run, fromStage }),
+        });
+      } catch (err) {
+        alert("Could not start this run: " + err.message);
+      }
+      await loadLibrary();
+    });
+  });
 
   $("runGrid").querySelectorAll(".runTag").forEach((btn) => {
     btn.addEventListener("click", () => editRunTag(btn.closest(".runCard")));

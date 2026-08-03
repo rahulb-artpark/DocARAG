@@ -226,6 +226,25 @@ def _elapsed_seconds(started):
     return max((now - start).total_seconds(), 0.0)
 
 
+# A driver that is killed -- a reboot, a kill -9, a crash -- cannot write its own
+# epitaph, so its run keeps claiming to be running forever. Nothing else
+# reconciles that, which is how a machine restart left a card spinning with no
+# way to tell it from real work. Liveness is decided by whether the recorded
+# driver is still there, not by what the record last managed to say.
+_LIVE_RUN_STATUSES = frozenset(
+    {"running", "pending", "initialize", "waiting_for_capacity", "capacity_acquired"}
+)
+
+
+def run_driver_is_alive(run_dir, state):
+    """Whether this run's recorded driver process is still present."""
+
+    pid = state.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    return _process_is_running(pid) and _process_matches_run(pid, run_dir)
+
+
 def run_progress(run_dir, history=None):
     """Report one run's stages and metrics from its own published state."""
 
@@ -233,10 +252,20 @@ def run_progress(run_dir, history=None):
     stats = _read_json_if_present(run_dir / "indexing_stats.json")
     history = history or {}
     raw_stages = state.get("stages") or {}
+    overall_status = state.get("overall_status")
+    # Claimed to be running with no driver behind it: the process died without
+    # being able to record that it had.
+    interrupted = overall_status in _LIVE_RUN_STATUSES and not run_driver_is_alive(
+        run_dir, state
+    )
+    if interrupted:
+        overall_status = "interrupted"
     stages = []
     for name in STAGE_ORDER:
         entry = raw_stages.get(name) or {}
         status = entry.get("status") or "pending"
+        if interrupted and status == "running":
+            status = "interrupted"
         elapsed = _elapsed_seconds(entry.get("started_at")) if status == "running" else None
         progress = _stage_progress(run_dir, name) if status == "running" else None
         eta = eta_basis = None
@@ -278,7 +307,8 @@ def run_progress(run_dir, history=None):
     return {
         "runDir": str(run_dir),
         "phase": state.get("phase"),
-        "overallStatus": state.get("overall_status"),
+        "overallStatus": overall_status,
+        "interrupted": interrupted,
         "currentStage": state.get("current_stage"),
         "startedAt": state.get("started_at"),
         "updatedAt": state.get("updated_at"),
@@ -359,6 +389,18 @@ def run_summary(run_dir, history=None):
     progress["name"] = name
     progress["tag"] = read_run_tag(run_dir)
     progress["createdAt"] = run_created_at(run_dir)
+    # What the library may offer for this run. Computed here so a button is
+    # never shown for something the server would refuse.
+    progress["isIndexing"] = bool(
+        progress.get("overallStatus") in _LIVE_RUN_STATUSES
+    )
+    resumable = run_code_fingerprint_matches(run_dir)
+    progress["codeChanged"] = resumable is False
+    progress["canResume"] = bool(
+        not progress["isIndexing"]
+        and resumable is not False
+        and run_source_pdf(run_dir) is not None
+    )
     # Kept for callers that still read it, but nothing orders by it: writing a
     # tag or saving a chat moves it, and neither changes when the run was made.
     progress["mtime"] = run_dir.stat().st_mtime
@@ -627,6 +669,74 @@ def stop_indexing_run(run_dir):
                 return {"pid": pid, "stopped": True, "signal": int(signal_number)}
             time.sleep(0.2)
     return {"pid": pid, "stopped": False}
+
+
+def mark_run_interrupted(run_dir, reason):
+    """Record that a run is no longer in progress.
+
+    Written from here rather than by the driver because the cases needing it are
+    exactly the ones where the driver cannot write anything: it was killed, or
+    the machine went down under it.
+    """
+
+    path = Path(run_dir) / "index-state.json"
+    state = _read_json_if_present(path)
+    if not state or state.get("overall_status") not in _LIVE_RUN_STATUSES:
+        return False
+    state["overall_status"] = "failed"
+    state["error"] = reason
+    state["ended_at"] = datetime.now(timezone.utc).isoformat()
+    for stage in (state.get("stages") or {}).values():
+        if isinstance(stage, dict) and stage.get("status") == "running":
+            stage["status"] = "failed"
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except OSError:
+        logging.exception("Could not record the interrupted run: %s", path)
+        return False
+    return True
+
+
+def run_source_pdf(run_dir):
+    """The document a run was built from, so it can be submitted again."""
+
+    source = _read_json_if_present(Path(run_dir) / "run-manifest.json").get("source") or {}
+    for key in ("path", "snapshot_path", "snapshot"):
+        candidate = source.get(key)
+        if isinstance(candidate, str) and Path(candidate).is_file():
+            return Path(candidate)
+    return None
+
+
+def run_code_fingerprint_matches(run_dir):
+    """Whether this run can still be resumed, or only replaced.
+
+    A run's identity includes a fingerprint over main.py, Core, docarag and the
+    controller. Submitting the same document after any of those change computes
+    a different revision id, so what looks like "resume" is really a new index
+    from nothing. Reported rather than discovered an hour in.
+    """
+
+    recorded = (
+        (_read_json_if_present(Path(run_dir) / "run-manifest.json").get("controller") or {})
+        .get("code_fingerprint")
+        or {}
+    ).get("sha256")
+    if not isinstance(recorded, str) or not recorded:
+        return None
+    try:
+        from docarag.admission import compute_code_fingerprint
+
+        current, _count = compute_code_fingerprint(REPO, REPO / "Scripts" / "index_pdf.sh")
+    except Exception:
+        logging.exception("Could not compute the current code fingerprint")
+        return None
+    return current == recorded
 
 
 def read_run_config(run_dir):
@@ -1848,6 +1958,12 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/run-tag":
             self.set_run_tag()
             return
+        if parsed.path == "/api/run-stop":
+            self.stop_run()
+            return
+        if parsed.path == "/api/run-start":
+            self.start_run()
+            return
         if parsed.path == "/api/conversations":
             try:
                 self.send_json(self.state.create_conversation(), HTTPStatus.CREATED)
@@ -1985,6 +2101,124 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(
             {"ok": True, "name": name, "path": str(target), "runDir": run_dir}
         )
+
+    def _requested_run(self, payload):
+        run_dir = self.resolve_run_argument(payload.get("runDir"))
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+        return run_dir
+
+    def stop_run(self):
+        """End an index in progress without discarding what it has produced.
+
+        Deleting was the only way to end a run, so stopping something meant
+        throwing away the hours it had already spent. A stopped run keeps its
+        finished stages and can be started again.
+        """
+
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        run_dir = self._requested_run(payload)
+        if run_dir is None:
+            return
+        stopped = stop_indexing_run(run_dir)
+        # Record the outcome here: the driver that would normally write it is
+        # the thing that was just stopped.
+        mark_run_interrupted(run_dir, "stopped from the library")
+        self.send_json({"ok": True, "runDir": str(run_dir), "stopped": stopped})
+
+    def start_run(self):
+        """Start or resume a run, optionally rebuilding from one stage."""
+
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        run_dir = self._requested_run(payload)
+        if run_dir is None:
+            return
+        state = _read_json_if_present(run_dir / "index-state.json")
+        if state.get("overall_status") in _LIVE_RUN_STATUSES and run_driver_is_alive(
+            run_dir, state
+        ):
+            self.send_error_json(HTTPStatus.CONFLICT, "This run is already indexing")
+            return
+        if run_code_fingerprint_matches(run_dir) is False:
+            self.send_error_json(
+                HTTPStatus.CONFLICT,
+                "The indexing code changed since this run started, so it cannot be "
+                "resumed. Its revision identity is derived from that code; starting "
+                "now would index the document from nothing under a new revision. "
+                "Delete this run and add the document again if that is what you want.",
+            )
+            return
+        source = run_source_pdf(run_dir)
+        if source is None:
+            self.send_error_json(
+                HTTPStatus.CONFLICT, "This run no longer has the document it was built from"
+            )
+            return
+        from_stage = payload.get("fromStage")
+        if from_stage is not None:
+            if from_stage not in STAGE_ORDER:
+                self.send_error_json(
+                    HTTPStatus.BAD_REQUEST, f"fromStage must be one of {list(STAGE_ORDER)}"
+                )
+                return
+            if not self._rebuild_from_stage(run_dir, from_stage):
+                return
+        try:
+            started = start_index(source)
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not start indexing", str(exc)
+            )
+            return
+        self.send_json({"ok": True, "runDir": started or str(run_dir), "fromStage": from_stage})
+
+    def _rebuild_from_stage(self, run_dir, from_stage):
+        """Quarantine one stage and everything downstream so it is rebuilt.
+
+        Downstream too, necessarily: a vdb built from the old graph cannot stand
+        while the graph is rebuilt. Answers True when the caller may proceed.
+        """
+
+        attempt_dir = (
+            run_dir
+            / "attempts"
+            / f"rebuild-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}-{from_stage}"
+        )
+        try:
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            completed = subprocess.run(
+                [
+                    sys.executable, "-m", "docarag.recovery",
+                    "--run", str(run_dir),
+                    "--attempt-dir", str(attempt_dir),
+                    "--from-stage", from_stage,
+                ],
+                cwd=str(REPO), capture_output=True, text=True, timeout=300,
+            )
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not prepare the rebuild", str(exc)
+            )
+            return False
+        if completed.returncode != 0:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Could not quarantine outputs from the {from_stage} stage",
+                (completed.stderr or completed.stdout).strip(),
+            )
+            return False
+        return True
 
     def set_run_tag(self):
         """Label one document in the library, or clear its label."""
