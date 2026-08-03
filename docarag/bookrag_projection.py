@@ -1404,6 +1404,15 @@ def _project_table(
                 + "; ".join(conversion_errors),
                 block=block,
             )
+        # A table whose structure was never recognised, carrying only what the
+        # native-PDF recovery read off the page, is text. Projecting it as a
+        # table with an empty body would assert a structure that was never
+        # found; losing the block would discard real page content and take the
+        # document with it. The adapter already represents that text -- this is
+        # the second gate it has to pass, and both had to learn the same thing.
+        if _text_entries(block, (RepresentationKind.TEXT,)):
+            _project_text(block, row)
+            return
         _raise_loss(
             ProjectionErrorCode.UNREPRESENTABLE_TABLE,
             "table has neither structured table content nor a safe local crop",
