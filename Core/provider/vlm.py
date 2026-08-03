@@ -28,10 +28,69 @@ from Core.configs.vlm_config import VLMConfig
 import logging
 import time
 import gc
+from pathlib import Path, PurePath
 
 from Core.utils.bounded_executor import iter_bounded_ordered
 
 log = logging.getLogger(__name__)
+
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _root_cause(error: BaseException) -> str:
+    """The message of the deepest cause, which is the one that says what broke.
+
+    Provider wrappers re-raise as RuntimeError("Could not get a JSON response
+    from Ollama model 'x'"), which names the model and not the fault. The
+    server's own text sits at the bottom of the ``__cause__`` chain.
+    """
+
+    seen: set[int] = set()
+    while error.__cause__ is not None and id(error) not in seen:
+        seen.add(id(error))
+        error = error.__cause__
+    return str(error).strip() or type(error).__name__
+
+
+def _as_image_payloads(images):
+    """Turn image references into something the client cannot misread.
+
+    Given a ``str``, ollama-python guesses: it takes the value as a path if
+    ``Path(value).exists()`` says so, and otherwise falls through to
+    ``b64decode(value)`` -- which, without ``validate=True``, silently discards
+    every character outside the base64 alphabet rather than refusing. A path
+    that survives that discard is forwarded to the server *as if it were the
+    image*, and the server answers "illegal base64 data at input byte 3". The
+    exists() check is wrapped in a bare ``except Exception: pass``, so any
+    reason it fails to answer -- not only a missing file -- lands on that
+    branch. Six figures were lost to it, deterministically, while the same
+    paths resolved perfectly in every process we could test by hand.
+
+    Passing ``Path`` takes the first branch of that serializer unconditionally:
+    the bytes are read and encoded here, with no guess in between. A file we
+    cannot read now says so, naming itself, instead of being posted as garbage.
+    """
+
+    if not images:
+        return []
+    payloads = []
+    for image in images:
+        if isinstance(image, (bytes, bytearray, PurePath)):
+            payloads.append(image)
+            continue
+        if not isinstance(image, str):
+            payloads.append(image)
+            continue
+        # A base64 string a caller already prepared is left alone; only things
+        # that look like image files are resolved.
+        if not image.lower().endswith(_IMAGE_SUFFIXES):
+            payloads.append(image)
+            continue
+        path = Path(image)
+        if not path.is_file():
+            raise FileNotFoundError(f"VLM image does not exist: {image}")
+        payloads.append(path)
+    return payloads
 
 GenerationKeyT = TypeVar("GenerationKeyT")
 VLMInput = Union[str, List[Dict[str, Any]]]
@@ -583,6 +642,8 @@ class OllamaVLMController(BaseVLMController):
         - If prompt_or_memory is a string, creates a new user message.
         - If it's a list of dicts, uses it directly and appends images to the last message if needed.
         """
+        images = _as_image_payloads(images)
+
         if isinstance(prompt_or_memory, str):
             # Case 1: Input is a simple string query.
             log.debug("Preparing messages from a string query.")
@@ -794,11 +855,18 @@ class VLM:
                 return response
             except Exception as e:
                 last_exception = e
+                # The type alone reads "RuntimeError", and that wrapper's own
+                # message names only the model. Six figures were lost to a
+                # provider 400 -- "illegal base64 data at input byte 3" -- whose
+                # text lived at the bottom of the __cause__ chain and was thrown
+                # away here, leaving no way to tell which payload was refused.
                 log.warning(
-                    "VLM JSON generation attempt %d/%d failed (%s)",
+                    "VLM JSON generation attempt %d/%d failed (%s: %s) for image(s) %s",
                     attempt,
                     self.config.max_retries,
                     type(e).__name__,
+                    _root_cause(e),
+                    ", ".join(str(image) for image in (images or ())) or "none",
                 )
                 if (
                     attempt < self.config.max_retries
