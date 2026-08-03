@@ -968,7 +968,6 @@ run_detached_driver() {
   local retrieval_index_kind
   local index_type
   local stage
-  local stage_marker
   local status
   local error
   local lock_fd
@@ -1128,7 +1127,6 @@ PY
 
   verify_stage() {
     local stage_to_verify="$1"
-    local stage_started_marker="$2"
     local graph_artifact
 
     case "$stage_to_verify" in
@@ -1142,8 +1140,16 @@ PY
         ;;
       graph)
         graph_artifact="$expected_graph_artifact"
-        [[ -s "$graph_artifact" && "$graph_artifact" -nt "$stage_started_marker" ]] || {
-          echo "[driver] graph stage did not create or refresh configured artifact: $graph_artifact" >&2
+        # Existence, not recency. A resumed stage legitimately leaves its
+        # artifact untouched -- the work was already done and the stage
+        # correctly skipped it -- so requiring the file to be newer than this
+        # attempt's start marker failed every resume. The tree stage never had
+        # this problem because it verifies content rather than mtime.
+        # What recency was approximating is "this artifact belongs to this
+        # attempt", and the checks below establish that directly and better:
+        # the payload is parsed, and qdrant_readiness is given --revision-id.
+        [[ -s "$graph_artifact" ]] || {
+          echo "[driver] graph stage produced no configured artifact: $graph_artifact" >&2
           return 1
         }
         python3 - "$graph_artifact" <<'PY'
@@ -1158,8 +1164,8 @@ if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
 if not isinstance(payload.get("tree2kg"), dict):
     raise SystemExit("graph artifact does not contain a tree2kg mapping")
 PY
-        [[ -s "$expected_entity_attestation" && "$expected_entity_attestation" -nt "$stage_started_marker" ]] || {
-          echo "[driver] graph stage did not publish configured entity attestation: $expected_entity_attestation" >&2
+        [[ -s "$expected_entity_attestation" ]] || {
+          echo "[driver] graph stage published no entity attestation: $expected_entity_attestation" >&2
           return 1
         }
         if ! run_tracked "entity Qdrant readiness verification" \
@@ -1181,8 +1187,8 @@ PY
           }
           return 0
         fi
-        [[ -s "$expected_retrieval_artifact" && "$expected_retrieval_artifact" -nt "$stage_started_marker" ]] || {
-          echo "[driver] missing or stale Qdrant retrieval attestation: $expected_retrieval_artifact" >&2
+        [[ -s "$expected_retrieval_artifact" ]] || {
+          echo "[driver] missing Qdrant retrieval attestation: $expected_retrieval_artifact" >&2
           return 1
         }
         run_tracked "retrieval Qdrant readiness verification" \
@@ -1241,8 +1247,6 @@ PY
       fi
     fi
 
-    stage_marker="$run_dir/logs/.index-$stage.started"
-    : > "$stage_marker"
     attempt_log="$DRIVER_ATTEMPT_DIR/index-$stage.log"
     ln -sfn "../attempts/$DRIVER_ATTEMPT_ID/index-$stage.log" "$run_dir/logs/index-$stage.log"
     echo "[driver] $(date) starting $stage"
@@ -1260,7 +1264,7 @@ PY
       return "$status"
     fi
 
-    if ! verify_stage "$stage" "$stage_marker"; then
+    if ! verify_stage "$stage"; then
       status=1
       error="$stage artifact verification failed; see $run_dir/logs/index-driver.log"
       echo "[driver] $(date) $stage FAILED artifact verification; stopping" >&2
