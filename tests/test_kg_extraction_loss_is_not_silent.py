@@ -22,6 +22,8 @@ These tests hold all three shut.
 from __future__ import annotations
 
 import contextvars
+import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -147,7 +149,22 @@ class FurnitureIsSkippedByDecisionNotByError(unittest.TestCase):
         )
 
 
-class AFailedNodeIsRetriedThenRefusesToPublish(unittest.TestCase):
+class AFailedNodeIsRetriedThenRecordedAsAGap(unittest.TestCase):
+    """Stopping the stage was worse than the loss it guarded against.
+
+    Six figures a provider deterministically refused left a whole document with
+    no index at all, and resuming could not help because the refusal repeated.
+    The graph is published without them; what must not happen is the loss going
+    unrecorded, which is the bug this file exists for.
+    """
+
+    def _gaps(self, directory):
+        path = kg_builder.extraction_gaps_path(directory)
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
     def test_a_node_that_fails_once_is_retried_and_succeeds(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART, NodeType.TEXT)
         extractor = _Extractor(fail_ids={2}, fail_times=1)
@@ -155,25 +172,40 @@ class AFailedNodeIsRetriedThenRefusesToPublish(unittest.TestCase):
             _run(_config(directory), tree, extractor)
             # A completed stage still clears its resume state.
             self.assertFalse(state_path(directory).exists())
+            self.assertIsNone(self._gaps(directory), "nothing was actually lost")
         self.assertEqual([1, 2, 3, 2], extractor.seen)
 
-    def test_a_node_that_keeps_failing_stops_the_graph_being_published(self):
+    def test_a_node_that_keeps_failing_does_not_stop_the_stage(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART, NodeType.DIAGRAM)
-        extractor = _Extractor(fail_ids={2, 3})
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(kg_builder.IncompleteKnowledgeGraphError) as caught:
-                _run(_config(directory), tree, extractor)
-            # The resume state survives, so the graph stage can be resumed and
-            # will re-attempt exactly the nodes that failed.
-            self.assertTrue(state_path(directory).exists())
-        self.assertEqual([2, 3], caught.exception.failed_node_ids)
+            _run(_config(directory), tree, _Extractor(fail_ids={2, 3}))
+            self.assertIsNotNone(self._gaps(directory))
 
-    def test_the_error_names_the_nodes_that_were_lost(self):
+    def test_the_record_names_the_nodes_that_were_lost(self):
+        tree = _tree(NodeType.TEXT, NodeType.CHART, NodeType.DIAGRAM)
+        with tempfile.TemporaryDirectory() as directory:
+            _run(_config(directory), tree, _Extractor(fail_ids={2, 3}))
+            missing = self._gaps(directory)["missing"]
+        self.assertEqual([2, 3], [entry["node_idx"] for entry in missing])
+        self.assertEqual(["chart", "diagram"], [entry["node_type"] for entry in missing])
+
+    def test_a_clean_run_does_not_inherit_an_older_runs_gaps(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART)
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(kg_builder.IncompleteKnowledgeGraphError) as caught:
+            _run(_config(directory), tree, _Extractor(fail_ids={2}))
+            self.assertIsNotNone(self._gaps(directory))
+            _run(_config(directory), tree, _Extractor())
+            self.assertIsNone(self._gaps(directory))
+
+    def test_the_loss_is_reported_at_error_level(self):
+        tree = _tree(NodeType.TEXT, NodeType.CHART)
+        errors: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                kg_builder.log, "error", lambda msg, *a: errors.append(msg % a if a else msg)
+            ):
                 _run(_config(directory), tree, _Extractor(fail_ids={2}))
-        self.assertIn("2", str(caught.exception))
+        self.assertTrue(any("missing" in message for message in errors))
 
     def test_a_failed_node_is_not_recorded_as_refined(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART)
@@ -184,19 +216,17 @@ class AFailedNodeIsRetriedThenRefusesToPublish(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(kg_builder, "save_refinement_state", spy):
-                with self.assertRaises(kg_builder.IncompleteKnowledgeGraphError):
-                    _run(_config(directory), tree, _Extractor(fail_ids={2}))
+                _run(_config(directory), tree, _Extractor(fail_ids={2}))
 
         self.assertTrue(captured)
         for snapshot in captured:
-            self.assertNotIn(2, snapshot, "a failed node would never be re-attempted")
+            self.assertNotIn(2, snapshot, "a failed node must not pass as extracted")
 
     def test_a_failed_node_is_not_refined_into_the_graph(self):
         tree = _tree(NodeType.TEXT, NodeType.CHART)
         refiner = _refiner_mock()
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(kg_builder.IncompleteKnowledgeGraphError):
-                _run(_config(directory), tree, _Extractor(fail_ids={2}), refiner)
+            _run(_config(directory), tree, _Extractor(fail_ids={2}), refiner)
         refined_sources = [
             call.kwargs.get("source_id") for call in refiner.advanced_kg_refiner.call_args_list
         ]

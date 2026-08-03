@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 # print log for test
 from rich.logging import RichHandler
 
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,25 +31,47 @@ from contextvars import copy_context
 from itertools import batched
 
 
-class IncompleteKnowledgeGraphError(RuntimeError):
-    """Raised when extraction lost nodes that the graph is supposed to cover.
+EXTRACTION_GAPS_FILE = "kg_extraction_gaps.json"
 
-    Publishing anyway would leave those nodes unreachable through the graph with
-    nothing recording their absence, and clearing the refinement state would
-    make the loss permanent.  Failing keeps every committed checkpoint, so a
-    resumed graph stage re-attempts only the nodes that failed.
+
+def extraction_gaps_path(save_path) -> str:
+    return os.path.join(save_path, EXTRACTION_GAPS_FILE)
+
+
+def record_extraction_gaps(save_path, tree, failed_node_ids, *, variant=None) -> None:
+    """Write down which nodes the graph does not cover, or clear the record.
+
+    Stopping the stage instead was worse than the loss it was guarding against:
+    a handful of figures that a provider refused would leave a document with no
+    index at all, and no amount of resuming helps when the refusal is
+    deterministic.  So the graph is published without them and the gap becomes
+    something the run states, in a file a later pass can read, rather than
+    something a reader has to notice.
     """
 
-    def __init__(self, failed_node_ids):
-        self.failed_node_ids = sorted(failed_node_ids)
-        preview = ", ".join(str(node_id) for node_id in self.failed_node_ids[:20])
-        if len(self.failed_node_ids) > 20:
-            preview += ", ..."
-        super().__init__(
-            f"KG extraction failed for {len(self.failed_node_ids)} node(s) "
-            f"after a retry: {preview}. Refusing to publish a graph that is "
-            f"missing them; resume the graph stage to re-attempt."
-        )
+    path = extraction_gaps_path(save_path)
+    if not failed_node_ids:
+        # A clean run must not inherit an older run's gaps.
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return
+
+    by_id = {node.index_id: node for node in tree.nodes}
+    gaps = []
+    for node_id in sorted(failed_node_ids):
+        node = by_id.get(node_id)
+        node_type = getattr(getattr(node, "type", None), "value", None)
+        gaps.append({"node_idx": node_id, "node_type": node_type})
+    payload = {
+        "schema_version": "docarag.kg-extraction-gaps.v1",
+        "variant": variant,
+        "extractable_nodes": sum(1 for node in tree.nodes if node is not tree.root_node),
+        "missing": gaps,
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 # log_dir = "/home/wangshu/multimodal/GBC-RAG/test/index_qwen3/logs"
 # if not os.path.exists(log_dir):
@@ -274,8 +297,20 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
             ]
             commit_batches(batched(retry_nodes, cfg.graph.extraction_batch_size))
 
+        # The gap is published with the graph rather than in place of it. It is
+        # logged at error level and written down, so it is visible without being
+        # fatal -- the failure mode this replaced left a document unindexable.
         if failed_node_ids:
-            raise IncompleteKnowledgeGraphError(failed_node_ids)
+            log.error(
+                "Knowledge graph is missing %d node(s) whose extraction failed twice: %s. "
+                "Recorded in %s; the graph is published without them.",
+                len(failed_node_ids),
+                sorted(failed_node_ids),
+                EXTRACTION_GAPS_FILE,
+            )
+        record_extraction_gaps(
+            cfg.save_path, tree, failed_node_ids, variant=variant
+        )
 
         log.info("Knowledge graph extraction completed.")
         log.info("Extracted %d nodes from the document tree.", extracted_count)
