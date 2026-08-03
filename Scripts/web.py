@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -551,6 +552,81 @@ def refresh_answer_time_budgets(cfg):
         value = getattr(fresh, name, None)
         if value is not None and hasattr(strategy, name):
             setattr(strategy, name, value)
+
+
+# Deleting a run used to remove its directory and leave its indexer running.
+# The driver kept the GPU admission lock, kept writing MinerU output into a path
+# whose manifest, inputs and logs had just been deleted, and could never finish
+# usefully -- while every later document queued behind a lock held by a run that
+# no longer existed. Deleting a document has to stop the work that is producing
+# it, so that is done here before the files go.
+# Bounded because a delete is a synchronous request: long enough for a driver to
+# run its exit trap, short enough not to hang the browser.
+_STOP_TERM_SECONDS = 6.0
+_STOP_KILL_SECONDS = 3.0
+
+
+def _process_is_running(pid):
+    """Alive and not a zombie.
+
+    A killed process stays in the table until its parent reaps it, and both
+    kill(pid, 0) and killpg(group, 0) succeed on a zombie -- so signalling alone
+    can never observe the thing it just killed go away.
+    """
+
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            fields = handle.read().rsplit(b")", 1)[-1].split()
+    except OSError:
+        return False
+    return bool(fields) and fields[0] not in (b"Z", b"X")
+
+
+def _process_matches_run(pid, run_dir):
+    """Whether this pid is really the driver for this run, not a recycled id."""
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return False
+    return str(run_dir) in cmdline
+
+
+def stop_indexing_run(run_dir):
+    """Stop a run's indexer if one is alive. Returns what was stopped."""
+
+    state = _read_json_if_present(Path(run_dir) / "index-state.json")
+    pid = state.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return None
+    if state.get("overall_status") in {"succeeded", "failed"}:
+        return None
+    if not _process_matches_run(pid, run_dir):
+        # Either it already exited or the id belongs to something else now.
+        # Signalling on a bare pid match would eventually kill a stranger.
+        return None
+    try:
+        group = os.getpgid(pid)
+    except OSError:
+        return None
+    # The driver is setsid-detached, so it leads its own group: signalling the
+    # group takes the conda wrapper and the stage worker with it. Terminating
+    # only the driver leaves the worker holding the GPU.
+    for signal_number, grace in (
+        (signal.SIGTERM, _STOP_TERM_SECONDS),
+        (signal.SIGKILL, _STOP_KILL_SECONDS),
+    ):
+        try:
+            os.killpg(group, signal_number)
+        except OSError:
+            return {"pid": pid, "stopped": True}
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if not _process_is_running(pid):
+                return {"pid": pid, "stopped": True, "signal": int(signal_number)}
+            time.sleep(0.2)
+    return {"pid": pid, "stopped": False}
 
 
 def read_run_config(run_dir):
@@ -1840,7 +1916,14 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
         try:
-            self.send_json(delete_run_everywhere(run_dir))
+            # Stop the work before removing what it writes into, or the indexer
+            # outlives its own run and holds the GPU lock against every document
+            # queued behind it.
+            stopped = stop_indexing_run(run_dir)
+            removed = delete_run_everywhere(run_dir)
+            if stopped is not None:
+                removed["stoppedIndexing"] = stopped
+            self.send_json(removed)
         except OSError as exc:
             self.send_error_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, "Could not delete the run", str(exc)
