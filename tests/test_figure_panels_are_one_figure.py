@@ -274,3 +274,56 @@ class ASpreadOutMatrixIsStillOneFigure(unittest.TestCase):
             live = _live([banner] + blocks)
             self.assertEqual(2, len(live))
             self.assertFalse(banner.get("invalid"), "the ray diagram stays its own figure")
+
+
+class TheDocumentGetsTheFinalSayOnWhatIsOneFigure(unittest.TestCase):
+    """Geometry cannot tell one figure's panels from four separate figures.
+
+    Every other guard here is about shape, and four unrelated figures set on an
+    even 2x2 grid at one size satisfy all of them. A caption is the one signal
+    that says what the document meant: panels of one figure carry row or column
+    labels, or nothing, while separate figures are numbered.
+    """
+
+    def test_panels_captioned_as_different_figures_are_not_merged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = _grid(directory, 2, 2)
+            blocks[0]["image_caption"] = ["Figure 3. Spot diagram"]
+            blocks[1]["image_caption"] = ["Figure 4. Ray trace"]
+            figure_merger(blocks)
+            self.assertEqual(4, len(_live(blocks)))
+
+    def test_row_labels_are_not_figure_numbers(self):
+        # The real case: "CLASSIC SCT" / "EDGEHD" label rows of one matrix.
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = _grid(directory, 2, 2)
+            blocks[0]["image_caption"] = ["CLASSIC SCT"]
+            blocks[2]["image_caption"] = ["EDGEHD"]
+            figure_merger(blocks)
+            self.assertEqual(1, len(_live(blocks)))
+
+    def test_one_caption_for_the_whole_grid_still_merges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = _grid(directory, 2, 2)
+            blocks[0]["image_caption"] = ["Figure 2. Matrix spot diagram"]
+            figure_merger(blocks)
+            self.assertEqual(1, len(_live(blocks)))
+
+    def test_the_same_figure_number_repeated_still_merges(self):
+        # One figure whose panels each repeat its number is still one figure.
+        with tempfile.TemporaryDirectory() as directory:
+            blocks = _grid(directory, 2, 2)
+            blocks[0]["image_caption"] = ["Figure 5a"]
+            blocks[1]["image_caption"] = ["Figure 5a"]
+            figure_merger(blocks)
+            self.assertEqual(1, len(_live(blocks)))
+
+    def test_abbreviated_and_tabular_labels_count_too(self):
+        for first, second in (("Fig. 1", "Fig. 2"), ("Table 1", "Table 2")):
+            with self.subTest(first=first):
+                with tempfile.TemporaryDirectory() as directory:
+                    blocks = _grid(directory, 2, 2)
+                    blocks[0]["image_caption"] = [first]
+                    blocks[3]["image_caption"] = [second]
+                    figure_merger(blocks)
+                    self.assertEqual(4, len(_live(blocks)))

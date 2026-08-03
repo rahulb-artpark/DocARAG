@@ -1964,6 +1964,38 @@ def _compose_panels(members: list[dict], boxes: list[tuple]) -> Optional[str]:
     return path
 
 
+_FIGURE_LABEL = re.compile(
+    r"\b(?:fig(?:ure)?|table|chart|plate|scheme|exhibit)\s*\.?\s*"
+    r"([0-9]+[a-z]?|[ivxlc]+)\b",
+    re.IGNORECASE,
+)
+
+
+def _figure_labels(members: list[dict]) -> set:
+    labels = set()
+    for member in members:
+        for caption in member.get("image_caption") or ():
+            if not isinstance(caption, str):
+                continue
+            for match in _FIGURE_LABEL.finditer(caption):
+                labels.add(match.group(1).lower())
+    return labels
+
+
+def _names_separate_figures(members: list[dict]) -> bool:
+    """Whether the document itself says these panels are different figures.
+
+    Every other test here is geometric, and geometry cannot tell one figure's
+    panels from four figures a layout happened to set on an even grid at one
+    size. A caption can: panels of one figure carry row or column labels
+    ("CLASSIC SCT", "EDGEHD") or no caption at all, while separate figures are
+    numbered, and two different numbers under one grid means the document drew
+    a line the geometry does not show.
+    """
+
+    return len(_figure_labels(members)) > 1
+
+
 def _figure_list_field(members: list[dict], field: str) -> list:
     merged: list = []
     for member in members:
@@ -1979,6 +2011,13 @@ def merge_figure_and_mark_invalid(
     """Make one figure of a grid of panels, or leave every panel untouched."""
 
     members = [anchor, *contributors]
+    if _names_separate_figures(members):
+        log.info(
+            "Left %d panels on page %d alone: their captions name different figures",
+            len(members),
+            anchor.get("page_idx", -1) + 1,
+        )
+        return False
     composed = _compose_panels(members, boxes)
     if composed is None:
         return False
