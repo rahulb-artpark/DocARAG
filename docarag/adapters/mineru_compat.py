@@ -783,6 +783,26 @@ def _representations(
         confidence=confidence,
         source_field="chart_data",
     )
+    if not result:
+        # Last resort: the block's own text, whatever its type says its evidence
+        # channels are. This exists for text the native-PDF recovery pass puts
+        # back into a block whose type does not read that channel -- a table
+        # whose body was never recognised gets its page text written to "text",
+        # and every table representation is built from table_body, caption and
+        # footnote, so the recovered text was invisible. The block then carried
+        # neither a representation nor an asset, and one such block aborts the
+        # whole document: a 93 MB scan died on it after three hours.
+        #
+        # Only when nothing else produced anything, so no existing block changes
+        # shape, and text that was recovered is represented instead of discarded.
+        _add_text_representation(
+            result,
+            kind=RepresentationKind.TEXT,
+            value=block.get("text"),
+            media_type="text/plain",
+            confidence=confidence,
+            language=language,
+        )
     return tuple(result)
 
 
