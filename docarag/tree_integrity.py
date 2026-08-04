@@ -220,15 +220,26 @@ def _resolve_image(path: str, run: Path) -> Path | None:
     return None
 
 
-def _image_faults(views: Any, run: Path) -> list[str]:
-    """Name every visual node the next stage could not open an image for."""
+def _image_faults(views: Any, run: Path) -> tuple[list[str], list[str]]:
+    """Separate broken image references from figures the parser never cropped.
+
+    These are different failures and deserve different answers.  A reference
+    that exists but cannot be opened is corruption: something wrote an image
+    into the store that nothing can read, which is exactly what cost a document
+    its chart and diagram entities, and it is never correct.  A visual node with
+    no reference at all is a parser outcome -- a real 500-page book has one
+    captioned figure MinerU produced no crop for -- and failing the whole index
+    over it would trade a silent loss for a blocked run, which is the worse of
+    the two.  So the first is an error and the second is reported.
+    """
 
     from docarag.vdb_tree_source import asset_cas_root, openable_image
 
     # Resolved exactly as the stages resolve it, so the gate passes a tree if
     # and only if the next stage can open its figures.
     cas_root = asset_cas_root(run)
-    faults: list[str] = []
+    broken: list[str] = []
+    uncropped: list[str] = []
     for view in views:
         kind = (str(view.type) if view.type else "").lower()
         if kind not in VISUAL_NODE_TYPES:
@@ -239,19 +250,16 @@ def _image_faults(views: Any, run: Path) -> list[str]:
         if not path:
             named = [item for item in candidates if isinstance(item, str) and item]
             if named:
-                # An identifier reached the field a filename belongs in and the
-                # store does not hold it. This is the exact shape of the bug
-                # that cost a document its chart and diagram entities.
-                faults.append(
+                broken.append(
                     f"node {view.index_id} ({kind}) carries an image reference "
                     f"nothing can open: {named[0]!r}"
                 )
             else:
-                faults.append(f"node {view.index_id} ({kind}) has no image at all")
+                uncropped.append(f"node {view.index_id} ({kind})")
             continue
         if _resolve_image(path, run) is None:
-            faults.append(f"node {view.index_id} ({kind}) names a missing image: {path}")
-    return faults
+            broken.append(f"node {view.index_id} ({kind}) names a missing image: {path}")
+    return broken, uncropped
 
 
 def verify_stored_tree(run_dir: Path) -> None:
@@ -280,11 +288,19 @@ def verify_stored_tree(run_dir: Path) -> None:
             "was never persisted"
         )
     _validate_topology(_stored_summaries(views))
-    faults = _image_faults(views, run)
-    if faults:
+    broken, uncropped = _image_faults(views, run)
+    if uncropped:
+        # Stated, so the loss is known rather than discovered later in an
+        # answer that quietly had nothing to show.
+        print(
+            f"tree integrity note: {len(uncropped)} visual node(s) have no image "
+            "and will contribute only their caption: " + ", ".join(uncropped),
+            file=sys.stderr,
+        )
+    if broken:
         raise TreeIntegrityError(
             "the stored tree carries images no stage can open:\n  "
-            + "\n  ".join(faults)
+            + "\n  ".join(broken)
         )
 
 

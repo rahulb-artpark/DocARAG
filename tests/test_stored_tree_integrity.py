@@ -14,6 +14,7 @@ These tests hold the gate on the store.
 
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,13 +123,34 @@ class AVisualNodeMustCarryAnImageAStageCanOpen(unittest.TestCase):
         self.assertIn("node 1", message)
         self.assertIn("cas://", message)
 
-    def test_a_visual_node_with_no_image_at_all_fails(self):
+    def test_a_figure_the_parser_never_cropped_is_reported_not_blocked(self):
+        # A real 500-page book has one captioned figure MinerU produced no crop
+        # for. Failing its whole index over that trades a silent loss for a
+        # blocked run, which is worse; the loss is stated instead.
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(TreeIntegrityError, "no image at all"):
+            with patch("sys.stderr", new_callable=io.StringIO) as captured:
                 _verify(
                     [_view(0, "root", None), _view(1, "diagram", 0)],
                     directory,
                 )
+        note = captured.getvalue()
+        self.assertIn("node 1", note)
+        self.assertIn("caption", note)
+
+    def test_a_broken_reference_still_fails_beside_an_uncropped_figure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(TreeIntegrityError) as raised:
+                    _verify(
+                        [
+                            _view(0, "root", None),
+                            _view(1, "diagram", 0),
+                            _view(2, "chart", 0, evidence_img="cas://sha256/" + "f" * 64),
+                        ],
+                        directory,
+                    )
+        self.assertIn("node 2", str(raised.exception))
+        self.assertNotIn("node 1", str(raised.exception))
 
     def test_an_image_the_run_no_longer_has_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -192,8 +214,8 @@ class AVisualNodeMustCarryAnImageAStageCanOpen(unittest.TestCase):
                 _verify(
                     [
                         _view(0, "root", None),
-                        _view(1, "chart", 0),
-                        _view(2, "diagram", 0),
+                        _view(1, "chart", 0, evidence_img="cas://sha256/" + "a" * 64),
+                        _view(2, "diagram", 0, img_path="/gone/panel.jpg"),
                     ],
                     directory,
                 )
