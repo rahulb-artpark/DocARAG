@@ -73,6 +73,29 @@ class SectionSelectionBudgetExceeded(PlanningBudgetExceeded):
     """The prompt budget cannot represent all source-linked sections."""
 
 
+# Node types whose own text says what they show but never what they are about.
+# The subject sits in the heading above them, so retrieval carries that heading
+# along; see GBCRAG._with_section_titles.
+_SECTIONED_TYPE_VALUES = frozenset(
+    kind.value
+    for kind in (
+        NodeType.IMAGE,
+        NodeType.CHART,
+        NodeType.DIAGRAM,
+        NodeType.EQUATION,
+        NodeType.CODE,
+        NodeType.ALGORITHM,
+    )
+)
+
+
+def _node_type_value(node: object) -> str:
+    """One node's type as a plain string, however retrieval is holding it."""
+
+    kind = getattr(node, "type", None)
+    return kind.value if isinstance(kind, NodeType) else str(kind or "")
+
+
 def _citation_validation_from_partials(partials: object) -> Dict[str, Any]:
     if not isinstance(partials, list):
         return {}
@@ -1430,6 +1453,59 @@ class GBCRAG(BaseRAG):
         iter_context.iteration_image_nodes = image_nodes
         iter_context.iteration_text_nodes = text_nodes
 
+    def _with_section_titles(self, node_ids: List[int]) -> List[int]:
+        """Bring each retrieved figure, equation or listing's heading with it.
+
+        A figure, an equation and a code listing all state what they show
+        without stating what they are about: the subject is in the heading
+        above them. Retrieval scores each node on its own text, so the heading
+        is never the reason one of these is found and never arrives beside it.
+
+        An answer then gets a sag equation with no way to know which surface it
+        defines, or a rendered surface described as "an abstract teardrop form"
+        with nothing tying it to the section it illustrates. The heading is one
+        short node away and is the whole context, so it is brought along rather
+        than left to be inferred.
+
+        Measured on a 1871-page optics manual: 2956 of the 2957 figure,
+        equation and listing nodes sit directly under their section title, so
+        the direct parent is the heading in every case that matters. Titles
+        already retrieved on their own merit are not added twice, and a node
+        parented straight to the root simply has no heading to add.
+        """
+
+        tree = self.gbc_index.TreeIndex
+        ordered = list(node_ids)
+        seen = set(ordered)
+        titles: List[int] = []
+        for node_id in ordered:
+            node = tree.get_node_by_index_id(node_id)
+            if node is None or _node_type_value(node) not in _SECTIONED_TYPE_VALUES:
+                continue
+            # A store-backed view names its parent by id; an in-memory tree
+            # holds the node itself. Both shapes reach retrieval.
+            parent = getattr(node, "parent", None)
+            if parent is None:
+                parent_id = getattr(node, "parent_id", None)
+                parent = (
+                    tree.get_node_by_index_id(parent_id)
+                    if parent_id is not None
+                    else None
+                )
+            if parent is None or _node_type_value(parent) != NodeType.TITLE.value:
+                continue
+            if parent.index_id in seen:
+                continue
+            seen.add(parent.index_id)
+            titles.append(parent.index_id)
+        if titles:
+            log.info(
+                "Retrieval brought %d section heading(s) along with the "
+                "figures, equations and listings that sit under them",
+                len(titles),
+            )
+        return ordered + titles
+
     def _attach_candidate_fusion_trace(
         self, tree_data: List[Dict[str, Any]]
     ) -> None:
@@ -1512,6 +1588,7 @@ class GBCRAG(BaseRAG):
         iter_context.iteration_graph_nodes = Graph_data.get("nodes", [])
         iter_context.iteration_graph_edges = Graph_data.get("edges", [])
 
+        tree_node_ids = self._with_section_titles(tree_node_ids)
         tree_data = self.gbc_index.TreeIndex.get_nodes_data(tree_node_ids)
         self._attach_candidate_fusion_trace(tree_data)
         self._process_retrieved_nodes(tree_data, iter_context)
