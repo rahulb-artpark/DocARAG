@@ -1039,6 +1039,35 @@ def _table_text(node) -> str:
     return "\n".join(part for part in (summary, caption, body) if part)
 
 
+def _visual_text(node) -> str:
+    """What a figure is about, in whatever words are attached to it.
+
+    A caption is where a figure's subject is normally written, and reading the
+    caption alone is enough for a producer that fills it. MinerU fills neither
+    caption nor footnote: the vision model's account of the pixels lands in
+    ``content`` and the section's own words land in ``summary``. So caption
+    plus footnote indexed 1866 of one document's 2002 figures as the empty
+    string -- every one of them reachable only through its pixels, and a
+    figure whose pixels do not spell out its subject was reachable not at all.
+
+    That is how "the image of Zernike Surface" returned three screenshots of
+    Zemax coefficient windows -- the embedder could read "Zernike" rendered
+    inside those screenshots -- while the Zernike Surface section's own figure,
+    an abstract shaded form, was never a candidate. Its summary names the
+    subject in the first line; nothing was reading it.
+
+    The summary leads because it is the sentence a question resembles, the
+    same order ``_table_text`` uses, and it is the part worth keeping if the
+    embedder's window truncates.
+    """
+
+    summary = str(getattr(node, "summary", "") or "").strip()
+    described = _context_contribution(node)
+    if summary and described:
+        return f"{summary}\n{described}"
+    return summary or described
+
+
 def _equation_self_text(node) -> str:
     """What the equation says, in words and in symbols."""
 
@@ -1207,12 +1236,15 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
 
         if node_type in _VISUAL_NODE_TYPES:
             image_path = node.meta_info.img_path
-            image_str = (node.meta_info.caption or "") + (
-                node.meta_info.footnote or ""
-            )
-            yield TreeIndexRecord(
-                "text", image_str, _representation_metadata(meta_data, "text")
-            )
+            image_str = _visual_text(node)
+            # An empty text is not a representation of anything: it embeds to
+            # whatever the model returns for "", and every figure lacking a
+            # caption landed on that same point. Emitting nothing keeps them
+            # out of the index rather than crowding one spot in it.
+            if image_str:
+                yield TreeIndexRecord(
+                    "text", image_str, _representation_metadata(meta_data, "text")
+                )
             if image_path and os.path.exists(image_path):
                 yield TreeIndexRecord(
                     "image",

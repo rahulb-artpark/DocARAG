@@ -155,7 +155,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                 [
                     "alpha",
                     "table heading\n|a|b|",
-                    "figure captionfigure footnote",
+                    "figure caption figure footnote",
                     r"E=mc^2",
                     # The neighbouring figure contributes its caption, which is
                     # where a figure's prose lives; content alone would lose it.
@@ -170,7 +170,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "table heading\n|a|b|",
-                    "figure captionfigure footnote",
+                    "figure caption figure footnote",
                     # The crop is paired with the neighbourhood, not the LaTeX:
                     # a picture of the symbols and a transcription of the same
                     # symbols are the same evidence twice.
@@ -284,6 +284,10 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                 if record.modality == "text"
                 and record.value.startswith("Figure 1.5:")
                 and "shaded" in record.value
+                # The figure now carries its own text record, which opens with
+                # the same caption; the equation's LaTeX is what tells the
+                # context window apart from the figure it starts with.
+                and "M = {(x,y)" in record.value
             ]
 
             self.assertEqual(1, len(context), context)
