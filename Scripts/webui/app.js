@@ -2032,6 +2032,7 @@ function beginSummaryEdit(nodeId, current) {
 /* =============================== CHAT =================================== */
 const ASSISTANT_NAME = "Noetics-AI";
 const SIDEBAR_COLLAPSED_KEY = "noeticsrag.chatSidebarCollapsed";
+const CITATIONS_HIDDEN_KEY = "noeticsrag.chatCitationsHidden";
 const CHAT_INTRO =
   `<div class="answer">Ask a question about the indexed document. Your conversation ` +
   `will be saved automatically, including the retrieved tree nodes and graph evidence.</div>`;
@@ -2048,7 +2049,33 @@ function wireChat() {
   // The collapsed state is a workspace preference, not document state, so it
   // outlives both the conversation and the selected PDF.
   applySidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
+  const cites = $("citeToggle");
+  if (cites) {
+    cites.addEventListener("change", () => applyCitationsShown(cites.checked, true));
+    applyCitationsShown(localStorage.getItem(CITATIONS_HIDDEN_KEY) !== "1", false);
+  }
   showChatIntro();
+}
+
+// Whether an answer shows its own [E1] / [Q1-E1] markers is a reading
+// preference, so it is applied to the whole transcript at once rather than per
+// message: the same conversation reads either way without being asked again,
+// and switching costs nothing because every marker is already its own element.
+// Only the inline markers go -- the References list stays, since it is the
+// evidence itself rather than an interruption in the prose.
+function applyCitationsShown(shown, persist) {
+  const shell = $("chatShell");
+  const toggle = $("citeToggle");
+  if (shell) shell.classList.toggle("citationsHidden", !shown);
+  if (toggle) {
+    toggle.checked = shown;
+    toggle.title = shown
+      ? "Hide the [E1] markers inside answers"
+      : "Show the [E1] markers inside answers";
+  }
+  if (persist) {
+    try { localStorage.setItem(CITATIONS_HIDDEN_KEY, shown ? "0" : "1"); } catch (e) {}
+  }
 }
 
 function applySidebarCollapsed(collapsed) {
@@ -2431,14 +2458,38 @@ function linkifyCitations(scope, citations) {
     while ((m = pattern.exec(text))) {
       const label = m[1];
       if (!known.has(label)) continue;
-      frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      // The whitespace around a marker belongs to the marker, and goes inside
+      // its wrapper so that hiding inline references closes the prose up
+      // instead of leaving the gaps behind. The space in front always counts.
+      // The space behind counts when the model wrote "[E1] ." and the stop
+      // would otherwise be left stranded, or when the marker opens the text
+      // and so has no space of its own to give back.
+      const before = text.slice(last, m.index);
+      const lead = before.match(/[ \t]+$/);
+      const afterIndex = m.index + m[0].length;
+      const rest = text.slice(afterIndex);
+      const spacing = rest.match(/^[ \t]+/);
+      const tail =
+        spacing && (!lead || /^[.,;:!?)]/.test(rest.slice(spacing[0].length)))
+          ? spacing[0]
+          : "";
+      frag.appendChild(
+        document.createTextNode(lead ? before.slice(0, -lead[0].length) : before)
+      );
       const a = document.createElement("a");
       a.className = "cite";
       a.href = `#ref-${label}`;
       a.dataset.cite = label;
       a.textContent = `[${label}]`;
-      frag.appendChild(a);
-      last = m.index + m[0].length;
+      // The wrapper is unstyled and is not a block, so the chip looks exactly
+      // as it did and inlineCitedFigures still finds the marker's paragraph.
+      const wrap = document.createElement("span");
+      wrap.className = "citeWrap";
+      if (lead) wrap.appendChild(document.createTextNode(lead[0]));
+      wrap.appendChild(a);
+      if (tail) wrap.appendChild(document.createTextNode(tail));
+      frag.appendChild(wrap);
+      last = afterIndex + tail.length;
     }
     frag.appendChild(document.createTextNode(text.slice(last)));
     textNode.replaceWith(frag);
