@@ -508,9 +508,14 @@ def _strip_nul_bytes(value: object) -> object:
     "\\u0000" form alike. MinerU emits a literal NUL as its fallback for a
     handful of glyphs a source PDF's font has no usable Unicode mapping for
     (seen in practice: Greek letters and a degree sign, in Zernike-polynomial
-    notation). Rare, but real, so this runs once here, on every artifact this
-    module reads, rather than trusting every downstream field access to
-    remember the constraint.
+    notation).
+
+    This is now a net for the artifact's own non-DTO fields only. Removing a
+    NUL from anything a digest was already taken over is what broke a
+    1871-page index: the block kept a content_sha256 for text the store no
+    longer held, and CanonicalBlock.from_dict refused every block on read.
+    ``freeze_json`` drops it before the digest is computed, so by the time an
+    artifact is read here its canonical blocks have nothing left to strip.
     """
 
     if isinstance(value, str):

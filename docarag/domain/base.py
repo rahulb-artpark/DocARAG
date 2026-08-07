@@ -94,9 +94,22 @@ def freeze_json(value: object, *, field: str = "value") -> JsonValue:
 
     Copying into tuples and mapping proxies prevents mutation after a stable
     content hash has been calculated.
+
+    A NUL is dropped here, before any digest is taken over the value, because
+    PostgreSQL's text and jsonb types both reject an embedded NUL outright and
+    MinerU emits a literal NUL as its fallback for a glyph a source PDF's font
+    has no usable Unicode mapping for (Greek letters and a degree sign, in
+    Zernike-polynomial notation). Something has to remove it before the value
+    can be stored, and the only safe moment is before it is hashed: dropping it
+    downstream instead left six blocks of a 1871-page document carrying a
+    content_sha256 for text the store no longer held, and every query against
+    that document failed on "Representation content_sha256 mismatch" -- a whole
+    index lost to a character that was never storable in the first place.
     """
 
-    if value is None or isinstance(value, (str, bool, int)):
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):

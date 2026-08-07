@@ -80,10 +80,23 @@ def _non_empty_text(value: object) -> str | None:
 
 
 def _joined_text(value: object) -> str | None:
+    """The block's text, or None when it carries none worth representing.
+
+    A NUL is MinerU's fallback for a glyph it could not map, and the contract
+    drops it before hashing (see ``freeze_json``). Emptiness is therefore
+    judged on the text that will actually be stored: a block whose only
+    "text" is an unmappable glyph has none, and saying so here degrades that
+    one block instead of failing the bind on an empty representation.
+    """
+
     if isinstance(value, str):
-        return value if value.strip() else None
+        return value if value.replace("\x00", "").strip() else None
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        items = [
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.replace("\x00", "").strip()
+        ]
         return " ".join(items) if items else None
     return None
 
