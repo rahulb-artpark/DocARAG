@@ -382,9 +382,12 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
   justify-content: flex-end;
   align-items: center;
   gap: 10px;
-  /* The same centred gutter .messages uses, so the control sits flush with the
-     right edge of the answer column rather than the window. */
-  padding: 10px max(22px, calc((100% - 1080px) / 2)) 0;
+  /* Sits below the transcript and above the composer. The same centred gutter
+     .messages uses, so the control lines up with the right edge of the answer
+     column rather than the window. flex-shrink: 0 keeps it off the scroll --
+     .messages takes the overflow, this stays put at the bottom. */
+  flex-shrink: 0;
+  padding: 2px max(22px, calc((100% - 1080px) / 2)) 8px;
 }
 .citeToggle {
   display: inline-flex;
