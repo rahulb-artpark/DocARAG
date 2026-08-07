@@ -120,21 +120,46 @@ class AFigureIsFoundByItsSubject(unittest.TestCase):
             text = next(t for t in _texts(tree) if "Figure 4" in t)
             self.assertEqual(1, text.count("Figure 4"))
 
-    def test_the_fused_image_text_carries_the_same_words(self):
-        # Tables and equations already pass their full text as the image's
-        # paired text; a figure passed the empty string.
+    def test_the_crop_keeps_a_visual_vector_not_a_prose_one(self):
+        # The paired text is fused *into* the image vector, not stored beside
+        # it. Feeding every figure its whole summary put 4 image vectors in a
+        # top 200 -- best at rank 36 -- and a question that said "show me the
+        # image" retrieved none. The prose belongs in the text record; the
+        # crop stays a picture.
         with tempfile.TemporaryDirectory() as directory:
             image = f"{directory}/figure.jpg"
             Path(image).write_bytes(b"\xff\xd8\xff\xe0jpeg")
             tree, figure = _tree(directory, content="A teardrop form.", img_path=image)
             figure.summary = "The Zernike Surface illustration."
 
+            records = list(vdb_index.iter_tree_index_records(tree))
+            paired = [r.image_text for r in records if r.modality == "image"]
+            texts = [r.value for r in records if r.modality == "text"]
+
+            self.assertEqual([""], paired, "the crop must not carry the prose")
+            self.assertTrue(
+                any("Zernike Surface illustration" in t for t in texts),
+                "the prose must still be indexed, as its own text record",
+            )
+
+    def test_a_caption_is_the_one_text_a_crop_does_carry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = f"{directory}/figure.jpg"
+            Path(image).write_bytes(b"\xff\xd8\xff\xe0jpeg")
+            tree, figure = _tree(
+                directory,
+                caption="Figure 4: the Zernike sag surface.",
+                content="A long visual description that must not be fused in.",
+                img_path=image,
+            )
+            figure.summary = "A long summary that must not be fused in either."
+
             paired = [
                 record.image_text
                 for record in vdb_index.iter_tree_index_records(tree)
                 if record.modality == "image"
             ]
-            self.assertTrue(paired and "Zernike Surface" in paired[0], paired)
+            self.assertEqual(["Figure 4: the Zernike sag surface."], paired)
 
 
 class NothingIsIndexedAsTheEmptyString(unittest.TestCase):

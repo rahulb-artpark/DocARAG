@@ -1068,6 +1068,24 @@ def _listing_text(node) -> str:
     return summary or listing
 
 
+def _crop_label(node) -> str:
+    """The short label that belongs *inside* a crop's own vector.
+
+    Whatever is passed beside an image reaches ``embed_fused`` and is mixed
+    into the image's vector rather than stored next to it, so this is the one
+    place where more text is not better: a caption sharpens what the picture
+    already shows, while a paragraph drowns it. Empty is a valid answer and
+    the common one -- MinerU fills neither field -- which leaves a clean
+    visual embedding, the only representation a "show me the image" question
+    has to match on.
+    """
+
+    meta = getattr(node, "meta_info", None)
+    caption = str(getattr(meta, "caption", "") or "").strip()
+    footnote = str(getattr(meta, "footnote", "") or "").strip()
+    return " ".join(part for part in (caption, footnote) if part)
+
+
 def _visual_text(node) -> str:
     """What a figure is about, in whatever words are attached to it.
 
@@ -1279,7 +1297,18 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
                     "image",
                     image_path,
                     _representation_metadata(meta_data, "image"),
-                    image_str,
+                    # The crop's own label, not the node's whole prose. The
+                    # embedder fuses this text *into* the image vector, so a
+                    # long description does not describe the picture, it
+                    # replaces it: feeding every figure its ~945-character
+                    # summary pushed the entire visual modality below the text
+                    # vectors -- 4 image vectors in the top 200, best at rank
+                    # 36 -- and a question that said "show me the image"
+                    # retrieved no image at all. A figure's prose belongs in
+                    # the text record above, where it is searched as prose;
+                    # the crop stays a picture, which is the one thing only it
+                    # can be matched on.
+                    _crop_label(node),
                 )
         elif node_type in (NodeType.TABLE, NodeType.LIST):
             # A grid embeds as markup: "<table><tr><td>" is noise, and the
