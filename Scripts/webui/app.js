@@ -2408,7 +2408,10 @@ function renderReferences(citations) {
       ${jump}
     </div>`;
   }).join("");
-  return `<details class="evidence" open><summary>References (${citations.length})</summary><div class="refList">${cards}</div></details>`;
+  // Closed by default, like every other evidence panel. Reopening it on every
+  // answer buried the next question under a full reference list each time the
+  // reader switched conversations; clicking a citation still opens it.
+  return `<details class="evidence"><summary>References (${citations.length})</summary><div class="refList">${cards}</div></details>`;
 }
 
 // Entities the retrieval touched but that the answer may not have named
@@ -2516,6 +2519,11 @@ function wireEvidenceLinks(scope) {
       e.preventDefault();
       const target = scope.querySelector(`#ref-${a.dataset.cite}`);
       if (!target) return;
+      // The references panel is collapsed until asked for, and a card inside a
+      // closed <details> has no box to scroll to -- following a citation would
+      // do nothing at all. Open it first, then scroll.
+      const panel = target.closest("details");
+      if (panel && !panel.open) panel.open = true;
       target.scrollIntoView({ behavior: "smooth", block: "center" });
       target.classList.add("flash");
       setTimeout(() => target.classList.remove("flash"), 1200);
