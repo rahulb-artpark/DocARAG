@@ -1009,6 +1009,13 @@ _NOT_INDEXED_NODE_TYPES = frozenset(
     }
 )
 
+# Prose types whose "text" is not prose. A listing is indexed like a table --
+# its own words in front of its syntax -- while the rest of _TEXT_NODE_TYPES
+# index as themselves, because a paragraph, an abstract or a reference already
+# is the sentence a question resembles. These stay inside _TEXT_NODE_TYPES so
+# the "every reachable type is declared" check still sees them.
+_LISTING_NODE_TYPES = frozenset({NodeType.CODE, NodeType.ALGORITHM})
+
 # Types that may carry a materialized crop alongside their text.
 _CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {
     NodeType.TABLE,
@@ -1037,6 +1044,28 @@ def _table_text(node) -> str:
     caption = node_content(node)
     body = str(getattr(getattr(node, "meta_info", None), "table_body", "") or "").strip()
     return "\n".join(part for part in (summary, caption, body) if part)
+
+
+def _listing_text(node) -> str:
+    """What a listing does, in words, above what it says in syntax.
+
+    A listing embeds as syntax for the same reason a grid embeds as markup:
+    "! comment (optional)" and "<zerntype> <numterms> <datatype>" are the
+    shape of a file format, not a sentence about one, and a question is a
+    sentence. Every one of this document's 313 code nodes had a summary
+    naming the subject -- "the INT Zernike file format consists of optional
+    comment lines followed by the Zernike coefficient data" -- and indexed
+    only the skeleton.
+
+    Summary first, matching ``_table_text``: it is the part a question
+    resembles and the part worth keeping if the window truncates.
+    """
+
+    summary = str(getattr(node, "summary", "") or "").strip()
+    listing = _node_content(node)
+    if summary and listing:
+        return f"{summary}\n{listing}"
+    return summary or listing
 
 
 def _visual_text(node) -> str:
@@ -1312,6 +1341,12 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
                     _representation_metadata(meta_data, "image"),
                     context_text or self_text or "",
                 )
+        elif node_type in _LISTING_NODE_TYPES:
+            listing = _listing_text(node)
+            if listing:
+                yield TreeIndexRecord(
+                    "text", listing, _representation_metadata(meta_data, "text")
+                )
         elif node_type in _TEXT_NODE_TYPES:
             text_content = node.meta_info.content
             if text_content:
@@ -1320,6 +1355,25 @@ def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
                     text_content,
                     _representation_metadata(meta_data, "text"),
                 )
+
+            # A heading is a few words; the section under it is what the
+            # heading is about. "2.3.2.2.94. Zernike Surface" and "defines the
+            # Zernike surface ... characterized by a sag equation combining
+            # base conic, aspheric and Zernike polynomial terms" answer
+            # different questions, and only the first was reachable.
+            #
+            # A second record rather than a blend, for the reason the equation
+            # branch keeps two: a heading is the exact string someone searching
+            # for the section types, and lengthening that vector with a
+            # paragraph is what would cost the exact match.
+            if node_type == NodeType.TITLE:
+                section_summary = str(getattr(node, "summary", "") or "").strip()
+                if section_summary and section_summary != (text_content or "").strip():
+                    yield TreeIndexRecord(
+                        "text",
+                        section_summary,
+                        _representation_metadata(meta_data, "text"),
+                    )
 
         yield from _iter_semantic_element_records(node.meta_info, meta_data)
 
