@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict, Any, Tuple, Union, Literal, Mapping
+from typing import List, Optional, Dict, Any, Tuple, Union, Literal, Mapping, Sequence
 import json
 import re
 
@@ -342,6 +342,28 @@ def _scope_answer_markers(answer: str, scope: str) -> str:
         ),
         answer,
     )
+
+
+def _evidence_scope_of(evidence_nodes: Sequence[Mapping[str, Any]]) -> str | None:
+    """The one scope every piece of this evidence was labelled under.
+
+    A sub-question's evidence is labelled ``Q1-E1``; a simple question's is
+    labelled ``E1``. Returns the scope only when every label agrees on it, so
+    a mixed or unscoped set normalizes nothing.
+    """
+
+    scopes: set[str] = set()
+    for node in evidence_nodes:
+        label = node.get("evidence_label") if isinstance(node, Mapping) else None
+        if not isinstance(label, str) or "-" not in label:
+            return None
+        scope = label.split("-", 1)[0]
+        if _EVIDENCE_SCOPE.fullmatch(scope) is None:
+            return None
+        scopes.add(scope)
+    if len(scopes) != 1:
+        return None
+    return scopes.pop()
 
 
 def _raw_complex_bindings(result: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -915,8 +937,21 @@ class AnswerAgent:
 
         This is a structural source-reference gate, not a semantic entailment
         claim. The latter remains a separate post-generation verifier.
+
+        A sub-question's evidence is labelled ``Q1-E1`` while the prompt offers
+        the model both that form and the plain ``E1``, so a model that takes
+        the shorter one cites evidence it was genuinely given under a name the
+        binding map does not hold. Validating that verbatim reported every
+        marker as ``unknown_citations`` and threw the answer away -- on the
+        same question, unchanged, it depended only on which form the model
+        happened to choose that run. The markers are namespaced to the scope
+        the evidence already carries before they are judged, which is the same
+        rewrite ``_scope_answer_markers`` performs for the final synthesis.
         """
 
+        scope = _evidence_scope_of(evidence_nodes)
+        if scope is not None:
+            answer = _scope_answer_markers(answer, scope)
         validation = validate_answer_citations(
             answer,
             _evidence_bindings(evidence_nodes),
