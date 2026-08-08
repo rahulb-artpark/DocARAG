@@ -9,8 +9,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import networkx as nx
 import logging
 
+from Core.pipelines.entity_facets import lexical_terms
 from Core.provider.embedding import TextEmbeddingProvider, MMRerankerProvider
 from Core.provider.rerank import TextRerankerProvider
+from Core.provider.vdb import _TREE_SPARSE_VECTOR
 from Core.Index.Tree import TreeNode, NodeType
 from Core.utils.table_utils import table2text
 from Core.utils.utils import num_tokens, TextProcessor
@@ -342,15 +344,23 @@ class Retriever:
             return int(value)
         return None
 
-    def _dense_candidates(
+    def _vector_candidates(
         self,
         subtree_nodes: List[TreeNode],
         query: str,
-    ) -> List[Tuple[TreeNode, Mapping[str, Any]]]:
-        """Search attested text and visual TreeVDB representations."""
+    ) -> Dict[str, List[Tuple[TreeNode, Mapping[str, Any]]]]:
+        """One bounded candidate list per named vector, from one round trip.
+
+        A node's readings share a point now, so asking for a name is what
+        separates "this figure looks like the question" from "this figure's
+        caption reads like it". Returned unfused, because which vector matched
+        is the signal the schema exists to carry -- fusing server-side would
+        hand back one opaque list and leave the RRF trace below claiming an
+        arithmetic it never performed.
+        """
 
         if self.tree_vdb is None or not subtree_nodes:
-            return []
+            return {}
         allowed = {node.index_id: node for node in subtree_nodes}
         # Search a bounded oversample because the source-scoped Qdrant index is
         # document-wide while section selection may authorize one subtree.
@@ -358,19 +368,61 @@ class Retriever:
             4096,
             max(self.candidate_pool_size, 4 * self.candidate_pool_size),
         )
-        rows = self.tree_vdb.search(query_text=query, top_k=search_limit)
+        search_named = getattr(self.tree_vdb, "search_tree_vectors", None)
+        if callable(search_named):
+            rows_by_name = search_named(
+                query,
+                top_k=search_limit,
+                lexical_terms=lexical_terms(query),
+            )
+        else:
+            # A store with one unnamed vector has one list and no name to give
+            # it -- the gbcvanilla index, and every mock in the tests.
+            rows_by_name = {
+                "": self.tree_vdb.search(query_text=query, top_k=search_limit)
+            }
+        return {
+            name: self._bounded_subtree_rows(rows, allowed)
+            for name, rows in rows_by_name.items()
+        }
+
+    def _bounded_subtree_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        allowed: Mapping[int, TreeNode],
+    ) -> List[Tuple[TreeNode, Mapping[str, Any]]]:
         candidates: list[tuple[TreeNode, Mapping[str, Any]]] = []
         for row in rows:
             if not isinstance(row, Mapping):
                 raise ValueError("TreeVDB search must return mapping records")
-            node_id = self._node_id_from_hit(row)
-            node = allowed.get(node_id)
+            node = allowed.get(self._node_id_from_hit(row))
             if node is None:
                 continue
             candidates.append((node, row))
             if len(candidates) == self.candidate_pool_size:
                 break
         return candidates
+
+    def _expected_vector_names(self) -> Tuple[str, ...]:
+        """The legs this store would have produced, for tracing a failure."""
+
+        from Core.provider.vdb import _TREE_DENSE_VECTORS
+
+        if self.tree_vdb is not None and callable(
+            getattr(self.tree_vdb, "search_tree_vectors", None)
+        ):
+            return (*_TREE_DENSE_VECTORS, _TREE_SPARSE_VECTOR)
+        return ("",)
+
+    @staticmethod
+    def _leg_identity(vector_name: str) -> Tuple[str, str, str]:
+        """The leg id, kind and backend one vector name is retrieved under."""
+
+        if vector_name == _TREE_SPARSE_VECTOR:
+            return "lexical-tree", "sparse", "qdrant-tree-sparse"
+        if not vector_name:
+            return "dense-tree", "dense", "qdrant-tree-dense"
+        return f"dense-tree-{vector_name}", "dense", "qdrant-tree-dense"
 
     @staticmethod
     def _sha256_json(value: object) -> str:
@@ -497,7 +549,7 @@ class Retriever:
         *,
         subtree_nodes: List[TreeNode],
         query: str,
-        dense_candidates: List[Tuple[TreeNode, Mapping[str, Any]]],
+        vector_candidates: Dict[str, List[Tuple[TreeNode, Mapping[str, Any]]]],
         bm25_candidates: List[Tuple[TreeNode, float]],
         dense_error: bool,
     ) -> List[TreeNode]:
@@ -528,39 +580,45 @@ class Retriever:
                 "dense_oversample": 4,
                 "rrf_k": 60,
                 "policy": policy_identity,
+                # Which vectors were asked is part of what the config is: the
+                # same query over a different set of names is a different
+                # retrieval.
+                "vector_names": sorted(vector_candidates),
             }
         )
-        dense_backend = "qdrant-tree-dense"
         bm25_backend = "bookrag-tree-bm25"
-        dense_leg_config = self._sha256_json(
-            {"backend": dense_backend, "index": binding.dense_index_revision_id}
-        )
         bm25_leg_config = self._sha256_json(
             {"backend": bm25_backend, "tree": binding.tree_revision_id}
         )
 
-        dense_hits = []
-        for rank, (node, row) in enumerate(dense_candidates, start=1):
-            distance = row.get("distance")
-            if isinstance(distance, bool) or not isinstance(distance, numbers.Real):
-                raise ValueError("TreeVDB hit distance must be numeric")
-            row_id = row.get("id")
-            if not isinstance(row_id, str) or not row_id:
-                row_id = self._sha256_json(row)
-            dense_hits.append(
-                self._candidate_hit(
-                    node=node,
-                    rank=rank,
-                    backend_id=dense_backend,
-                    leg_kind="dense",
-                    index_revision_id=binding.dense_index_revision_id,
-                    raw_score=1.0 - float(distance),
-                    payload=row,
-                    hit_id=f"dense-{row_id}",
-                    filter_identity=filter_identity,
-                    policy_identity=policy_identity,
+        vector_hits: dict[str, list] = {}
+        for vector_name, candidates in vector_candidates.items():
+            leg_id, leg_kind, backend_id = self._leg_identity(vector_name)
+            hits = []
+            for rank, (node, row) in enumerate(candidates, start=1):
+                distance = row.get("distance")
+                if isinstance(distance, bool) or not isinstance(distance, numbers.Real):
+                    raise ValueError("TreeVDB hit distance must be numeric")
+                row_id = row.get("id")
+                if not isinstance(row_id, str) or not row_id:
+                    row_id = self._sha256_json(row)
+                hits.append(
+                    self._candidate_hit(
+                        node=node,
+                        rank=rank,
+                        backend_id=backend_id,
+                        leg_kind=leg_kind,
+                        index_revision_id=binding.dense_index_revision_id,
+                        raw_score=1.0 - float(distance),
+                        payload=row,
+                        # The row id already ends in the vector name, so hits
+                        # from different legs never collide.
+                        hit_id=f"{leg_id}-{row_id}",
+                        filter_identity=filter_identity,
+                        policy_identity=policy_identity,
+                    )
                 )
-            )
+            vector_hits[vector_name] = hits
         bm25_hits = [
             self._candidate_hit(
                 node=node,
@@ -577,32 +635,22 @@ class Retriever:
             for rank, (node, score) in enumerate(bm25_candidates, start=1)
         ]
 
+        all_hits = [hit for hits in vector_hits.values() for hit in hits]
+        all_hits.extend(bm25_hits)
         revision_ids = tuple(
-            sorted(
-                {
-                    value
-                    for hit in (*dense_hits, *bm25_hits)
-                    for value in hit.canonical_revision_ids
-                }
-            )
+            sorted({value for hit in all_hits for value in hit.canonical_revision_ids})
         )
         representation_ids = tuple(
             sorted(
                 {
                     value
-                    for hit in (*dense_hits, *bm25_hits)
+                    for hit in all_hits
                     for value in hit.canonical_representation_ids
                 }
             )
         )
         asset_ids = tuple(
-            sorted(
-                {
-                    value
-                    for hit in (*dense_hits, *bm25_hits)
-                    for value in hit.canonical_asset_ids
-                }
-            )
+            sorted({value for hit in all_hits for value in hit.canonical_asset_ids})
         )
         document_binding = DocumentEvidenceBinding(
             document_id=binding.document_id,
@@ -614,25 +662,50 @@ class Retriever:
             canonical_representation_ids=representation_ids,
             canonical_asset_ids=asset_ids,
         )
-        plans = (
+        vector_legs = []
+        for vector_name in sorted(vector_hits):
+            leg_id, leg_kind, backend_id = self._leg_identity(vector_name)
+            vector_legs.append(
+                (
+                    vector_name,
+                    leg_id,
+                    leg_kind,
+                    backend_id,
+                    self._sha256_json(
+                        {
+                            "backend": backend_id,
+                            "index": binding.dense_index_revision_id,
+                            "vector": vector_name,
+                        }
+                    ),
+                )
+            )
+        include_bm25 = bool(bm25_candidates) or not vector_legs
+        plans = tuple(
             PlannedRetrievalLeg(
-                leg_id="dense-tree",
-                leg_kind="dense",
-                backend_id=dense_backend,
+                leg_id=leg_id,
+                leg_kind=leg_kind,
+                backend_id=backend_id,
                 index_revision_id=binding.dense_index_revision_id,
-                leg_config_sha256=dense_leg_config,
+                leg_config_sha256=leg_config,
                 max_hits=self.candidate_pool_size,
                 budget_ms=30_000,
-            ),
-            PlannedRetrievalLeg(
-                leg_id="bm25-tree",
-                leg_kind="bm25",
-                backend_id=bm25_backend,
-                index_revision_id=binding.tree_revision_id,
-                leg_config_sha256=bm25_leg_config,
-                max_hits=self.candidate_pool_size,
-                budget_ms=30_000,
-            ),
+            )
+            for _name, leg_id, leg_kind, backend_id, leg_config in vector_legs
+        ) + (
+            (
+                PlannedRetrievalLeg(
+                    leg_id="bm25-tree",
+                    leg_kind="bm25",
+                    backend_id=bm25_backend,
+                    index_revision_id=binding.tree_revision_id,
+                    leg_config_sha256=bm25_leg_config,
+                    max_hits=self.candidate_pool_size,
+                    budget_ms=30_000,
+                ),
+            )
+            if include_bm25
+            else ()
         )
         scope = CandidateQueryScope(
             tenant_id=binding.tenant_id,
@@ -644,40 +717,52 @@ class Retriever:
             document_bindings=(document_binding,),
             planned_legs=plans,
             ready_index_revisions={
-                dense_backend: binding.dense_index_revision_id,
-                bm25_backend: binding.tree_revision_id,
+                **{
+                    backend_id: binding.dense_index_revision_id
+                    for _n, _i, _k, backend_id, _c in vector_legs
+                },
+                **({bm25_backend: binding.tree_revision_id} if include_bm25 else {}),
             },
         )
-        dense_status = (
-            "error" if dense_error else "success" if dense_hits else "empty"
-        )
-        legs = (
+        legs = tuple(
             CandidateLeg(
-                leg_id="dense-tree",
-                leg_kind="dense",
-                backend_id=dense_backend,
+                leg_id=leg_id,
+                leg_kind=leg_kind,
+                backend_id=backend_id,
                 index_revision_id=binding.dense_index_revision_id,
                 query_sha256=query_sha256,
                 retrieval_config_sha256=retrieval_config_sha256,
-                leg_config_sha256=dense_leg_config,
-                hits=tuple(dense_hits),
-                status=dense_status,
+                leg_config_sha256=leg_config,
+                hits=tuple(vector_hits[name]),
+                status=(
+                    "error"
+                    if dense_error
+                    else "success"
+                    if vector_hits[name]
+                    else "empty"
+                ),
                 error_code="backend_error" if dense_error else None,
-            ),
-            CandidateLeg(
-                leg_id="bm25-tree",
-                leg_kind="bm25",
-                backend_id=bm25_backend,
-                index_revision_id=binding.tree_revision_id,
-                query_sha256=query_sha256,
-                retrieval_config_sha256=retrieval_config_sha256,
-                leg_config_sha256=bm25_leg_config,
-                hits=tuple(bm25_hits),
-                status="success" if bm25_hits else "empty",
-            ),
+            )
+            for name, leg_id, leg_kind, backend_id, leg_config in vector_legs
+        ) + (
+            (
+                CandidateLeg(
+                    leg_id="bm25-tree",
+                    leg_kind="bm25",
+                    backend_id=bm25_backend,
+                    index_revision_id=binding.tree_revision_id,
+                    query_sha256=query_sha256,
+                    retrieval_config_sha256=retrieval_config_sha256,
+                    leg_config_sha256=bm25_leg_config,
+                    hits=tuple(bm25_hits),
+                    status="success" if bm25_hits else "empty",
+                ),
+            )
+            if include_bm25
+            else ()
         )
         bounds = FusionBounds(
-            max_legs=2,
+            max_legs=max(len(legs), 1),
             max_hits_per_leg=self.candidate_pool_size,
             max_output=self.candidate_pool_size,
         )
@@ -726,27 +811,44 @@ class Retriever:
     ) -> List[TreeNode]:
         """Fuse dense/visual Qdrant and BM25 before bounded model reranking."""
 
-        bm25_candidates = self._bm25_candidates(subtree_nodes, query)
         dense_error = False
         try:
-            dense_candidates = self._dense_candidates(subtree_nodes, query)
+            vector_candidates = self._vector_candidates(subtree_nodes, query)
         except Exception:
             dense_error = True
-            dense_candidates = []
-            log.exception("TreeVDB dense/visual retrieval failed; continuing with BM25")
+            # Empty legs rather than no legs: a failure the trace does not
+            # mention is a failure nobody can see afterwards.
+            vector_candidates = {name: [] for name in self._expected_vector_names()}
+            log.exception("TreeVDB retrieval failed; continuing with in-process BM25")
+
+        # Lexical search is Qdrant's now: server-side, over the whole document
+        # scope, so a keyword can reach a section the selector did not pick --
+        # which the in-process leg could never do, scoring only the subtree it
+        # was handed. It stays for the one case that still needs it: when
+        # Qdrant is unreachable, an outage would otherwise take the dense and
+        # lexical legs together and leave no answer at all.
+        has_lexical = bool(vector_candidates.get(_TREE_SPARSE_VECTOR))
+        bm25_candidates = (
+            self._bm25_candidates(subtree_nodes, query)
+            if dense_error or not has_lexical
+            else []
+        )
 
         selected: list[TreeNode]
         try:
             selected = self._contract_fusion(
                 subtree_nodes=subtree_nodes,
                 query=query,
-                dense_candidates=dense_candidates,
+                vector_candidates=vector_candidates,
                 bm25_candidates=bm25_candidates,
                 dense_error=dense_error,
             )
         except _CandidateContractUnavailable:
             self.last_fusion_result = None
-            selected = self._internal_rrf(dense_candidates, bm25_candidates)
+            selected = self._internal_rrf(
+                [row for rows in vector_candidates.values() for row in rows],
+                bm25_candidates,
+            )
 
         # Keep deterministic source coverage when both retrieval legs return a
         # small set (or a legacy tree cannot participate in contract fusion).
