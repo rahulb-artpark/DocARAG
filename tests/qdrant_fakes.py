@@ -20,10 +20,30 @@ class FakeModels:
         size: int
         distance: str
 
+    class Modifier:
+        IDF = "idf"
+
+    @dataclass
+    class SparseIndexParams:
+        on_disk: bool | None = None
+
+    @dataclass
+    class SparseVectorParams:
+        index: Any | None = None
+        modifier: str | None = None
+
+    @dataclass
+    class SparseVector:
+        indices: list[int]
+        values: list[float]
+
     @dataclass
     class PointStruct:
         id: str
-        vector: list[float]
+        # A named-vector point carries a mapping of vector name to vector, and
+        # may carry only a subset of the collection's names -- which is the
+        # property a one-point-per-node schema depends on.
+        vector: list[float] | dict[str, Any]
         payload: dict[str, Any]
 
     @dataclass
@@ -59,11 +79,19 @@ class FakeModels:
 
     @dataclass
     class QueryRequest:
-        query: list[float]
+        query: Any
         filter: Any | None = None
         limit: int = 10
         with_payload: bool = True
         with_vectors: bool = False
+        using: str | None = None
+
+
+def _named_vectors(point: Any) -> dict[str | None, Any]:
+    """One point's vectors keyed by name; an unnamed point keys on None."""
+
+    vector = point.vector
+    return dict(vector) if isinstance(vector, dict) else {None: vector}
 
 
 def _matches(record_id: str, payload: dict[str, Any], filter_: Any | None) -> bool:
@@ -100,13 +128,20 @@ class FakeQdrantClient:
     def collection_exists(self, *, collection_name: str) -> bool:
         return collection_name in self.collections
 
-    def create_collection(self, *, collection_name: str, vectors_config: Any) -> None:
+    def create_collection(
+        self,
+        *,
+        collection_name: str,
+        vectors_config: Any,
+        sparse_vectors_config: Any | None = None,
+    ) -> None:
         if collection_name in self.collections:
             error = RuntimeError("already exists")
             error.status_code = 409
             raise error
         self.collections[collection_name] = {
             "vectors_config": vectors_config,
+            "sparse_vectors_config": sparse_vectors_config,
             "payload_schema": {},
             "records": {},
         }
@@ -118,7 +153,10 @@ class FakeQdrantClient:
         collection = self.collections[collection_name]
         return SimpleNamespace(
             config=SimpleNamespace(
-                params=SimpleNamespace(vectors=collection["vectors_config"])
+                params=SimpleNamespace(
+                    vectors=collection["vectors_config"],
+                    sparse_vectors=collection.get("sparse_vectors_config"),
+                )
             ),
             payload_schema=dict(collection["payload_schema"]),
         )
@@ -149,6 +187,10 @@ class FakeQdrantClient:
                 "wait": wait,
                 "ids": [point.payload["_docarag_record_id"] for point in points],
                 "embeddings": [point.vector for point in points],
+                # The same vectors keyed by name, so a named-vector test can
+                # assert which slots a point carries without unpacking
+                # PointStruct. An unnamed point reports {None: vector}.
+                "vectors": [_named_vectors(point) for point in points],
                 "documents": [point.payload["_docarag_content"] for point in points],
                 "metadatas": [
                     {
@@ -244,15 +286,54 @@ class FakeQdrantClient:
         )
         return numerator / denominator if denominator else 0.0
 
+    @staticmethod
+    def _sparse_dot(left: Any, right: Any) -> float:
+        """Term-frequency overlap, standing in for Qdrant's IDF scoring.
+
+        The server weights each term by its collection-wide rarity; a fake has
+        no corpus to compute that from, so this scores on shared terms alone.
+        Enough to assert that a keyword query reaches the point holding the
+        term and not the ones that do not.
+        """
+
+        weights = dict(zip(right.indices, right.values))
+        return float(
+            sum(value * weights.get(index, 0.0)
+                for index, value in zip(left.indices, left.values))
+        )
+
+    @staticmethod
+    def _vector_for(point: Any, using: str | None) -> Any:
+        """The vector a query targets, or None when the point does not carry it.
+
+        Returning None -- and skipping the point -- is what makes "a point may
+        carry a subset of the collection's vectors" a testable property.
+        """
+
+        vector = point.vector
+        if isinstance(vector, dict):
+            return vector.get(using)
+        return vector if using is None else None
+
+    def _score(self, query: Any, vector: Any) -> float:
+        if isinstance(query, FakeModels.SparseVector):
+            if not isinstance(vector, FakeModels.SparseVector):
+                return 0.0
+            return self._sparse_dot(query, vector)
+        if isinstance(vector, FakeModels.SparseVector):
+            return 0.0
+        return self._cosine(query, vector)
+
     def query_points(
         self,
         *,
         collection_name: str,
-        query: list[float],
+        query: Any,
         query_filter: Any | None,
         limit: int,
         with_payload: bool,
         with_vectors: bool,
+        using: str | None = None,
     ):
         call = {
             "collection_name": collection_name,
@@ -261,18 +342,24 @@ class FakeQdrantClient:
             "limit": limit,
             "with_payload": with_payload,
             "with_vectors": with_vectors,
+            "using": using,
         }
         self.query_calls.append(call)
         records = self.collections[collection_name]["records"]
-        hits = [
-            SimpleNamespace(
-                id=record_id,
-                score=self._cosine(query, point.vector),
-                payload=dict(point.payload),
+        hits = []
+        for record_id, point in records.items():
+            if not _matches(record_id, point.payload, query_filter):
+                continue
+            vector = self._vector_for(point, using)
+            if vector is None:
+                continue
+            hits.append(
+                SimpleNamespace(
+                    id=record_id,
+                    score=self._score(query, vector),
+                    payload=dict(point.payload),
+                )
             )
-            for record_id, point in records.items()
-            if _matches(record_id, point.payload, query_filter)
-        ]
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return SimpleNamespace(points=hits[:limit])
 
@@ -288,6 +375,7 @@ class FakeQdrantClient:
                 limit=request.limit,
                 with_payload=request.with_payload,
                 with_vectors=request.with_vectors,
+                using=getattr(request, "using", None),
             )
             for request in requests
         ]
@@ -303,6 +391,7 @@ class FakeQdrantClient:
                 record_id = point.payload["_docarag_record_id"]
                 logical[record_id] = {
                     "embedding": point.vector,
+                    "vectors": _named_vectors(point),
                     "document": point.payload["_docarag_content"],
                     "metadata": {
                         key: value
