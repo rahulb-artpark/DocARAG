@@ -179,12 +179,27 @@ class TheSectionHasToBeThere(unittest.TestCase):
 
 
 class TheSchemaSaysItChanged(unittest.TestCase):
-    def test_the_index_schema_is_v8(self):
-        # Readiness never recomputes the projection, so without this bump an
-        # index with no context vectors would pass as ready and no document
-        # would ever be rebuilt.
-        self.assertTrue(vdb_index.TREE_VECTOR_INDEX_SCHEMA.endswith(".v8"))
-        self.assertTrue(vdb_index.TREE_VECTOR_PROJECTION_SCHEMA.endswith(".v8"))
+    """Readiness never recomputes the projection.
+
+    It compares the configured vector *names*, which a change to what goes in
+    a slot does not move. So a projection change that is not accompanied by a
+    schema bump reaches no document: every existing index passes as ready.
+    The version is not pinned here -- pinning it means editing this test on
+    every bump, which is the opposite of a guard -- but the two constants have
+    to move together, since one seals the attestation and the other the
+    projection stream inside it.
+    """
+
+    def test_both_schema_constants_carry_the_same_version(self):
+        index_version = vdb_index.TREE_VECTOR_INDEX_SCHEMA.rsplit(".", 1)[-1]
+        projection_version = vdb_index.TREE_VECTOR_PROJECTION_SCHEMA.rsplit(".", 1)[-1]
+
+        self.assertEqual(index_version, projection_version)
+
+    def test_the_version_is_past_the_shape_without_section_context(self):
+        version = int(vdb_index.TREE_VECTOR_INDEX_SCHEMA.rsplit(".v", 1)[-1])
+
+        self.assertGreaterEqual(version, 8)
 
 
 if __name__ == "__main__":

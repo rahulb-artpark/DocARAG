@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import networkx as nx
 import logging
 
-from Core.pipelines.entity_facets import lexical_terms
+from Core.pipelines.entity_facets import bm25_query_terms
 from Core.provider.embedding import TextEmbeddingProvider, MMRerankerProvider
 from Core.provider.rerank import TextRerankerProvider
 from Core.provider.vdb import _TREE_SPARSE_VECTOR
@@ -373,7 +373,10 @@ class Retriever:
             rows_by_name = search_named(
                 query,
                 top_k=search_limit,
-                lexical_terms=lexical_terms(query),
+                # Every query term once. The saturation and length
+                # normalization are baked into the stored values; applying
+                # them again here would score the question, not the document.
+                lexical_terms=bm25_query_terms(query),
             )
         else:
             # A store with one unnamed vector has one list and no name to give

@@ -93,6 +93,61 @@ def lexical_terms(text: str) -> dict[int, float]:
     return counts
 
 
+#: Okapi BM25's usual constants: k1 bounds how fast a repeated term saturates,
+#: b how hard length is normalized. The standard pair, and the pair FastEmbed
+#: uses against Qdrant.
+BM25_K1 = 1.2
+BM25_B = 0.75
+
+
+def bm25_terms(
+    text: str,
+    *,
+    average_length: float,
+    k1: float = BM25_K1,
+    b: float = BM25_B,
+) -> dict[int, float]:
+    """BM25 term weights, keyed by the same stable token id.
+
+    Qdrant's ``Modifier.IDF`` supplies the idf factor and nothing else: the
+    term-frequency saturation and the length normalization are the client's to
+    apply, baked into the *stored* values. Sending raw counts instead -- which
+    ``lexical_terms`` does, correctly, for entities -- makes the score a plain
+    tf-idf dot product, and a dot product grows without bound with length.
+
+    On a 1871-page optics manual whose nodes run from 3 tokens to 10047 against
+    a median of 32, that ranked a 10047-token operand table first for every
+    query: it matches "surface" two hundred times where the heading
+    "2.3.2.2.93. Wolter Surface" matches once. The top twenty averaged 5203
+    tokens against a corpus mean of 78. Under BM25 the same query returns that
+    heading first and the top twenty average 216.
+
+    Entities never showed it because their names and descriptions are all one
+    length, which is why ``lexical_terms`` stays exactly as it is and this is a
+    second function rather than an edit to it.
+    """
+
+    if not (average_length > 0):
+        raise ValueError("average_length must be positive")
+    counts = lexical_terms(text)
+    floor = k1 * (1.0 - b + b * (sum(counts.values()) / average_length))
+    return {
+        token_id: (count * (k1 + 1.0)) / (count + floor)
+        for token_id, count in counts.items()
+    }
+
+
+def bm25_query_terms(text: str) -> dict[int, float]:
+    """The query side of BM25: every term once, whatever its frequency.
+
+    BM25 saturates the document side only. A term repeated in the question is
+    not evidence about the documents, and weighting by it would let a clumsily
+    phrased query outvote the corpus statistics.
+    """
+
+    return {token_id: 1.0 for token_id in lexical_terms(text)}
+
+
 def _stable_token_id(token: str) -> int:
     # FNV-1a, 32-bit, masked to stay a non-negative Qdrant index.
     value = 0x811C9DC5

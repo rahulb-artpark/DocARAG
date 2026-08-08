@@ -13,7 +13,7 @@ from Core.provider.embedding import (
     MultimodalEmbeddingProvider,
 )
 from Core.provider.llm import LLM
-from Core.pipelines.entity_facets import lexical_terms
+from Core.pipelines.entity_facets import BM25_B, BM25_K1, bm25_terms, lexical_terms
 from Core.provider.vdb import (
     TREE_VECTOR_RECORD_ID_SCHEMA,
     VECTOR_RECORD_ID_SCHEMA,
@@ -71,8 +71,15 @@ DEFAULT_TREE_INDEX_BATCH_SIZE = 256
 #: the projection to compare against the attested ``projection_sha256``. So an
 #: index whose points are missing every new context vector would otherwise pass
 #: as ready, and the change would reach no document.
-TREE_VECTOR_INDEX_SCHEMA = "docarag.bookrag-tree-qdrant-index.v8"
-TREE_VECTOR_PROJECTION_SCHEMA = "docarag.bookrag-tree-vector-projection.v8"
+#:
+#: v9 stores BM25 term weights where v8 stored raw counts. Qdrant's IDF
+#: modifier is only the idf half of BM25, so v8's sparse leg was a tf-idf dot
+#: product and ranked by length: the longest node in the document came first
+#: for every query. The stored values change, the text they come from does not,
+#: so nothing in the record identity moves and this bump is the only thing that
+#: makes an existing index rebuild.
+TREE_VECTOR_INDEX_SCHEMA = "docarag.bookrag-tree-qdrant-index.v9"
+TREE_VECTOR_PROJECTION_SCHEMA = "docarag.bookrag-tree-vector-projection.v9"
 MAX_VECTOR_SEMANTIC_REFS = 128
 MAX_VECTOR_SOURCE_EVIDENCE_REFS = 64
 MAX_VECTOR_SEMANTIC_REFS_BYTES = 65_536
@@ -99,6 +106,9 @@ _VECTOR_ATTESTATION_IDENTITY_FIELDS = (
     "point_count",
     "vector_count",
     "sparse_vector_count",
+    "lexical_average_length",
+    "lexical_k1",
+    "lexical_b",
     "collection_name",
     "scope_filter",
     "qdrant_endpoint_sha256",
@@ -610,6 +620,7 @@ def expected_tree_vector_index_attestation(
     point_count = 0
     vector_count = 0
     sparse_vector_count = 0
+    lexical_token_total = 0.0
     for point in iter_tree_point_records(tree):
         vectors = {
             name: value
@@ -662,6 +673,11 @@ def expected_tree_vector_index_attestation(
         vector_count += len(vectors)
         if point.lexical_source:
             sparse_vector_count += 1
+            # BM25 normalizes each document against the mean, so the mean has
+            # to be known before the first point is written. This pass already
+            # visits every point to count them; counting their tokens here is
+            # what lets the writer stream in batches without a second walk.
+            lexical_token_total += sum(lexical_terms(point.lexical_source).values())
     # Visual paths are hashed for identity here and again by the writer, but
     # the current legacy crop store is path-based rather than CAS-backed. A
     # concurrent mutation between hashing and model decode remains detectable
@@ -689,6 +705,18 @@ def expected_tree_vector_index_attestation(
         # guard the projection against the writer and nothing further.
         "vector_count": vector_count,
         "sparse_vector_count": sparse_vector_count,
+        # The BM25 length normalizer, and the constants it was applied with.
+        # Recorded because the stored sparse values cannot be reproduced from
+        # the node text alone -- they depend on this mean -- so an attestation
+        # without it could not say what the index actually holds. Rounded so
+        # the digest does not turn on a float's last bits.
+        "lexical_average_length": (
+            round(lexical_token_total / sparse_vector_count, 6)
+            if sparse_vector_count
+            else 0.0
+        ),
+        "lexical_k1": BM25_K1,
+        "lexical_b": BM25_B,
         "collection_name": collection_name,
         "scope_filter": scope_filter,
         "qdrant_endpoint_sha256": vector_config["qdrant_endpoint_sha256"],
@@ -1577,6 +1605,7 @@ def _write_tree_vector_index(
     vdb_cfg: VDBConfig,
     *,
     expected_point_count: int,
+    lexical_average_length: float,
     batch_size: int | None = None,
 ) -> None:
     """Reset and write one payload scope with bounded microbatches."""
@@ -1662,7 +1691,17 @@ def _write_tree_vector_index(
                     "metadata": point.metadata,
                     "vectors": vectors,
                     "image_text": point.image_text,
-                    "lexical_terms": lexical_terms(point.lexical_source),
+                    # BM25 weights, not raw counts: Qdrant's IDF modifier is
+                    # only the idf half, so the saturation and the length
+                    # normalization have to be in the values it multiplies.
+                    "lexical_terms": (
+                        bm25_terms(
+                            point.lexical_source,
+                            average_length=lexical_average_length,
+                        )
+                        if point.lexical_source
+                        else {}
+                    ),
                     "lexical_source": point.lexical_source,
                 }
             )
@@ -1812,6 +1851,7 @@ def build_vdb_index(
                 tree,
                 vdb_cfg,
                 expected_point_count=int(expected["point_count"]),
+                lexical_average_length=float(expected["lexical_average_length"]),
                 batch_size=batch_size,
             )
             # The remote client and embedder close before local attestation is
