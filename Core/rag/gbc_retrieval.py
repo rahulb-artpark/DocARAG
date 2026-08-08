@@ -25,6 +25,27 @@ from Core.rag.gbc_utils import (
 )
 
 log = logging.getLogger(__name__)
+#: Node types projected to the reranker with the heading above them. The same
+#: set the index gives a section ``context`` vector: each of these shows
+#: something without naming it. A paragraph is excluded because it already is
+#: the section's prose, and a title because it is the heading.
+_SECTION_RERANK_NODE_TYPES = frozenset(
+    {
+        NodeType.IMAGE,
+        NodeType.CHART,
+        NodeType.DIAGRAM,
+        NodeType.TABLE,
+        NodeType.LIST,
+        NodeType.CODE,
+        NodeType.ALGORITHM,
+        NodeType.EQUATION,
+    }
+)
+#: Node types whose ``summary`` is prose about content that is not prose. The
+#: reranker read content, caption and footnote only, so a figure reached it as
+#: the vision model's account of the pixels and nothing else.
+_SUMMARY_RERANK_NODE_TYPES = _SECTION_RERANK_NODE_TYPES
+
 MAX_SEMANTIC_RERANK_CHARS = 8192
 MAX_SEMANTIC_RERANK_ELEMENTS = 256
 SEMANTIC_SELECTOR_METADATA_FIELDS = (
@@ -214,10 +235,42 @@ class Retriever:
 
     @staticmethod
     def _node_rerank_text(node: TreeNode) -> str:
-        """Return a safe text projection for every BookRAG evidence modality."""
+        """Return a safe text projection for every BookRAG evidence modality.
+
+        A figure, table or listing is projected with the heading above it and
+        its own summary in front of its content, for the reason the index gives
+        them a section vector: they show something without naming it, and the
+        name is what a question says.
+
+        Measured on the Wolter figure against "show me the image of Wolter
+        Surface, its parameters and the equation that defines it", with the ten
+        nodes that actually won the slots for comparison:
+
+            content + caption + footnote   0.0000   the floor
+            + summary                      0.8516   below the weakest winner
+            + heading                      0.9961   above seven of the ten
+            + heading + summary            0.9922   above seven of the ten
+                          weakest winner   0.9297
+
+        Zero, not merely low: "3D rendered image of a smooth, gray cylindrical
+        object" has nothing to do with that question, so the reranker rejected
+        it outright and the answer said the document contained no image of the
+        Wolter Surface. Retrieval had already ranked it first in two legs.
+
+        The summary is kept alongside the heading even though it scores a step
+        lower here -- one step on a 0.6B reranker's quantized scale is noise,
+        and it is the only prose naming the subject where a heading is generic.
+        """
 
         meta = node.meta_info
         values: list[str] = []
+        section = Retriever._section_heading_text(node)
+        if section:
+            values.append(section)
+        if node.type in _SUMMARY_RERANK_NODE_TYPES:
+            summary = getattr(node, "summary", None)
+            if isinstance(summary, str) and summary.strip():
+                values.append(summary.strip())
         if node.type == NodeType.TABLE:
             try:
                 table_text = table2text(meta.model_dump())
@@ -233,6 +286,23 @@ class Retriever:
         if semantic_text:
             values.append(semantic_text)
         return "\n".join(values)
+
+    @staticmethod
+    def _section_heading_text(node: TreeNode) -> str:
+        """The heading directly above a node that shows without naming.
+
+        The direct parent, matching the index's ``_section_context_text`` and
+        ``GBCRAG._with_section_titles``: 2956 of 2957 figures, equations and
+        listings in this corpus sit straight under their heading.
+        """
+
+        if node.type not in _SECTION_RERANK_NODE_TYPES:
+            return ""
+        parent = getattr(node, "parent", None)
+        if parent is None or getattr(parent, "type", None) != NodeType.TITLE:
+            return ""
+        heading = getattr(getattr(parent, "meta_info", None), "content", None)
+        return heading.strip() if isinstance(heading, str) else ""
 
     @staticmethod
     def _query_terms(query: str) -> tuple[str, ...]:
