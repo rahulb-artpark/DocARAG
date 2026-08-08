@@ -22,12 +22,20 @@ DEFAULT_QDRANT_URL_ENV = "DOCARAG_QDRANT_URL"
 DEFAULT_QDRANT_API_KEY_ENV = "QDRANT_API_KEY"
 VECTOR_RECORD_ID_SCHEMA = "docarag.qdrant-record-id.v4"
 VECTOR_PAYLOAD_SCHEMA = "docarag.qdrant-payload.v2"
+#: Tree points get their own ID and payload namespaces. The shared ones stay put
+#: because the entity and chunk collections are written with them, and re-IDing
+#: those would orphan live points this migration does not touch.
+TREE_VECTOR_RECORD_ID_SCHEMA = "docarag.qdrant-tree-node-record-id.v1"
+TREE_NODE_PAYLOAD_SCHEMA = "docarag.qdrant-tree-node-payload.v1"
 _QDRANT_POINT_NAMESPACE = uuid.UUID("65dc7f26-27fe-5b93-8df8-76c53255e978")
 _PAYLOAD_RECORD_ID = "_docarag_record_id"
 _PAYLOAD_CONTENT = "_docarag_content"
+#: One point now has a content per named vector, so the single content above
+#: becomes the primary and this carries the rest keyed by vector name.
+_PAYLOAD_CONTENTS = "_docarag_contents"
 _PAYLOAD_SCHEMA = "_docarag_schema"
 _RESERVED_PAYLOAD_KEYS = frozenset(
-    {_PAYLOAD_RECORD_ID, _PAYLOAD_CONTENT, _PAYLOAD_SCHEMA}
+    {_PAYLOAD_RECORD_ID, _PAYLOAD_CONTENT, _PAYLOAD_CONTENTS, _PAYLOAD_SCHEMA}
 )
 #: Named dense vectors of the hybrid entity collection. ``name`` reproduces the
 #: pre-hybrid behaviour exactly, so the schema adds evidence rather than
@@ -44,6 +52,11 @@ _TREE_DENSE_VECTORS = ("text", "context", "image")
 _TREE_IMAGE_VECTOR = "image"
 #: Sparse vector over everything the node says, for server-side lexical search.
 _TREE_SPARSE_VECTOR = "lexical"
+#: A tree collection holds two families of point. A semantic element is not a
+#: node -- it is one cell, symbol or flowchart box inside one -- and it keeps its
+#: own point because its element id, kind and box are per-element payload that a
+#: shared point could not carry.
+_TREE_POINT_KINDS = ("node", "semantic_element")
 
 
 #: The dense names each schema requires. ``UNNAMED`` is absent on purpose: it is
@@ -182,7 +195,15 @@ def _representation_identity(
     }
 
 
-def _normalized_metadata(metadata: Mapping[str, Any], *, modality: str) -> dict:
+def _normalized_metadata(metadata: Mapping[str, Any], *, modality: str | None) -> dict:
+    """Coerce metadata to storable scalars, stamping the write's modality.
+
+    ``modality=None`` is the tree-point mode: one point carries several named
+    vectors, so there is no single modality to stamp. The fields are rejected
+    rather than ignored, because a caller that still supplies one is describing
+    a shape that no longer exists and its retrieval would silently read as text.
+    """
+
     if not isinstance(metadata, Mapping):
         raise TypeError("vector-store metadata must be a mapping")
     result = {}
@@ -200,6 +221,16 @@ def _normalized_metadata(metadata: Mapping[str, Any], *, modality: str) -> dict:
             "vector-store metadata uses reserved payload keys: "
             + ", ".join(sorted(reserved))
         )
+    if modality is None:
+        stamped = {key for key in ("modality", "type") if key in result}
+        if stamped:
+            raise ValueError(
+                "tree-point metadata may not carry a point-level "
+                + ", ".join(sorted(stamped))
+                + "; a point holds several named vectors and each one's"
+                " modality is the vector it was written under"
+            )
+        return result
     existing_modality = result.get("modality")
     if existing_modality not in (None, modality):
         raise ValueError(
@@ -361,6 +392,96 @@ def _metadata_filter(
     if not combined:
         return None
     return combined
+
+
+def tree_vector_identity(
+    name: str,
+    value: str,
+    *,
+    image_text: str | None = None,
+    strict_source_identity: bool = True,
+) -> Mapping[str, str]:
+    """The source digest for one named vector, reusing the existing rule.
+
+    An image is hashed by its bytes, text by its characters -- the same
+    ``_representation_identity`` the per-representation writer used, so a
+    vector's identity does not change merely because it moved onto a shared
+    point.
+    """
+
+    if name not in _TREE_DENSE_VECTORS:
+        raise ValueError(f"unknown tree vector name: {name!r}")
+    return _representation_identity(
+        value,
+        modality="image" if name == _TREE_IMAGE_VECTOR else "text",
+        image_text=image_text,
+        strict_source_identity=strict_source_identity,
+    )
+
+
+def tree_point_record_id(
+    *,
+    kind: str,
+    metadata: Mapping[str, Any],
+    representations: Mapping[str, Mapping[str, str]],
+    lexical_source: str = "",
+    strict_source_identity: bool = True,
+) -> str:
+    """One ID for a whole point, with no modality in it.
+
+    The per-representation ID bakes the modality in twice, which is exactly what
+    has to go: a node's vectors now share a point, so the ID has to name the
+    node rather than one of its readings. Every representation digest stays
+    inside it, so the property ``_unique_record_indexes`` relies on still holds
+    -- the same ID implies the same content, and changing any one vector's
+    source re-IDs the point.
+    """
+
+    if kind not in _TREE_POINT_KINDS:
+        raise ValueError(f"unknown tree point kind: {kind!r}")
+    if not representations:
+        raise ValueError("a tree point requires at least one vector")
+    normalized = _normalized_metadata(metadata, modality=None)
+    document_version_id = normalized.get("document_version_id")
+    source_sha256 = normalized.get("source_sha256")
+    source_identity = {
+        key: normalized[key]
+        for key in _SOURCE_IDENTITY_FIELDS
+        if normalized.get(key) not in (None, "")
+    }
+    if strict_source_identity:
+        if not isinstance(document_version_id, str) or not document_version_id.strip():
+            raise MissingVectorSourceIdentityError(
+                "strict tree point requires document_version_id"
+            )
+        if not isinstance(source_sha256, str) or _LOWER_SHA256.fullmatch(
+            source_sha256
+        ) is None:
+            raise MissingVectorSourceIdentityError(
+                "strict tree point requires lowercase source_sha256"
+            )
+        if not source_identity:
+            raise MissingVectorSourceIdentityError(
+                "strict tree point requires a node or evidence identity"
+            )
+    identity = {
+        "schema": TREE_VECTOR_RECORD_ID_SCHEMA,
+        "scope": "source-bound-tree-point",
+        "record_kind": kind,
+        "document_version_id": document_version_id,
+        "source_sha256": source_sha256,
+        "source_identity": source_identity,
+        "node_type": normalized.get("node_type"),
+        "representations": {
+            name: dict(digest) for name, digest in sorted(representations.items())
+        },
+        # Hashed from the text the terms were counted from rather than the term
+        # map, so a tokenizer change is visible in the ID too.
+        "lexical_source_sha256": hashlib.sha256(
+            (lexical_source or "").encode("utf-8")
+        ).hexdigest(),
+    }
+    return f"record_{kind}_{_canonical_sha256(identity)}"
 
 
 def qdrant_point_id(record_id: str) -> str:
@@ -1038,6 +1159,212 @@ class VectorStore:
                 "vector_schema=VectorSchema.TREE_NODE"
             )
 
+    def add_tree_node_points(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        batch_size: int = 256,
+    ) -> List[str]:
+        """Write one point per tree node, carrying all of its vectors.
+
+        Each record supplies ``kind``, ``metadata``, a ``vectors`` map of
+        name to source (text for ``text``/``context``, a crop path for
+        ``image``), an optional ``image_text`` fused into the crop, and
+        ``lexical_terms`` with the ``lexical_source`` they were counted from.
+
+        A point is written in one upsert with every vector it has, because a
+        plain upsert replaces a point rather than merging into it -- writing the
+        halves separately would leave whichever went second as the whole point.
+        Both dense halves go through one embedder call per batch for the same
+        reason ``add_entity_points`` does: a second call could observe a changed
+        model and produce vectors that are not comparable.
+        """
+
+        self._require_tree_node()
+        self._require_open()
+        if not records:
+            return []
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size < 1
+        ):
+            raise ValueError("batch_size must be at least 1")
+
+        record_ids: List[str] = []
+        for start in range(0, len(records), batch_size):
+            batch = records[start : start + batch_size]
+            record_ids.extend(self._write_tree_point_batch(batch))
+        log.info("Upserted %d tree points into Qdrant", len(record_ids))
+        return record_ids
+
+    def _write_tree_point_batch(self, batch: Sequence[Mapping[str, Any]]) -> List[str]:
+        metadatas = [
+            self._apply_scope(_normalized_metadata(record["metadata"], modality=None))
+            for record in batch
+        ]
+        vector_maps = [dict(record.get("vectors") or {}) for record in batch]
+        image_texts = [record.get("image_text") for record in batch]
+        for vectors in vector_maps:
+            unknown = set(vectors).difference(_TREE_DENSE_VECTORS)
+            if unknown:
+                raise ValueError(
+                    "unknown tree vector names: " + ", ".join(sorted(unknown))
+                )
+            if not vectors:
+                raise ValueError("a tree point requires at least one vector")
+
+        ids = [
+            tree_point_record_id(
+                kind=record.get("kind", "node"),
+                metadata=metadata,
+                representations={
+                    name: tree_vector_identity(
+                        name, value, image_text=image_text, strict_source_identity=True
+                    )
+                    for name, value in vectors.items()
+                },
+                lexical_source=record.get("lexical_source", ""),
+                strict_source_identity=True,
+            )
+            for record, metadata, vectors, image_text in zip(
+                batch, metadatas, vector_maps, image_texts
+            )
+        ]
+        # The ID already carries every vector's source digest, so two records
+        # sharing one necessarily share their vectors; metadata is the only
+        # thing left that can disagree.
+        keep = _unique_record_indexes(
+            ids, [None] * len(ids), metadatas, [None] * len(ids), compare_values=False
+        )
+
+        dense = self._embed_tree_vectors(
+            [vector_maps[index] for index in keep],
+            [image_texts[index] for index in keep],
+        )
+        if not dense:
+            return []
+        self._ensure_collection(len(next(iter(dense[0].values()))))
+
+        points = []
+        for position, index in enumerate(keep):
+            record = batch[index]
+            vectors: dict[str, Any] = dict(dense[position])
+            terms = record.get("lexical_terms") or {}
+            if terms:
+                vectors[_TREE_SPARSE_VECTOR] = self._models.SparseVector(
+                    indices=[int(term) for term in terms],
+                    values=[float(value) for value in terms.values()],
+                )
+            contents = dict(vector_maps[index])
+            metadata = dict(metadatas[index])
+            metadata["record_kind"] = record.get("kind", "node")
+            crop = contents.get(_TREE_IMAGE_VECTOR)
+            if crop:
+                digest = tree_vector_identity(
+                    _TREE_IMAGE_VECTOR,
+                    crop,
+                    image_text=image_texts[index],
+                    strict_source_identity=True,
+                ).get("image_sha256")
+                if digest is not None:
+                    metadata["asset_sha256"] = digest
+            points.append(
+                self._models.PointStruct(
+                    id=qdrant_point_id(ids[index]),
+                    vector=vectors,
+                    payload=self._tree_point_payload(ids[index], contents, metadata),
+                )
+            )
+        self.client.upsert(
+            collection_name=self.collection_name, points=points, wait=True
+        )
+        return [ids[index] for index in keep]
+
+    def _embed_tree_vectors(
+        self,
+        vector_maps: Sequence[Mapping[str, str]],
+        image_texts: Sequence[str | None],
+    ) -> List[dict[str, Any]]:
+        """Embed a batch's vectors, one call per kind rather than per point."""
+
+        text_slots: list[tuple[int, str]] = []
+        text_values: list[str] = []
+        for position, vectors in enumerate(vector_maps):
+            for name in _TREE_DENSE_VECTORS:
+                if name == _TREE_IMAGE_VECTOR or name not in vectors:
+                    continue
+                text_slots.append((position, name))
+                text_values.append(vectors[name])
+
+        embedded: List[dict[str, Any]] = [{} for _ in vector_maps]
+        if text_values:
+            vectors = _normalize_vectors(
+                self.embedding_model.embed_texts(text_values), len(text_values)
+            )
+            for (position, name), vector in zip(text_slots, vectors):
+                embedded[position][name] = vector
+
+        crops = [
+            (position, vectors[_TREE_IMAGE_VECTOR], image_texts[position])
+            for position, vectors in enumerate(vector_maps)
+            if _TREE_IMAGE_VECTOR in vectors
+        ]
+        if crops:
+            if not getattr(self.embedding_model, "MM_EMBEDDER", False):
+                raise ValueError(
+                    "a crop vector requires a multi-modal embedding model"
+                )
+            # Split by whether a crop carries fused text: a pure image vector is
+            # a different embedding call, not the same one with an empty string,
+            # and embed_fused rejects empty text outright.
+            fused = [item for item in crops if item[2]]
+            pure = [item for item in crops if not item[2]]
+            for group, vectors in (
+                (
+                    fused,
+                    self.embedding_model.embed_fused(
+                        images=[item[1] for item in fused],
+                        texts=[item[2] for item in fused],
+                    )
+                    if fused
+                    else [],
+                ),
+                (
+                    pure,
+                    self.embedding_model.embed_images([item[1] for item in pure])
+                    if pure
+                    else [],
+                ),
+            ):
+                if not group:
+                    continue
+                for (position, _path, _text), vector in zip(
+                    group, _normalize_vectors(vectors, len(group))
+                ):
+                    embedded[position][_TREE_IMAGE_VECTOR] = vector
+        return embedded
+
+    @staticmethod
+    def _tree_point_payload(
+        record_id: str, contents: Mapping[str, str], metadata: Mapping[str, Any]
+    ) -> dict:
+        # The primary content keeps the single-content invariant every existing
+        # reader relies on; the per-name map is what a named-vector read uses to
+        # return the text that actually matched.
+        primary = ""
+        for name in _TREE_DENSE_VECTORS:
+            if contents.get(name):
+                primary = contents[name]
+                break
+        return {
+            **dict(metadata),
+            _PAYLOAD_RECORD_ID: record_id,
+            _PAYLOAD_CONTENT: primary,
+            _PAYLOAD_CONTENTS: dict(contents),
+            _PAYLOAD_SCHEMA: TREE_NODE_PAYLOAD_SCHEMA,
+        }
+
     def add_entity_points(
         self,
         records: Sequence[Mapping[str, Any]],
@@ -1428,14 +1755,21 @@ class VectorStore:
         return ids
 
     @staticmethod
-    def _retrieval_result(hit: Any) -> Dict[str, Any]:
+    def _retrieval_result(hit: Any, *, vector_name: str | None = None) -> Dict[str, Any]:
         payload = getattr(hit, "payload", None)
         if not isinstance(payload, Mapping):
             raise RuntimeError("Qdrant retrieval hit has no payload")
-        if payload.get(_PAYLOAD_SCHEMA) != VECTOR_PAYLOAD_SCHEMA:
+        if payload.get(_PAYLOAD_SCHEMA) not in (
+            VECTOR_PAYLOAD_SCHEMA,
+            TREE_NODE_PAYLOAD_SCHEMA,
+        ):
             raise RuntimeError("Qdrant retrieval hit has an incompatible payload schema")
         record_id = payload.get(_PAYLOAD_RECORD_ID)
         content = payload.get(_PAYLOAD_CONTENT)
+        if vector_name is not None:
+            contents = payload.get(_PAYLOAD_CONTENTS)
+            if isinstance(contents, Mapping) and contents.get(vector_name):
+                content = contents[vector_name]
         if not isinstance(record_id, str) or not record_id:
             raise RuntimeError("Qdrant retrieval hit has no logical record ID")
         if not isinstance(content, str):
@@ -1451,6 +1785,19 @@ class VectorStore:
             for key, value in payload.items()
             if key not in _RESERVED_PAYLOAD_KEYS
         }
+        if vector_name is not None:
+            # A tree point has no point-level modality; the modality of a hit is
+            # the vector it was matched on. Reporting it here is what lets every
+            # existing consumer of metadata["modality"] read unchanged.
+            metadata["vector_name"] = vector_name
+            metadata["modality"] = (
+                "image" if vector_name == _TREE_IMAGE_VECTOR else "text"
+            )
+            metadata.setdefault("type", metadata["modality"])
+            # One point can be hit on several vectors, and callers key audit
+            # rows by this id -- a bare point id would let a node's image row
+            # overwrite its text row.
+            record_id = f"{record_id}#{vector_name}"
         return {
             "id": record_id,
             # Qdrant returns cosine similarity while BookRAG's established
@@ -1479,6 +1826,18 @@ class VectorStore:
             self.embedding_model.embed_texts([query_text]), 1
         )[0]
         self._validate_existing_collection(len(query_embedding))
+        if self.vector_schema is VectorSchema.TREE_NODE:
+            # A named collection cannot answer an unnamed query. Merging the
+            # dense names by score reproduces what the single unnamed vector
+            # did -- one ranked list with pictures and prose scored against
+            # each other -- so callers that never named a vector are unaffected.
+            merged: List[Dict[str, Any]] = []
+            for rows in self._tree_vector_rows(
+                query_embedding, query_filter, top_k, _TREE_DENSE_VECTORS
+            ).values():
+                merged.extend(rows)
+            merged.sort(key=lambda row: row["distance"])
+            return merged[:top_k]
         response = self.client.query_points(
             collection_name=self.collection_name,
             query=query_embedding,
@@ -1491,6 +1850,92 @@ class VectorStore:
         if not isinstance(points, Iterable):
             raise RuntimeError("Qdrant returned an invalid query response")
         return [self._retrieval_result(hit) for hit in points]
+
+    def search_tree_vectors(
+        self,
+        query_text: str,
+        top_k: int = 3,
+        *,
+        dense_names: Sequence[str] = _TREE_DENSE_VECTORS,
+        lexical_terms: Mapping[int, float] | None = None,
+        metadata_filter: Mapping[str, Any] | None = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """One ranked list per vector name, from a single round trip.
+
+        Returned separately rather than fused server-side: which vector matched
+        is the signal this schema exists to provide, and a server-side fusion
+        would collapse it into one opaque list and leave the client's own RRF
+        trace claiming an arithmetic it never performed.
+        """
+
+        self._require_tree_node()
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("top_k must be at least 1")
+        unknown = set(dense_names).difference(_TREE_DENSE_VECTORS)
+        if unknown:
+            raise ValueError("unknown tree vector names: " + ", ".join(sorted(unknown)))
+        query_filter = self._qdrant_filter(metadata_filter, None)
+        if not self._collection_exists():
+            return {}
+        query_embedding = _normalize_vectors(
+            self.embedding_model.embed_texts([query_text]), 1
+        )[0]
+        self._validate_existing_collection(len(query_embedding))
+        return self._tree_vector_rows(
+            query_embedding, query_filter, top_k, dense_names, lexical_terms
+        )
+
+    def _tree_vector_rows(
+        self,
+        query_embedding: Any,
+        query_filter: Any,
+        top_k: int,
+        dense_names: Sequence[str],
+        lexical_terms: Mapping[int, float] | None = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        names = list(dense_names)
+        requests = [
+            self._models.QueryRequest(
+                query=query_embedding,
+                filter=query_filter,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+                using=name,
+            )
+            for name in names
+        ]
+        if lexical_terms:
+            names.append(_TREE_SPARSE_VECTOR)
+            requests.append(
+                self._models.QueryRequest(
+                    query=self._models.SparseVector(
+                        indices=[int(term) for term in lexical_terms],
+                        values=[float(value) for value in lexical_terms.values()],
+                    ),
+                    filter=query_filter,
+                    limit=top_k,
+                    with_payload=True,
+                    with_vectors=False,
+                    using=_TREE_SPARSE_VECTOR,
+                )
+            )
+        responses = self.client.query_batch_points(
+            collection_name=self.collection_name, requests=requests
+        )
+        if not isinstance(responses, Iterable):
+            raise RuntimeError("Qdrant returned an invalid batch query response")
+        rows: Dict[str, List[Dict[str, Any]]] = {}
+        for name, response in zip(names, responses):
+            points = getattr(response, "points", None)
+            if not isinstance(points, Iterable):
+                raise RuntimeError("Qdrant returned an invalid query response")
+            # The sparse name has no content of its own, so it falls through to
+            # the point's primary text -- which is what it was matched on.
+            rows[name] = [
+                self._retrieval_result(hit, vector_name=name) for hit in points
+            ]
+        return rows
 
     def batch_search(
         self,
