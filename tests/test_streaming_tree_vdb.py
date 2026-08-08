@@ -174,10 +174,12 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                 [
                     None,
                     "table heading\n|a|b|",
-                    "figure caption figure footnote",
-                    # The crop is paired with the neighbourhood, not the LaTeX:
-                    # a picture of the symbols and a transcription of the same
-                    # symbols are the same evidence twice.
+                    # A figure's crop carries no text: the caption is already in
+                    # its text vector, and fusing prose into a picture displaces
+                    # the one signal only the picture has.
+                    None,
+                    # A table and an equation still fuse, because for them the
+                    # crop is secondary to the text it depicts.
                     "figure caption figure footnote\nE=mc^2\nConclusion",
                     None,
                 ],

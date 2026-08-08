@@ -1154,24 +1154,6 @@ def _listing_text(node) -> str:
     return summary or listing
 
 
-def _crop_label(node) -> str:
-    """The short label that belongs *inside* a crop's own vector.
-
-    Whatever is passed beside an image reaches ``embed_fused`` and is mixed
-    into the image's vector rather than stored next to it, so this is the one
-    place where more text is not better: a caption sharpens what the picture
-    already shows, while a paragraph drowns it. Empty is a valid answer and
-    the common one -- MinerU fills neither field -- which leaves a clean
-    visual embedding, the only representation a "show me the image" question
-    has to match on.
-    """
-
-    meta = getattr(node, "meta_info", None)
-    caption = str(getattr(meta, "caption", "") or "").strip()
-    footnote = str(getattr(meta, "footnote", "") or "").strip()
-    return " ".join(part for part in (caption, footnote) if part)
-
-
 def _visual_text(node) -> str:
     """What a figure is about, in whatever words are attached to it.
 
@@ -1380,16 +1362,19 @@ def _node_vectors(node, node_type) -> tuple[dict[str, str], str | None]:
         if _visual_text(node):
             vectors["text"] = _visual_text(node)
         if has_crop:
-            # The crop's own label, not the node's whole prose. The embedder
-            # fuses this text *into* the image vector, so a long description
-            # does not describe the picture, it replaces it: feeding every
-            # figure its ~945-character summary pushed the entire visual
-            # modality below the text vectors -- 4 image vectors in the top
-            # 200, best at rank 36 -- and a question that said "show me the
-            # image" retrieved no image at all. The prose belongs in ``text``,
-            # where it is searched as prose; the crop stays a picture.
+            # No text at all: whatever is passed beside a crop is fused *into*
+            # its vector rather than stored next to it, so text there does not
+            # annotate the picture, it displaces it. Feeding every figure its
+            # ~945-character summary pushed the whole visual modality below the
+            # text vectors -- 4 image vectors in a top 200, best at rank 36 --
+            # and a question that said "show me the image" returned none.
+            #
+            # A caption was the cautious middle ground while a figure had one
+            # vector. It has two now: the caption is already in ``text``, via
+            # context_contribution, where it is searched as the prose it is.
+            # So the crop is left a picture, which is the one thing only it can
+            # be matched on.
             vectors[_TREE_IMAGE_VECTOR] = crop
-            image_text = _crop_label(node)
     elif node_type in (NodeType.TABLE, NodeType.LIST):
         # A grid embeds as markup: "<table><tr><td>" is noise, and the cells
         # that carry the meaning are values, not sentences. The summary is the

@@ -136,13 +136,16 @@ class AFigureIsFoundByItsSubject(unittest.TestCase):
             paired = [r.image_text for r in records if r.modality == "image"]
             texts = [r.value for r in records if r.modality == "text"]
 
-            self.assertEqual([""], paired, "the crop must not carry the prose")
+            self.assertEqual([None], paired, "the crop must carry no text at all")
             self.assertTrue(
                 any("Zernike Surface illustration" in t for t in texts),
                 "the prose must still be indexed, as its own text record",
             )
 
-    def test_a_caption_is_the_one_text_a_crop_does_carry(self):
+    def test_even_a_caption_is_not_fused_into_the_crop(self):
+        # A caption was the cautious middle ground while a figure had one
+        # vector. It has two now, and the caption is already in the text one --
+        # so the crop is left a picture, which only it can be matched on.
         with tempfile.TemporaryDirectory() as directory:
             image = f"{directory}/figure.jpg"
             Path(image).write_bytes(b"\xff\xd8\xff\xe0jpeg")
@@ -154,12 +157,15 @@ class AFigureIsFoundByItsSubject(unittest.TestCase):
             )
             figure.summary = "A long summary that must not be fused in either."
 
-            paired = [
-                record.image_text
-                for record in vdb_index.iter_tree_index_records(tree)
-                if record.modality == "image"
-            ]
-            self.assertEqual(["Figure 4: the Zernike sag surface."], paired)
+            records = list(vdb_index.iter_tree_index_records(tree))
+            paired = [r.image_text for r in records if r.modality == "image"]
+            texts = [r.value for r in records if r.modality == "text"]
+
+            self.assertEqual([None], paired)
+            self.assertTrue(
+                any("Figure 4: the Zernike sag surface." in t for t in texts),
+                "the caption is not lost; it is searched as the prose it is",
+            )
 
 
 class NothingIsIndexedAsTheEmptyString(unittest.TestCase):
