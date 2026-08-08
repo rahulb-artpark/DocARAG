@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from itertools import chain
-from typing import Dict, Iterator, List, Literal, Tuple
+from typing import Dict, Iterator, List, Literal, Mapping, Tuple
 from pathlib import Path
 import hashlib
 import stat
@@ -14,8 +14,12 @@ from Core.provider.embedding import (
 )
 from Core.provider.llm import LLM
 from Core.provider.vdb import (
+    TREE_VECTOR_RECORD_ID_SCHEMA,
     VECTOR_RECORD_ID_SCHEMA,
     VectorStore,
+    _TREE_DENSE_VECTORS,
+    _TREE_IMAGE_VECTOR,
+    _TREE_SPARSE_VECTOR,
     stable_vector_record_id,
 )
 from Core.Index.Tree import DocumentTree, NodeType
@@ -123,6 +127,39 @@ class TreeIndexRecord:
     value: str
     metadata: dict
     image_text: str | None = None
+
+
+@dataclass(frozen=True)
+class TreePointRecord:
+    """Everything one Qdrant point holds: a node, or one semantic element.
+
+    A node's readings are named rather than separate -- ``text`` is its own
+    words, ``context`` the words around or under it, ``image`` its crop -- and a
+    point carries whichever of them that node has. The names are assigned by
+    role and never by availability: an equation with no text of its own carries
+    ``context`` alone rather than promoting its neighbourhood into ``text``,
+    because the two are scored separately on purpose.
+    """
+
+    kind: Literal["node", "semantic_element"]
+    metadata: dict
+    vectors: Mapping[str, str]
+    image_text: str | None = None
+
+    @property
+    def lexical_source(self) -> str:
+        """The text the sparse vector's terms are counted from.
+
+        Every text this point holds, joined. The dense split exists because
+        blending *embeddings* measured worse; term frequencies are a bag of
+        words and do not dilute that way, so lexical search gets the lot.
+        """
+
+        return "\n".join(
+            self.vectors[name]
+            for name in _TREE_DENSE_VECTORS
+            if name != _TREE_IMAGE_VECTOR and self.vectors.get(name)
+        )
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -1189,7 +1226,9 @@ def _semantic_element_embedding_text(structure, element) -> str:
     return rendered[:MAX_SEMANTIC_ELEMENT_EMBED_TEXT_CHARS]
 
 
-def _iter_semantic_element_records(node_meta, base_metadata: dict) -> Iterator[TreeIndexRecord]:
+def _iter_semantic_element_points(
+    node_meta, base_metadata: dict
+) -> Iterator["TreePointRecord"]:
     """Yield independently retrievable cells, symbols, and visual graph elements."""
 
     raw_structures = getattr(node_meta, "semantic_substructures", None)
@@ -1264,147 +1303,140 @@ def _iter_semantic_element_records(node_meta, base_metadata: dict) -> Iterator[T
                 metadata["semantic_coordinate_origin"] = element_geometry[
                     "coordinate_origin"
                 ]
-            yield TreeIndexRecord(
-                "text",
-                _semantic_element_embedding_text(structure, element),
-                _representation_metadata(metadata, "text"),
+            yield TreePointRecord(
+                kind="semantic_element",
+                metadata=metadata,
+                vectors={"text": _semantic_element_embedding_text(structure, element)},
             )
 
 
-def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
-    """Yield text and visual representations in stable tree order."""
+def _node_vectors(node, node_type) -> tuple[dict[str, str], str | None]:
+    """The named vectors one node carries, and the text fused into its crop.
+
+    Slots go by role. A figure's prose is ``text`` whether it came from a
+    caption or a vision model; an equation's neighbourhood is ``context`` even
+    when the equation has no text of its own. Nothing is promoted between slots
+    to fill a gap, because the slots are scored separately on purpose.
+    """
+
+    vectors: dict[str, str] = {}
+    image_text: str | None = None
+    crop = node.meta_info.img_path
+    has_crop = bool(crop) and os.path.exists(crop)
+
+    if node_type in _VISUAL_NODE_TYPES:
+        # An empty text is not a representation of anything: it embeds to
+        # whatever the model returns for "", and every figure lacking a caption
+        # landed on that same point.
+        if _visual_text(node):
+            vectors["text"] = _visual_text(node)
+        if has_crop:
+            # The crop's own label, not the node's whole prose. The embedder
+            # fuses this text *into* the image vector, so a long description
+            # does not describe the picture, it replaces it: feeding every
+            # figure its ~945-character summary pushed the entire visual
+            # modality below the text vectors -- 4 image vectors in the top
+            # 200, best at rank 36 -- and a question that said "show me the
+            # image" retrieved no image at all. The prose belongs in ``text``,
+            # where it is searched as prose; the crop stays a picture.
+            vectors[_TREE_IMAGE_VECTOR] = crop
+            image_text = _crop_label(node)
+    elif node_type in (NodeType.TABLE, NodeType.LIST):
+        # A grid embeds as markup: "<table><tr><td>" is noise, and the cells
+        # that carry the meaning are values, not sentences. The summary is the
+        # only prose a table has. A list has the same shape of problem: its
+        # items are fragments sharing a subject stated once, in the stem above.
+        table_str = _table_text(node)
+        vectors["text"] = table_str
+        if has_crop:
+            vectors[_TREE_IMAGE_VECTOR] = crop
+            image_text = table_str
+    elif node_type == NodeType.EQUATION:
+        # Two readings of one equation, because no single text serves both. A
+        # definition is found through its summary -- "convergence in
+        # probability" -- while a worked example is found through the sentences
+        # around it -- "Romeo and Juliet arrive within 15 minutes". Measured,
+        # each text that rescues one case degrades the other by about as much,
+        # so they stay separate vectors and retrieval keeps whichever hits.
+        self_text = _equation_self_text(node)
+        context_text = _equation_context_text(node)
+        if self_text:
+            vectors["text"] = self_text
+        if context_text and context_text != self_text:
+            vectors["context"] = context_text
+        if has_crop:
+            # The crop is paired with the neighbourhood rather than the LaTeX:
+            # a picture of symbols and a transcription of the same symbols are
+            # the same evidence twice, and neither says what the formula is for.
+            vectors[_TREE_IMAGE_VECTOR] = crop
+            image_text = context_text or self_text or ""
+    elif node_type in _LISTING_NODE_TYPES:
+        if _listing_text(node):
+            vectors["text"] = _listing_text(node)
+    elif node_type in _TEXT_NODE_TYPES:
+        text_content = node.meta_info.content
+        if text_content:
+            vectors["text"] = text_content
+        # A heading is a few words; the section under it is what the heading is
+        # about. "2.3.2.2.94. Zernike Surface" and "defines the Zernike surface
+        # ... characterized by a sag equation" answer different questions, and
+        # only the first was reachable. A separate vector rather than a blend,
+        # for the reason the equation keeps two: a heading is the exact string
+        # someone searching for the section types.
+        if node_type == NodeType.TITLE:
+            section_summary = str(getattr(node, "summary", "") or "").strip()
+            if section_summary and section_summary != (text_content or "").strip():
+                vectors["context"] = section_summary
+    return vectors, image_text
+
+
+def iter_tree_point_records(tree: DocumentTree) -> Iterator[TreePointRecord]:
+    """Yield one record per Qdrant point, in stable tree order.
+
+    Two families: one point per tree node, and one per semantic element. An
+    element is not a node -- it is a cell, symbol or flowchart box inside one --
+    and it keeps its own point because its element id, kind and box are
+    per-element payload a shared point could not carry.
+    """
 
     for node in tree.nodes:
         if node == tree.root_node:
             continue
 
-        node_type = node.type
         meta_data = _node_trace_metadata(tree, node)
-
-        if node_type in _VISUAL_NODE_TYPES:
-            image_path = node.meta_info.img_path
-            image_str = _visual_text(node)
-            # An empty text is not a representation of anything: it embeds to
-            # whatever the model returns for "", and every figure lacking a
-            # caption landed on that same point. Emitting nothing keeps them
-            # out of the index rather than crowding one spot in it.
-            if image_str:
-                yield TreeIndexRecord(
-                    "text", image_str, _representation_metadata(meta_data, "text")
-                )
-            if image_path and os.path.exists(image_path):
-                yield TreeIndexRecord(
-                    "image",
-                    image_path,
-                    _representation_metadata(meta_data, "image"),
-                    # The crop's own label, not the node's whole prose. The
-                    # embedder fuses this text *into* the image vector, so a
-                    # long description does not describe the picture, it
-                    # replaces it: feeding every figure its ~945-character
-                    # summary pushed the entire visual modality below the text
-                    # vectors -- 4 image vectors in the top 200, best at rank
-                    # 36 -- and a question that said "show me the image"
-                    # retrieved no image at all. A figure's prose belongs in
-                    # the text record above, where it is searched as prose;
-                    # the crop stays a picture, which is the one thing only it
-                    # can be matched on.
-                    _crop_label(node),
-                )
-        elif node_type in (NodeType.TABLE, NodeType.LIST):
-            # A grid embeds as markup: "<table><tr><td>" is noise, and the
-            # cells that carry the meaning are values, not sentences. The
-            # summary is the only prose a table has -- "the trigonometric
-            # ratios for angles of 0, 30, 45, 60 and 90 degrees" is what a
-            # question matches, and it was the one part left out.
-            #
-            # A list has the same shape of problem: its items are fragments
-            # sharing a subject stated once, in the stem above them, so
-            # "Acts as a primary lens" embeds without the eye's cornea in it.
-            table_str = _table_text(node)
-            yield TreeIndexRecord(
-                "text", table_str, _representation_metadata(meta_data, "text")
+        vectors, image_text = _node_vectors(node, node.type)
+        if vectors:
+            yield TreePointRecord(
+                kind="node",
+                metadata=meta_data,
+                vectors=vectors,
+                image_text=image_text,
             )
 
-            table_img = node.meta_info.img_path
-            if table_img and os.path.exists(table_img):
-                yield TreeIndexRecord(
-                    "image",
-                    table_img,
-                    _representation_metadata(meta_data, "image"),
-                    table_str,
-                )
-        elif node_type == NodeType.EQUATION:
-            # Two readings of one equation, because no single text serves both.
-            # A definition is found through its summary -- "convergence in
-            # probability" -- while a worked example is found through the
-            # sentences around it -- "Romeo and Juliet arrive within 15
-            # minutes". Measured, each text that rescues one case degrades the
-            # other by about as much, so they are indexed separately and
-            # retrieval keeps whichever hits.
-            self_text = _equation_self_text(node)
-            if self_text:
-                yield TreeIndexRecord(
-                    "text",
-                    self_text,
-                    _representation_metadata(meta_data, "text"),
-                )
+        yield from _iter_semantic_element_points(node.meta_info, meta_data)
 
-            context_text = _equation_context_text(node)
-            if context_text and context_text != self_text:
-                yield TreeIndexRecord(
-                    "text",
-                    context_text,
-                    _representation_metadata(meta_data, "text"),
-                )
 
-            # Equation crops share the node metadata with their LaTeX text so
-            # retrieval can hydrate either representation from source truth.
-            # The crop is paired with the neighbourhood rather than the LaTeX:
-            # a picture of symbols and a transcription of the same symbols are
-            # the same evidence twice, and neither says what the formula is for.
-            equation_img = node.meta_info.img_path
-            if equation_img and os.path.exists(equation_img):
-                yield TreeIndexRecord(
-                    "image",
-                    equation_img,
-                    _representation_metadata(meta_data, "image"),
-                    context_text or self_text or "",
-                )
-        elif node_type in _LISTING_NODE_TYPES:
-            listing = _listing_text(node)
-            if listing:
-                yield TreeIndexRecord(
-                    "text", listing, _representation_metadata(meta_data, "text")
-                )
-        elif node_type in _TEXT_NODE_TYPES:
-            text_content = node.meta_info.content
-            if text_content:
-                yield TreeIndexRecord(
-                    "text",
-                    text_content,
-                    _representation_metadata(meta_data, "text"),
-                )
+def iter_tree_index_records(tree: DocumentTree) -> Iterator[TreeIndexRecord]:
+    """Flatten the points back into one record per vector.
 
-            # A heading is a few words; the section under it is what the
-            # heading is about. "2.3.2.2.94. Zernike Surface" and "defines the
-            # Zernike surface ... characterized by a sag equation combining
-            # base conic, aspheric and Zernike polynomial terms" answer
-            # different questions, and only the first was reachable.
-            #
-            # A second record rather than a blend, for the reason the equation
-            # branch keeps two: a heading is the exact string someone searching
-            # for the section types, and lengthening that vector with a
-            # paragraph is what would cost the exact match.
-            if node_type == NodeType.TITLE:
-                section_summary = str(getattr(node, "summary", "") or "").strip()
-                if section_summary and section_summary != (text_content or "").strip():
-                    yield TreeIndexRecord(
-                        "text",
-                        section_summary,
-                        _representation_metadata(meta_data, "text"),
-                    )
+    The index writes points now; this is the per-representation view the
+    projection digest and the older readers were written against. Vectors come
+    out in ``_TREE_DENSE_VECTORS`` order, which is the order the per-branch
+    dispatch used to yield them in.
+    """
 
-        yield from _iter_semantic_element_records(node.meta_info, meta_data)
+    for point in iter_tree_point_records(tree):
+        for name in _TREE_DENSE_VECTORS:
+            value = point.vectors.get(name)
+            if not value:
+                continue
+            modality = "image" if name == _TREE_IMAGE_VECTOR else "text"
+            yield TreeIndexRecord(
+                modality,
+                value,
+                _representation_metadata(point.metadata, modality),
+                point.image_text if modality == "image" else None,
+            )
 
 
 def process_tree_nodes(tree: DocumentTree) -> Tuple[Dict[str, List], Dict[str, List]]:
