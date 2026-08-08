@@ -3,6 +3,8 @@ from typing import Optional
 
 from Core.Index.Tree import NodeType, TreeNode
 
+from docarag.derived_identity import caption_footnote_text, channel_text
+
 log = logging.getLogger(__name__)
 
 
@@ -106,16 +108,12 @@ def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
         node.outline_node = isTitle
     elif content_type in _VISUAL_CONTENT_TYPES:
         caption = pdf_content.get("image_caption", [])
-        caption_str = " ".join(caption) if isinstance(caption, list) else ""
         footnote = pdf_content.get("image_footnote", [])
-        footnote_str = " ".join(footnote) if isinstance(footnote, list) else ""
         node_meta = {
             "img_path": pdf_content.get("img_path", ""),
-            "caption": caption_str,
-            "footnote": footnote_str,
-            "content": " ".join(
-                part for part in (caption_str, footnote_str) if part
-            ),
+            "caption": channel_text(caption),
+            "footnote": channel_text(footnote),
+            "content": caption_footnote_text(caption, footnote),
             "pdf_id": pdf_content.get("pdf_id", -1),
             "page_idx": pdf_content.get("page_idx", -1),
             "pdf_para_block": pdf_content.get("middle_json", {}),
@@ -125,17 +123,13 @@ def create_node_by_type(pdf_content: Optional[dict], isTitle: bool) -> TreeNode:
         node.type = _VISUAL_CONTENT_TYPES[content_type]
     elif content_type == "table":
         caption = pdf_content.get("table_caption", [])
-        caption_str = " ".join(caption) if isinstance(caption, list) else ""
         footnote = pdf_content.get("table_footnote", [])
-        footnote_str = " ".join(footnote) if isinstance(footnote, list) else ""
 
         node_meta = {
             "img_path": pdf_content.get("img_path", ""),
-            "caption": caption_str,
-            "footnote": footnote_str,
-            "content": " ".join(
-                part for part in (caption_str, footnote_str) if part
-            ),
+            "caption": channel_text(caption),
+            "footnote": channel_text(footnote),
+            "content": caption_footnote_text(caption, footnote),
             "table_body": pdf_content.get("table_body", ""),
             "pdf_id": pdf_content.get("pdf_id", -1),
             "page_idx": pdf_content.get("page_idx", -1),

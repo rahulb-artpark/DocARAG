@@ -23,6 +23,7 @@ from statistics import median
 
 from docarag.adapters.mineru_compat import unwrap_presentation
 from docarag.derived_identity import (
+    caption_footnote_text,
     derived_evidence_id,
     derived_identity_payload,
     derived_output_identity,
@@ -377,12 +378,32 @@ def _semantic_substructure_union(
     ]
 
 
-def _derived_output_content(content: dict) -> dict:
-    """Select output fields whose value determines derived evidence identity."""
+#: Block types with no ``text`` channel at all: what they say is in their
+#: caption and footnote. Mirrors bookrag_projection's _VISUAL_NODE_TYPE_BY_BLOCK.
+_VISUAL_OUTPUT_TYPES = frozenset({"image", "chart", "diagram"})
 
+
+def _derived_output_content(content: dict) -> dict:
+    """Select output fields whose value determines derived evidence identity.
+
+    The hydrator recomputes this digest from the *tree node*, so what is
+    sealed here has to be what the node will carry. A visual block has no
+    ``text``: reading one sealed the empty string over every merged figure,
+    which both left its text unprotected and made the identity impossible to
+    reproduce from the node -- and a merged figure was then refused as
+    tampered-with the first time an answer tried to cite one.
+    """
+
+    content_type = content.get("type", "unknown")
+    if content_type in _VISUAL_OUTPUT_TYPES:
+        text = caption_footnote_text(
+            content.get("image_caption"), content.get("image_footnote")
+        )
+    else:
+        text = content.get("text", "")
     return derived_output_identity(
-        content_type=content.get("type", "unknown"),
-        text=content.get("text", ""),
+        content_type=content_type,
+        text=text,
         table_body=content.get("table_body", ""),
         table_caption=content.get("table_caption", []),
         table_footnote=content.get("table_footnote", []),

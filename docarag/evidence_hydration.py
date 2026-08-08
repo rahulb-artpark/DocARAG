@@ -48,6 +48,7 @@ from docarag.domain.base import (
     stable_id,
 )
 from docarag.derived_identity import (
+    caption_footnote_text,
     derived_evidence_id,
     derived_identity_payload,
     derived_output_identity,
@@ -1022,9 +1023,17 @@ class CanonicalEvidenceHydrator:
                 if isinstance(value, str) and value
             )
         )
+        # The refiner seals this identity over the *block* it transformed, and
+        # a block's type is not always the node's: the outline pass afterwards
+        # promotes a text block that opens a section to "title". Reading the
+        # node's type here made every promoted heading unciteable, so the type
+        # comes from the same canonical projection the refiner was handed.
+        primary = project_canonical_blocks(
+            self.catalog.document, (first,), validate_relation_targets=False
+        )[0]
         identity_payload = derived_identity_payload(
             output=derived_output_identity(
-                content_type=tree_node.get("type", "unknown"),
+                content_type=primary.get("type", "unknown"),
                 text=tree_node.get("content", ""),
                 table_body=tree_node.get("table_body", ""),
                 table_caption=tree_node.get("caption", ""),
@@ -1147,11 +1156,8 @@ class CanonicalEvidenceHydrator:
         elif projected_type == "table":
             if node_type != "table":
                 _fail("direct tree node type differs from canonical block")
-            expected_content = "".join(
-                [
-                    " ".join(projected.get("table_caption", [])),
-                    " ".join(projected.get("table_footnote", [])),
-                ]
+            expected_content = caption_footnote_text(
+                projected.get("table_caption"), projected.get("table_footnote")
             )
             if tree_node.get("table_body") != projected.get("table_body"):
                 _fail("direct tree table body differs from canonical block")
@@ -1162,11 +1168,13 @@ class CanonicalEvidenceHydrator:
         elif projected_type in _VISUAL_NODE_TYPES:
             if node_type != projected_type:
                 _fail("direct tree node type differs from canonical block")
-            expected_content = "".join(
-                [
-                    " ".join(projected.get("image_caption", [])),
-                    " ".join(projected.get("image_footnote", [])),
-                ]
+            # Caption and footnote are separate channels, and the tree writes
+            # them as one string with a space between. Gluing them here instead
+            # refused every figure and table that has both -- which is most of
+            # the ones a question asks about, because a figure worth citing is
+            # usually the one the document bothered to caption.
+            expected_content = caption_footnote_text(
+                projected.get("image_caption"), projected.get("image_footnote")
             )
         else:  # pragma: no cover - projector rejects unsupported block kinds.
             _fail("canonical projection produced an unsupported node type")

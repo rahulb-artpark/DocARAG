@@ -33,6 +33,32 @@ def _joined_text(value: object) -> str:
     return ""
 
 
+def channel_text(value: object) -> str:
+    """One BookRAG text channel read as the single string a node carries.
+
+    Caption and footnote arrive as lists of entries; a node holds one string.
+    """
+
+    return " ".join(value) if isinstance(value, list) else ""
+
+
+def caption_footnote_text(caption: object, footnote: object) -> str:
+    """The content a caption/footnote-bearing node carries: both channels.
+
+    A visual or table block has no ``text`` channel -- its evidence is the
+    caption and footnote -- so this is the whole of what such a node retains.
+    Three places must agree on it exactly: the tree builder writes it, the
+    refiner seals a derived node's identity over it, and the hydrator
+    recomputes both from the canonical projection. It lives here because a
+    separator that differs between any two of them is silent until a figure
+    that has both a caption and a footnote reaches an answer, and then that
+    figure is refused.
+    """
+
+    parts = (channel_text(caption), channel_text(footnote))
+    return " ".join(part for part in parts if part)
+
+
 def derived_output_identity(
     *,
     content_type: object,

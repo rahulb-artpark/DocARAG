@@ -37,6 +37,8 @@ from docarag.evidence_hydration import (
     EvidenceHydrationError,
 )
 from docarag.derived_identity import (
+    caption_footnote_text,
+    channel_text,
     derived_evidence_id,
     derived_identity_payload,
     derived_output_identity,
@@ -99,17 +101,18 @@ def make_block(
 def tree_record(document: DocumentRef, block: CanonicalBlock, index_id: int) -> dict:
     row = project_canonical_blocks(document, (block,))[0]
     node_type = row["type"]
-    if node_type == "text":
+    # Whatever create_node_by_type writes, and nothing else: a fixture that
+    # joins the channels its own way agrees with the hydrator by coincidence
+    # and stops testing the rule.
+    if node_type in {"text", "equation"}:
         content = row["text"]
     elif node_type == "table":
-        content = " ".join(row["table_caption"]) + " ".join(
-            row["table_footnote"]
+        content = caption_footnote_text(
+            row["table_caption"], row["table_footnote"]
         )
-    elif node_type == "equation":
-        content = row["text"]
     else:
-        content = " ".join(row["image_caption"]) + " ".join(
-            row["image_footnote"]
+        content = caption_footnote_text(
+            row["image_caption"], row["image_footnote"]
         )
     record = {
         "index_id": index_id,
@@ -143,8 +146,8 @@ def tree_record(document: DocumentRef, block: CanonicalBlock, index_id: int) -> 
         record.update(
             {
                 "table_body": row["table_body"],
-                "caption": " ".join(row["table_caption"]),
-                "footnote": " ".join(row["table_footnote"]),
+                "caption": channel_text(row["table_caption"]),
+                "footnote": channel_text(row["table_footnote"]),
             }
         )
     return record
@@ -363,8 +366,12 @@ class EvidenceHydrationTests(unittest.TestCase):
         self.assertEqual("", hydrated[2]["img_path"])
 
     def test_derived_evidence_resolves_every_source_in_declared_order(self):
+        # The primary source leads: the refiner seals a merge over the anchor
+        # block it kept, and the hydrator reads that block's type back out of
+        # the canonical projection. An equation anchor keeps the merged text
+        # inside the digest, which a table anchor would not.
         refs = []
-        for block in (self.table, self.formula):
+        for block in (self.formula, self.table):
             refs.append(
                 {
                     "canonical_block_id": block.block_id,
@@ -379,29 +386,29 @@ class EvidenceHydrationTests(unittest.TestCase):
             )
         derived = {
             "index_id": 9,
-            "type": "text",
+            "type": "equation",
             "content": "The table value is defined by the equation.",
-            "page": self.table.page_index,
-            "page_id": self.table.page_id,
+            "page": self.formula.page_index,
+            "page_id": self.formula.page_id,
             "document_version_id": self.document.document_version_id,
             "source_uri": self.document.source_uri,
             "source_sha256": self.document.content_sha256,
             "derived_evidence_id": "pending",
             "source_canonical_block_ids": [
-                self.table.block_id,
                 self.formula.block_id,
+                self.table.block_id,
             ],
             "source_canonical_revision_ids": [
-                self.table.revision_id,
                 self.formula.revision_id,
+                self.table.revision_id,
             ],
             "source_observation_ids": [
-                *self.table.source_observation_ids,
                 *self.formula.source_observation_ids,
+                *self.table.source_observation_ids,
             ],
             "source_evidence_refs": refs,
             "transformations": ["bookrag.fixture_merge.v1"],
-            "geometry": self.table.geometry.to_dict(),
+            "geometry": self.formula.geometry.to_dict(),
         }
         derived["derived_evidence_id"] = derived_evidence_id(
             derived_identity_payload(
@@ -423,10 +430,10 @@ class EvidenceHydrationTests(unittest.TestCase):
 
         self.assertEqual(2, item["canonical_source_count"])
         self.assertEqual(
-            [self.table.revision_id, self.formula.revision_id],
+            [self.formula.revision_id, self.table.revision_id],
             item["citation"]["canonical_revision_ids"],
         )
-        self.assertEqual([0, 1], item["citation"]["page_indices"])
+        self.assertEqual([1, 0], item["citation"]["page_indices"])
         self.assertEqual(
             ["bookrag.fixture_merge.v1"], item["citation"]["transformations"]
         )
