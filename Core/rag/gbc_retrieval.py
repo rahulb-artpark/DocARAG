@@ -348,6 +348,7 @@ class Retriever:
         self,
         subtree_nodes: List[TreeNode],
         query: str,
+        requested_node_types: Sequence[str] = (),
     ) -> Dict[str, List[Tuple[TreeNode, Mapping[str, Any]]]]:
         """One bounded candidate list per named vector, from one round trip.
 
@@ -377,6 +378,10 @@ class Retriever:
                 # normalization are baked into the stored values; applying
                 # them again here would score the question, not the document.
                 lexical_terms=bm25_query_terms(query),
+                # Empty unless the plan said the question asks to be shown a
+                # kind of content, in which case each vector also gets a twin
+                # leg restricted to it.
+                scoped_node_types=tuple(requested_node_types),
             )
         else:
             # A store with one unnamed vector has one list and no name to give
@@ -418,14 +423,37 @@ class Retriever:
         return ("",)
 
     @staticmethod
-    def _leg_identity(vector_name: str) -> Tuple[str, str, str]:
-        """The leg id, kind and backend one vector name is retrieved under."""
+    def _leg_identity(leg_name: str) -> Tuple[str, str, str]:
+        """The leg id, kind and backend one leg name is retrieved under.
 
+        A type-scoped leg is a leg of its own in the trace, because it asked a
+        different question of the index -- the same vector over a restricted
+        population -- and a reader of the trace has to be able to tell whether a
+        node arrived because it matched or because its kind was asked for.
+        """
+
+        from Core.provider.vdb import (
+            TREE_SCOPED_VECTOR_SUFFIX,
+            tree_vector_base_name,
+        )
+
+        scoped = leg_name.endswith(TREE_SCOPED_VECTOR_SUFFIX)
+        vector_name = tree_vector_base_name(leg_name)
+        prefix = "typed-" if scoped else ""
+        backend_scope = "-typed" if scoped else ""
         if vector_name == _TREE_SPARSE_VECTOR:
-            return "lexical-tree", "sparse", "qdrant-tree-sparse"
+            return (
+                f"{prefix}lexical-tree",
+                "sparse",
+                f"qdrant-tree-sparse{backend_scope}",
+            )
         if not vector_name:
             return "dense-tree", "dense", "qdrant-tree-dense"
-        return f"dense-tree-{vector_name}", "dense", "qdrant-tree-dense"
+        return (
+            f"{prefix}dense-tree-{vector_name}",
+            "dense",
+            f"qdrant-tree-dense{backend_scope}",
+        )
 
     @staticmethod
     def _sha256_json(value: object) -> str:
@@ -811,12 +839,15 @@ class Retriever:
         self,
         subtree_nodes: List[TreeNode],
         query: str,
+        requested_node_types: Sequence[str] = (),
     ) -> List[TreeNode]:
         """Fuse dense/visual Qdrant and BM25 before bounded model reranking."""
 
         dense_error = False
         try:
-            vector_candidates = self._vector_candidates(subtree_nodes, query)
+            vector_candidates = self._vector_candidates(
+                subtree_nodes, query, requested_node_types
+            )
         except Exception:
             dense_error = True
             # Empty legs rather than no legs: a failure the trace does not
@@ -976,14 +1007,19 @@ class Retriever:
         return kept
 
     def text_reranker(
-        self, subtree_nodes: List[TreeNode], query: str
+        self,
+        subtree_nodes: List[TreeNode],
+        query: str,
+        requested_node_types: Sequence[str] = (),
     ) -> List[Tuple[int, float]]:
         """
         Rerank the original text in the subtree based on their relevance to the query.
         Use Reranker model
         """
         with self.timings.time("candidate_fusion"):
-            candidates = self._hybrid_candidates(subtree_nodes, query)
+            candidates = self._hybrid_candidates(
+                subtree_nodes, query, requested_node_types
+            )
         if not candidates:
             return []
 
@@ -1164,6 +1200,7 @@ class Retriever:
         subtree_nodes: List[TreeNode],
         subgraph: nx.Graph,
         start_ent_map: Dict[str, List[str]],
+        requested_node_types: Sequence[str] = (),
     ) -> Tuple[List[int], List[str]]:
         if len(subtree_nodes) == 0:
             log.info("No subtree nodes available for reranking.")
@@ -1172,7 +1209,7 @@ class Retriever:
         if self.variant == "wo_graph":
             log.info("Variant 'wo_graph' selected: Skipping graph reranker.")
             # Only use text reranker
-            text_rerank_res = self.text_reranker(subtree_nodes, sub_query)
+            text_rerank_res = self.text_reranker(subtree_nodes, sub_query, requested_node_types)
             tree_node_ids = [
                 node_id for node_id, _ in self._confidence_filtered(text_rerank_res)
             ]
@@ -1205,7 +1242,7 @@ class Retriever:
         )
 
         # 2.2 Rerank with text reranker model.
-        text_rerank_res = self.text_reranker(subtree_nodes, sub_query)
+        text_rerank_res = self.text_reranker(subtree_nodes, sub_query, requested_node_types)
 
         # 2.3 Rerank with Multimodal method.
         # mm_rerank_res = self.multimodal_reranker(subtree_nodes, sub_query)

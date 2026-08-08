@@ -51,6 +51,10 @@ class FakeModels:
         value: Any
 
     @dataclass
+    class MatchAny:
+        any: list[Any]
+
+    @dataclass
     class Range:
         gte: float | None = None
         lte: float | None = None
@@ -107,8 +111,15 @@ def _matches(record_id: str, payload: dict[str, Any], filter_: Any | None) -> bo
                 return False
             continue
         value = payload.get(condition.key)
-        if condition.match is not None and value != condition.match.value:
-            return False
+        if condition.match is not None:
+            # Matched by shape rather than by class, so a real qdrant-client
+            # MatchAny/MatchValue works here too -- tests deliberately run
+            # production code against the real models over this transport.
+            if hasattr(condition.match, "any"):
+                if value not in condition.match.any:
+                    return False
+            elif value != condition.match.value:
+                return False
         if condition.range is not None:
             if value is None:
                 return False
@@ -319,12 +330,23 @@ class FakeQdrantClient:
             return vector.get(using)
         return vector if using is None else None
 
+    @staticmethod
+    def _is_sparse(value: Any) -> bool:
+        """Sparse by shape, not by class.
+
+        Tests run production code against the *real* qdrant-client models over
+        this fake transport -- that is what turns "the fake agreed with us" into
+        "the client agrees with us". An isinstance check against the fake's own
+        SparseVector silently treats a real one as dense and multiplies a list
+        by a tuple.
+        """
+
+        return hasattr(value, "indices") and hasattr(value, "values")
+
     def _score(self, query: Any, vector: Any) -> float:
-        if isinstance(query, FakeModels.SparseVector):
-            if not isinstance(vector, FakeModels.SparseVector):
-                return 0.0
-            return self._sparse_dot(query, vector)
-        if isinstance(vector, FakeModels.SparseVector):
+        if self._is_sparse(query):
+            return self._sparse_dot(query, vector) if self._is_sparse(vector) else 0.0
+        if self._is_sparse(vector):
             return 0.0
         return self._cosine(query, vector)
 

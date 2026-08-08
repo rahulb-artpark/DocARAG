@@ -6,6 +6,7 @@ from Core.configs.gbc_limits import (
     ABSOLUTE_MAX_FILTERS,
     ABSOLUTE_MAX_FILTER_VALUE_CHARS,
     ABSOLUTE_MAX_QUERY_CHARS,
+    ABSOLUTE_MAX_REQUESTED_NODE_TYPES,
     ABSOLUTE_MAX_SUBQUESTION_CHARS,
     ABSOLUTE_MAX_SUBQUESTIONS,
 )
@@ -48,9 +49,69 @@ def _validate_bounded_text(value: object, *, field: str, max_chars: int) -> str:
     return value
 
 
+#: What a question can ask to be shown, as the four families a reader actually
+#: distinguishes rather than as the eight node types the tree happens to use.
+#:
+#: Someone asking for "the image" means any picture, and whether the extractor
+#: labelled that picture an image, a chart or a diagram is a fact about the
+#: extractor, not about the question. Likewise a listing and an algorithm are
+#: one thing to a reader, while a table, a list and a paragraph are the same
+#: content in three formats. An equation is genuinely its own kind.
+#:
+#: Naming the families rather than the types also gives the planner four
+#: choices instead of eight, and none of them require it to know how MinerU
+#: classifies a figure.
+RequestedNodeType = Literal["image", "table", "equation", "code"]
+
+#: Each family expanded to the ``node_type`` payload values it covers. Node type
+#: strings rather than the enum so this stays usable where retrieval reads
+#: payloads back out of Qdrant.
+REQUESTED_NODE_TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "image": ("image", "chart", "diagram"),
+    "table": ("table", "text", "list"),
+    "equation": ("equation",),
+    "code": ("code", "algorithm"),
+}
+
+#: The family that is already what retrieval returns by default. Scoping to it
+#: selects most of the document, so it cannot lift anything -- and issuing a
+#: second leg over the same population would double those nodes' weight in a
+#: rank-based fusion, biasing the answer toward prose for a question that only
+#: asked to see a table. So the request is accepted and recorded, and no
+#: scoped leg is built for it.
+UNSCOPED_NODE_TYPE_FAMILIES = frozenset({"table"})
+
+
+def requested_node_type_filter(families: object) -> tuple[str, ...]:
+    """The node types a scoped retrieval leg should match, for these families.
+
+    Empty when nothing was requested, and empty when everything requested is
+    already the default population -- in both cases the caller issues no scoped
+    leg and retrieval behaves exactly as it did before.
+    """
+
+    if not isinstance(families, (list, tuple)):
+        return ()
+    types: dict[str, None] = {}
+    for family in families:
+        if family in UNSCOPED_NODE_TYPE_FAMILIES:
+            continue
+        for node_type in REQUESTED_NODE_TYPE_FAMILIES.get(family, ()):
+            types.setdefault(node_type, None)
+    return tuple(types)
+
+
 # Step 1 Output Model
 class QueryTypeResult(BaseModel):
     query_type: Literal["simple", "complex", "global"]
+    #: Asked for in the same call that classifies the query, because a simple
+    #: plan makes no second call and a modality request is worth no extra
+    #: round trip. Only used for a simple plan: a complex one carries it per
+    #: sub-question and a global one says it through ``filters``.
+    requested_node_types: Optional[List[RequestedNodeType]] = Field(
+        default=None,
+        max_length=ABSOLUTE_MAX_REQUESTED_NODE_TYPES,
+    )
 
 
 # Step 2 'complex' Output Model
@@ -60,11 +121,29 @@ class SubQuestion(BaseModel):
         max_length=ABSOLUTE_MAX_SUBQUESTION_CHARS,
     )
     type: Literal["retrieval", "synthesis"]
+    requested_node_types: Optional[List[RequestedNodeType]] = Field(
+        default=None,
+        max_length=ABSOLUTE_MAX_REQUESTED_NODE_TYPES,
+    )
 
     @model_validator(mode="after")
     def validate_question_text(self):
         if not self.question.strip():
             raise ValueError("sub-question must not contain only whitespace")
+        if self.requested_node_types is not None:
+            # A synthesis step does no lookup, so a modality request on one
+            # would scope a retrieval that never happens.
+            if self.type != "retrieval":
+                raise ValueError(
+                    "only a retrieval sub-question may request node types"
+                )
+            deduplicated = list(dict.fromkeys(self.requested_node_types))
+            if deduplicated != self.requested_node_types:
+                raise ValueError("requested_node_types must not repeat a type")
+            if not deduplicated:
+                raise ValueError(
+                    "requested_node_types must be omitted rather than empty"
+                )
         return self
 
 
@@ -160,6 +239,14 @@ class PlanResult(BaseModel):
         max_length=ABSOLUTE_MAX_FILTERS,
     )
     operation: Optional[Literal["COUNT", "LIST", "SUMMARIZE", "ANALYZE"]] = None
+    #: What kind of node the question asks to be shown, when it asks at all.
+    #: Carried here for a simple query and on each sub-question for a complex
+    #: one. A global query already expresses this through ``filters``, and two
+    #: mechanisms that could disagree is worse than one.
+    requested_node_types: Optional[List[RequestedNodeType]] = Field(
+        default=None,
+        max_length=ABSOLUTE_MAX_REQUESTED_NODE_TYPES,
+    )
 
     @model_validator(mode="after")
     def check_fields_for_type(self):
@@ -182,6 +269,21 @@ class PlanResult(BaseModel):
         if self.query_type == "global" and self.sub_questions is not None:
             raise ValueError(
                 "For 'global' query_type, sub_questions must be null."
+            )
+        # A complex plan carries the request per sub-question, because its
+        # sub-questions ask for different things: "show me the image" and "what
+        # is the equation" are one query and two modalities. A global plan says
+        # it through ``filters`` already. Either one also setting it here would
+        # be a second, disagreeing answer to the same question.
+        if self.query_type in ("complex", "global") and (
+            self.requested_node_types is not None
+        ):
+            raise ValueError(
+                f"For '{self.query_type}' query_type, requested_node_types must "
+                "be null; it belongs on each sub-question"
+                if self.query_type == "complex"
+                else f"For '{self.query_type}' query_type, requested_node_types "
+                "must be null; use filters"
             )
         if self.query_type == "simple" and (
             self.sub_questions is not None
@@ -319,7 +421,50 @@ Category Definitions:
     - Example: "How many tables are in the document?" -> This is GLOBAL because the process is to **filter** for all items of type 'table' across the document, and then **aggregate** by counting them.
     - Example: "Summarize the discussion about 'data augmentation' in the 'Methodology' section." -> This is GLOBAL because the process is to first apply a **structural filter** (retrieve all content from the 'Methodology' section), and then perform an **aggregation** (summarize that content) with a focus on 'data augmentation'.
 
+{self._requested_node_types_rules()}
+
 User Query: "{query}"
+"""
+
+    def _requested_node_types_rules(self) -> str:
+        """The one instruction block both prompts share, written once.
+
+        The hard case is not recognising a request; it is refusing one. In a
+        technical document the words are also the subject matter: this corpus
+        uses "image" 3913 times, at least 1622 of them in "image surface",
+        "image space", "image height" -- optics, not a request to be shown a
+        picture. A word-spotting rule fires on all of them, which is why this
+        asks for the reader's *intent* and spells out the negative cases.
+        """
+
+        return f"""
+### REQUESTED NODE TYPES ###
+
+Set `requested_node_types` ONLY when the user is asking to be **shown a
+particular kind of content**. Choose from: "image" (any picture, figure, chart,
+plot or diagram), "table" (tabular or itemised data), "equation" (a formula),
+"code" (a listing, file format or algorithm). At most
+{ABSOLUTE_MAX_REQUESTED_NODE_TYPES}, no repeats. Omit the field entirely -- do
+not send an empty list -- when the user is not asking to see a kind of content.
+
+The words themselves are NOT the signal; the request is. These words are often
+ordinary technical vocabulary of the subject, and in that use they must NOT set
+this field.
+
+SET IT:
+- "show me the image of the Wolter Surface"        -> ["image"]
+- "what does the Zernike surface look like?"       -> ["image"]
+- "show me the figure and the equation for it"     -> ["image", "equation"]
+- "give me the code for the INT Zernike format"    -> ["code"]
+
+DO NOT SET IT:
+- "what is the paraxial image plane?"              -> omit (optics term)
+- "how is image height computed?"                  -> omit (optics term)
+- "how do I configure the merit function?"         -> omit (no request)
+- "what does the table say about tolerances?"      -> omit (asks the content,
+  not to be shown the table)
+- "how many images are in the document?"           -> omit (this is a global
+  aggregation; it is expressed through filters)
 """
 
     def _get_complex_prompt(self, query: str) -> str:
@@ -333,7 +478,9 @@ You are a query decomposition expert. You have been given a "complex" question. 
 3.  A `synthesis` question requires comparing, calculating, or combining the answers of the previous `retrieval` questions. It does **NOT** require a new lookup in the document.
 4.  Return at most {self.max_subquestions} sub-questions, and keep each `question` at or below {self.max_subquestion_chars} characters. If the request cannot be represented within this budget, do not invent a partial decomposition.
 
-You MUST provide your response in a JSON object with a single key 'sub_questions', which contains a list of objects. Each object must have a 'question' (string) and a 'type' (string: "retrieval" or "synthesis").
+You MUST provide your response in a JSON object with a single key 'sub_questions', which contains a list of objects. Each object must have a 'question' (string) and a 'type' (string: "retrieval" or "synthesis"), and may have 'requested_node_types' (a list of strings) on a `retrieval` sub-question only.
+
+{self._requested_node_types_rules()}
 
 --- EXAMPLE 1 (Correct Decomposition with Independent Lookups) ---
 Complex Query: "What is the color of the personality vector in the soft-labled personality embedding matrix that with the highest Receptiviti score for User A2GBIFL43U1LKJ?"
@@ -451,12 +598,9 @@ User: "{query}"
 Assistant:
 """
 
-    def _classify_query_type(
-        self, query: str
-    ) -> Literal["simple", "complex", "global"]:
+    def _classify_query_type(self, query: str) -> QueryTypeResult:
         prompt = self._get_classification_prompt(query)
-        result = self.llm.get_json_completion(prompt, schema=QueryTypeResult)
-        return result.query_type
+        return self.llm.get_json_completion(prompt, schema=QueryTypeResult)
 
     def _process_complex_query(self, query: str) -> List[SubQuestion]:
         prompt = self._get_complex_prompt(query)
@@ -482,10 +626,18 @@ Assistant:
 
         self.validate_query(query)
         known_sections = bounded_section_titles(section_titles)
-        query_type = self._classify_query_type(query)
+        classification = self._classify_query_type(query)
+        query_type = classification.query_type
 
         if query_type == "simple":
-            plan = PlanResult(query_type=query_type, original_query=query)
+            plan = PlanResult(
+                query_type=query_type,
+                original_query=query,
+                # A complex plan carries this per sub-question and a global one
+                # through its filters, so the classifier's answer is only ever
+                # read here. Dropping it elsewhere keeps one source of truth.
+                requested_node_types=classification.requested_node_types,
+            )
 
         elif query_type == "complex":
             sub_questions = self._process_complex_query(query)

@@ -57,6 +57,19 @@ _TREE_SPARSE_VECTOR = "lexical"
 #: own point because its element id, kind and box are per-element payload that a
 #: shared point could not carry.
 _TREE_POINT_KINDS = ("node", "semantic_element")
+#: Marks the type-scoped twin of a vector's leg in a ``search_tree_vectors``
+#: result. Not a vector name -- Qdrant only ever sees the base name -- so it
+#: uses a character no vector name contains, and callers strip it with
+#: ``tree_vector_base_name`` before reading anything off the row.
+TREE_SCOPED_VECTOR_SUFFIX = "@type"
+
+
+def tree_vector_base_name(leg_name: str) -> str:
+    """The vector a leg queried, with any type-scoping marker removed."""
+
+    if leg_name.endswith(TREE_SCOPED_VECTOR_SUFFIX):
+        return leg_name[: -len(TREE_SCOPED_VECTOR_SUFFIX)]
+    return leg_name
 
 
 #: The dense names each schema requires. ``UNNAMED`` is absent on purpose: it is
@@ -1859,6 +1872,7 @@ class VectorStore:
         dense_names: Sequence[str] = _TREE_DENSE_VECTORS,
         lexical_terms: Mapping[int, float] | None = None,
         metadata_filter: Mapping[str, Any] | None = None,
+        scoped_node_types: Sequence[str] = (),
     ) -> Dict[str, List[Dict[str, Any]]]:
         """One ranked list per vector name, from a single round trip.
 
@@ -1866,6 +1880,13 @@ class VectorStore:
         is the signal this schema exists to provide, and a server-side fusion
         would collapse it into one opaque list and leave the client's own RRF
         trace claiming an arithmetic it never performed.
+
+        ``scoped_node_types`` adds a second list per name, restricted to those
+        node types, under the ``name + TREE_SCOPED_VECTOR_SUFFIX`` key. Added
+        rather than substituted: a question that asks to be shown a figure
+        still needs the paragraph that explains it, so the unrestricted lists
+        stay exactly as they were and the restricted ones give the requested
+        kind a ranking it cannot be crowded out of.
         """
 
         self._require_tree_node()
@@ -1882,8 +1903,34 @@ class VectorStore:
         )[0]
         self._validate_existing_collection(len(query_embedding))
         return self._tree_vector_rows(
-            query_embedding, query_filter, top_k, dense_names, lexical_terms
+            query_embedding,
+            query_filter,
+            top_k,
+            dense_names,
+            lexical_terms,
+            self._type_scoped_filter(query_filter, scoped_node_types),
         )
+
+    def _type_scoped_filter(
+        self, query_filter: Any, node_types: Sequence[str]
+    ) -> Any | None:
+        """The scope filter narrowed to a set of node types, or None.
+
+        ``node_type`` carries a keyword payload index, so this costs a filtered
+        search rather than a scan. The scope conditions are kept: a type-scoped
+        leg must not reach outside the document the rest of the query is bound
+        to.
+        """
+
+        wanted = [str(node_type) for node_type in node_types if str(node_type)]
+        if not wanted:
+            return None
+        condition = self._models.FieldCondition(
+            key="node_type",
+            match=self._models.MatchAny(any=sorted(set(wanted))),
+        )
+        existing = list(getattr(query_filter, "must", None) or [])
+        return self._models.Filter(must=[*existing, condition])
 
     def _tree_vector_rows(
         self,
@@ -1892,34 +1939,46 @@ class VectorStore:
         top_k: int,
         dense_names: Sequence[str],
         lexical_terms: Mapping[int, float] | None = None,
+        scoped_filter: Any | None = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        names = list(dense_names)
-        requests = [
-            self._models.QueryRequest(
-                query=query_embedding,
-                filter=query_filter,
-                limit=top_k,
-                with_payload=True,
-                with_vector=False,
-                using=name,
+        def sparse_query() -> Any:
+            return self._models.SparseVector(
+                indices=[int(term) for term in lexical_terms or {}],
+                values=[float(value) for value in (lexical_terms or {}).values()],
             )
-            for name in names
-        ]
-        if lexical_terms:
-            names.append(_TREE_SPARSE_VECTOR)
-            requests.append(
-                self._models.QueryRequest(
-                    query=self._models.SparseVector(
-                        indices=[int(term) for term in lexical_terms],
-                        values=[float(value) for value in lexical_terms.values()],
-                    ),
-                    filter=query_filter,
-                    limit=top_k,
-                    with_payload=True,
-                    with_vector=False,
-                    using=_TREE_SPARSE_VECTOR,
+
+        names: list[str] = []
+        requests: list[Any] = []
+        # The unrestricted legs first, then the same legs restricted to the
+        # requested node types. One batch either way, so scoping costs a round
+        # trip's worth of extra requests rather than a second round trip.
+        for scope, suffix in ((query_filter, ""), (scoped_filter, TREE_SCOPED_VECTOR_SUFFIX)):
+            if suffix and scoped_filter is None:
+                continue
+            for name in dense_names:
+                names.append(f"{name}{suffix}")
+                requests.append(
+                    self._models.QueryRequest(
+                        query=query_embedding,
+                        filter=scope,
+                        limit=top_k,
+                        with_payload=True,
+                        with_vector=False,
+                        using=name,
+                    )
                 )
-            )
+            if lexical_terms:
+                names.append(f"{_TREE_SPARSE_VECTOR}{suffix}")
+                requests.append(
+                    self._models.QueryRequest(
+                        query=sparse_query(),
+                        filter=scope,
+                        limit=top_k,
+                        with_payload=True,
+                        with_vector=False,
+                        using=_TREE_SPARSE_VECTOR,
+                    )
+                )
         responses = self.client.query_batch_points(
             collection_name=self.collection_name, requests=requests
         )
@@ -1930,10 +1989,15 @@ class VectorStore:
             points = getattr(response, "points", None)
             if not isinstance(points, Iterable):
                 raise RuntimeError("Qdrant returned an invalid query response")
+            # A row records the vector it matched on, not the leg it arrived
+            # under: a scoped and an unscoped hit on the same vector are the
+            # same evidence, and giving them different row ids would stop them
+            # deduplicating into one candidate.
             # The sparse name has no content of its own, so it falls through to
             # the point's primary text -- which is what it was matched on.
             rows[name] = [
-                self._retrieval_result(hit, vector_name=name) for hit in points
+                self._retrieval_result(hit, vector_name=tree_vector_base_name(name))
+                for hit in points
             ]
         return rows
 

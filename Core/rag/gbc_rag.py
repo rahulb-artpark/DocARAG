@@ -26,6 +26,7 @@ from Core.rag.gbc_plan import (
     PlanningBudgetExceeded,
     TaskPlanner,
     PlanResult,
+    requested_node_type_filter,
 )
 from Core.rag.gbc_retrieval import HybridRetrievalBinding, Retriever
 from Core.pipelines.entity_facets import (
@@ -1579,7 +1580,11 @@ class GBCRAG(BaseRAG):
         start_ent_map = iter_context.gbc_entity_map
 
         tree_node_ids, res_entities = self.retriever.skyline_filter(
-            iter_context.sub_query, subtree_nodes, subgraph, start_ent_map
+            iter_context.sub_query,
+            subtree_nodes,
+            subgraph,
+            start_ent_map,
+            iter_context.requested_node_types,
         )
 
         log.info(f"After skyline filtering, select {len(tree_node_ids)} TreeNodes")
@@ -1642,7 +1647,13 @@ class GBCRAG(BaseRAG):
 
         if query_analysis.query_type == "simple":
             query = query_analysis.original_query
-            current_step = SubStep(sub_query=query, sub_number=1)
+            current_step = SubStep(
+                sub_query=query,
+                sub_number=1,
+                requested_node_types=list(
+                    requested_node_type_filter(query_analysis.requested_node_types)
+                ),
+            )
             self._retrieve(query, current_step)
             self._notify_retrieval_ready(context, current_step)
 
@@ -1675,7 +1686,13 @@ class GBCRAG(BaseRAG):
             sub_question_results = []
             for i, task in enumerate(retrieval_tasks):
                 sub_question = task.question
-                current_step = SubStep(sub_query=sub_question, sub_number=i + 1)
+                current_step = SubStep(
+                    sub_query=sub_question,
+                    sub_number=i + 1,
+                    requested_node_types=list(
+                        requested_node_type_filter(task.requested_node_types)
+                    ),
+                )
                 self._retrieve(sub_question, current_step)
                 self._notify_retrieval_ready(context, current_step)
 

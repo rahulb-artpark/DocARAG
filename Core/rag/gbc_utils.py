@@ -17,6 +17,10 @@ log = logging.getLogger(__name__)
 class SubStep(BaseModel):
     sub_query: str
     sub_number: int
+    #: The node-type families the plan says this step asks to be shown, already
+    #: expanded to node_type payload values. Empty for a question that is not
+    #: asking to see a kind of content, which is the common case.
+    requested_node_types: List[str] = Field(default_factory=list)
     gbc_entity_map: Dict[str, List[str]] = Field(default_factory=dict)
     linked_tree_nodes: List[Dict[str, Any]] = Field(default_factory=list)
     linked_section_ids: List[int] = Field(default_factory=list)

@@ -10,4 +10,8 @@ ABSOLUTE_MAX_SUBQUESTIONS = 32
 ABSOLUTE_MAX_SUBQUESTION_CHARS = 4_096
 ABSOLUTE_MAX_FILTERS = 16
 ABSOLUTE_MAX_FILTER_VALUE_CHARS = 1_024
+#: A question can ask for a few kinds of node at once -- "the image and the
+#: equation" -- but each requested kind costs a retrieval leg, so the count is
+#: bounded like every other model-controlled fan-out here.
+ABSOLUTE_MAX_REQUESTED_NODE_TYPES = 4
 
