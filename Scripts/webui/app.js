@@ -2343,7 +2343,9 @@ function inlineFigureHtml(citation) {
     .filter(Boolean)
     .map((part) => escapeHtml(String(part)))
     .join(" · ");
-  return `<figure class="answerFigure" data-figure="${escapeHtml(citation.label)}">
+  // Keyed by node, not by label: one crop belongs to one node however many
+  // evidence scopes cite it.
+  return `<figure class="answerFigure" data-figure="${escapeHtml(String(citation.nodeId))}">
     <img src="${treeImageUrl(citation.nodeId)}" alt="${escapeHtml(citation.label)}" loading="lazy" />
     <figcaption>${caption}${
       citation.nodeId != null
@@ -2353,14 +2355,45 @@ function inlineFigureHtml(citation) {
   </figure>`;
 }
 
+// Which crops an answer should show, and under which label each is anchored.
+//
+// One figure per *node*, not per label. A decomposed question gives every
+// sub-question its own evidence scope, so one table reaches the answer as
+// Q1-E5, Q2-E8 and Q3-E7 -- three labels, one crop -- and keying the
+// "already drawn" check on the label drew the same table three times.
+//
+// The anchor is a label the prose actually uses, which is not always the
+// lowest-numbered scope: in that answer Q1-E5 is never named and Q2-E8 is, so
+// anchoring on the first label would have parked the figure at the end of the
+// answer instead of beside the paragraph it illustrates.
+//
+// Kept free of the DOM so it can be tested on plain data; `isMentioned` is the
+// only thing the caller has to look up.
+function figuresToInline(citations, isMentioned) {
+  const byNode = new Map();
+  for (const citation of citations || []) {
+    if (!citation || !citation.hasImage || citation.nodeId == null) continue;
+    const key = String(citation.nodeId);
+    if (!byNode.has(key)) byNode.set(key, []);
+    byNode.get(key).push(citation);
+  }
+  const chosen = [];
+  for (const group of byNode.values()) {
+    chosen.push(group.find((c) => isMentioned(c.label)) || group[0]);
+  }
+  return chosen;
+}
+
 function inlineCitedFigures(scope, citations) {
   const root = scope.querySelector(".answer");
   if (!root) return;
-  const withImages = (citations || []).filter((c) => c.hasImage && c.nodeId != null);
+  const withImages = figuresToInline(citations, (label) =>
+    Boolean(root.querySelector(`a.cite[data-cite="${CSS.escape(label)}"]`)),
+  );
   if (!withImages.length) return;
 
   for (const citation of withImages) {
-    if (root.querySelector(`[data-figure="${CSS.escape(citation.label)}"]`)) continue;
+    if (root.querySelector(`[data-figure="${CSS.escape(String(citation.nodeId))}"]`)) continue;
     // linkifyCitations has already turned the marker into an anchor, so the
     // first mention is exactly where the reader met this evidence.
     const marker = root.querySelector(`a.cite[data-cite="${CSS.escape(citation.label)}"]`);
