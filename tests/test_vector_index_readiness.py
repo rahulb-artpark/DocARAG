@@ -48,13 +48,22 @@ class FakeScopedQdrant:
         self.events.append("reset")
         self.remote[self.key] = {"count": 0}
 
-    def add_texts(self, *, texts, **_kwargs):
+    def add_tree_node_points(self, *, records, **_kwargs):
         self.events.append("write")
-        self.embedding_model.embed_texts(texts)
-        self.remote.setdefault(self.key, {"count": 0})["count"] += len(texts)
-
-    def add_images(self, *, image_paths, **_kwargs):
-        self.remote.setdefault(self.key, {"count": 0})["count"] += len(image_paths)
+        # The embedder is touched exactly where the real writer touches it, so
+        # the "attestation reused without loading the model" test still means
+        # what it says.
+        self.embedding_model.embed_texts(
+            [
+                value
+                for record in records
+                for name, value in record["vectors"].items()
+                if name != "image"
+            ]
+        )
+        # One point per record, whatever it carries: point_count counts Qdrant
+        # points and always did.
+        self.remote.setdefault(self.key, {"count": 0})["count"] += len(records)
 
     def count(self):
         self.events.append("count")
@@ -196,7 +205,7 @@ class VectorIndexReadinessTests(unittest.TestCase):
 
     def test_write_failure_removes_attestation_and_closes_resources(self):
         class FailingStore(FakeScopedQdrant):
-            def add_texts(self, **_kwargs):
+            def add_tree_node_points(self, **_kwargs):
                 self.events.append("write")
                 raise RuntimeError("interrupted write")
 

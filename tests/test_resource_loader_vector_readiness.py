@@ -126,11 +126,10 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             def reset(self):
                 remote[self.key] = 0
 
-            def add_texts(self, *, texts, **_kwargs):
-                remote[self.key] += len(texts)
-
-            def add_images(self, *, image_paths, **_kwargs):
-                remote[self.key] += len(image_paths)
+            def add_tree_node_points(self, *, records, **_kwargs):
+                # One point per record now, whatever it carries -- the count the
+                # attestation compares against is Qdrant points, not vectors.
+                remote[self.key] += len(records)
 
             def count(self):
                 return remote[self.key]

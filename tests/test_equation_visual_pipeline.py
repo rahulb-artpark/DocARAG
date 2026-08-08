@@ -91,7 +91,8 @@ class EquationVisualPipelineTests(unittest.TestCase):
             embedding = Mock()
             store = Mock()
             store.embedding_model = embedding
-            store.count.return_value = 2
+            # The LaTeX and the crop are one node, so they are one point.
+            store.count.return_value = 1
             cfg = SimpleNamespace(
                 mm_embedding=True,
                 tenant_id="test",
@@ -114,42 +115,29 @@ class EquationVisualPipelineTests(unittest.TestCase):
             ):
                 vdb_index.build_vdb_index(tree, cfg)
 
-            store.add_texts.assert_called_once_with(
-                texts=[latex],
-                metadatas=[
-                    {
-                        "node_id": 1,
-                        "node_type": "equation",
-                        "index_kind": "tree",
-                        "pdf_id": 17,
-                        "document_version_id": "equations-v1",
-                        "page_idx": 2,
-                        "source_sha256": "a" * 64,
-                        "canonical_block_id": "equation-17",
-                        "modality": "text",
-                        "type": "text",
-                    }
-                ],
-                strict_source_identity=True,
-            )
-            store.add_images.assert_called_once_with(
-                image_paths=[str(crop)],
-                metadatas=[
-                    {
-                        "node_id": 1,
-                        "node_type": "equation",
-                        "index_kind": "tree",
-                        "pdf_id": 17,
-                        "document_version_id": "equations-v1",
-                        "page_idx": 2,
-                        "source_sha256": "a" * 64,
-                        "canonical_block_id": "equation-17",
-                        "modality": "image",
-                        "type": "image",
-                    }
-                ],
-                image_str=[latex],
-                strict_source_identity=True,
+            store.add_tree_node_points.assert_called_once()
+            records = store.add_tree_node_points.call_args.kwargs["records"]
+            self.assertEqual(1, len(records))
+            record = records[0]
+
+            # Both readings on one point, each under its own name, and no
+            # point-level modality: a point holds several vectors and each
+            # one's modality is the vector it was written under.
+            self.assertEqual({"text": latex, "image": str(crop)}, record["vectors"])
+            self.assertEqual(latex, record["image_text"])
+            self.assertEqual("node", record["kind"])
+            self.assertEqual(
+                {
+                    "node_id": 1,
+                    "node_type": "equation",
+                    "index_kind": "tree",
+                    "pdf_id": 17,
+                    "document_version_id": "equations-v1",
+                    "page_idx": 2,
+                    "source_sha256": "a" * 64,
+                    "canonical_block_id": "equation-17",
+                },
+                record["metadata"],
             )
             store.close.assert_called_once_with()
             store.reset.assert_called_once_with()

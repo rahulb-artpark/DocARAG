@@ -130,9 +130,9 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             tree, expected_images = self._tree(directory)
             embedder = Mock()
             store = Mock()
-            # An equation contributes two texts: what it says, and the
-            # neighbourhood that says what it is for.
-            store.count.return_value = 9
+            # Five content nodes, five points -- carrying the nine vectors the
+            # index used to spread across nine points.
+            store.count.return_value = 5
 
             with (
                 patch.object(vdb_index, "MultimodalEmbeddingProvider", return_value=embedder),
@@ -142,46 +142,49 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
                     tree, self._config(directory), batch_size=2
                 )
 
-            text_batches = [
-                call.kwargs["texts"] for call in store.add_texts.call_args_list
+            batches = [
+                call.kwargs["records"]
+                for call in store.add_tree_node_points.call_args_list
             ]
-            image_batches = [
-                call.kwargs["image_paths"]
-                for call in store.add_images.call_args_list
-            ]
-            self.assertTrue(all(len(batch) <= 2 for batch in text_batches))
-            self.assertTrue(all(len(batch) <= 2 for batch in image_batches))
+            self.assertTrue(all(len(batch) <= 2 for batch in batches))
+            points = [record for batch in batches for record in batch]
+
             self.assertEqual(
                 [
-                    "alpha",
-                    "table heading\n|a|b|",
-                    "figure caption figure footnote",
-                    r"E=mc^2",
-                    # The neighbouring figure contributes its caption, which is
-                    # where a figure's prose lives; content alone would lose it.
-                    "figure caption figure footnote\nE=mc^2\nConclusion",
-                    "Conclusion",
+                    {"text": "alpha"},
+                    {"text": "table heading\n|a|b|", "image": expected_images[0]},
+                    {
+                        "text": "figure caption figure footnote",
+                        "image": expected_images[1],
+                    },
+                    {
+                        "text": r"E=mc^2",
+                        # The neighbouring figure contributes its caption, which
+                        # is where a figure's prose lives; content alone would
+                        # lose it.
+                        "context": "figure caption figure footnote\nE=mc^2\nConclusion",
+                        "image": expected_images[2],
+                    },
+                    {"text": "Conclusion"},
                 ],
-                [item for batch in text_batches for item in batch],
+                [record["vectors"] for record in points],
             )
-            self.assertEqual(
-                expected_images, [item for batch in image_batches for item in batch]
-            )
+            self.assertEqual(9, sum(len(r["vectors"]) for r in points))
             self.assertEqual(
                 [
+                    None,
                     "table heading\n|a|b|",
                     "figure caption figure footnote",
                     # The crop is paired with the neighbourhood, not the LaTeX:
                     # a picture of the symbols and a transcription of the same
                     # symbols are the same evidence twice.
                     "figure caption figure footnote\nE=mc^2\nConclusion",
+                    None,
                 ],
-                [
-                    item
-                    for call in store.add_images.call_args_list
-                    for item in call.kwargs["image_str"]
-                ],
+                [record["image_text"] for record in points],
             )
+            # Every point that holds text also holds terms for the lexical leg.
+            self.assertTrue(all(record["lexical_terms"] for record in points))
             store.close.assert_called_once_with()
             store.reset.assert_called_once_with()
             embedder.close.assert_called_once_with()
@@ -406,7 +409,7 @@ class StreamingTreeVectorIndexTests(unittest.TestCase):
             tree, _ = self._tree(directory)
             embedder = Mock()
             store = Mock()
-            store.add_texts.side_effect = RuntimeError("write failed")
+            store.add_tree_node_points.side_effect = RuntimeError("write failed")
 
             with (
                 patch.object(vdb_index, "MultimodalEmbeddingProvider", return_value=embedder),

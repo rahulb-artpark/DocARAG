@@ -13,14 +13,18 @@ from Core.provider.embedding import (
     MultimodalEmbeddingProvider,
 )
 from Core.provider.llm import LLM
+from Core.pipelines.entity_facets import lexical_terms
 from Core.provider.vdb import (
     TREE_VECTOR_RECORD_ID_SCHEMA,
     VECTOR_RECORD_ID_SCHEMA,
+    VectorSchema,
     VectorStore,
     _TREE_DENSE_VECTORS,
     _TREE_IMAGE_VECTOR,
     _TREE_SPARSE_VECTOR,
     stable_vector_record_id,
+    tree_point_record_id,
+    tree_vector_identity,
 )
 from Core.Index.Tree import DocumentTree, NodeType
 from Core.pipelines.node_context import context_contribution, node_content
@@ -53,8 +57,13 @@ save_path = "/home/wangshu/multimodal/GBC-RAG/test/sf/"
 
 
 DEFAULT_TREE_INDEX_BATCH_SIZE = 256
-TREE_VECTOR_INDEX_SCHEMA = "docarag.bookrag-tree-qdrant-index.v6"
-TREE_VECTOR_PROJECTION_SCHEMA = "docarag.bookrag-tree-vector-projection.v6"
+#: v7 is one point per node carrying named vectors, where v6 was one point per
+#: representation carrying a single unnamed one. Nothing dispatches on these --
+#: they are domain separators inside the digests, so bumping them is what makes
+#: every attestation written under the old shape fail its exact comparison and
+#: forces a rebuild rather than silently reading points that are not there.
+TREE_VECTOR_INDEX_SCHEMA = "docarag.bookrag-tree-qdrant-index.v7"
+TREE_VECTOR_PROJECTION_SCHEMA = "docarag.bookrag-tree-vector-projection.v7"
 MAX_VECTOR_SEMANTIC_REFS = 128
 MAX_VECTOR_SOURCE_EVIDENCE_REFS = 64
 MAX_VECTOR_SEMANTIC_REFS_BYTES = 65_536
@@ -79,6 +88,8 @@ _VECTOR_ATTESTATION_IDENTITY_FIELDS = (
     "projection_sha256",
     "node_count",
     "point_count",
+    "vector_count",
+    "sparse_vector_count",
     "collection_name",
     "scope_filter",
     "qdrant_endpoint_sha256",
@@ -315,11 +326,16 @@ def _vector_config_identity(vdb_cfg: VDBConfig) -> dict[str, object]:
     endpoint_sha256 = qdrant_endpoint_sha256(vdb_cfg.qdrant_url)
     return {
         "projection_schema": TREE_VECTOR_PROJECTION_SCHEMA,
-        "record_id_schema": VECTOR_RECORD_ID_SCHEMA,
+        "record_id_schema": TREE_VECTOR_RECORD_ID_SCHEMA,
         "backend": "qdrant",
         "collection_name": collection_name,
         "qdrant_endpoint_sha256": endpoint_sha256,
         "distance_metric": "cosine",
+        # The shape of the collection is part of what an attestation attests:
+        # the same tree written under a different set of vector names is a
+        # different index, and this is what says so.
+        "vector_names": list(_TREE_DENSE_VECTORS),
+        "sparse_vector": _TREE_SPARSE_VECTOR,
         "multimodal": vdb_cfg.mm_embedding,
         "embedding": _embedding_identity(vdb_cfg),
     }
@@ -583,34 +599,60 @@ def expected_tree_vector_index_attestation(
         {"schema": TREE_VECTOR_PROJECTION_SCHEMA},
     )
     point_count = 0
-    for record in iter_tree_index_records(tree):
-        if record.modality == "image" and not vdb_cfg.mm_embedding:
+    vector_count = 0
+    sparse_vector_count = 0
+    for point in iter_tree_point_records(tree):
+        vectors = {
+            name: value
+            for name, value in point.vectors.items()
+            if name != _TREE_IMAGE_VECTOR or vdb_cfg.mm_embedding
+        }
+        if not vectors:
             continue
-        if record.metadata.get("document_version_id") != document_version_id:
+        if point.metadata.get("document_version_id") != document_version_id:
             raise VectorIndexBindingError(
-                f"tree node {record.metadata.get('node_id')} vector record has "
+                f"tree node {point.metadata.get('node_id')} vector record has "
                 "another document version"
             )
-        if record.metadata.get("source_sha256") != source_sha256:
+        if point.metadata.get("source_sha256") != source_sha256:
             raise VectorIndexBindingError(
-                f"tree node {record.metadata.get('node_id')} vector record is not "
+                f"tree node {point.metadata.get('node_id')} vector record is not "
                 "source-bound"
             )
-        record_id = stable_vector_record_id(
-            record.value,
-            record.metadata,
-            modality=record.modality,
-            image_text=record.image_text,
+        representations = {
+            name: tree_vector_identity(
+                name,
+                value,
+                image_text=point.image_text,
+                strict_source_identity=True,
+            )
+            for name, value in vectors.items()
+        }
+        record_id = tree_point_record_id(
+            kind=point.kind,
+            metadata=point.metadata,
+            representations=representations,
+            lexical_source=point.lexical_source,
             strict_source_identity=True,
         )
         _hash_stream_item(
             projection_digest,
             {
                 "record_id": record_id,
-                "metadata": record.metadata,
+                "record_kind": point.kind,
+                "metadata": point.metadata,
+                # Redundant with the record ID, which already contains every
+                # digest -- carried anyway so the attestation says which vectors
+                # a point holds without having to recompute an ID to find out.
+                "vectors": {
+                    name: dict(digest) for name, digest in sorted(representations.items())
+                },
             },
         )
         point_count += 1
+        vector_count += len(vectors)
+        if point.lexical_source:
+            sparse_vector_count += 1
     # Visual paths are hashed for identity here and again by the writer, but
     # the current legacy crop store is path-based rather than CAS-backed. A
     # concurrent mutation between hashing and model decode remains detectable
@@ -631,6 +673,13 @@ def expected_tree_vector_index_attestation(
         "projection_sha256": projection_digest.hexdigest(),
         "node_count": len(tree.nodes),
         "point_count": point_count,
+        # point_count alone can no longer tell "every node indexed with all its
+        # vectors" from "every node indexed with one": a bug that dropped every
+        # crop would leave it correct. These two catch that. Neither is remotely
+        # verifiable -- Qdrant's count API counts points, not vectors -- so they
+        # guard the projection against the writer and nothing further.
+        "vector_count": vector_count,
+        "sparse_vector_count": sparse_vector_count,
         "collection_name": collection_name,
         "scope_filter": scope_filter,
         "qdrant_endpoint_sha256": vector_config["qdrant_endpoint_sha256"],
@@ -1517,62 +1566,65 @@ def _write_tree_vector_index(
             api_key_env=vdb_cfg.api_key_env,
             timeout_seconds=vdb_cfg.timeout_seconds,
             scope_filter=tree_vector_scope(tree, vdb_cfg),
+            vector_schema=VectorSchema.TREE_NODE,
         )
         # Deterministic upserts alone do not delete records removed from a
         # newer tree. A payload-scope reset reconciles stale records without
         # disturbing other documents, revisions, or index kinds in the collection.
         vdb.reset()
 
-        text_batch: list[str] = []
-        text_metadata_batch: list[dict] = []
-        image_batch: list[str] = []
-        image_metadata_batch: list[dict] = []
-        image_text_batch: list[str] = []
+        # Points, not representations. A plain upsert replaces a point rather
+        # than merging into it, so a node's vectors have to reach Qdrant in one
+        # call -- buffering them separately would leave whichever went second
+        # as the whole point.
+        point_batch: list[dict] = []
+        pending_texts = 0
+        pending_crops = 0
 
-        def flush_texts() -> None:
-            if not text_batch:
+        def flush_points() -> None:
+            nonlocal pending_texts, pending_crops
+            if not point_batch:
                 return
-            # Pass snapshots because the reusable buffers are cleared after a
-            # synchronous write.  This also keeps adapter/mock implementations
+            # Pass a snapshot because the reusable buffer is cleared after a
+            # synchronous write. This also keeps adapter/mock implementations
             # from retaining a subsequently mutated list.
-            vdb.add_texts(
-                texts=list(text_batch),
-                metadatas=list(text_metadata_batch),
-                strict_source_identity=True,
+            vdb.add_tree_node_points(records=list(point_batch))
+            point_batch.clear()
+            pending_texts = 0
+            pending_crops = 0
+
+        for point in iter_tree_point_records(tree):
+            vectors = {
+                name: value
+                for name, value in point.vectors.items()
+                if name != _TREE_IMAGE_VECTOR or vdb_cfg.mm_embedding
+            }
+            if not vectors:
+                continue
+            point_batch.append(
+                {
+                    "kind": point.kind,
+                    "metadata": point.metadata,
+                    "vectors": vectors,
+                    "image_text": point.image_text,
+                    "lexical_terms": lexical_terms(point.lexical_source),
+                    "lexical_source": point.lexical_source,
+                }
             )
-            text_batch.clear()
-            text_metadata_batch.clear()
+            crops = 1 if _TREE_IMAGE_VECTOR in vectors else 0
+            pending_texts += len(vectors) - crops
+            pending_crops += crops
+            # Bound the batch by whichever embedder call it would make largest,
+            # so a document of titles and a document of figures both keep their
+            # per-call work at the configured size.
+            if (
+                len(point_batch) >= effective_batch_size
+                or pending_texts >= effective_batch_size
+                or pending_crops >= effective_batch_size
+            ):
+                flush_points()
 
-        def flush_images() -> None:
-            if not image_batch:
-                return
-            vdb.add_images(
-                image_paths=list(image_batch),
-                metadatas=list(image_metadata_batch),
-                image_str=list(image_text_batch),
-                strict_source_identity=True,
-            )
-            image_batch.clear()
-            image_metadata_batch.clear()
-            image_text_batch.clear()
-
-        for record in iter_tree_index_records(tree):
-            if record.modality == "text":
-                text_batch.append(record.value)
-                text_metadata_batch.append(record.metadata)
-                if len(text_batch) >= effective_batch_size:
-                    flush_texts()
-            elif vdb_cfg.mm_embedding:
-                image_batch.append(record.value)
-                image_metadata_batch.append(record.metadata)
-                image_text_batch.append(record.image_text or "")
-                if len(image_batch) >= effective_batch_size:
-                    flush_images()
-
-        flush_texts()
-        if vdb_cfg.mm_embedding:
-            flush_images()
-            log.info("Images added to vector database successfully.")
+        flush_points()
 
         observed_point_count = vdb.count()
         if observed_point_count != expected_point_count:
