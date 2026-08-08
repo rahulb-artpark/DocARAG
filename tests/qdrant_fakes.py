@@ -83,7 +83,11 @@ class FakeModels:
         filter: Any | None = None
         limit: int = 10
         with_payload: bool = True
-        with_vectors: bool = False
+        # Singular, because the real model spells it that way while
+        # client.query_points takes the plural. The fake accepted both and so
+        # hid a live ValidationError behind a green suite; it now rejects the
+        # plural exactly as qdrant-client does.
+        with_vector: bool = False
         using: str | None = None
 
 
@@ -374,7 +378,7 @@ class FakeQdrantClient:
                 query_filter=request.filter,
                 limit=request.limit,
                 with_payload=request.with_payload,
-                with_vectors=request.with_vectors,
+                with_vectors=request.with_vector,
                 using=getattr(request, "using", None),
             )
             for request in requests

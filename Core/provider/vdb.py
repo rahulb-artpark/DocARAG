@@ -1900,7 +1900,7 @@ class VectorStore:
                 filter=query_filter,
                 limit=top_k,
                 with_payload=True,
-                with_vectors=False,
+                with_vector=False,
                 using=name,
             )
             for name in names
@@ -1916,7 +1916,7 @@ class VectorStore:
                     filter=query_filter,
                     limit=top_k,
                     with_payload=True,
-                    with_vectors=False,
+                    with_vector=False,
                     using=_TREE_SPARSE_VECTOR,
                 )
             )
@@ -1966,7 +1966,7 @@ class VectorStore:
                     filter=query_filter,
                     limit=top_k,
                     with_payload=True,
-                    with_vectors=False,
+                    with_vector=False,
                 )
                 for embedding in query_embeddings
             ],
