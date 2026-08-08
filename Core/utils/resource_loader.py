@@ -80,14 +80,30 @@ def _runtime_scope(
     }
 
 
-def _vector_store_kwargs(vdb_cfg, scope_filter: dict[str, str]) -> dict[str, object]:
-    return {
+def _vector_store_kwargs(
+    vdb_cfg,
+    scope_filter: dict[str, str],
+    *,
+    vector_schema: "VectorSchema | None" = None,
+) -> dict[str, object]:
+    """Open kwargs for one store. The schema must match the collection.
+
+    Only the tree collection carries named vectors; the chunk, vanilla and
+    raptor collections keep the single unnamed one, and the entity collection
+    has its own shape and its own opener. Passing the wrong one fails at the
+    first call rather than reading a vector name that is not there.
+    """
+
+    kwargs: dict[str, object] = {
         "qdrant_url": vdb_cfg.qdrant_url,
         "collection_name": vdb_cfg.collection_name,
         "api_key_env": vdb_cfg.api_key_env,
         "timeout_seconds": vdb_cfg.timeout_seconds,
         "scope_filter": scope_filter,
     }
+    if vector_schema is not None:
+        kwargs["vector_schema"] = vector_schema
+    return kwargs
 
 
 def _acquire_ready_scoped_qdrant(
@@ -213,7 +229,7 @@ def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
 
     from Core.configs.embedding_config import EmbeddingConfig
     from Core.pipelines.vdb_index import _is_lower_sha256
-    from Core.provider.vdb import VectorStore
+    from Core.provider.vdb import VectorSchema, VectorStore
     from Core.utils.vector_index_manifest import read_vector_index_attestation
 
     attestation_path = str(
@@ -257,7 +273,9 @@ def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
 
         vdb = VectorStore(
             embedding_model=embed_model,
-            **_vector_store_kwargs(vdb_cfg, scope_filter),
+            **_vector_store_kwargs(
+                vdb_cfg, scope_filter, vector_schema=VectorSchema.TREE_NODE
+            ),
         )
         attestation = read_vector_index_attestation(attestation_path)
         tree_sha256 = (
@@ -369,7 +387,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
             dependencies["bm25"] = bm25
         else:
             from Core.configs.embedding_config import EmbeddingConfig
-            from Core.provider.vdb import VectorStore
+            from Core.provider.vdb import VectorSchema, VectorStore
             from Core.provider.embedding import TextEmbeddingProvider
 
             embed_cfg: EmbeddingConfig = rag_config.vdb_config.embedding_config
@@ -410,7 +428,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
     elif strategy_name == "gbcvanilla":
         from Core.configs.embedding_config import EmbeddingConfig
         from Core.configs.vdb_config import VDBConfig
-        from Core.provider.vdb import VectorStore
+        from Core.provider.vdb import VectorSchema, VectorStore
         from Core.provider.embedding import TextEmbeddingProvider
 
         # This strategy consumes a source-scoped chunk collection plus the
@@ -476,7 +494,7 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
 
     elif strategy_name == "mmr":
         from Core.configs.embedding_config import EmbeddingConfig
-        from Core.provider.vdb import VectorStore
+        from Core.provider.vdb import VectorSchema, VectorStore
 
         from Core.configs.vdb_config import VDBConfig
 
@@ -526,7 +544,9 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
 
             vdb = VectorStore(
                 embedding_model=embed_model,
-                **_vector_store_kwargs(vdb_cfg, scope_filter),
+                **_vector_store_kwargs(
+                    vdb_cfg, scope_filter, vector_schema=VectorSchema.TREE_NODE
+                ),
             )
             vdb.attach_read_lease(read_lease)
             read_lease = None

@@ -55,7 +55,7 @@ vdb:
   qdrant_url: "http://127.0.0.1:6333"
   api_key_env: "QDRANT_API_KEY"
   timeout_seconds: 10.0
-  collection_name: "TreeVDB"
+  collection_name: "TreeVDB-hybrid-v1"
   embedding_config:
     model_name: Qwen/Qwen3-VL-Embedding-2B
     device: "cuda:3"
@@ -70,7 +70,7 @@ rag:
     qdrant_url: "http://127.0.0.1:6333"
     api_key_env: "QDRANT_API_KEY"
     timeout_seconds: 10.0
-    collection_name: "TreeVDB"
+    collection_name: "TreeVDB-hybrid-v1"
     embedding_config:
       type: "gme"
       model_name: Qwen/Qwen3-VL-Embedding-2B

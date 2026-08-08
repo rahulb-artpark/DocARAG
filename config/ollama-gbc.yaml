@@ -103,7 +103,7 @@ vdb:
   # cannot accept vectors of another, and _validate_existing_collection raises
   # rather than mixing them. A distinct name means the old 1536d collection
   # stays queryable while this one is rebuilt.
-  collection_name: "TreeVDB-qwen3vl-2048"
+  collection_name: "TreeVDB-qwen3vl-2048-hybrid-v1"
   embedding_config:
     # gme-Qwen2-VL hard-asserts transformers<4.52.0 in its own remote code,
     # and MinerU 3.4.4 requires >=4.57.3. They cannot share an interpreter, so

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from Core.Index.Tree import DocumentTree, NodeType, TreeNode
 from Core.pipelines import vdb_index
+from Core.provider.vdb import VectorSchema
 from Core.utils import resource_loader
 from Core.utils.vector_index_manifest import vector_index_lock
 from Core.utils.artifact_paths import QdrantCollectionState
@@ -232,6 +233,9 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                     "source_sha256": "a" * 64,
                     "index_kind": "tree",
                 },
+                # The tree collection carries named vectors; opening it as
+                # anything else would read a vector name that is not there.
+                vector_schema=VectorSchema.TREE_NODE,
             )
             self.assertIsNotNone(store.lease)
 
