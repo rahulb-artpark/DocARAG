@@ -35,6 +35,51 @@ _RESERVED_PAYLOAD_KEYS = frozenset(
 _HYBRID_DENSE_VECTORS = ("name", "context")
 #: Sparse vector carrying term frequencies; Qdrant applies IDF server-side.
 _HYBRID_SPARSE_VECTOR = "lexical"
+#: Named dense vectors of the tree-node collection. ``text`` is the node's own
+#: words, ``context`` the words around or under it, ``image`` its crop. They are
+#: separate rather than blended because that is where the separation was
+#: measured -- see the equation branch of ``Core/pipelines/vdb_index.py``.
+_TREE_DENSE_VECTORS = ("text", "context", "image")
+#: The one dense name whose vector is a picture rather than prose.
+_TREE_IMAGE_VECTOR = "image"
+#: Sparse vector over everything the node says, for server-side lexical search.
+_TREE_SPARSE_VECTOR = "lexical"
+
+
+#: The dense names each schema requires. ``UNNAMED`` is absent on purpose: it is
+#: the shape that has no names at all, and the absence is what the guards read.
+_EXPECTED_DENSE_VECTORS = {}
+_SCHEMA_LABELS = {}
+
+
+class VectorSchema(str, Enum):
+    """Which vector shape a collection carries.
+
+    Qdrant cannot convert an unnamed vector into named ones, so a collection's
+    shape is fixed at creation and a store has to know which one it is talking
+    to. One VectorStore class serves all three; the guards below make a
+    mismatch fail closed at the first call rather than write a point nothing
+    can read.
+    """
+
+    UNNAMED = "unnamed"
+    HYBRID_ENTITY = "hybrid-entity"
+    TREE_NODE = "tree-node"
+
+
+_EXPECTED_DENSE_VECTORS.update(
+    {
+        VectorSchema.HYBRID_ENTITY: _HYBRID_DENSE_VECTORS,
+        VectorSchema.TREE_NODE: _TREE_DENSE_VECTORS,
+    }
+)
+_SCHEMA_LABELS.update(
+    {
+        VectorSchema.UNNAMED: "unnamed",
+        VectorSchema.HYBRID_ENTITY: "hybrid entity",
+        VectorSchema.TREE_NODE: "tree-node",
+    }
+)
 
 _KEYWORD_PAYLOAD_INDEXES = (
     "tenant_id",
@@ -460,6 +505,7 @@ class VectorStore:
         scope_filter: Mapping[str, Any] | None = None,
         allow_collection_reset: bool = False,
         hybrid_entity_schema: bool = False,
+        vector_schema: "VectorSchema | str | None" = None,
         client: Any | None = None,
         models: Any | None = None,
     ) -> None:
@@ -467,6 +513,8 @@ class VectorStore:
             raise TypeError("embedding_model is required")
         if not isinstance(hybrid_entity_schema, bool):
             raise TypeError("hybrid_entity_schema must be a boolean")
+        if vector_schema is not None and hybrid_entity_schema:
+            raise ValueError("pass vector_schema or hybrid_entity_schema, not both")
         if not isinstance(collection_name, str) or not collection_name.strip():
             raise ValueError("collection_name must be a non-empty string")
         if collection_name != collection_name.strip():
@@ -538,14 +586,31 @@ class VectorStore:
         self._payload_indexes_ready = False
         self.scope_filter = dict(normalized_scope)
         self.allow_collection_reset = allow_collection_reset
-        # The entity collection carries named dense vectors plus a sparse one;
-        # the tree-node collection keeps the single unnamed vector. Making this
-        # per-instance is what keeps the query path's own index out of the
-        # entity migration -- one VectorStore class serves both shapes.
-        self.hybrid_entity_schema = hybrid_entity_schema
+        # Each collection has its own vector shape and Qdrant cannot convert
+        # between them, so this is per-instance: one VectorStore class serves
+        # the unnamed chunk collections, the hybrid entity collection, and the
+        # named tree-node collection. ``hybrid_entity_schema=True`` stays as the
+        # spelling its three existing call sites use, one of which is the graph
+        # stage this migration must not touch.
+        if vector_schema is None:
+            vector_schema = (
+                VectorSchema.HYBRID_ENTITY
+                if hybrid_entity_schema
+                else VectorSchema.UNNAMED
+            )
+        try:
+            self.vector_schema = VectorSchema(vector_schema)
+        except ValueError as exc:
+            raise ValueError(f"unknown vector_schema: {vector_schema!r}") from exc
         self.collection = _CollectionCountView(self)
         self._read_lease = None
         log.info("Qdrant collection '%s' configured at %s", collection_name, qdrant_url)
+
+    @property
+    def hybrid_entity_schema(self) -> bool:
+        """Kept as a read-only view so the entity call sites read unchanged."""
+
+        return self.vector_schema is VectorSchema.HYBRID_ENTITY
 
     def _require_open(self) -> None:
         if self._closed or self.client is None:
@@ -563,38 +628,56 @@ class VectorStore:
             raise RuntimeError("Qdrant returned an invalid collection-exists response")
         return exists
 
+    def _require_sparse_vector(self, collection_info: Any) -> None:
+        """A tree collection without its sparse vector cannot serve lexical search.
+
+        Fail here rather than at the first keyword query, where the symptom
+        would be an empty leg rather than a missing index.
+        """
+
+        sparse = getattr(collection_info.config.params, "sparse_vectors", None)
+        if not isinstance(sparse, Mapping) or _TREE_SPARSE_VECTOR not in sparse:
+            raise RuntimeError(
+                f"tree-node collection is missing the {_TREE_SPARSE_VECTOR!r} sparse "
+                "vector, so this collection predates hybrid search and must be rebuilt"
+            )
+
     def _vector_params(self, collection_info: Any) -> tuple[int, str]:
         try:
             vectors = collection_info.config.params.vectors
         except AttributeError as exc:
             raise RuntimeError("Qdrant returned an invalid collection configuration") from exc
+        expected_names = _EXPECTED_DENSE_VECTORS.get(self.vector_schema)
         if isinstance(vectors, Mapping):
-            if not self.hybrid_entity_schema:
+            if expected_names is None:
                 raise RuntimeError(
                     "DocARAG requires one unnamed dense vector; named-vector collection "
                     "configuration is incompatible"
                 )
-            missing = set(_HYBRID_DENSE_VECTORS).difference(vectors)
+            label = _SCHEMA_LABELS[self.vector_schema]
+            missing = set(expected_names).difference(vectors)
             if missing:
                 raise RuntimeError(
-                    "hybrid entity collection is missing dense vectors: "
+                    f"{label} collection is missing dense vectors: "
                     + ", ".join(sorted(missing))
                 )
-            # Both dense vectors come from one embedder, so a collection whose
+            # Every dense vector comes from one embedder, so a collection whose
             # halves disagree cannot have been written by this code.
             sizes = {
-                name: getattr(vectors[name], "size", None)
-                for name in _HYBRID_DENSE_VECTORS
+                name: getattr(vectors[name], "size", None) for name in expected_names
             }
             if len(set(sizes.values())) != 1:
                 raise RuntimeError(
-                    f"hybrid entity dense vectors disagree on dimension: {sizes}"
+                    f"{label} dense vectors disagree on dimension: {sizes}"
                 )
-            vectors = vectors[_HYBRID_DENSE_VECTORS[0]]
-        elif self.hybrid_entity_schema:
+            if self.vector_schema is VectorSchema.TREE_NODE:
+                self._require_sparse_vector(collection_info)
+            vectors = vectors[expected_names[0]]
+        elif expected_names is not None:
+            label = _SCHEMA_LABELS[self.vector_schema]
             raise RuntimeError(
-                "hybrid entity collection requires named dense vectors; found an "
-                "unnamed vector, so this collection predates the hybrid schema "
+                f"{label} collection requires named dense vectors; found an "
+                f"unnamed vector, so this collection predates the {label} schema "
                 "and must be rebuilt"
             )
         size = getattr(vectors, "size", None)
@@ -683,6 +766,30 @@ class VectorStore:
                             # IDF from collection statistics, so the client
                             # sends raw term frequencies and no vocabulary has
                             # to be persisted or kept in sync with the index.
+                            modifier=self._models.Modifier.IDF,
+                        )
+                    },
+                )
+            elif self.vector_schema is VectorSchema.TREE_NODE:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config={
+                        name: self._models.VectorParams(
+                            size=vector_size,
+                            distance=self._models.Distance.COSINE,
+                        )
+                        for name in _TREE_DENSE_VECTORS
+                    },
+                    sparse_vectors_config={
+                        _TREE_SPARSE_VECTOR: self._models.SparseVectorParams(
+                            index=self._models.SparseIndexParams(),
+                            # Same reasoning as the entity collection: IDF is
+                            # computed from collection statistics, so the client
+                            # sends raw term frequencies and no vocabulary is
+                            # persisted. Note those statistics span every
+                            # document in the collection -- a scope filter
+                            # restricts results, not the corpus IDF is drawn
+                            # from.
                             modifier=self._models.Modifier.IDF,
                         )
                     },
@@ -838,6 +945,7 @@ class VectorStore:
         batch_size: int = 256,
         strict_source_identity: bool = False,
     ):
+        self._require_unnamed()
         if not texts:
             return
         if (
@@ -907,6 +1015,27 @@ class VectorStore:
             raise RuntimeError(
                 "this operation requires a vector store opened with "
                 "hybrid_entity_schema=True"
+            )
+
+    def _require_unnamed(self) -> None:
+        """One vector per point, written without a name.
+
+        A named collection would take such a point and silently store it under
+        no name, where nothing queries it. Refusing is what makes a collection
+        that was never renamed fail at the write rather than at the read.
+        """
+
+        if self.vector_schema is not VectorSchema.UNNAMED:
+            raise RuntimeError(
+                "this operation writes one unnamed vector per point and cannot "
+                f"be used on a {_SCHEMA_LABELS[self.vector_schema]} collection"
+            )
+
+    def _require_tree_node(self) -> None:
+        if self.vector_schema is not VectorSchema.TREE_NODE:
+            raise RuntimeError(
+                "this operation requires a vector store opened with "
+                "vector_schema=VectorSchema.TREE_NODE"
             )
 
     def add_entity_points(
@@ -1195,6 +1324,7 @@ class VectorStore:
         batch_size: int = 256,
         strict_source_identity: bool = False,
     ):
+        self._require_unnamed()
         if not image_paths:
             return
         if (
