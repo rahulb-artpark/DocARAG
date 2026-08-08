@@ -73,8 +73,12 @@ class ANodeIsOnePoint(unittest.TestCase):
 
             point = next(p for p in _points(tree) if p.metadata["node_type"] == "image")
 
-            self.assertEqual({"text", "image"}, set(point.vectors))
+            # ``context`` is the heading above it: a figure states what it
+            # shows without stating what it is about. See
+            # test_a_figure_is_reachable_through_its_section.
+            self.assertEqual({"text", "context", "image"}, set(point.vectors))
             self.assertIn("Zernike Surface illustration", point.vectors["text"])
+            self.assertEqual("2. Zernike Surface", point.vectors["context"])
             self.assertTrue(point.vectors["image"].endswith(".jpg"))
 
     def test_a_title_keeps_its_heading_and_its_section_summary_apart(self):

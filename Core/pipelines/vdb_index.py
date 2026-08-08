@@ -57,13 +57,22 @@ save_path = "/home/wangshu/multimodal/GBC-RAG/test/sf/"
 
 
 DEFAULT_TREE_INDEX_BATCH_SIZE = 256
-#: v7 is one point per node carrying named vectors, where v6 was one point per
-#: representation carrying a single unnamed one. Nothing dispatches on these --
-#: they are domain separators inside the digests, so bumping them is what makes
-#: every attestation written under the old shape fail its exact comparison and
-#: forces a rebuild rather than silently reading points that are not there.
-TREE_VECTOR_INDEX_SCHEMA = "docarag.bookrag-tree-qdrant-index.v7"
-TREE_VECTOR_PROJECTION_SCHEMA = "docarag.bookrag-tree-vector-projection.v7"
+#: v7 was one point per node carrying named vectors, where v6 was one point per
+#: representation carrying a single unnamed one. v8 gives a figure, table,
+#: listing and list the ``context`` vector only titles and equations had, so a
+#: figure is reachable through the section it illustrates and not only through
+#: its own words. Nothing dispatches on these -- they are domain separators
+#: inside the digests, so bumping them is what makes every attestation written
+#: under the old shape fail its exact comparison and forces a rebuild rather
+#: than silently reading points that are not there.
+#:
+#: The bump is load-bearing here in a way it was not for v7. Readiness compares
+#: the *configured* vector names, which v8 does not change; it never recomputes
+#: the projection to compare against the attested ``projection_sha256``. So an
+#: index whose points are missing every new context vector would otherwise pass
+#: as ready, and the change would reach no document.
+TREE_VECTOR_INDEX_SCHEMA = "docarag.bookrag-tree-qdrant-index.v8"
+TREE_VECTOR_PROJECTION_SCHEMA = "docarag.bookrag-tree-vector-projection.v8"
 MAX_VECTOR_SEMANTIC_REFS = 128
 MAX_VECTOR_SOURCE_EVIDENCE_REFS = 64
 MAX_VECTOR_SEMANTIC_REFS_BYTES = 65_536
@@ -1109,6 +1118,15 @@ _CROP_BEARING_NODE_TYPES = _VISUAL_NODE_TYPES | {
     NodeType.LIST,
 }
 
+#: Types whose ``context`` slot is free to carry the section they sit under.
+#: TITLE fills it with its own section summary and EQUATION with its
+#: neighbourhood, so both are absent here. So is TEXT: a paragraph already is
+#: the section's prose, and giving 12,000 of them a near-identical section
+#: vector would crowd out the leg they share with the sections themselves.
+_SECTION_CONTEXT_NODE_TYPES = (
+    _VISUAL_NODE_TYPES | _LISTING_NODE_TYPES | {NodeType.TABLE, NodeType.LIST}
+)
+
 _EQUATION_CONTEXT_NEIGHBOURS = 1
 
 #: Bounds one equation's context so a long sibling cannot crowd the embedder.
@@ -1181,6 +1199,43 @@ def _visual_text(node) -> str:
     if summary and described:
         return f"{summary}\n{described}"
     return summary or described
+
+
+def _section_context_text(node) -> str:
+    """The section a figure sits under, as a vector of its own.
+
+    A figure's own words describe the figure. The word a question uses is in
+    the heading above it, and nothing put the two together: asking for "the
+    image of Wolter Surface" ranked that figure outside a top 200 whose first
+    hit was its own section, because the figure's prose says "a 3D rendered,
+    smooth, matte gray tapered cylinder" and never says Wolter.
+
+    Blending the heading into ``text`` would answer that question and lose the
+    other one. Measured on the same figure: the query naming the subject scored
+    0.50 against today's ``text`` and 0.85 against heading-plus-section, while
+    the query describing the picture -- "a tapered cylinder on a purple
+    gradient background" -- scored 0.83 against the figure's own prose and 0.62
+    once the heading was mixed into it. So the section is its own vector, for
+    the reason a title keeps its heading apart from its section summary, and
+    retrieval keeps whichever leg hits.
+
+    This also reaches a figure whose own summary is wrong. The Zernike figure's
+    summary argues the picture is *not* a Zernike surface, so no arrangement of
+    its own words retrieves it; its section still scores 0.83.
+
+    The direct parent, matching ``GBCRAG._with_section_titles``, which measured
+    2956 of 2957 figures, equations and listings sitting straight under their
+    heading on this corpus.
+    """
+
+    parent = getattr(node, "parent", None)
+    if parent is None or getattr(parent, "type", None) != NodeType.TITLE:
+        return ""
+    heading = str(_node_content(parent) or "").strip()
+    section = str(getattr(parent, "summary", "") or "").strip()
+    if heading and section:
+        return f"{heading}\n{section}"
+    return heading or section
 
 
 def _equation_self_text(node) -> str:
@@ -1421,6 +1476,21 @@ def _node_vectors(node, node_type) -> tuple[dict[str, str], str | None]:
             section_summary = str(getattr(node, "summary", "") or "").strip()
             if section_summary and section_summary != (text_content or "").strip():
                 vectors["context"] = section_summary
+
+    # A figure, table, listing or list shows something without naming it: the
+    # subject is in the heading above. Added last and never over an existing
+    # context, so a title keeps its own section summary and an equation keeps
+    # its neighbourhood -- both measured, both about something other than the
+    # enclosing section.
+    #
+    # Gated on the node having contributed a vector of its own. A figure with
+    # no prose, no crop and nothing else is not made findable by the section it
+    # sits in; indexing it on the section alone would put a contentless point,
+    # near-identical to its siblings', into the same leg as the section itself.
+    if vectors and node_type in _SECTION_CONTEXT_NODE_TYPES and "context" not in vectors:
+        section_text = _section_context_text(node)
+        if section_text:
+            vectors["context"] = section_text
     return vectors, image_text
 
 
