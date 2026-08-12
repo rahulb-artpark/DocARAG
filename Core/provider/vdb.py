@@ -855,6 +855,19 @@ class VectorStore:
                     raise
         self._payload_indexes_ready = True
 
+    def require_writable(self) -> None:
+        """Raise now if an existing collection cannot accept this store's schema.
+
+        A rebuild resets a scope before it writes, and a schema mismatch that
+        surfaces at write time has already destroyed what it was replacing. An
+        absent collection is writable: it will be created with this schema.
+        """
+
+        self._require_open()
+        if not self._collection_exists():
+            return
+        self._validate_existing_collection()
+
     def _validate_existing_collection(
         self,
         expected_size: int | None = None,

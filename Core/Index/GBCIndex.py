@@ -257,6 +257,12 @@ class GBC:
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
         expected = self._expected_entity_attestation()
+        # Refuse before destroying anything. The old order invalidated the
+        # attestation and reset the scope, then discovered at write time that
+        # the collection could not hold named vectors -- so a revision on a
+        # pre-hybrid collection lost the index it had and gained nothing. A
+        # rebuild that cannot write must leave what is there alone.
+        self.entity_vdb.require_writable()
         with vector_index_lock(self.entity_attestation_path, exclusive=True):
             invalidate_vector_index_attestation(self.entity_attestation_path)
             try:

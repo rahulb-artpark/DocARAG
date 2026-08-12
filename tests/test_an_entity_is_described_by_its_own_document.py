@@ -199,5 +199,92 @@ class TheStoreServesThisRevisionsWording(unittest.TestCase):
         self.assertIn("blob.blob_key = ent.description_blob_key", _GRAPH_ENTITIES_SQL)
 
 
+class ARebuildThatCannotWriteDestroysNothing(unittest.TestCase):
+    """The order that cost six revisions their entity index."""
+
+    def _store(self, *, named: bool):
+        from Core.provider.vdb import VectorSchema, VectorStore
+        from tests.qdrant_fakes import FakeModels, FakeQdrantClient
+
+        client = FakeQdrantClient()
+        store = VectorStore(
+            SimpleNamespace(embed_texts=lambda texts: [[1.0] for _ in texts],
+                            MM_EMBEDDER=False, close=lambda: None),
+            collection_name="entities",
+            client=client,
+            models=FakeModels,
+            vector_schema=VectorSchema.HYBRID_ENTITY,
+            scope_filter={"tenant_id": "t", "corpus_id": "c"},
+        )
+        if named is not None:
+            client.create_collection(
+                collection_name="entities",
+                vectors_config=(
+                    {
+                        name: FakeModels.VectorParams(size=1, distance="Cosine")
+                        for name in ("name", "context")
+                    }
+                    if named
+                    else FakeModels.VectorParams(size=1, distance="Cosine")
+                ),
+                sparse_vectors_config={},
+            )
+        return store, client
+
+    def test_a_mismatched_collection_is_refused_before_the_reset(self):
+        store, _client = self._store(named=False)
+
+        with self.assertRaisesRegex(RuntimeError, "named dense vectors"):
+            store.require_writable()
+
+    def test_a_matching_collection_passes(self):
+        store, _client = self._store(named=True)
+
+        store.require_writable()
+
+    def test_the_rebuild_checks_before_it_invalidates(self):
+        # The ordering *is* the fix: require_writable has to run before the
+        # attestation is invalidated and the scope reset, or a rebuild that
+        # cannot write still destroys the index it was replacing.
+        from unittest.mock import Mock, patch
+
+        from Core.Index.GBCIndex import GBC
+
+        index = object.__new__(GBC)
+        index.save_dir = "/tmp/run"
+        index.entity_attestation_path = "/tmp/run/entity-attestation"
+        index.entity_vdb = Mock()
+        index.entity_vdb.require_writable.side_effect = RuntimeError(
+            "hybrid entity collection requires named dense vectors"
+        )
+
+        with (
+            patch.object(GBC, "_expected_entity_attestation", return_value={}),
+            patch("Core.Index.GBCIndex.invalidate_vector_index_attestation") as clear,
+            self.assertRaisesRegex(RuntimeError, "named dense vectors"),
+        ):
+            index.rebuild_vdb()
+
+        clear.assert_not_called()
+        index.entity_vdb.reset.assert_not_called()
+
+    def test_an_absent_collection_is_writable(self):
+        # Nothing to destroy, and the create will use this schema.
+        from Core.provider.vdb import VectorSchema, VectorStore
+        from tests.qdrant_fakes import FakeModels, FakeQdrantClient
+
+        store = VectorStore(
+            SimpleNamespace(embed_texts=lambda texts: [[1.0] for _ in texts],
+                            MM_EMBEDDER=False, close=lambda: None),
+            collection_name="absent",
+            client=FakeQdrantClient(),
+            models=FakeModels,
+            vector_schema=VectorSchema.HYBRID_ENTITY,
+            scope_filter={"tenant_id": "t", "corpus_id": "c"},
+        )
+
+        store.require_writable()
+
+
 if __name__ == "__main__":
     unittest.main()
