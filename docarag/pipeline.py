@@ -247,6 +247,68 @@ def run_stage(run: Path, stage: str) -> int:
     return completed.returncode
 
 
+def republish_run_artifacts(run: Path) -> int:
+    """Re-seal the artifact manifest around artifacts that changed in place.
+
+    The stage writes an attestation; publication is what records its digest in
+    the manifest. Anything that rewrites an attestation without republishing
+    leaves readiness failing closed on "artifact digest differs for
+    qdrant-tree-attestation/..." -- correct, since it cannot tell a rebuild
+    from a corrupted file, and unhelpful when the rebuild was intended.
+
+    This is publication only. ``_republish`` additionally runs the bash
+    finalizer, which re-persists canonical evidence -- a whole-run operation an
+    edit has no business triggering, and one that would rewrite a revision from
+    an artifact the store has deliberately diverged from.
+    """
+
+    repo = Path(__file__).resolve().parent.parent
+    artifact_manifest = run / "artifact-manifest.json"
+    manifest = json.loads(artifact_manifest.read_text(encoding="utf-8"))
+    state_path = run / "index-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    roles = manifest.get("roles") or {}
+    published = subprocess.run(
+        [
+            sys.executable, "-m", "docarag.provenance", "publish",
+            "--run", str(run),
+            "--revision-id", str(manifest["revision_id"]),
+            "--attempt-id", str(state.get("attempt_id") or manifest["attempt_id"]),
+            "--retrieval-attestation", str(run / str(roles["retrieval_attestation"])),
+            "--graph-artifact", str(run / str(roles["graph"])),
+            "--entity-attestation", str(run / str(roles["entity_attestation"])),
+        ],
+        cwd=str(repo),
+        env=dict(os.environ),
+    )
+    if published.returncode != 0:
+        return published.returncode
+
+    republished = json.loads(artifact_manifest.read_text(encoding="utf-8"))
+    digests = {
+        "artifact_manifest_sha256": hashlib.sha256(
+            artifact_manifest.read_bytes()
+        ).hexdigest(),
+        "artifact_set_sha256": republished["artifact_set_sha256"],
+    }
+    state.update(digests)
+    state_path.write_text(
+        json.dumps(state, indent=1, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+    # The archived attempt records the same digests and is sealed read-only.
+    attempt = run / "attempts" / str(state["attempt_id"]) / "state.json"
+    if attempt.is_file():
+        mode = attempt.stat().st_mode & 0o777
+        attempt.chmod(0o600)
+        archived = json.loads(attempt.read_text(encoding="utf-8"))
+        archived.update(digests)
+        attempt.write_text(
+            json.dumps(archived, indent=1, ensure_ascii=False, sort_keys=True) + "\n"
+        )
+        attempt.chmod(mode)
+    return 0
+
+
 def _republish(run: Path, repo: Path, env: dict) -> int:
     """Refresh the artifact manifest and reseal run state after a stage re-run."""
 

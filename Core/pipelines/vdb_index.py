@@ -22,6 +22,7 @@ from Core.provider.vdb import (
     _TREE_DENSE_VECTORS,
     _TREE_IMAGE_VECTOR,
     _TREE_SPARSE_VECTOR,
+    qdrant_point_id,
     stable_vector_record_id,
     tree_point_record_id,
     tree_vector_identity,
@@ -577,8 +578,19 @@ def _validated_tree_artifact_sha256(tree: DocumentTree) -> str | None:
 def expected_tree_vector_index_attestation(
     tree: DocumentTree,
     vdb_cfg: VDBConfig,
+    *,
+    frozen_average_length: float | None = None,
 ) -> dict[str, object]:
-    """Compute the exact, secret-free identity required for index reuse."""
+    """Compute the exact, secret-free identity required for index reuse.
+
+    ``frozen_average_length`` is the BM25 normalizer an incremental reconcile
+    kept rather than recomputed. ``lexical_average_length`` states the value
+    the stored weights were computed with, not the corpus mean -- those are the
+    same number after a full rebuild and drift apart across edits -- so a
+    reconcile that re-weighted only the points it touched has to record the
+    value those weights actually used, or the attestation describes an index
+    that does not exist.
+    """
 
     if tree.root_node is None or not tree.nodes:
         raise VectorIndexBindingError("vector index requires a non-empty BookRAG tree")
@@ -711,9 +723,13 @@ def expected_tree_vector_index_attestation(
         # without it could not say what the index actually holds. Rounded so
         # the digest does not turn on a float's last bits.
         "lexical_average_length": (
-            round(lexical_token_total / sparse_vector_count, 6)
-            if sparse_vector_count
-            else 0.0
+            round(frozen_average_length, 6)
+            if frozen_average_length is not None
+            else (
+                round(lexical_token_total / sparse_vector_count, 6)
+                if sparse_vector_count
+                else 0.0
+            )
         ),
         "lexical_k1": BM25_K1,
         "lexical_b": BM25_B,
@@ -1737,6 +1753,237 @@ def _write_tree_vector_index(
             try:
                 vdb.close()
             except Exception as exc:  # cleanup must continue to the model
+                cleanup_errors.append(exc)
+                log.exception("Failed to close tree vector store")
+        if embedder is not None:
+            try:
+                embedder.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                log.exception("Failed to close tree embedding provider")
+        if cleanup_errors and not active_error:
+            raise cleanup_errors[0]
+
+
+#: How far the frozen BM25 normalizer may drift from the corpus mean before a
+#: reconcile refuses. Incremental edits keep the attested average rather than
+#: re-weighting every point against a new one, so the two separate slowly. A
+#: tenth is far past the point where it changes a ranking and far short of
+#: where an edit becomes useless.
+DEFAULT_MAX_AVERAGE_LENGTH_DRIFT = 0.10
+
+
+@dataclass(frozen=True)
+class TreeVectorReconciliation:
+    """What one reconcile moved, and what it left alone."""
+
+    added: int
+    removed: int
+    unchanged: int
+    point_count: int
+    #: The normalizer the stored weights use.
+    average_length: float
+    #: What a full rebuild would compute instead.
+    corpus_average_length: float
+
+    @property
+    def drift(self) -> float:
+        if not (self.average_length > 0):
+            return 0.0
+        return abs(self.corpus_average_length - self.average_length) / self.average_length
+
+    def describe(self) -> str:
+        return (
+            f"{self.added} point(s) re-embedded, {self.removed} removed, "
+            f"{self.unchanged} untouched, {self.point_count} attested"
+        )
+
+
+def _projected_tree_points(
+    tree: DocumentTree, vdb_cfg: VDBConfig
+) -> tuple[list[dict], float, int]:
+    """Every point this tree projects to, in tree order, with its token count.
+
+    The point's identity is content-addressed over each vector's source, so
+    the resulting IDs *are* the dependency graph: a title whose summary changed
+    re-IDs its own point and, through ``_section_context_text``, every child
+    point that quoted it. No caller has to know which nodes an edit reached.
+
+    The IDs themselves are not computed here. They depend on the store's scope,
+    which is applied at write time, so only the store can say what a record
+    will be keyed under -- see ``VectorStore.tree_point_ids``.
+    """
+
+    projected: list[dict] = []
+    lexical_token_total = 0.0
+    sparse_count = 0
+    for point in iter_tree_point_records(tree):
+        vectors = {
+            name: value
+            for name, value in point.vectors.items()
+            if name != _TREE_IMAGE_VECTOR or vdb_cfg.mm_embedding
+        }
+        if not vectors:
+            continue
+        projected.append(
+            {
+                "kind": point.kind,
+                "metadata": point.metadata,
+                "vectors": vectors,
+                "image_text": point.image_text,
+                "lexical_source": point.lexical_source,
+            }
+        )
+        if point.lexical_source:
+            sparse_count += 1
+            lexical_token_total += sum(lexical_terms(point.lexical_source).values())
+    corpus_average = lexical_token_total / sparse_count if sparse_count else 0.0
+    return projected, corpus_average, sparse_count
+
+
+def reconcile_tree_vector_index(
+    tree: DocumentTree,
+    vdb_cfg: VDBConfig,
+    *,
+    frozen_average_length: float,
+    batch_size: int | None = None,
+    max_average_length_drift: float = DEFAULT_MAX_AVERAGE_LENGTH_DRIFT,
+) -> TreeVectorReconciliation:
+    """Bring one scope's points to what the tree now projects, and no further.
+
+    The full builder resets the scope and rewrites every point, which for an
+    edited summary means re-embedding a whole document to change four vectors.
+    This diffs instead: what the tree projects against what Qdrant holds, by
+    point ID. Only the difference is embedded, and only the points the
+    projection no longer contains are deleted.
+
+    ``frozen_average_length`` is the BM25 normalizer already in the
+    attestation. Keeping it is what makes the write small: recomputing the mean
+    would change every stored weight in the index, none of whose point IDs
+    change with it, so the diff could not see the work and every point would
+    have to be rewritten anyway. Holding it fixed keeps the index internally
+    consistent -- every weight normalized the same way -- at the cost of the
+    mean slowly ceasing to be the corpus mean, which is what the drift ceiling
+    watches.
+    """
+
+    if not (frozen_average_length > 0):
+        raise ValueError("frozen_average_length must be positive")
+    effective_batch_size = (
+        batch_size
+        if batch_size is not None
+        else getattr(vdb_cfg, "index_batch_size", DEFAULT_TREE_INDEX_BATCH_SIZE)
+    )
+    if (
+        isinstance(effective_batch_size, bool)
+        or not isinstance(effective_batch_size, int)
+        or effective_batch_size < 1
+    ):
+        raise ValueError("batch_size must be at least 1")
+
+    projected, corpus_average, _sparse_count = _projected_tree_points(tree, vdb_cfg)
+    if not projected:
+        raise VectorIndexBindingError("refusing to publish an empty vector index")
+    drift = (
+        abs(corpus_average - frozen_average_length) / frozen_average_length
+        if frozen_average_length > 0
+        else 0.0
+    )
+    if drift > max_average_length_drift:
+        raise VectorIndexBindingError(
+            "BM25 average document length has drifted "
+            f"{drift:.1%} from the attested {frozen_average_length:.3f} "
+            f"(corpus is now {corpus_average:.3f}); rebuild the vdb stage "
+            "instead of reconciling"
+        )
+
+    embedder = None
+    vdb = None
+    active_error = False
+    try:
+        if vdb_cfg.mm_embedding:
+            embedder = MultimodalEmbeddingProvider(
+                model_name=vdb_cfg.embedding_config.model_name,
+                device=vdb_cfg.embedding_config.device,
+            )
+        else:
+            embedder = TextEmbeddingProvider(
+                model_name=vdb_cfg.embedding_config.model_name,
+                device=vdb_cfg.embedding_config.device,
+                backend=vdb_cfg.embedding_config.backend,
+                api_base=vdb_cfg.embedding_config.api_base,
+                api_key=getattr(vdb_cfg.embedding_config, "api_key", None),
+                max_length=vdb_cfg.embedding_config.max_length,
+            )
+        vdb = VectorStore(
+            embedding_model=embedder,
+            qdrant_url=vdb_cfg.qdrant_url,
+            collection_name=vdb_cfg.collection_name,
+            api_key_env=vdb_cfg.api_key_env,
+            timeout_seconds=vdb_cfg.timeout_seconds,
+            scope_filter=tree_vector_scope(tree, vdb_cfg),
+            vector_schema=VectorSchema.TREE_NODE,
+        )
+
+        # The store derives the IDs, because the scope it applies at write time
+        # is part of them.
+        point_ids = vdb.tree_point_ids(projected)
+        live = vdb.live_point_ids()
+        wanted = set(point_ids)
+        to_add = [
+            record
+            for record, point_id in zip(projected, point_ids)
+            if point_id not in live
+        ]
+        to_remove = sorted(live.difference(wanted))
+
+        for start in range(0, len(to_add), effective_batch_size):
+            vdb.add_tree_node_points(
+                records=[
+                    {
+                        **record,
+                        "lexical_terms": (
+                            bm25_terms(
+                                record["lexical_source"],
+                                average_length=frozen_average_length,
+                            )
+                            if record["lexical_source"]
+                            else {}
+                        ),
+                    }
+                    for record in to_add[start : start + effective_batch_size]
+                ],
+                batch_size=effective_batch_size,
+            )
+        # Added before removed: a crash between the two leaves the scope holding
+        # both readings of a node, which the next reconcile cleans up. The other
+        # order leaves it holding neither.
+        if to_remove:
+            vdb.delete_points(to_remove)
+
+        observed = vdb.count()
+        if observed != len(wanted):
+            raise VectorIndexBindingError(
+                f"tree vector scope contains {observed} points after reconcile; "
+                f"expected {len(wanted)}"
+            )
+        return TreeVectorReconciliation(
+            added=len(to_add),
+            removed=len(to_remove),
+            unchanged=len(wanted) - len(to_add),
+            point_count=len(wanted),
+            average_length=frozen_average_length,
+            corpus_average_length=corpus_average,
+        )
+    except BaseException:
+        active_error = True
+        raise
+    finally:
+        cleanup_errors = []
+        if vdb is not None:
+            try:
+                vdb.close()
+            except Exception as exc:
                 cleanup_errors.append(exc)
                 log.exception("Failed to close tree vector store")
         if embedder is not None:

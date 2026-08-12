@@ -1041,6 +1041,79 @@ class VectorStore:
             raise RuntimeError("Qdrant returned an invalid collection count")
         return count
 
+    def live_point_ids(self, *, page_size: int = 1024) -> set[str]:
+        """Every point ID durably in this store's scope, and nothing else.
+
+        Read without payload or vectors: this exists to be diffed against a
+        projection, and a scope holding 23,274 points would otherwise pull
+        every vector across the wire to answer a question about identity.
+
+        The scope filter is what keeps a shared collection safe. The entity
+        collection holds every document's entities, so an unscoped listing here
+        would invite a caller to delete another document's points as "missing".
+        """
+
+        self._require_open()
+        if not self._collection_exists():
+            return set()
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+        ):
+            raise ValueError("page_size must be at least 1")
+        self._validate_existing_collection()
+        found: set[str] = set()
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=self._qdrant_filter(),
+                limit=page_size,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for point in points:
+                point_id = getattr(point, "id", None)
+                if point_id is None:
+                    raise RuntimeError("Qdrant returned a point with no ID")
+                found.add(str(point_id))
+            if offset is None or not points:
+                return found
+
+    def delete_points(self, point_ids: Sequence[str]) -> int:
+        """Delete named points, refusing any that are outside this scope.
+
+        Deletion by ID alone would ignore ``scope_filter`` entirely, which on a
+        collection shared between documents is one transposed argument away
+        from deleting another document's index. The IDs are checked against the
+        scope first, and the deletion itself is filtered as well.
+        """
+
+        self._require_open()
+        wanted = [str(point_id) for point_id in point_ids]
+        if not wanted:
+            return 0
+        if not self._collection_exists():
+            raise RuntimeError("cannot delete from a collection that does not exist")
+        self._validate_existing_collection()
+        outside = sorted(set(wanted).difference(self.live_point_ids()))
+        if outside:
+            raise RuntimeError(
+                "refusing to delete points outside this store's scope: "
+                + ", ".join(outside[:5])
+            )
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=self._models.FilterSelector(
+                filter=self._qdrant_filter(point_ids=wanted)
+            ),
+            wait=True,
+        )
+        log.info("Deleted %d points from Qdrant", len(set(wanted)))
+        return len(set(wanted))
+
     def close(self) -> None:
         """Drop client/model references and release any attached read lease."""
 
@@ -1210,6 +1283,47 @@ class VectorStore:
             record_ids.extend(self._write_tree_point_batch(batch))
         log.info("Upserted %d tree points into Qdrant", len(record_ids))
         return record_ids
+
+    def tree_point_ids(self, records: Sequence[Mapping[str, Any]]) -> List[str]:
+        """The Qdrant IDs these records would be written under, without writing.
+
+        A caller diffing a projection against what the store holds has to
+        derive IDs the way the writer does or the two sets never intersect.
+        The metadata is scoped first, and the scope is part of the ID, so
+        computing one from the caller's own unscoped metadata silently yields
+        a different point -- every point looks new, every existing point looks
+        deleted, and a reconcile rewrites the whole index believing it did not.
+        """
+
+        self._require_tree_node()
+        return [
+            qdrant_point_id(record_id)
+            for record_id in self._tree_point_record_ids(records)
+        ]
+
+    def _tree_point_record_ids(
+        self, records: Sequence[Mapping[str, Any]]
+    ) -> List[str]:
+        return [
+            tree_point_record_id(
+                kind=record.get("kind", "node"),
+                metadata=self._apply_scope(
+                    _normalized_metadata(record["metadata"], modality=None)
+                ),
+                representations={
+                    name: tree_vector_identity(
+                        name,
+                        value,
+                        image_text=record.get("image_text"),
+                        strict_source_identity=True,
+                    )
+                    for name, value in dict(record.get("vectors") or {}).items()
+                },
+                lexical_source=record.get("lexical_source", ""),
+                strict_source_identity=True,
+            )
+            for record in records
+        ]
 
     def _write_tree_point_batch(self, batch: Sequence[Mapping[str, Any]]) -> List[str]:
         metadatas = [

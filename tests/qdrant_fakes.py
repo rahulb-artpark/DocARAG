@@ -137,6 +137,7 @@ class FakeQdrantClient:
         self.query_calls: list[dict[str, Any]] = []
         self.batch_query_calls: list[dict[str, Any]] = []
         self.delete_calls: list[dict[str, Any]] = []
+        self.scroll_calls: list[dict[str, Any]] = []
         self.set_payload_calls: list[dict[str, Any]] = []
         self.closed = False
 
@@ -235,6 +236,49 @@ class FakeQdrantClient:
                 _matches(record_id, point.payload, count_filter)
                 for record_id, point in records.items()
             )
+        )
+
+    def scroll(
+        self,
+        *,
+        collection_name: str,
+        scroll_filter: Any | None = None,
+        limit: int = 10,
+        offset: Any | None = None,
+        with_payload: bool = True,
+        with_vectors: bool = True,
+    ):
+        """Page through the scope in ID order, returning the next offset.
+
+        Real Qdrant returns an opaque continuation token and ``None`` when the
+        page is the last one; the ID of the first unreturned record serves the
+        same purpose here, so production paging code is exercised rather than
+        short-circuited by a single oversized page.
+        """
+
+        self.scroll_calls.append(
+            {"collection_name": collection_name, "limit": limit, "offset": offset}
+        )
+        records = self.collections[collection_name]["records"]
+        matching = [
+            (record_id, point)
+            for record_id, point in sorted(records.items())
+            if _matches(record_id, point.payload, scroll_filter)
+        ]
+        if offset is not None:
+            matching = [item for item in matching if item[0] >= str(offset)]
+        page = matching[:limit]
+        remaining = matching[limit:]
+        return (
+            [
+                SimpleNamespace(
+                    id=record_id,
+                    payload=dict(point.payload) if with_payload else None,
+                    vector=(_named_vectors(point) if with_vectors else None),
+                )
+                for record_id, point in page
+            ],
+            remaining[0][0] if remaining else None,
         )
 
     def delete(

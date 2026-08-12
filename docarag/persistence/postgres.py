@@ -1755,9 +1755,19 @@ class PostgresLedger:
             cursor.itersize = 500
             cursor.execute(_SEAL_DIGEST_ROWS_SQL, (revision_key,))
             for row in cursor:
+                # ``.values()``, because this connection's row factory is
+                # ``dict_row`` and iterating a mapping yields its *keys*. The
+                # seal was therefore a digest of its own column names repeated
+                # once per node: a pure function of the node count, identical
+                # for three different documents that happened to have 44 nodes
+                # each, and unchanged by any edit to the rows it claims to
+                # seal. The vector attestation binds to this value to assert
+                # that the vectors describe the sealed store, so until now that
+                # assertion held no content.
+                values = row.values() if hasattr(row, "values") else row
                 digest.update(
                     json.dumps(
-                        [str(item) for item in row],
+                        [str(item) for item in values],
                         ensure_ascii=False,
                     ).encode("utf-8")
                 )
