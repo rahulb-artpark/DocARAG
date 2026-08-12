@@ -209,6 +209,32 @@ def _evidence_text(node: Dict[str, Any], content: object) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _visual_evidence_content(node: Dict[str, Any]) -> str:
+    """What a figure is, before what it looks like.
+
+    A crop was sent to the VLM with only the vision model's own description of
+    the pixels beside it, and for a figure that shows something without naming
+    it that description is all surface. Shown test.pdf's Zernike surface, the
+    VLM answered "a 3D rendered icon or graphic, not a chart, table, or
+    diagram" -- so the answer said the document held no image of a Zernike
+    surface while displaying that very image, one line below.
+
+    The summary is the sentence that names the subject, and it is already on
+    the retrieved node. It leads, because the question resembles the name and
+    not the shading, and the pixel description follows so a question about
+    what the figure looks like is still answerable from the same prompt.
+    """
+
+    summary = node.get("summary")
+    content = node.get("content", "")
+    parts: list[str] = []
+    if isinstance(summary, str) and summary.strip():
+        parts.append(summary.strip())
+    if isinstance(content, str) and content.strip() and content.strip() not in parts:
+        parts.append(content.strip())
+    return "\n".join(parts) if parts else (content if isinstance(content, str) else "")
+
+
 def _prompt_evidence_labels(memory: Memory) -> list[str]:
     """Read trusted prompt metadata without scraping untrusted source text."""
 
@@ -502,8 +528,7 @@ class AnswerAgent:
         for node in image_nodes:
             evidence_labels, citation_ids = _evidence_prompt_metadata([node])
             img_path = node["img_path"]
-            node_content = node.get("content", "")
-            content = _evidence_text(node, node_content)
+            content = _evidence_text(node, _visual_evidence_content(node))
             vlm_prompt = (
                 f"{CITED_GENERATION_SYS_PROMPT.strip()}\n\n"
                 f"{VLM_GENERATION_USER_PROMPT.format(question=query, content=content).strip()}"
@@ -698,8 +723,9 @@ class AnswerAgent:
         if valid_image_nodes:
             selected_image = valid_image_nodes[0]
             img_path = selected_image.get("img_path")
-            node_content = selected_image.get("content", "")
-            image_meta = _evidence_text(selected_image, node_content)
+            image_meta = _evidence_text(
+                selected_image, _visual_evidence_content(selected_image)
+            )
             max_tokens = getattr(
                 self.vlm.config, "max_tokens", self.llm.config.max_tokens
             )
