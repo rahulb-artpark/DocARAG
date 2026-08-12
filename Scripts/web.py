@@ -1955,6 +1955,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/edit-summary":
             self.edit_summary()
             return
+        if parsed.path == "/api/edit-entity":
+            self.edit_entity()
+            return
         if parsed.path == "/api/run-tag":
             self.set_run_tag()
             return
@@ -2264,7 +2267,56 @@ class Handler(SimpleHTTPRequestHandler):
             edit_node_summary(self.state.run_dir, node_id, text.strip())
             # The tree changed under the viewer; its cache must not outlive it.
             self.state._tree_cache = None
-            self.send_json({"ok": True, "nodeId": node_id, "vdb": "stale"})
+            # The vectors were re-derived by the edit, so the document is
+            # answerable again rather than waiting on a stage re-run.
+            self.send_json({"ok": True, "nodeId": node_id, "vdb": "reconciled"})
+        except SystemExit as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "Edit failed",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+
+    def edit_entity(self):
+        try:
+            self.state.require_run()
+            payload = self.read_json_body()
+            canonical = payload.get("canonical")
+            kind = payload.get("kind")
+            text = payload.get("text")
+            if (
+                not isinstance(canonical, str)
+                or not canonical.strip()
+                or not isinstance(kind, str)
+                or not kind.strip()
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                self.send_error_json(
+                    HTTPStatus.BAD_REQUEST,
+                    "canonical, kind and non-empty text are required",
+                )
+                return
+            from docarag.edit import edit_entity_description
+
+            edit_entity_description(
+                self.state.run_dir, canonical.strip(), kind.strip(), text.strip()
+            )
+            self.state._tree_cache = None
+            self.send_json(
+                {
+                    "ok": True,
+                    "canonical": canonical.strip(),
+                    "kind": kind.strip(),
+                    # Said explicitly because the corpus row is shared and this
+                    # write deliberately is not: the same entity keeps its other
+                    # documents' wording.
+                    "scope": "this revision only",
+                    "entities": "reconciled",
+                }
+            )
         except SystemExit as exc:
             self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
         except Exception as exc:

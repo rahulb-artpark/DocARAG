@@ -123,6 +123,91 @@ def edit_node_summary(run: Path, node_no: int, text: str) -> None:
     print(report)
 
 
+def _reindex_run_entities(run: Path, node_names: list[str]) -> str:
+    """Re-embed the named entities for one revision and republish."""
+
+    import yaml
+
+    from Core.configs.graph_config import graph_artifact_variant
+    from Core.configs.system_config import SystemConfig
+    from Core.Index.GBCIndex import GBC
+    from Core.Index.Graph import Graph
+    from docarag.pipeline import republish_run_artifacts
+    from docarag.vdb_tree_source import StoreTreeSource
+
+    config = SystemConfig(**yaml.safe_load((run / "run_config.yaml").read_text()))
+    tree = StoreTreeSource.open(str(run))
+    graph = Graph.load_from_dir(
+        config.save_path, variant=graph_artifact_variant(config.graph)
+    )
+    index = GBC(
+        config=config, graph_index=graph, TreeIndex=tree, require_entity_ready=False
+    )
+    try:
+        written = index.reindex_entities(node_names)
+    finally:
+        index.close()
+    published = republish_run_artifacts(run)
+    if published != 0:
+        raise SystemExit(f"error: artifact republication failed ({published})")
+    return f"{written} entity point(s) re-embedded in place"
+
+
+def edit_entity_description(run: Path, canonical: str, kind: str, text: str) -> None:
+    """Rewrite what one revision says an entity is.
+
+    Scoped to this revision on purpose. ``docarag.entity`` is corpus-wide, so
+    writing the description there would change every document that mentions the
+    entity -- 730 of one paper's 862 entities are mentioned by another revision.
+    The per-revision row keeps the edit where it was made.
+    """
+
+    from Core.rag.stored_index import entity_node_name
+
+    scope, revision_id = scope_for_run(run)
+    ledger = PostgresLedger(load_settings().resolve_database_url())
+    revision_key = ledger.revision_key(scope, revision_id)
+    with ledger._connection() as connection:
+        row = connection.execute(
+            "SELECT e.entity_key FROM docarag.entity e "
+            "WHERE e.tenant_id = %s AND e.corpus_id = %s "
+            "AND e.entity_kind = %s AND e.canonical = %s",
+            (scope.tenant_id, scope.corpus_id, kind, canonical),
+        ).fetchone()
+        if row is None:
+            raise SystemExit(f"error: this corpus has no {kind} entity {canonical!r}")
+        entity_key = int(row["entity_key"])
+        mentioned = connection.execute(
+            "SELECT 1 FROM docarag.entity_mention "
+            "WHERE revision_key = %s AND entity_key = %s "
+            "UNION SELECT 1 FROM docarag.statement_role "
+            "WHERE revision_key = %s AND entity_key = %s LIMIT 1",
+            (revision_key, entity_key, revision_key, entity_key),
+        ).fetchone()
+        if mentioned is None:
+            raise SystemExit(
+                f"error: this revision does not mention {canonical!r}"
+            )
+        blob_key = ledger._intern_text(connection, text)
+        connection.execute(
+            "INSERT INTO docarag.entity_description "
+            "(revision_key, entity_key, description_blob_key) VALUES (%s, %s, %s) "
+            "ON CONFLICT (revision_key, entity_key) DO UPDATE SET "
+            "description_blob_key = EXCLUDED.description_blob_key",
+            (revision_key, entity_key, blob_key),
+        )
+        ledger._seal_graph(connection, revision_key)
+        seal = str(
+            connection.execute(
+                "SELECT graph_sha256 FROM docarag.revision_seal "
+                "WHERE revision_key = %s",
+                (revision_key,),
+            ).fetchone()["graph_sha256"]
+        )
+    print(f"{canonical!r} description updated; graph resealed {seal[:16]}…")
+    print(_reindex_run_entities(run, [entity_node_name(canonical, kind)]))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Edit stored content in place")
     sub = parser.add_subparsers(dest="what", required=True)
@@ -130,8 +215,18 @@ def main(argv: list[str] | None = None) -> int:
     node.add_argument("--run", type=Path, required=True)
     node.add_argument("--node", type=int, required=True)
     node.add_argument("--text", required=True)
+    entity = sub.add_parser(
+        "entity", help="Replace one entity's description for this revision"
+    )
+    entity.add_argument("--run", type=Path, required=True)
+    entity.add_argument("--canonical", required=True)
+    entity.add_argument("--kind", required=True)
+    entity.add_argument("--text", required=True)
     args = parser.parse_args(argv)
-    edit_node_summary(args.run, args.node, args.text)
+    if args.what == "entity":
+        edit_entity_description(args.run, args.canonical, args.kind, args.text)
+    else:
+        edit_node_summary(args.run, args.node, args.text)
     return 0
 
 

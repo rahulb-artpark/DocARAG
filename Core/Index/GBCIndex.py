@@ -269,20 +269,8 @@ class GBC:
                 self.entity_vdb.reset()
                 records = []
                 total = 0
-
-                def _record(text, metadata):
-                    description = metadata.get("description", "") or ""
-                    return {
-                        "name_text": text,
-                        "context_text": context_text(text, description),
-                        "lexical_terms": lexical_terms(
-                            lexical_text(text, description)
-                        ),
-                        "metadata": metadata,
-                    }
-
                 for text, metadata in self._entity_records():
-                    records.append(_record(text, metadata))
+                    records.append(self._entity_point_record(text, metadata))
                     if len(records) >= batch_size:
                         self.entity_vdb.add_entity_points(
                             records, batch_size=batch_size
@@ -305,6 +293,68 @@ class GBC:
                 invalidate_vector_index_attestation(self.entity_attestation_path)
                 raise
         log.info("Rebuilt and attested entity Qdrant scope with %d entries.", total)
+
+    def _entity_point_record(self, text, metadata) -> dict:
+        """One entity's point in the shape the writer and the refiner share."""
+
+        description = metadata.get("description", "") or ""
+        return {
+            "name_text": text,
+            "context_text": context_text(text, description),
+            "lexical_terms": lexical_terms(lexical_text(text, description)),
+            "metadata": metadata,
+        }
+
+    def reindex_entities(self, node_names) -> int:
+        """Re-embed the named entities in place, and re-attest the scope.
+
+        An entity's point ID is derived from its name and metadata, not its
+        description, so a rewritten description keeps the ID and an upsert
+        replaces the point. Nothing is deleted and nothing is reset: the
+        collection is shared between documents, and a reset would take this
+        document's whole scope to change one entity.
+
+        The attestation is recomputed over every entity because its projection
+        digest covers all of them -- reading is cheap, embedding is what this
+        avoids.
+        """
+
+        wanted = {str(name) for name in node_names}
+        if not wanted:
+            raise ValueError("reindex_entities requires at least one entity")
+        expected = self._expected_entity_attestation()
+        self.entity_vdb.require_writable()
+        with vector_index_lock(self.entity_attestation_path, exclusive=True):
+            invalidate_vector_index_attestation(self.entity_attestation_path)
+            try:
+                records = [
+                    self._entity_point_record(text, metadata)
+                    for text, metadata in self._entity_records()
+                    if text in wanted
+                ]
+                missing = wanted.difference(
+                    record["name_text"] for record in records
+                )
+                if missing:
+                    raise ValueError(
+                        "this revision does not mention: "
+                        + ", ".join(sorted(missing)[:3])
+                    )
+                self.entity_vdb.add_entity_points(records)
+                observed = self.entity_vdb.count()
+                if observed != expected["point_count"]:
+                    raise ValueError(
+                        f"entity Qdrant scope contains {observed} points; "
+                        f"expected {expected['point_count']}"
+                    )
+                publish_vector_index_attestation(
+                    self.entity_attestation_path, expected
+                )
+            except BaseException:
+                invalidate_vector_index_attestation(self.entity_attestation_path)
+                raise
+        log.info("Re-embedded %d entity point(s) in place.", len(records))
+        return len(records)
 
     def close(self) -> None:
         """Release entity-store and embedding resources idempotently."""
