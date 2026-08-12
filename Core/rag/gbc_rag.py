@@ -1155,6 +1155,14 @@ class GBCRAG(BaseRAG):
             node_type = node_type.value
         if node_type in {
             NodeType.IMAGE.value,
+            # A chart and a diagram are pictures the same way an image is. They
+            # were left to the subtype fallback below, which only recognises
+            # the generic words -- so a chart the parser typed by what kind of
+            # chart it is ("bubble", "bar") had no visual evidence at all: no
+            # crop leased, no img_path, and an answer that cited the figure
+            # without ever showing it.
+            NodeType.CHART.value,
+            NodeType.DIAGRAM.value,
             NodeType.TABLE.value,
             NodeType.EQUATION.value,
         }:
