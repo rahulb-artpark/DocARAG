@@ -519,6 +519,8 @@ VLM_ONE_GENERATION_USER_PROMPT = """
 SYNTHESIS_SYS_PROMPT = """
 You are an expert AI assistant specializing in synthesizing information.
 Given the user question, please merge all analyses into a final answer.
+Each analysis saw only its own evidence, so one reporting that it lacks
+something is silence, not denial. Lead with what was found.
 """
 
 SYNTHESIS_USER_PROMPT = """
