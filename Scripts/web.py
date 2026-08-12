@@ -1228,6 +1228,29 @@ class AppState:
             self._write_conversations(data)
             return conversation["id"]
 
+    def release_index_locks(self):
+        """Drop the held agent so an in-place edit can take the build lock.
+
+        A served RAG keeps a *shared* lease on the attestation's build lock for
+        its whole life, and re-deriving vectors needs that lock exclusively. An
+        edit issued from inside this server therefore blocked in ``flock``
+        against the server's own reader and never answered -- the save button
+        looked dead because the request was still waiting.
+
+        The agent is rebuilt by the next question, which is cheap beside
+        re-embedding, and its readiness check will see the vectors this edit
+        just wrote.
+        """
+
+        with self.chat_lock:
+            if self.rag_agent is not None:
+                close = getattr(self.rag_agent, "close", None)
+                if callable(close):
+                    close()
+            self.rag_agent = None
+            self._rag_identity_key = None
+            self._readiness_cache_key = None
+
     def switch_run(self, run_dir):
         """Rebind every cache and release the agent held for the old run."""
 
@@ -2264,6 +2287,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             from docarag.edit import edit_node_summary
 
+            # The vectors are re-derived in place, which needs the attestation
+            # build lock this server's own agent holds a shared lease on.
+            self.state.release_index_locks()
             edit_node_summary(self.state.run_dir, node_id, text.strip())
             # The tree changed under the viewer; its cache must not outlive it.
             self.state._tree_cache = None
@@ -2301,6 +2327,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             from docarag.edit import edit_entity_description
 
+            self.state.release_index_locks()
             edit_entity_description(
                 self.state.run_dir, canonical.strip(), kind.strip(), text.strip()
             )

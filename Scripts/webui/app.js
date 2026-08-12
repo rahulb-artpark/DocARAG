@@ -2011,10 +2011,18 @@ function beginSummaryEdit(nodeId, current) {
   if (!host) return;
   host.innerHTML = `<textarea id="summaryDraft" rows="5" style="width:100%">${escapeHtml(current)}</textarea>
     <div style="margin-top:6px"><button class="miniBtn" id="saveSummary">save</button>
-    <span class="structNote">saving reseals the revision and marks vectors stale</span></div>`;
-  host.querySelector("#saveSummary").onclick = async () => {
+    <span class="structNote" id="saveNote">saving re-embeds this node and re-attests the index</span></div>`;
+  const button = host.querySelector("#saveSummary");
+  const note = host.querySelector("#saveNote");
+  button.onclick = async () => {
     const text = host.querySelector("#summaryDraft").value.trim();
     if (!text) return;
+    // Saving re-embeds and re-attests before it answers, which takes seconds
+    // rather than milliseconds. Without a busy state the button looked broken
+    // and invited a second click, which would queue a second reconcile.
+    button.disabled = true;
+    button.textContent = "saving…";
+    note.textContent = "re-embedding and re-attesting; this takes a few seconds";
     try {
       await api("/api/edit-summary", {
         method: "POST",
@@ -2024,6 +2032,9 @@ function beginSummaryEdit(nodeId, current) {
       await loadData();
       selectTreeNode(nodeId);
     } catch (err) {
+      button.disabled = false;
+      button.textContent = "save";
+      note.textContent = "";
       alert("Edit failed: " + err.message);
     }
   };
