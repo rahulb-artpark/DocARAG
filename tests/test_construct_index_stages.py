@@ -173,6 +173,11 @@ class ConstructIndexStageTests(unittest.TestCase):
                 "durable_stage",
                 side_effect=lambda name, **_kwargs: _CapturedStage(name, stage_calls),
             ),
+            patch.object(
+                construct_index,
+                "_persist_graph_evidence",
+                side_effect=lambda _path: stage_calls.append(("persist", "graph")),
+            ) as persist,
         ):
             construct_index.construct_GBC_index(config, graph_only=True)
 
@@ -189,6 +194,21 @@ class ConstructIndexStageTests(unittest.TestCase):
         self.assertEqual(
             ["graph", "entity"],
             [value for action, value in stage_calls if action == "enter"],
+        )
+        # The entity index is derived from the store, so the graph's rows have
+        # to be there before it is built. The orchestrator persists a stage's
+        # evidence after that stage's process exits, which is one process too
+        # late for the entity stage running inside it.
+        persist.assert_called_once_with(config.save_path)
+        order = [
+            index
+            for index, (action, value) in enumerate(stage_calls)
+            if (action, value) in (("persist", "graph"), ("enter", "entity"))
+        ]
+        self.assertEqual(sorted(order), order)
+        self.assertLess(
+            stage_calls.index(("persist", "graph")),
+            stage_calls.index(("enter", "entity")),
         )
         self.assertIn(
             ("artifact:graph", "bookrag-knowledge-graph"), stage_calls

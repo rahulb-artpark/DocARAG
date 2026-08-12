@@ -177,6 +177,31 @@ def _mirror_stage_state(ledger, scope, revision_id: str, run: Path) -> None:
         return
 
 
+def _named_collection(run: Path) -> str | None:
+    """The tree collection this run's configuration names.
+
+    ``run_config.yaml`` is the resolved configuration and the better source,
+    but the first stage writes it -- at admission time it does not exist yet,
+    and falling through to the default registered "TreeVDB" for a run whose
+    config named something else. The vdb stage then registered the real name
+    and the two disagreed, so a fresh index of any document on a non-default
+    collection failed with "index revision ID already exists with different
+    bindings". The admitted input snapshot is there from the start.
+    """
+
+    candidates = [run / "run_config.yaml", *sorted((run / "inputs").glob("system-config-*.yaml"))]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            # Whole key, so entity_collection_name never answers for the tree.
+            if line.strip().startswith("collection_name:"):
+                named = line.split(":", 1)[1].strip().strip('"\'')
+                if named:
+                    return named
+    return None
+
+
 def _admit_revision(ledger, scope, manifest, run, spec_type) -> None:
     """Record the revision this run published, if it is not already known.
 
@@ -199,13 +224,7 @@ def _admit_revision(ledger, scope, manifest, run, spec_type) -> None:
         if canonical.is_file()
         else "0" * 64
     )
-    collection = "TreeVDB"
-    config_path = run / "run_config.yaml"
-    if config_path.is_file():
-        for line in config_path.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("collection_name:"):
-                collection = line.split(":", 1)[1].strip().strip('"\'')
-                break
+    collection = _named_collection(run) or "TreeVDB"
     ledger.create_index_revision(
         spec_type(
             scope=scope,

@@ -63,6 +63,22 @@ def _graph_variant(cfg) -> str:
     return graph_artifact_variant(graph_cfg) if graph_cfg is not None else "basic"
 
 
+def _persist_graph_evidence(run_directory: str) -> None:
+    """Land this revision's graph rows before anything reads them back.
+
+    Called in-process rather than shelled out, because the entity stage that
+    follows is in this same process and the orchestrator's own persist step
+    runs only after it exits.  Idempotent: persisting an already-persisted
+    part rewrites the same rows.
+    """
+
+    from docarag.evidence_persist import main as persist_evidence
+
+    code = persist_evidence(["--run", str(run_directory), "--part", "graph"])
+    if code != 0:
+        raise RuntimeError(f"graph evidence persistence failed (exit {code})")
+
+
 def construct_GBC_index(
     cfg: SystemConfig,
     tree_only: bool = False,
@@ -164,6 +180,13 @@ def _construct_GBC_index(
 
         kg_duration = time.time() - kg_start_time
         log.info(f"Knowledge graph constructed and saved in {kg_duration:.2f} seconds.")
+
+        # The entity index is derived from the store: its records are the
+        # revision's entity rows and its attestation binds to the graph seal
+        # written when those rows land. So the rows have to land first. The
+        # orchestrator persists a stage's evidence after the stage's process
+        # exits, which is one process too late for the entity stage inside it.
+        _persist_graph_evidence(cfg.save_path)
 
         with durable_stage(
             "entity",
