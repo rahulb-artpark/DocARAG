@@ -213,10 +213,21 @@ class GBCResourceLifecycleTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             gbc = object.__new__(GBC)
-            gbc.GraphIndex = SimpleNamespace(
-                kg=SimpleNamespace(nodes=entities.keys()),
-                get_entity_by_node_name=lambda name: entities[name],
-            )
+            # Entity records come from the store now; this test is about how
+            # rebuild_vdb batches them, not where they were read, so it
+            # supplies them directly rather than standing up a store.
+            records = [
+                (
+                    name,
+                    {
+                        "entity_name": entity.entity_name,
+                        "entity_type": entity.entity_type,
+                        "description": entity.description,
+                        "node_id": name,
+                    },
+                )
+                for name, entity in entities.items()
+            ]
             gbc.entity_scope = {
                 "tenant_id": "test",
                 "corpus_id": "test",
@@ -224,6 +235,7 @@ class GBCResourceLifecycleTests(unittest.TestCase):
                 "source_sha256": "a" * 64,
                 "index_kind": "entity",
             }
+            gbc.save_dir = directory
             gbc.entity_attestation_path = str(Path(directory) / "entity-attestation")
             gbc.entity_vdb = Mock()
             gbc.entity_vdb.count.return_value = 5
@@ -234,6 +246,7 @@ class GBCResourceLifecycleTests(unittest.TestCase):
                     "_expected_entity_attestation",
                     return_value={"point_count": 5},
                 ),
+                patch.object(GBC, "_entity_records", return_value=iter(records)),
                 patch(
                     "Core.Index.GBCIndex.vector_index_lock",
                     return_value=nullcontext(),

@@ -258,7 +258,13 @@ class TreeStore:
         with self._session() as connection:
             rows = connection.execute(
                 _GRAPH_ENTITIES_SQL,
-                (self._revision_key, self._revision_key, self._revision_key, limit),
+                (
+                    self._revision_key,  # mentions
+                    self._revision_key,  # statement roles
+                    self._revision_key,  # this revision's own descriptions
+                    self._revision_key,  # evidence nodes
+                    limit,
+                ),
             ).fetchall()
         return [
             {
@@ -525,11 +531,19 @@ WITH revision_entities AS (
 SELECT
     ent.canonical,
     ent.entity_kind,
-    blob.body AS description,
+    -- This revision's own wording first. ``entity.description_blob_key`` is
+    -- corpus-scoped and last-writer-wins, so it holds whatever document
+    -- mentioned the entity most recently -- 605 of one paper's 862 entities
+    -- carried another revision's text that way. The corpus row remains the
+    -- fallback for an entity a revision never described.
+    COALESCE(own_blob.body, blob.body) AS description,
     mentioned.node_nos
 FROM revision_entities re
 JOIN docarag.entity ent ON ent.entity_key = re.entity_key
 LEFT JOIN docarag.text_blob blob ON blob.blob_key = ent.description_blob_key
+LEFT JOIN docarag.entity_description own
+    ON own.revision_key = %s AND own.entity_key = ent.entity_key
+LEFT JOIN docarag.text_blob own_blob ON own_blob.blob_key = own.description_blob_key
 LEFT JOIN LATERAL (
     SELECT array_agg(DISTINCT node.node_no) AS node_nos
     FROM docarag.entity_mention mention

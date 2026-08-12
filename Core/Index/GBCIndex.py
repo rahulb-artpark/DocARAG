@@ -38,14 +38,6 @@ def _json_sha256(value: object) -> str:
     ).hexdigest()
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 class GBC:
     """
     A class representing the index combining graph and tree structures.
@@ -121,24 +113,51 @@ class GBC:
         uses, so it has to carry the same three vectors. ``canonical_id`` is the
         node's own id here: merges are already resolved by the time the graph is
         saved, so every surviving entity is its own canonical.
+
+        Read from the store rather than from ``graph_data.json``. The artifact
+        was the only place a revision's own entity descriptions lived, which
+        made a build artifact a source of truth for what queries search; the
+        store now records them per revision and answers the same question
+        without a file in the loop.
         """
 
-        for node_name in sorted(self.GraphIndex.kg.nodes):
-            entity = self.GraphIndex.get_entity_by_node_name(node_name)
-            description = entity.description or ""
+        from docarag.document_store import DocumentStore
+        from Core.rag.stored_index import entity_node_name
+
+        store = DocumentStore.open(self.save_dir)
+        try:
+            rows = store.tree.graph_entities()
+        finally:
+            store.close()
+        for row in sorted(rows, key=lambda item: (item["canonical"], item["entity_kind"])):
+            node_name = entity_node_name(row["canonical"], row["entity_kind"])
             yield node_name, {
-                "entity_name": entity.entity_name,
-                "entity_type": entity.entity_type,
-                "description": description,
+                "entity_name": row["canonical"],
+                "entity_type": row["entity_kind"],
+                "description": row["description"] or "",
                 "node_id": node_name,
                 CANONICAL_FIELD: node_name,
                 **self.entity_scope,
             }
 
+    def _graph_seal(self) -> str:
+        """The store digest these entity vectors attest to."""
+
+        from docarag.document_store import scope_for_run
+        from docarag.persistence.postgres import PostgresLedger
+        from docarag.settings import load_settings
+
+        scope, revision_id = scope_for_run(Path(self.save_dir))
+        seal = PostgresLedger(load_settings().resolve_database_url()).graph_seal(
+            scope, revision_id
+        )
+        if not seal:
+            raise ValueError(
+                "entity attestation requires a sealed graph; re-run the graph stage"
+            )
+        return seal
+
     def _expected_entity_attestation(self) -> dict[str, object]:
-        graph_path = Path(self.save_dir) / self.GraphIndex.data_filename
-        if graph_path.is_symlink() or not graph_path.is_file():
-            raise ValueError("entity attestation requires the saved graph artifact")
         records = list(self._entity_records())
         if not records:
             raise ValueError("refusing to attest an empty entity index")
@@ -161,11 +180,15 @@ class GBC:
             for text, metadata in records
         ]
         identity = {
-            "schema": "docarag.bookrag-entity-qdrant-index.v3",
+            # v4: the entity records come from the store and the binding is the
+            # graph seal rather than the graph file's digest, so every v3
+            # attestation is refused and rebuilt rather than trusted against a
+            # source it no longer describes.
+            "schema": "docarag.bookrag-entity-qdrant-index.v4",
             "source_sha256": self.entity_scope["source_sha256"],
             "document_version_id": self.entity_scope["document_version_id"],
             "index_revision_id": self.entity_scope["index_revision_id"],
-            "graph_artifact_sha256": _file_sha256(graph_path),
+            "graph_sha256": self._graph_seal(),
             "projection_sha256": _json_sha256(projection),
             "point_count": len(records),
             "collection_name": self.config.graph.entity_collection_name,
@@ -222,10 +245,10 @@ class GBC:
 
     def rebuild_vdb(self, *, batch_size: int = 256):
         """
-        Rebuilds the vector database for entities using the current graph index.
+        Rebuilds the vector database for entities from the store's graph rows.
         """
-        if not self.GraphIndex:
-            raise ValueError("GraphIndex is not set. Cannot rebuild VDB.")
+        if not getattr(self, "save_dir", None):
+            raise ValueError("Entity rebuild requires the run directory.")
 
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")

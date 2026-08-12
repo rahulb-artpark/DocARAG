@@ -1343,7 +1343,7 @@ class PostgresLedger:
                 }
             if "graph" in parts:
                 entity_keys = self._intern_entities(
-                    connection, scope, evidence.entities
+                    connection, scope, evidence.entities, revision_key
                 )
                 self._write_mentions(
                     connection, revision_key, evidence.mentions, entity_keys,
@@ -1353,6 +1353,7 @@ class PostgresLedger:
                     connection, revision_key, evidence.statements, entity_keys,
                     node_keys, block_keys,
                 )
+                self._seal_graph(connection, revision_key)
         return evidence.counts()
 
     # -- writers ------------------------------------------------------------
@@ -1605,11 +1606,17 @@ class PostgresLedger:
         connection: _Connection,
         scope: DocumentScope,
         entities: Sequence[EntityRecord],
+        revision_key: int,
     ) -> dict[str, int]:
         """Resolve corpus-scoped entities, reusing any this corpus already knows."""
 
         keys: dict[str, int] = {}
         for entity in entities:
+            description_key = (
+                self._intern_text(connection, entity.description)
+                if entity.description
+                else None
+            )
             row = _mapping(
                 connection.execute(
                     "INSERT INTO docarag.entity (tenant_id, corpus_id, entity_kind, "
@@ -1623,15 +1630,28 @@ class PostgresLedger:
                         scope.corpus_id,
                         entity.kind,
                         entity.canonical,
-                        self._intern_text(connection, entity.description)
-                        if entity.description
-                        else None,
+                        description_key,
                         _json_text(entity.attrs),
                     ),
                 ).fetchone(),
                 operation="entity interning",
             )
-            keys[entity.ref] = int(row["entity_key"])
+            entity_key = int(row["entity_key"])
+            # The corpus row keeps whichever description reached it first, so
+            # it says nothing about what *this* revision read. Record that
+            # separately: the entity index quotes the description into a
+            # vector, and a document must be searched by what its own
+            # extraction said, not by another document's account of the same
+            # entity.
+            connection.execute(
+                "INSERT INTO docarag.entity_description "
+                "(revision_key, entity_key, description_blob_key) "
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (revision_key, entity_key) DO UPDATE SET "
+                "description_blob_key = EXCLUDED.description_blob_key",
+                (revision_key, entity_key, description_key),
+            )
+            keys[entity.ref] = entity_key
         return keys
 
     def _write_mentions(
@@ -1778,6 +1798,51 @@ class PostgresLedger:
             (revision_key, digest.hexdigest()),
         )
 
+    def _seal_graph(self, connection: _Connection, revision_key: int) -> None:
+        """Digest the graph rows the entity index is built from.
+
+        The tree half of this binds the tree vectors to the sealed nodes. This
+        binds the entity vectors the same way, over what the entity index
+        actually reads: each entity's canonical name, kind and *this
+        revision's* description. An edited description changes the digest, the
+        entity attestation stops matching, and the vectors that quoted the old
+        wording are rebuilt rather than silently served.
+        """
+
+        digest = hashlib.sha256()
+        with connection.cursor(name=f"graph_seal_{revision_key}") as cursor:
+            cursor.itersize = 500
+            cursor.execute(_SEAL_GRAPH_ROWS_SQL, (revision_key, revision_key, revision_key))
+            for row in cursor:
+                # ``.values()`` for the reason the tree seal needs it: this
+                # connection yields mappings, and iterating one gives its keys.
+                values = row.values() if hasattr(row, "values") else row
+                digest.update(
+                    json.dumps(
+                        [str(item) for item in values],
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                )
+        connection.execute(
+            "INSERT INTO docarag.revision_seal (revision_key, tree_sha256, graph_sha256) "
+            "VALUES (%s, repeat('0', 64), %s) ON CONFLICT (revision_key) DO UPDATE SET "
+            "graph_sha256 = EXCLUDED.graph_sha256, sealed_at = clock_timestamp()",
+            (revision_key, digest.hexdigest()),
+        )
+
+    def graph_seal(self, scope: DocumentScope, revision_id: str) -> str | None:
+        """Return the sealed graph digest for one revision, or None if unsealed."""
+
+        revision_key = self.revision_key(scope, revision_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT graph_sha256 FROM docarag.revision_seal "
+                "WHERE revision_key = %s",
+                (revision_key,),
+            ).fetchone()
+        value = (row or {}).get("graph_sha256") if row else None
+        return str(value) if value else None
+
     def revision_seal(self, scope: DocumentScope, revision_id: str) -> str | None:
         """Return the sealed tree digest for one revision, or None if unsealed."""
 
@@ -1813,6 +1878,30 @@ LEFT JOIN docarag.block blk
     ON blk.revision_key = node.revision_key AND blk.block_key = node.block_key
 WHERE node.revision_key = %s
 ORDER BY node.node_no
+"""
+
+
+#: Exactly what the entity index reads, in the order it reads it: the entity's
+#: identity and the description this revision gave it. Statements are not here
+#: -- they carry no vector -- so a graph edit that changes no entity text does
+#: not force an entity rebuild.
+_SEAL_GRAPH_ROWS_SQL = """
+WITH revision_entities AS (
+    SELECT entity_key FROM docarag.entity_mention WHERE revision_key = %s
+    UNION
+    SELECT entity_key FROM docarag.statement_role WHERE revision_key = %s
+)
+SELECT
+    ent.canonical,
+    ent.entity_kind,
+    encode(coalesce(own_blob.sha256, blob.sha256), 'hex')
+FROM revision_entities re
+JOIN docarag.entity ent ON ent.entity_key = re.entity_key
+LEFT JOIN docarag.text_blob blob ON blob.blob_key = ent.description_blob_key
+LEFT JOIN docarag.entity_description own
+    ON own.revision_key = %s AND own.entity_key = ent.entity_key
+LEFT JOIN docarag.text_blob own_blob ON own_blob.blob_key = own.description_blob_key
+ORDER BY ent.canonical, ent.entity_kind
 """
 
 

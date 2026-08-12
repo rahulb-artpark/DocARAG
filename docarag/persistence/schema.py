@@ -432,6 +432,12 @@ CREATE TABLE docarag.revision_seal (
     revision_key bigint NOT NULL PRIMARY KEY
         REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
     tree_sha256 char(64) NOT NULL,
+    -- The graph half of the same idea. The entity index binds to this to
+    -- assert that its vectors describe the sealed rows, exactly as the tree
+    -- index binds to tree_sha256, so an edited entity description invalidates
+    -- the vectors that quoted it. Nullable because a revision sealed before
+    -- the graph ran has a tree and no graph.
+    graph_sha256 char(64),
     sealed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
@@ -672,6 +678,27 @@ CREATE TABLE docarag.entity_mention (
         (char_start IS NULL AND char_end IS NULL)
         OR (char_start >= 0 AND char_end > char_start)
     )
+);
+
+-- What one revision's extraction said this entity is.
+--
+-- ``entity.description_blob_key`` is corpus-scoped and last-writer-wins: the
+-- same entity read by two documents keeps one row, so the description a
+-- document's own graph produced is overwritten by the next document to
+-- mention it. Measured on the live store, 605 of one paper's 862 entities
+-- carried another revision's wording that way. The entity index quotes the
+-- description into a vector, so serving the corpus-wide value would answer a
+-- question about this document with text written about a different one.
+--
+-- The corpus row stays -- it is what makes an entity one entity across
+-- documents -- and this records what each revision said about it.
+CREATE TABLE docarag.entity_description (
+    revision_key bigint NOT NULL
+        REFERENCES docarag.index_revisions(revision_key) ON DELETE CASCADE,
+    entity_key bigint NOT NULL
+        REFERENCES docarag.entity(entity_key) ON DELETE CASCADE,
+    description_blob_key bigint REFERENCES docarag.text_blob(blob_key),
+    PRIMARY KEY (revision_key, entity_key)
 );
 
 -- The retrieval entry point: a query entity resolves to the nodes mentioning it.
