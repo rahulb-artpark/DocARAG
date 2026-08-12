@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 from docarag.persistence.postgres import PostgresLedger
 from docarag.tree_store import _GRAPH_ENTITIES_SQL
@@ -112,6 +113,75 @@ class TheGraphSealFollowsItsEntities(unittest.TestCase):
         rows = [_entity("edgehd")]
 
         self.assertEqual(_seal(rows), _seal([tuple(row.values()) for row in rows]))
+
+
+class EveryEntityReachesTheIndex(unittest.TestCase):
+    """An index built from a display cap cannot answer about what it dropped."""
+
+    def _store(self, count):
+        from docarag.tree_store import TreeStore
+
+        rows = [
+            {
+                "canonical": f"entity-{index:05d}",
+                "entity_kind": "TECHNOLOGY",
+                "description": f"description {index}",
+            }
+            for index in range(count)
+        ]
+
+        class _Paged:
+            def execute(self, _sql, params):
+                after, kind, limit = params[3], params[4], params[5]
+                page = [
+                    row
+                    for row in rows
+                    if (row["canonical"], row["entity_kind"]) > (after, kind)
+                ][:limit]
+                return SimpleNamespace(fetchall=lambda: page)
+
+        # Through the real connection factory: TreeStore uses __slots__, and
+        # the paging under test is in iter_graph_entities, not in the session.
+        return TreeStore(lambda: _Paged(), 1), rows
+
+    def test_more_entities_than_one_page_are_all_returned(self):
+        store, rows = self._store(4500)
+
+        streamed = list(store.iter_graph_entities(page_size=1000))
+
+        self.assertEqual(len(rows), len(streamed))
+
+    def test_no_entity_is_yielded_twice(self):
+        store, _rows = self._store(4500)
+
+        streamed = list(store.iter_graph_entities(page_size=1000))
+        keys = [(row["canonical"], row["entity_kind"]) for row in streamed]
+
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_they_arrive_in_identity_order(self):
+        store, _rows = self._store(2500)
+
+        streamed = list(store.iter_graph_entities(page_size=500))
+        keys = [(row["canonical"], row["entity_kind"]) for row in streamed]
+
+        self.assertEqual(sorted(keys), keys)
+
+    def test_an_exact_multiple_of_the_page_size_terminates(self):
+        store, _rows = self._store(2000)
+
+        self.assertEqual(2000, len(list(store.iter_graph_entities(page_size=1000))))
+
+    def test_an_empty_revision_yields_nothing(self):
+        store, _rows = self._store(0)
+
+        self.assertEqual([], list(store.iter_graph_entities(page_size=1000)))
+
+    def test_a_page_size_must_be_positive(self):
+        store, _rows = self._store(10)
+
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            list(store.iter_graph_entities(page_size=0))
 
 
 class TheStoreServesThisRevisionsWording(unittest.TestCase):

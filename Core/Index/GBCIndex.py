@@ -126,10 +126,14 @@ class GBC:
 
         store = DocumentStore.open(self.save_dir)
         try:
-            rows = store.tree.graph_entities()
+            # ``iter_graph_entities``, not ``graph_entities``: the latter caps
+            # itself at MAX_GRAPH_ENTITIES for display, and an index built from
+            # a cap can never reach the entities beyond it. One revision here
+            # holds 36,572 against a cap of 8,192.
+            rows = list(store.tree.iter_graph_entities())
         finally:
             store.close()
-        for row in sorted(rows, key=lambda item: (item["canonical"], item["entity_kind"])):
+        for row in rows:
             node_name = entity_node_name(row["canonical"], row["entity_kind"])
             yield node_name, {
                 "entity_name": row["canonical"],

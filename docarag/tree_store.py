@@ -11,7 +11,7 @@ factory; each method is one indexed query.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -275,6 +275,41 @@ class TreeStore:
             }
             for row in rows
         ]
+
+    def iter_graph_entities(self, page_size: int = 2048) -> Iterator[dict[str, Any]]:
+        """Every entity this revision mentions, in identity order, unbounded.
+
+        ``graph_entities`` caps itself for display; an index built from a cap
+        answers nothing about the entities beyond it. Paged by (canonical,
+        kind) rather than OFFSET so a page costs the same at 36,000 entities as
+        at the first.
+        """
+
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+            raise ValueError("page_size must be at least 1")
+        cursor = ("", "")
+        while True:
+            with self._session() as connection:
+                rows = connection.execute(
+                    _GRAPH_ENTITIES_PAGE_SQL,
+                    (
+                        self._revision_key,
+                        self._revision_key,
+                        self._revision_key,
+                        cursor[0],
+                        cursor[1],
+                        page_size,
+                    ),
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield {
+                    "canonical": str(row["canonical"]),
+                    "entity_kind": str(row["entity_kind"]),
+                    "description": str(row["description"] or ""),
+                }
+            cursor = (str(rows[-1]["canonical"]), str(rows[-1]["entity_kind"]))
 
     def graph_statements(self, limit: int = MAX_SUBGRAPH_EDGES) -> list[dict[str, Any]]:
         """Return every statement of this revision as a binary edge with evidence."""
@@ -553,6 +588,36 @@ LEFT JOIN LATERAL (
     WHERE mention.revision_key = %s AND mention.entity_key = ent.entity_key
 ) mentioned ON true
 ORDER BY ent.canonical
+LIMIT %s
+"""
+
+
+#: The same rows, paged rather than capped.
+#:
+#: ``_GRAPH_ENTITIES_SQL`` bounds itself at ``MAX_GRAPH_ENTITIES`` because it
+#: answers "show me this document's graph" -- a display, where 8,192 entities is
+#: already more than anyone reads. The entity *index* is not a display: it must
+#: carry every entity or a question can reach none of the ones it dropped. One
+#: revision here holds 36,572, so the cap silently indexed 22% of it, and only
+#: the attestation's point count caught the difference.
+_GRAPH_ENTITIES_PAGE_SQL = """
+WITH revision_entities AS (
+    SELECT entity_key FROM docarag.entity_mention WHERE revision_key = %s
+    UNION
+    SELECT entity_key FROM docarag.statement_role WHERE revision_key = %s
+)
+SELECT
+    ent.canonical,
+    ent.entity_kind,
+    COALESCE(own_blob.body, blob.body) AS description
+FROM revision_entities re
+JOIN docarag.entity ent ON ent.entity_key = re.entity_key
+LEFT JOIN docarag.text_blob blob ON blob.blob_key = ent.description_blob_key
+LEFT JOIN docarag.entity_description own
+    ON own.revision_key = %s AND own.entity_key = ent.entity_key
+LEFT JOIN docarag.text_blob own_blob ON own_blob.blob_key = own.description_blob_key
+WHERE (ent.canonical, ent.entity_kind) > (%s, %s)
+ORDER BY ent.canonical, ent.entity_kind
 LIMIT %s
 """
 
