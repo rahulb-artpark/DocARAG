@@ -262,7 +262,14 @@ class Retriever:
         and it is the only prose naming the subject where a heading is generic.
         """
 
-        meta = node.meta_info
+        named = Retriever._rerank_named_text(node)
+        body = Retriever._rerank_body_text(node)
+        return "\n".join(part for part in (named, body) if part)
+
+    @staticmethod
+    def _rerank_named_text(node: TreeNode) -> str:
+        """What a node says it is: the heading above it and its own summary."""
+
         values: list[str] = []
         section = Retriever._section_heading_text(node)
         if section:
@@ -271,6 +278,14 @@ class Retriever:
             summary = getattr(node, "summary", None)
             if isinstance(summary, str) and summary.strip():
                 values.append(summary.strip())
+        return "\n".join(values)
+
+    @staticmethod
+    def _rerank_body_text(node: TreeNode) -> str:
+        """What a node holds: its grid, its own text, and its parts."""
+
+        meta = node.meta_info
+        values: list[str] = []
         if node.type == NodeType.TABLE:
             try:
                 table_text = table2text(meta.model_dump())
@@ -286,6 +301,42 @@ class Retriever:
         if semantic_text:
             values.append(semantic_text)
         return "\n".join(values)
+
+    @staticmethod
+    def _node_rerank_views(node: TreeNode) -> List[Tuple[str, str]]:
+        """One document per reading of a node, each scored on its own merits.
+
+        A figure that shows something without naming it carries two unrelated
+        texts: the heading and summary saying what it is, and a description of
+        what it looks like. Joined into one document the longer one decides the
+        score. Node 8297's 320-character summary naming the Zernike surface lost
+        to 610 characters of "a 3D rendered icon or graphic, not a chart, table,
+        or diagram ... typical of digital icons or interface elements", and the
+        figure ranked 31st of 512 for a question asking to be shown it.
+
+        Scored separately it ranks 5th at 1.0000 on its naming view, and the
+        pixel description keeps its own document -- so "what does the figure
+        look like" still reaches it. A node's score is the best any of its
+        readings achieves, because a question resembles one reading or the
+        other, never their concatenation.
+
+        Only a node that both shows and names gets a second document, so this
+        costs one extra per figure, table, listing and equation rather than per
+        node: 666 documents for 512 candidates, measured on that query.
+        """
+
+        named = Retriever._rerank_named_text(node)
+        body = Retriever._rerank_body_text(node)
+        if node.type in _SUMMARY_RERANK_NODE_TYPES and named and body:
+            section = Retriever._section_heading_text(node)
+            # The heading rides with both: it is the only thing placing the
+            # description in the document, and dropping it here would score the
+            # body worse than the single document it replaces.
+            return [
+                ("named", named),
+                ("body", "\n".join(part for part in (section, body) if part)),
+            ]
+        return [("whole", "\n".join(part for part in (named, body) if part))]
 
     @staticmethod
     def _section_heading_text(node: TreeNode) -> str:
@@ -1103,16 +1154,24 @@ class Retriever:
                 "prompt reserve"
             )
 
-        doc_text = []
-        tree_ids = [node.index_id for node in candidates]
+        # One document per reading of a node. Truncation is per document, so a
+        # long pixel description can no longer push the sentence naming the
+        # subject out of the window.
+        doc_text: list[str] = []
+        owners: list[int] = []
         for node in candidates:
-            text = self._node_rerank_text(node)
-            if num_tokens(text) > effective_token_length:
-                text = TextProcessor.split_text_into_chunks(
-                    text=text, max_length=effective_token_length
-                )
-                text = text[0]  # use the first chunk
-            doc_text.append(text)
+            for _kind, text in self._node_rerank_views(node):
+                if not text:
+                    continue
+                if num_tokens(text) > effective_token_length:
+                    text = TextProcessor.split_text_into_chunks(
+                        text=text, max_length=effective_token_length
+                    )
+                    text = text[0]  # use the first chunk
+                doc_text.append(text)
+                owners.append(node.index_id)
+        if not doc_text:
+            return []
 
         try:
             with self.timings.time("text_rerank"):
@@ -1125,10 +1184,10 @@ class Retriever:
                 raise ValueError(
                     "reranker must return a sized sequence of scores"
                 ) from exc
-            if score_count != len(tree_ids):
+            if score_count != len(doc_text):
                 raise ValueError(
                     "reranker returned an unexpected number of scores: "
-                    f"expected {len(tree_ids)}, got {score_count}"
+                    f"expected {len(doc_text)}, got {score_count}"
                 )
 
             validated_scores = []
@@ -1146,9 +1205,15 @@ class Retriever:
         finally:
             self.reranker.clean_cache()
 
-        ranked_res = sorted(
-            zip(tree_ids, validated_scores), key=lambda item: (-item[1], item[0])
-        )
+        # A node scores as well as its best reading: a question resembles one
+        # reading or the other, never their concatenation. Max rather than mean,
+        # because averaging reintroduces exactly the dilution this splits apart.
+        best: dict[int, float] = {}
+        for node_id, score in zip(owners, validated_scores):
+            if score > best.get(node_id, float("-inf")):
+                best[node_id] = score
+
+        ranked_res = sorted(best.items(), key=lambda item: (-item[1], item[0]))
 
         return ranked_res
 
