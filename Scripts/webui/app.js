@@ -1865,8 +1865,9 @@ function selectTreeNode(id, options = {}) {
     ${img}
     ${n.tableBody ? `<div class="section-h">Table</div><div class="tableWrap" id="nodeTable"></div>` : ""}
     ${(n.content || "").trim() || !n.tableBody
-      ? `<div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}</div>
-         <div class="prose">${renderContent(n)}</div>`
+      ? `<div class="section-h">${n.tableBody ? "Caption &amp; footnotes" : "Content"}
+           <button class="miniBtn" id="editContent">edit</button></div>
+         <div class="prose" id="contentText">${renderContent(n)}</div>`
       : ""}
     ${(n.structures || []).length ? `<div class="section-h">Extracted structure</div>${renderStructures(n.structures)}` : ""}
     ${n.summary ? `<div class="section-h">Summary (LLM-generated) <button class="miniBtn" id="editSummary">edit</button></div><div class="prose" id="summaryText">${escapeHtml(n.summary)}</div>` : ""}
@@ -1893,6 +1894,8 @@ function selectTreeNode(id, options = {}) {
   typesetMath($("treeDetail"));
   const editBtn = $("treeDetail").querySelector("#editSummary");
   if (editBtn) editBtn.onclick = () => beginSummaryEdit(id, n.summary);
+  const editContentBtn = $("treeDetail").querySelector("#editContent");
+  if (editContentBtn) editContentBtn.onclick = () => beginContentEdit(id, n.content);
   const im = $("treeDetail").querySelector(".nodeimg");
   if (im) im.onclick = () => openLightbox(im.src);
 }
@@ -2025,6 +2028,38 @@ function beginSummaryEdit(nodeId, current) {
     note.textContent = "re-embedding and re-attesting; this takes a few seconds";
     try {
       await api("/api/edit-summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nodeId, text }),
+      });
+      await loadData();
+      selectTreeNode(nodeId);
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = "save";
+      note.textContent = "";
+      alert("Edit failed: " + err.message);
+    }
+  };
+}
+
+function beginContentEdit(nodeId, current) {
+  const host = $("contentText");
+  if (!host) return;
+  host.innerHTML = `<textarea id="contentDraft" rows="7" style="width:100%">${escapeHtml(current || "")}</textarea>
+    <div style="margin-top:6px"><button class="miniBtn" id="saveContent">save</button>
+    <span class="structNote" id="contentNote">a correction is recorded as a human edit of the
+    original source, which stays cited alongside it</span></div>`;
+  const button = host.querySelector("#saveContent");
+  const note = host.querySelector("#contentNote");
+  button.onclick = async () => {
+    const text = host.querySelector("#contentDraft").value.trim();
+    if (!text) return;
+    button.disabled = true;
+    button.textContent = "saving…";
+    note.textContent = "re-deriving evidence, re-embedding and re-attesting…";
+    try {
+      await api("/api/edit-content", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ nodeId, text }),

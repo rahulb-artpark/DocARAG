@@ -1981,6 +1981,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/edit-entity":
             self.edit_entity()
             return
+        if parsed.path == "/api/edit-content":
+            self.edit_content()
+            return
         if parsed.path == "/api/run-tag":
             self.set_run_tag()
             return
@@ -2298,6 +2301,43 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"ok": True, "nodeId": node_id, "vdb": "reconciled"})
         except SystemExit as exc:
             self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "Edit failed",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+
+    def edit_content(self):
+        try:
+            self.state.require_run()
+            payload = self.read_json_body()
+            node_id = payload.get("nodeId")
+            text = payload.get("text")
+            if not isinstance(node_id, int) or not isinstance(text, str) or not text.strip():
+                self.send_error_json(
+                    HTTPStatus.BAD_REQUEST, "nodeId and non-empty text are required"
+                )
+                return
+            from docarag.edit import edit_node_content
+
+            self.state.release_index_locks()
+            edit_node_content(self.state.run_dir, node_id, text.strip())
+            self.state._tree_cache = None
+            self.send_json(
+                {
+                    "ok": True,
+                    "nodeId": node_id,
+                    # Said back explicitly: the node no longer claims to be a
+                    # verbatim reading of its source, it claims to be a
+                    # correction of one, and the source stays cited.
+                    "evidence": "derived",
+                    "transformation": "docarag.human_edit.v1",
+                    "vdb": "reconciled",
+                }
+            )
+        except SystemExit as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:
             self.send_error_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
