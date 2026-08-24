@@ -63,6 +63,7 @@ class TreeNodeView:
     summary: str = ""
     outline_node: bool = False
     children: tuple[int, ...] = field(default_factory=tuple)
+    document_version_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,20 +73,26 @@ class GraphEdge:
     predicate: str
     weight: float | None = None
     description: str = ""
+    link_origin: str | None = None  # e.g. "cross_document_inferred"; None for intra-document edges
+    source_kind: str = ""
+    target_kind: str = ""
 
 
 class TreeStore:
     """Bounded reads over one sealed revision."""
 
-    __slots__ = ("_connect", "_revision_key")
+    __slots__ = ("_connect", "_revision_key", "_document_version_id")
 
-    def __init__(self, connect: Callable[[], Any], revision_key: int) -> None:
+    def __init__(
+        self, connect: Callable[[], Any], revision_key: int, document_version_id: str = "",
+    ) -> None:
         if not callable(connect):
             raise TypeError("connect must be callable")
         if isinstance(revision_key, bool) or not isinstance(revision_key, int):
             raise TypeError("revision_key must be an integer")
         self._connect = connect
         self._revision_key = revision_key
+        self._document_version_id = document_version_id
 
     @property
     def revision_key(self) -> int:
@@ -197,6 +204,8 @@ class TreeStore:
                 predicate=str(row["predicate"]),
                 weight=row["weight"],
                 description=str(row["description"] or ""),
+                source_kind=str(row["src_kind"] or ""),
+                target_kind=str(row["dst_kind"] or ""),
             )
             for row in rows
         ]
@@ -363,7 +372,7 @@ class TreeStore:
     def _query(self, sql: str, params: tuple[object, ...]) -> list[TreeNodeView]:
         with self._session() as connection:
             rows = connection.execute(sql, params).fetchall()
-        return [_view(row) for row in rows]
+        return [_view(row, self._document_version_id) for row in rows]
 
     def _one(self, sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
         with self._session() as connection:
@@ -396,7 +405,7 @@ def _bounded_ids(values: Iterable[int]) -> list[int]:
     return list(seen)
 
 
-def _view(row: Mapping[str, Any]) -> TreeNodeView:
+def _view(row: Mapping[str, Any], document_version_id: str = "") -> TreeNodeView:
     return TreeNodeView(
         index_id=int(row["node_no"]),
         type=str(row["node_kind"]),
@@ -405,6 +414,7 @@ def _view(row: Mapping[str, Any]) -> TreeNodeView:
         summary=str(row.get("summary") or ""),
         evidence=(row.get("attrs") or {}).get("evidence"),
         outline_node=bool(row.get("is_outline")),
+        document_version_id=document_version_id,
         meta_info=NodeMeta(
             content=str(row.get("content") or row.get("label") or ""),
             page_idx=row.get("page_no"),
@@ -671,7 +681,9 @@ ORDER BY node.node_no
 _SUBGRAPH_SQL = """
 SELECT DISTINCT
     subject.canonical AS src,
+    subject.entity_kind AS src_kind,
     object.canonical AS dst,
+    object.entity_kind AS dst_kind,
     stmt.predicate,
     stmt.weight,
     blob.body AS description

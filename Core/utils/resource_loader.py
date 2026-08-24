@@ -302,10 +302,7 @@ def _open_ready_bookrag_tree_vdb(cfg: SystemConfig, vdb_cfg) -> Any:
 
 
 def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
-    """
-    根据配置加载并准备RAG agent所需的依赖项。
-    这是一个调度函数，它知道哪种策略需要哪种资源。
-    """
+    """Load and prepare the RAG agent's dependencies for one strategy."""
 
     rag_config = cfg.rag.strategy_config
     strategy_name = rag_config.strategy
@@ -566,3 +563,221 @@ def prepare_rag_dependencies(cfg: SystemConfig) -> Dict[str, Any]:
         raise ValueError(f"Unknown or unsupported RAG strategy: '{strategy_name}'")
 
     return dependencies
+
+
+class _CompositeReadLease:
+    """Several attestation leases held as one, released together."""
+
+    __slots__ = ("_leases",)
+
+    def __init__(self, leases: list) -> None:
+        self._leases = list(leases)
+
+    def close(self) -> None:
+        for lease in self._leases:
+            if lease is not None:
+                try:
+                    lease.close()
+                except Exception:
+                    log.exception("Failed to close a composite read lease member")
+
+
+class CorpusIndexBundle:
+    """Every document a corpus-scoped GBCRAG/GraphRAG query can draw from.
+
+    One shared ``tree_vdb``/``entity_vdb`` (scoped across every
+    ``document_version_id`` via MatchAny), plus one ``StoredIndex`` per
+    document for its own tree/graph. ``GBCRAG.from_corpus_bundle`` accepts
+    this in place of a single document's ``gbc_index``/``tree_vdb``.
+    """
+
+    __slots__ = (
+        "tenant_id", "corpus_id", "documents", "tree_vdb", "entity_vdb",
+        "embedder", "document_titles", "_closed",
+    )
+
+    def __init__(
+        self,
+        *,
+        tenant_id: str,
+        corpus_id: str,
+        documents: Dict[str, Any],
+        tree_vdb: Any,
+        entity_vdb: Any,
+        embedder: Any,
+        document_titles: Dict[str, str],
+    ) -> None:
+        if not documents:
+            raise ValueError("a corpus bundle needs at least one document")
+        self.tenant_id = tenant_id
+        self.corpus_id = corpus_id
+        self.documents = documents
+        self.tree_vdb = tree_vdb
+        self.entity_vdb = entity_vdb
+        self.embedder = embedder
+        self.document_titles = document_titles
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for stored_index in self.documents.values():
+            try:
+                stored_index.close()
+            except Exception:
+                log.exception("Failed to close a corpus bundle's document index")
+        for resource in (self.tree_vdb, self.entity_vdb, self.embedder):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    log.exception("Failed to close a corpus bundle's shared resource")
+
+    def __enter__(self) -> "CorpusIndexBundle":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.close()
+        return False
+
+
+def prepare_corpus_rag_dependencies(
+    document_configs: "list[SystemConfig]",
+) -> Dict[str, Any]:
+    """Multi-document counterpart to ``prepare_rag_dependencies``.
+
+    Only ``gbc``/``graph`` strategies have the entity/graph layer a corpus
+    bundle needs; the other four strategies stay single-document. Each entry
+    in ``document_configs`` is a fully-resolved per-document ``SystemConfig``
+    (``save_path``/``source`` set, the shape a caller already builds for one
+    document via ``prepare_rag_dependencies``) -- all sharing one
+    tenant/corpus/tree collection.
+    """
+
+    if not document_configs:
+        raise ValueError("prepare_corpus_rag_dependencies requires at least one document")
+
+    strategy_name = document_configs[0].rag.strategy_config.strategy
+    if strategy_name not in ("gbc", "graph"):
+        raise ValueError(
+            f"corpus-scoped retrieval supports only 'gbc'/'graph', got {strategy_name!r}"
+        )
+
+    base_cfg = document_configs[0]
+    base_vdb_cfg = base_cfg.vdb
+
+    from Core.rag.stored_index import StoredIndex
+
+    documents: Dict[str, Any] = {}
+    scopes: list = []
+    read_leases: list = []
+    try:
+        for cfg in document_configs:
+            if cfg.rag.strategy_config.strategy != strategy_name:
+                raise ValueError("every document in a corpus bundle must use the same strategy")
+            if (
+                cfg.vdb.tenant_id != base_vdb_cfg.tenant_id
+                or cfg.vdb.corpus_id != base_vdb_cfg.corpus_id
+            ):
+                raise ValueError("every document in a corpus bundle must share one tenant/corpus")
+            if cfg.vdb.collection_name != base_vdb_cfg.collection_name:
+                raise ValueError("every document in a corpus bundle must share one tree collection")
+
+            stored_index = StoredIndex.open(cfg.save_path, config=None)
+            scope = _runtime_scope(cfg, cfg.vdb, index_kind="tree")
+            attestation_path = str(
+                resolve_run_artifact_path(
+                    cfg.save_path, cfg.vdb.manifest_dir_name, label="vdb.manifest_dir_name"
+                )
+            )
+            read_lease = _acquire_ready_bookrag_tree_vdb(cfg, cfg.vdb, attestation_path)
+            document_version_id = scope["document_version_id"]
+            if document_version_id in documents:
+                stored_index.close()
+                read_lease.close()
+                raise ValueError(f"duplicate document_version_id in corpus bundle: {document_version_id}")
+            documents[document_version_id] = stored_index
+            scopes.append(scope)
+            read_leases.append(read_lease)
+
+        document_version_ids = [s["document_version_id"] for s in scopes]
+        merged_tree_scope = {
+            "tenant_id": scopes[0]["tenant_id"],
+            "corpus_id": scopes[0]["corpus_id"],
+            "document_version_id": document_version_ids,
+            "index_kind": "tree",
+        }
+
+        from Core.configs.embedding_config import EmbeddingConfig
+        from Core.pipelines.vdb_index import corpus_entity_vector_scope
+        from Core.provider.embedding import TextEmbeddingProvider
+        from Core.provider.vdb import VectorSchema, VectorStore
+
+        embed_cfg: EmbeddingConfig = base_vdb_cfg.embedding_config
+        shared_embedder = TextEmbeddingProvider(
+            model_name=embed_cfg.model_name,
+            backend=embed_cfg.backend,
+            device=embed_cfg.device,
+            max_length=embed_cfg.max_length,
+            api_base=embed_cfg.api_base,
+            api_key=getattr(embed_cfg, "api_key", None),
+            num_ctx=getattr(embed_cfg, "num_ctx", None),
+        )
+        tree_vdb = None
+        entity_vdb = None
+        try:
+            tree_vdb = VectorStore(
+                embedding_model=shared_embedder,
+                **_vector_store_kwargs(
+                    base_vdb_cfg, merged_tree_scope, vector_schema=VectorSchema.TREE_NODE
+                ),
+            )
+            # tree_revision_id is per-document identity elsewhere in the
+            # single-document path; a corpus digest is only ever used for
+            # trace/logging here, never compared against a per-document seal.
+            tree_vdb.tree_revision_id = "corpus-" + "-".join(sorted(document_version_ids))
+            tree_vdb.attach_read_lease(_CompositeReadLease(read_leases))
+            read_leases = []
+
+            entity_vdb = VectorStore(
+                qdrant_url=base_vdb_cfg.qdrant_url,
+                embedding_model=shared_embedder,
+                collection_name=base_cfg.graph.entity_collection_name,
+                api_key_env=base_vdb_cfg.api_key_env,
+                timeout_seconds=base_vdb_cfg.timeout_seconds,
+                scope_filter=corpus_entity_vector_scope(base_vdb_cfg),
+                hybrid_entity_schema=True,
+            )
+        except BaseException:
+            _close_partial_resources(
+                ("corpus tree_vdb", tree_vdb),
+                ("corpus entity_vdb", entity_vdb),
+                ("corpus shared embedder", shared_embedder),
+            )
+            raise
+
+        document_titles = {
+            doc_id: stored_index.TreeIndex.meta_info.file_name
+            for doc_id, stored_index in documents.items()
+        }
+        bundle = CorpusIndexBundle(
+            tenant_id=scopes[0]["tenant_id"],
+            corpus_id=scopes[0]["corpus_id"],
+            documents=documents,
+            tree_vdb=tree_vdb,
+            entity_vdb=entity_vdb,
+            embedder=shared_embedder,
+            document_titles=document_titles,
+        )
+        log.info(
+            "Successfully loaded a %d-document corpus bundle for strategy '%s'",
+            len(documents), strategy_name,
+        )
+        return {"corpus_bundle": bundle}
+    except BaseException:
+        _close_partial_resources(*[(f"document {k}", v) for k, v in documents.items()])
+        for lease in read_leases:
+            if lease is not None:
+                lease.close()
+        raise

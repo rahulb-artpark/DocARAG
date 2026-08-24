@@ -74,7 +74,12 @@ class GraphRAG(BaseRAG):
         self.topk_ent = self.cfg.topk_ent
 
         # Enhance graph for PageRank
-        self.graph = self.gbc_index.GraphIndex.kg
+        #
+        # StoredGraphIndex (the store-backed runtime type this always is in
+        # production; only the legacy in-memory Graph ever had `.kg`) has no
+        # `.kg` attribute -- get_full_graph() is the store-backed equivalent,
+        # reading the corpus's whole-document graph instead of one subtree's.
+        self.graph = self.gbc_index.GraphIndex.get_full_graph()
         self.enhanced_graph = enhance_graph_with_semantic_links(
             graph=self.graph, embedder=self.embedder, x_percentile=self.x_percentile
         )
@@ -181,10 +186,9 @@ class GraphRAG(BaseRAG):
             self.enhanced_graph,
             alpha=pagerank_alpha,
             personalization=personalization_vector,
-            weight="weight",  # 可以考虑使用相似度作为边的权重
+            weight="weight",
         )
 
-        # sort the ranked list by score and filter by topk_ent
         res_entities = [(ent, score) for ent, score in pagerank_scores.items()]
         res_entities = sorted(res_entities, key=lambda x: x[1], reverse=True)
         res_entities = res_entities[: self.topk_ent]
@@ -193,24 +197,14 @@ class GraphRAG(BaseRAG):
             f"Graph reranker: Retrieved {len(res_entities)} entities with topk={self.topk_ent}."
         )
 
-        # --- 步骤 3 & 4: 聚合分数到 Tree Node ID 并排序返回 ---
-        # 3.2 初始化一个字典来累加每个 tree_id 的分数
         tree_node_scores = defaultdict(float)
-
-        # 3.3 遍历 PageRank 的结果
         for entity_name, score in pagerank_scores.items():
-            # 从图中获取该实体节点的属性
-            # .get('source_ids', set()) 是一种安全的方式，防止节点没有该属性时出错
             node_attributes = self.graph.nodes.get(entity_name, {})
             source_ids = node_attributes.get("source_ids", set())
-
             for source_id in source_ids:
                 tree_node_scores[source_id] += score
 
-        # 4.1 将聚合后的分数字典转换为 (id, score) 的元组列表
         aggregated_ranked_list = list(tree_node_scores.items())
-
-        # 4.2 按聚合后的分数降序排序
         sorted_ranked_list = sorted(
             aggregated_ranked_list, key=lambda item: item[1], reverse=True
         )

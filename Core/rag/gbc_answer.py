@@ -164,6 +164,7 @@ def _evidence_text(node: Dict[str, Any], content: object) -> str:
         f"Type: {node_type} in Page: {node.get('page', -1)}",
     ]
     for label, field_name in (
+        ("Source document", "document_title"),
         ("Document version", "document_version_id"),
         ("Source SHA-256", "source_sha256"),
         ("Page ID", "page_id"),
@@ -616,12 +617,10 @@ class AnswerAgent:
                     _evidence_prompt_memory(user_prompt, current_chunk_nodes)
                 )
 
-                # 用当前节点开始一个新块
                 current_chunk_str = node_text
                 current_chunk_tokens = node_tokens
                 current_chunk_nodes = [node]
             else:
-                # 将节点内容添加到当前块
                 if not current_chunk_str:
                     current_chunk_str = node_text
                     current_chunk_tokens = node_tokens

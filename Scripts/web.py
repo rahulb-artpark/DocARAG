@@ -42,7 +42,7 @@ os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
 from docarag.cli import _load_project_environment
-from docarag.compat import inspect_run_readiness, run_provenance
+from docarag.compat import RunReadiness, inspect_run_readiness, run_provenance
 from docarag.provenance import query_readiness_stat_key
 from docarag.provenance import sha256_file
 from docarag.run_logging import RunLogInfo, RunLogScope
@@ -1021,6 +1021,15 @@ def bind_server(host, port, handler, attempts=20):
 class AppState:
     def __init__(self, run_dir=None):
         self.run_dir = run_dir
+        # "local" (default): chat against self.run_dir, exactly today's
+        # behavior. "global": chat across every completed document sharing
+        # self.run_dir's tenant/corpus. Local state and history are never
+        # touched by global mode -- see conversations_path below.
+        self.chat_scope = "local"
+        self.global_rag_agent = None
+        self._global_rag_identity_key = None
+        self._global_readiness_cache_key = None
+        self._global_readiness_cache = None
         self.chat_lock = threading.Lock()
         # Separate from chat_lock on purpose: a question holds chat_lock for the
         # whole retrieval, and the sidebar must stay readable and writable while
@@ -1062,6 +1071,9 @@ class AppState:
 
     @property
     def conversations_path(self):
+        if self.chat_scope == "global":
+            tenant_id, corpus_id = self.global_scope_key()
+            return runs_root() / "_global_chat" / f"{tenant_id}__{corpus_id}" / "conversations.json"
         return self.require_run() / "web_chat" / "conversations.json"
 
     @staticmethod
@@ -1273,10 +1285,15 @@ class AppState:
             self._readiness_cache_key = None
             self._readiness_cache = None
             self.run_dir = run_dir
+            # Switching documents can change which corpus "global" means.
+            self._global_readiness_cache_key = None
+            self._global_readiness_cache = None
 
     def chat_readiness(self):
         """Cache readiness until a query-loaded artifact/store identity changes."""
 
+        if self.chat_scope == "global":
+            return self._global_readiness_summary()
         self.require_run()
         key = query_readiness_stat_key(self.run_dir)
         if self._readiness_cache_key != key or self._readiness_cache is None:
@@ -1285,6 +1302,115 @@ class AppState:
             )
             self._readiness_cache_key = key
         return self._readiness_cache
+
+    def set_chat_scope(self, scope):
+        """Toggle between local (this document) and global (every document) chat."""
+
+        if scope not in ("local", "global"):
+            raise ValueError("scope must be 'local' or 'global'")
+        with self.chat_lock:
+            if scope == self.chat_scope:
+                return
+            self.chat_scope = scope
+
+    def global_scope_key(self):
+        """(tenant_id, corpus_id) that 'global' currently spans, from the selected document."""
+
+        self.require_run()
+        manifest = read_json(self.run_dir / "run-manifest.json")
+        return str(manifest.get("tenant_id") or ""), str(manifest.get("corpus_id") or "")
+
+    def global_run_dirs(self):
+        """Every completed run sharing the selected document's tenant/corpus."""
+
+        tenant_id, corpus_id = self.global_scope_key()
+        matches = []
+        for run in find_run_dirs():
+            if not run_completed(run):
+                continue
+            manifest_path = run / "run-manifest.json"
+            if not manifest_path.is_file():
+                continue
+            manifest = read_json(manifest_path)
+            if (
+                str(manifest.get("tenant_id") or "") == tenant_id
+                and str(manifest.get("corpus_id") or "") == corpus_id
+            ):
+                matches.append(run)
+        return sorted(matches)
+
+    def global_readiness(self):
+        """One RunReadiness per document currently in the global scope."""
+
+        return [
+            (run_dir, inspect_run_readiness(run_dir, purpose="ask"))
+            for run_dir in self.global_run_dirs()
+        ]
+
+    def _global_readiness_summary(self):
+        run_dirs = self.global_run_dirs()
+        key = tuple(str(p) for p in run_dirs)
+        if self._global_readiness_cache_key == key and self._global_readiness_cache is not None:
+            return self._global_readiness_cache
+        if not run_dirs:
+            summary = RunReadiness(
+                ready=False, purpose="ask", source="global",
+                missing=("No other completed documents share this document's corpus",),
+            )
+        else:
+            per_run = [inspect_run_readiness(run_dir, purpose="ask") for run_dir in run_dirs]
+            not_ready = [str(run_dirs[i]) for i, r in enumerate(per_run) if not r.ready]
+            summary = RunReadiness(
+                ready=not not_ready, purpose="ask", source="global",
+                missing=tuple(f"{path} is not ready" for path in not_ready),
+            )
+        self._global_readiness_cache = summary
+        self._global_readiness_cache_key = key
+        return summary
+
+    def ensure_global_rag(self):
+        """Build (or reuse) the multi-document RAG agent for the current global scope."""
+
+        readiness = self._global_readiness_summary()
+        if not readiness.ready:
+            raise RunNotReadyError(
+                "Global chat is not ready: " + ", ".join(readiness.missing)
+            )
+        run_dirs = self.global_run_dirs()
+        identity_key = tuple(str(p) for p in run_dirs)
+        if self.global_rag_agent is not None and self._global_rag_identity_key == identity_key:
+            return self.global_rag_agent
+        if self.global_rag_agent is not None:
+            close = getattr(self.global_rag_agent, "close", None)
+            if callable(close):
+                close()
+            self.global_rag_agent = None
+
+        from Core.configs.system_config import load_system_config
+        from Core.rag import create_rag_agent
+        from Core.utils.resource_loader import prepare_corpus_rag_dependencies
+
+        document_configs = []
+        for run_dir in run_dirs:
+            run_config = run_dir / "run_config.yaml"
+            cfg = load_system_config(str(run_config if run_config.is_file() else DEFAULT_CONFIG))
+            cfg.save_path = str(run_dir)
+            refresh_answer_time_budgets(cfg)
+            attestation_dir = find_retrieval_artifact_dir(run_dir)
+            if attestation_dir is not None:
+                cfg.vdb.manifest_dir_name = str(attestation_dir)
+            document_configs.append(cfg)
+
+        dependencies = prepare_corpus_rag_dependencies(document_configs)
+        base_cfg = document_configs[0]
+        self.global_rag_agent = create_rag_agent(
+            strategy_config=base_cfg.rag.strategy_config,
+            llm_config=base_cfg.llm,
+            vlm_config=base_cfg.vlm,
+            **dependencies,
+        )
+        self._global_rag_identity_key = identity_key
+        return self.global_rag_agent
 
     @property
     def doc_name(self):
@@ -1455,6 +1581,8 @@ class AppState:
         return payload
 
     def ensure_rag(self):
+        if self.chat_scope == "global":
+            return self.ensure_global_rag()
         readiness = self.chat_readiness()
         if not readiness.ready:
             raise RunNotReadyError(
@@ -1504,11 +1632,19 @@ class AppState:
         self._rag_identity_key = current_identity
         return self.rag_agent
 
+    def _chat_query_root(self):
+        """Where this scope's retrieval traces live -- never a local document's own folder for global queries."""
+
+        if self.chat_scope == "global":
+            tenant_id, corpus_id = self.global_scope_key()
+            return runs_root() / "_global_chat" / f"{tenant_id}__{corpus_id}" / "web_chat"
+        return self.require_run() / "web_chat"
+
     def ask(self, question):
         with self.chat_lock:
             started = time.monotonic()
             query_id = f"q_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-            query_root = self.run_dir / "web_chat"
+            query_root = self._chat_query_root()
             query_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             query_root.chmod(0o700)
             q_dir = query_root / query_id
@@ -1817,6 +1953,12 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/library":
             runs = find_run_dirs()
             history = _stage_history(runs)
+            global_document_count = None
+            if self.state.chat_scope == "global" and self.state.run_dir is not None:
+                try:
+                    global_document_count = len(self.state.global_run_dirs())
+                except RunNotReadyError:
+                    global_document_count = 0
             self.send_json(
                 {
                     "current": (
@@ -1824,6 +1966,8 @@ class Handler(SimpleHTTPRequestHandler):
                         if self.state.run_dir is None
                         else str(self.state.run_dir)
                     ),
+                    "chatScope": self.state.chat_scope,
+                    "globalDocumentCount": global_document_count,
                     "stageHistory": history,
                     "runs": [run_summary(item, history) for item in runs],
                 }
@@ -1983,6 +2127,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/edit-content":
             self.edit_content()
+            return
+        if parsed.path == "/api/chat-scope":
+            self.set_chat_scope()
             return
         if parsed.path == "/api/run-tag":
             self.set_run_tag()
@@ -2248,6 +2395,37 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return False
         return True
+
+    def set_chat_scope(self):
+        """Toggle chat between this document (local) and its whole corpus (global)."""
+
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        scope = payload.get("scope")
+        if scope not in ("local", "global"):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "scope must be 'local' or 'global'")
+            return
+        try:
+            self.state.set_chat_scope(scope)
+            response = {"ok": True, "scope": scope}
+            if scope == "global":
+                try:
+                    run_dirs = self.state.global_run_dirs()
+                    response["documentCount"] = len(run_dirs)
+                except RunNotReadyError as exc:
+                    self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
+                    return
+            self.send_json(response)
+        except RunNotReadyError as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
+        except Exception as exc:
+            traceback.print_exc()
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not change chat scope", str(exc)
+            )
 
     def set_run_tag(self):
         """Label one document in the library, or clear its label."""

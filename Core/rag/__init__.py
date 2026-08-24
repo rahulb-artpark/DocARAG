@@ -43,6 +43,8 @@ def _validate_strategy_dependencies(
             raise ValueError("TraverseAgent requires a 'tree_index' in dependencies.")
         return True
     if isinstance(strategy_config, GBCRAGConfig):
+        if dependencies.get("corpus_bundle") is not None:
+            return True
         missing = [
             name
             for name in ("gbc_index", "tree_vdb")
@@ -184,9 +186,18 @@ def _create_rag_agent_from_clients(
             tree_index=tree_index,
         )
     elif isinstance(strategy_config, GBCRAGConfig):
+        assert vlm_client is not None
+        corpus_bundle = dependencies.get("corpus_bundle")
+        if corpus_bundle is not None:
+            return GBCRAG.from_corpus_bundle(
+                llm=llm_client,
+                vlm=vlm_client,
+                config=strategy_config,
+                corpus_bundle=corpus_bundle,
+                asset_cas_root=dependencies.get("asset_cas_root"),
+            )
         gbc_index = dependencies.get("gbc_index")
         tree_vdb = dependencies.get("tree_vdb")
-        assert vlm_client is not None
         return GBCRAG(
             llm=llm_client,
             vlm=vlm_client,

@@ -156,6 +156,15 @@
           <section class="chatShell" id="chatShell">
             <div class="messages" id="messages"></div>
             <div class="chatToolbar">
+              <div class="scopeGroup">
+                <div class="scopeToggle" id="scopeToggle" role="group" aria-label="Chat scope">
+                  <button type="button" class="scopeBtn active" id="scopeLocalBtn" data-scope="local"
+                          aria-pressed="true" title="Answer using only the open document">This document</button>
+                  <button type="button" class="scopeBtn" id="scopeGlobalBtn" data-scope="global"
+                          aria-pressed="false" title="Answer using every indexed document in this corpus">All documents</button>
+                </div>
+                <span class="scopeHint" id="scopeHint"></span>
+              </div>
               <label class="citeToggle" for="citeToggle" title="Show or hide the [E1] markers inside answers">
                 <input type="checkbox" id="citeToggle" checked />
                 <span>Inline references</span>

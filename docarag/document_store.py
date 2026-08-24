@@ -80,7 +80,7 @@ class DocumentStore:
         self.run_dir = run_dir
         self._connection = connection
         self._closed = False
-        self.tree = TreeStore(self._borrow, revision_key)
+        self.tree = TreeStore(self._borrow, revision_key, scope.document_version_id)
 
     @classmethod
     def open(
@@ -150,6 +150,11 @@ class DocumentStore:
         if self._closed:
             raise DocumentStoreError("document store is closed")
         return self._connection
+
+    def connect(self) -> Any:
+        """The store's own connection, for a corpus-scoped reader sharing it."""
+
+        return self._borrow()
 
     def close(self) -> None:
         if self._closed:

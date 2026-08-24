@@ -58,7 +58,7 @@ def _health(port: int) -> dict | None:
         return None
 
 
-def start(port: int, run_dir: str | None) -> int:
+def start(port: int, run_dir: str | None, foreground: bool = False) -> int:
     if _running_pid() is not None:
         payload = json.loads(_pid_file().read_text(encoding="utf-8"))
         print(f"web UI already running: http://127.0.0.1:{payload['port']}")
@@ -77,6 +77,12 @@ def start(port: int, run_dir: str | None) -> int:
     command = [sys.executable, str(repo / "Scripts" / "web.py"), "--port", str(port)]
     if run_dir:
         command.insert(2, run_dir)
+    if foreground:
+        # No pidfile, no log redirection, no new session: the child shares
+        # this terminal's process group, so Ctrl+C stops it like any other
+        # foreground program. `docarag web status`/`stop` cannot see it.
+        print(f"web UI starting in the foreground: http://127.0.0.1:{port}")
+        return subprocess.call(command, cwd=str(repo))
     log = open(_log_file(), "ab")
     process = subprocess.Popen(
         command,
@@ -145,14 +151,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=("start", "stop", "status", "restart"))
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--run", help="run directory to serve initially")
+    parser.add_argument("-f", "--foreground", action="store_true")
     args = parser.parse_args(argv)
     if args.action == "start":
-        return start(args.port, args.run)
+        return start(args.port, args.run, foreground=args.foreground)
     if args.action == "stop":
         return stop()
     if args.action == "restart":
         stop()
-        return start(args.port, args.run)
+        return start(args.port, args.run, foreground=args.foreground)
     return status()
 
 

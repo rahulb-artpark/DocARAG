@@ -90,8 +90,23 @@ class HybridRetrievalBinding:
     dense_index_revision_id: str
 
 
+@dataclass(frozen=True)
+class CorpusRetrievalBinding:
+    """One HybridRetrievalBinding per document, all sharing one corpus scope."""
+
+    tenant_id: str
+    corpus_id: str
+    documents: Dict[str, HybridRetrievalBinding]
+
+
 class _CandidateContractUnavailable(ValueError):
     """A legacy tree node lacks the identity required by the v1 contract."""
+
+
+def _composite_tree_node_id(node: TreeNode) -> str:
+    """Globally unique across documents; a bare index_id is only unique within one."""
+
+    return f"{node.document_version_id}:{node.index_id}"
 
 
 class Retriever:
@@ -109,7 +124,7 @@ class Retriever:
         topk_min: int = 3,
         candidate_pool_size: int = 512,
         tree_vdb: Any | None = None,
-        retrieval_binding: HybridRetrievalBinding | None = None,
+        retrieval_binding: HybridRetrievalBinding | CorpusRetrievalBinding | None = None,
     ):
         if isinstance(topk, bool) or not isinstance(topk, int) or topk < 1:
             raise ValueError("topk must be a positive integer")
@@ -465,6 +480,12 @@ class Retriever:
             return int(value)
         return None
 
+    @staticmethod
+    def _document_version_id_from_hit(hit: Mapping[str, Any]) -> str:
+        metadata = hit.get("metadata")
+        value = metadata.get("document_version_id") if isinstance(metadata, Mapping) else None
+        return value if isinstance(value, str) else ""
+
     def _vector_candidates(
         self,
         subtree_nodes: List[TreeNode],
@@ -483,7 +504,7 @@ class Retriever:
 
         if self.tree_vdb is None or not subtree_nodes:
             return {}
-        allowed = {node.index_id: node for node in subtree_nodes}
+        allowed = {(node.document_version_id, node.index_id): node for node in subtree_nodes}
         # Search a bounded oversample because the source-scoped Qdrant index is
         # document-wide while section selection may authorize one subtree.
         search_limit = min(
@@ -518,13 +539,16 @@ class Retriever:
     def _bounded_subtree_rows(
         self,
         rows: Iterable[Mapping[str, Any]],
-        allowed: Mapping[int, TreeNode],
+        allowed: Mapping[tuple[str, int], TreeNode],
     ) -> List[Tuple[TreeNode, Mapping[str, Any]]]:
         candidates: list[tuple[TreeNode, Mapping[str, Any]]] = []
         for row in rows:
             if not isinstance(row, Mapping):
                 raise ValueError("TreeVDB search must return mapping records")
-            node = allowed.get(self._node_id_from_hit(row))
+            node_id = self._node_id_from_hit(row)
+            if node_id is None:
+                continue
+            node = allowed.get((self._document_version_id_from_hit(row), node_id))
             if node is None:
                 continue
             candidates.append((node, row))
@@ -604,6 +628,21 @@ class Retriever:
             result.append(value)
         return tuple(result)
 
+    def _binding_for_node(self, node: TreeNode) -> HybridRetrievalBinding:
+        """This node's own document binding, whether bound single- or corpus-scoped."""
+
+        binding = self.retrieval_binding
+        if binding is None:
+            raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        if isinstance(binding, CorpusRetrievalBinding):
+            resolved = binding.documents.get(node.document_version_id)
+            if resolved is None:
+                raise _CandidateContractUnavailable(
+                    f"no retrieval binding for document {node.document_version_id!r}"
+                )
+            return resolved
+        return binding
+
     def _candidate_hit(
         self,
         *,
@@ -611,7 +650,6 @@ class Retriever:
         rank: int,
         backend_id: str,
         leg_kind: str,
-        index_revision_id: str,
         raw_score: float,
         payload: object,
         hit_id: str,
@@ -620,9 +658,10 @@ class Retriever:
     ):
         from docarag.retrieval_candidates import CandidateHit
 
-        binding = self.retrieval_binding
-        if binding is None:
-            raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        binding = self._binding_for_node(node)
+        index_revision_id = (
+            binding.tree_revision_id if leg_kind == "bm25" else binding.dense_index_revision_id
+        )
         meta = node.meta_info
         direct_block = getattr(meta, "canonical_block_id", None)
         direct_revision = getattr(meta, "canonical_revision_id", None)
@@ -678,7 +717,7 @@ class Retriever:
             source_sha256=binding.source_sha256,
             canonical_artifact_sha256=binding.canonical_artifact_sha256,
             tree_revision_id=binding.tree_revision_id,
-            tree_node_id=str(node.index_id),
+            tree_node_id=_composite_tree_node_id(node),
             modality=modality,
             backend_id=backend_id,
             leg_kind=leg_kind,
@@ -696,6 +735,66 @@ class Retriever:
             **evidence,
         )
 
+    def _representative_index_revision_id(self, *, dense: bool) -> str:
+        """One leg-level identity for 'what index was queried' this call.
+
+        A single document's binding already has one value. A corpus binding
+        joins every bound document's own value deterministically, since a
+        leg describes the whole scope queried, not one hit's document.
+        """
+
+        binding = self.retrieval_binding
+        if binding is None:
+            raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        if isinstance(binding, CorpusRetrievalBinding):
+            values = sorted(
+                (b.dense_index_revision_id if dense else b.tree_revision_id)
+                for b in binding.documents.values()
+            )
+            return "corpus:" + ",".join(values)
+        return binding.dense_index_revision_id if dense else binding.tree_revision_id
+
+    def _document_bindings_for_hits(self, all_hits: list) -> tuple:
+        """One DocumentEvidenceBinding per document actually touched by these hits."""
+
+        from docarag.retrieval_candidates import DocumentEvidenceBinding
+
+        binding = self.retrieval_binding
+        by_doc: Dict[str, list] = {}
+        for hit in all_hits:
+            by_doc.setdefault(hit.document_version_id, []).append(hit)
+
+        bindings = []
+        for document_version_id in sorted(by_doc):
+            hits = by_doc[document_version_id]
+            if isinstance(binding, CorpusRetrievalBinding):
+                doc_binding = binding.documents.get(document_version_id)
+                if doc_binding is None:
+                    raise _CandidateContractUnavailable(
+                        f"no retrieval binding for document {document_version_id!r}"
+                    )
+            else:
+                doc_binding = binding
+            bindings.append(
+                DocumentEvidenceBinding(
+                    document_id=doc_binding.document_id,
+                    document_version_id=doc_binding.document_version_id,
+                    source_sha256=doc_binding.source_sha256,
+                    canonical_artifact_sha256=doc_binding.canonical_artifact_sha256,
+                    tree_revision_id=doc_binding.tree_revision_id,
+                    canonical_revision_ids=tuple(
+                        sorted({v for hit in hits for v in hit.canonical_revision_ids})
+                    ),
+                    canonical_representation_ids=tuple(
+                        sorted({v for hit in hits for v in hit.canonical_representation_ids})
+                    ),
+                    canonical_asset_ids=tuple(
+                        sorted({v for hit in hits for v in hit.canonical_asset_ids})
+                    ),
+                )
+            )
+        return tuple(bindings)
+
     def _contract_fusion(
         self,
         *,
@@ -710,7 +809,6 @@ class Retriever:
         from docarag.retrieval_candidates import (
             CandidateLeg,
             CandidateQueryScope,
-            DocumentEvidenceBinding,
             FusionBounds,
             PlannedRetrievalLeg,
             fuse_candidates,
@@ -719,9 +817,13 @@ class Retriever:
         binding = self.retrieval_binding
         if binding is None:
             raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        tenant_id = binding.tenant_id
+        corpus_id = binding.corpus_id
+        dense_index_revision_id = self._representative_index_revision_id(dense=True)
+        tree_index_revision_id = self._representative_index_revision_id(dense=False)
         filter_digest = hashlib.sha256()
         for node in subtree_nodes:
-            filter_digest.update(str(node.index_id).encode("ascii"))
+            filter_digest.update(_composite_tree_node_id(node).encode("utf-8"))
             filter_digest.update(b"\0")
         filter_identity = f"subtree-{filter_digest.hexdigest()}"
         policy_identity = "bookrag-hybrid-qdrant-bm25-v1"
@@ -740,7 +842,7 @@ class Retriever:
         )
         bm25_backend = "bookrag-tree-bm25"
         bm25_leg_config = self._sha256_json(
-            {"backend": bm25_backend, "tree": binding.tree_revision_id}
+            {"backend": bm25_backend, "tree": tree_index_revision_id}
         )
 
         vector_hits: dict[str, list] = {}
@@ -760,7 +862,6 @@ class Retriever:
                         rank=rank,
                         backend_id=backend_id,
                         leg_kind=leg_kind,
-                        index_revision_id=binding.dense_index_revision_id,
                         raw_score=1.0 - float(distance),
                         payload=row,
                         # The row id already ends in the vector name, so hits
@@ -777,10 +878,13 @@ class Retriever:
                 rank=rank,
                 backend_id=bm25_backend,
                 leg_kind="bm25",
-                index_revision_id=binding.tree_revision_id,
                 raw_score=score,
-                payload={"node_id": node.index_id, "score": score},
-                hit_id=f"bm25-{node.index_id}-{self._sha256_json(score)[:16]}",
+                payload={
+                    "node_id": node.index_id,
+                    "document_version_id": node.document_version_id,
+                    "score": score,
+                },
+                hit_id=f"bm25-{_composite_tree_node_id(node)}-{self._sha256_json(score)[:16]}",
                 filter_identity=filter_identity,
                 policy_identity=policy_identity,
             )
@@ -789,31 +893,7 @@ class Retriever:
 
         all_hits = [hit for hits in vector_hits.values() for hit in hits]
         all_hits.extend(bm25_hits)
-        revision_ids = tuple(
-            sorted({value for hit in all_hits for value in hit.canonical_revision_ids})
-        )
-        representation_ids = tuple(
-            sorted(
-                {
-                    value
-                    for hit in all_hits
-                    for value in hit.canonical_representation_ids
-                }
-            )
-        )
-        asset_ids = tuple(
-            sorted({value for hit in all_hits for value in hit.canonical_asset_ids})
-        )
-        document_binding = DocumentEvidenceBinding(
-            document_id=binding.document_id,
-            document_version_id=binding.document_version_id,
-            source_sha256=binding.source_sha256,
-            canonical_artifact_sha256=binding.canonical_artifact_sha256,
-            tree_revision_id=binding.tree_revision_id,
-            canonical_revision_ids=revision_ids,
-            canonical_representation_ids=representation_ids,
-            canonical_asset_ids=asset_ids,
-        )
+        document_bindings = self._document_bindings_for_hits(all_hits)
         vector_legs = []
         for vector_name in sorted(vector_hits):
             leg_id, leg_kind, backend_id = self._leg_identity(vector_name)
@@ -826,7 +906,7 @@ class Retriever:
                     self._sha256_json(
                         {
                             "backend": backend_id,
-                            "index": binding.dense_index_revision_id,
+                            "index": dense_index_revision_id,
                             "vector": vector_name,
                         }
                     ),
@@ -838,7 +918,7 @@ class Retriever:
                 leg_id=leg_id,
                 leg_kind=leg_kind,
                 backend_id=backend_id,
-                index_revision_id=binding.dense_index_revision_id,
+                index_revision_id=dense_index_revision_id,
                 leg_config_sha256=leg_config,
                 max_hits=self.candidate_pool_size,
                 budget_ms=30_000,
@@ -850,7 +930,7 @@ class Retriever:
                     leg_id="bm25-tree",
                     leg_kind="bm25",
                     backend_id=bm25_backend,
-                    index_revision_id=binding.tree_revision_id,
+                    index_revision_id=tree_index_revision_id,
                     leg_config_sha256=bm25_leg_config,
                     max_hits=self.candidate_pool_size,
                     budget_ms=30_000,
@@ -860,20 +940,20 @@ class Retriever:
             else ()
         )
         scope = CandidateQueryScope(
-            tenant_id=binding.tenant_id,
-            corpus_id=binding.corpus_id,
+            tenant_id=tenant_id,
+            corpus_id=corpus_id,
             filter_identity=filter_identity,
             policy_identity=policy_identity,
             query_sha256=query_sha256,
             retrieval_config_sha256=retrieval_config_sha256,
-            document_bindings=(document_binding,),
+            document_bindings=document_bindings,
             planned_legs=plans,
             ready_index_revisions={
                 **{
-                    backend_id: binding.dense_index_revision_id
+                    backend_id: dense_index_revision_id
                     for _n, _i, _k, backend_id, _c in vector_legs
                 },
-                **({bm25_backend: binding.tree_revision_id} if include_bm25 else {}),
+                **({bm25_backend: tree_index_revision_id} if include_bm25 else {}),
             },
         )
         legs = tuple(
@@ -881,7 +961,7 @@ class Retriever:
                 leg_id=leg_id,
                 leg_kind=leg_kind,
                 backend_id=backend_id,
-                index_revision_id=binding.dense_index_revision_id,
+                index_revision_id=dense_index_revision_id,
                 query_sha256=query_sha256,
                 retrieval_config_sha256=retrieval_config_sha256,
                 leg_config_sha256=leg_config,
@@ -902,7 +982,7 @@ class Retriever:
                     leg_id="bm25-tree",
                     leg_kind="bm25",
                     backend_id=bm25_backend,
-                    index_revision_id=binding.tree_revision_id,
+                    index_revision_id=tree_index_revision_id,
                     query_sha256=query_sha256,
                     retrieval_config_sha256=retrieval_config_sha256,
                     leg_config_sha256=bm25_leg_config,
@@ -920,15 +1000,18 @@ class Retriever:
         )
         result = fuse_candidates(legs, scope=scope, bounds=bounds, rrf_k=60)
         self.last_fusion_result = result
-        by_id = {str(node.index_id): node for node in subtree_nodes}
+        by_id = {_composite_tree_node_id(node): node for node in subtree_nodes}
         selected: list[TreeNode] = []
-        seen: set[int] = set()
+        seen: set[tuple[str, int]] = set()
         for candidate in result.candidates:
             for node_id in candidate.tree_node_ids:
                 node = by_id.get(node_id)
-                if node is None or node.index_id in seen:
+                if node is None:
                     continue
-                seen.add(node.index_id)
+                key = (node.document_version_id, node.index_id)
+                if key in seen:
+                    continue
+                seen.add(key)
                 selected.append(node)
                 if len(selected) == self.candidate_pool_size:
                     return selected
@@ -939,20 +1022,26 @@ class Retriever:
         dense_candidates: List[Tuple[TreeNode, Mapping[str, Any]]],
         bm25_candidates: List[Tuple[TreeNode, float]],
     ) -> List[TreeNode]:
-        """Compatibility RRF for historical trees without canonical identity."""
+        """RRF for trees without canonical identity.
 
-        scores: dict[int, float] = {}
-        nodes: dict[int, TreeNode] = {}
+        The store-backed NodeMeta never carries canonical_block_id/
+        derived_evidence_id, so _candidate_hit always raises and
+        _contract_fusion never succeeds at real query time -- this is the
+        path every live query actually takes today, not a rare fallback.
+        Composite keys here are load-bearing, not defensive.
+        """
+
+        scores: dict[tuple[str, int], float] = {}
+        nodes: dict[tuple[str, int], TreeNode] = {}
         for candidates in (dense_candidates, bm25_candidates):
-            seen_leg: set[int] = set()
+            seen_leg: set[tuple[str, int]] = set()
             for rank, (node, _raw) in enumerate(candidates, start=1):
-                if node.index_id in seen_leg:
+                key = (node.document_version_id, node.index_id)
+                if key in seen_leg:
                     continue
-                seen_leg.add(node.index_id)
-                nodes[node.index_id] = node
-                scores[node.index_id] = scores.get(node.index_id, 0.0) + 1.0 / (
-                    60 + rank
-                )
+                seen_leg.add(key)
+                nodes[key] = node
+                scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
         ranked_ids = sorted(scores, key=lambda node_id: (-scores[node_id], node_id))
         return [nodes[node_id] for node_id in ranked_ids[: self.candidate_pool_size]]
 
@@ -1097,11 +1186,11 @@ class Retriever:
 
     def _confidence_filtered(
         self,
-        ranked: List[Tuple[int, float]],
+        ranked: List[Tuple[Tuple[str, int], float]],
         *,
         limit: int | None = None,
         min_k: int | None = None,
-    ) -> List[Tuple[int, float]]:
+    ) -> List[Tuple[Tuple[str, int], float]]:
         """Keep the highest-scoring candidates, but stop at a real drop-off.
 
         ``limit`` (default ``self.topk``) is an upper bound, not a quota:
@@ -1132,7 +1221,7 @@ class Retriever:
         subtree_nodes: List[TreeNode],
         query: str,
         requested_node_types: Sequence[str] = (),
-    ) -> List[Tuple[int, float]]:
+    ) -> List[Tuple[Tuple[str, int], float]]:
         """
         Rerank the original text in the subtree based on their relevance to the query.
         Use Reranker model
@@ -1158,7 +1247,7 @@ class Retriever:
         # long pixel description can no longer push the sentence naming the
         # subject out of the window.
         doc_text: list[str] = []
-        owners: list[int] = []
+        owners: list[tuple[str, int]] = []
         for node in candidates:
             for _kind, text in self._node_rerank_views(node):
                 if not text:
@@ -1169,7 +1258,7 @@ class Retriever:
                     )
                     text = text[0]  # use the first chunk
                 doc_text.append(text)
-                owners.append(node.index_id)
+                owners.append((node.document_version_id, node.index_id))
         if not doc_text:
             return []
 
@@ -1208,7 +1297,7 @@ class Retriever:
         # A node scores as well as its best reading: a question resembles one
         # reading or the other, never their concatenation. Max rather than mean,
         # because averaging reintroduces exactly the dilution this splits apart.
-        best: dict[int, float] = {}
+        best: dict[tuple[str, int], float] = {}
         for node_id, score in zip(owners, validated_scores):
             if score > best.get(node_id, float("-inf")):
                 best[node_id] = score
@@ -1219,7 +1308,7 @@ class Retriever:
 
     # def multimodal_reranker(
     #     self, subtree_nodes: List[TreeNode], query: str
-    # ) -> List[Tuple[int, float]]:
+    # ) -> List[Tuple[Tuple[str, int], float]]:
     #     doc_mm = []
     #     tree_ids = [node.index_id for node in subtree_nodes]
     #     for node in subtree_nodes:
@@ -1245,7 +1334,7 @@ class Retriever:
         subgraph: nx.Graph,
         ent_map: Dict[str, List[str]],
         subtree_nodes: List[TreeNode],
-    ) -> Tuple[List[Tuple[int, float]], List[str]]:
+    ) -> Tuple[List[Tuple[Tuple[str, int], float]], List[str]]:
         ents_sim = {}
         with self.timings.time("entity_similarity"):
             for q_ent_name, gbc_ents in ent_map.items():
@@ -1268,7 +1357,6 @@ class Retriever:
             return [], []
 
         pagerank_alpha: float = self.alpha
-        # --- 步骤 1 & 2: 增强图并计算 PageRank 分数 ---
         with self.timings.time("semantic_links"):
             enhanced_graph = enhance_graph_with_semantic_links(
                 graph=subgraph, embedder=self.embedder, x_percentile=self.x_percentile
@@ -1279,10 +1367,9 @@ class Retriever:
                 enhanced_graph,
                 alpha=pagerank_alpha,
                 personalization=personalization_vector,
-                weight="weight",  # 可以考虑使用相似度作为边的权重
+                weight="weight",
             )
 
-        # sort the ranked list by score and filter by topk_ent
         res_entities = [(ent, score) for ent, score in pagerank_scores.items()]
         res_entities = sorted(res_entities, key=lambda item: (-item[1], item[0]))
         res_entities = res_entities[: self.topk_ent]
@@ -1291,38 +1378,26 @@ class Retriever:
             f"Graph reranker: Retrieved {len(res_entities)} entities with topk={self.topk_ent}."
         )
 
-        # --- 步骤 3 & 4: 聚合分数到 Tree Node ID 并排序返回 ---
-        # 3.1 创建一个目标 tree_id 的集合，用于快速查找
-        target_tree_ids = {node.index_id for node in subtree_nodes}
-        # 3.2 Only create candidates backed by at least one source-linked entity.
+        target_tree_ids = {(node.document_version_id, node.index_id) for node in subtree_nodes}
+        # Only create candidates backed by at least one source-linked entity.
         # Text fusion can still introduce graphless candidates in standard mode;
         # graph-only mode must not return arbitrary zero-score tree nodes.
         tree_node_scores = {}
 
-        # 3.3 遍历 PageRank 的结果
         for entity_name, score in pagerank_scores.items():
-            # 从图中获取该实体节点的属性
-            # .get('source_ids', set()) 是一种安全的方式，防止节点没有该属性时出错
             node_attributes = subgraph.nodes.get(entity_name, {})
             source_ids = node_attributes.get("source_ids", set())
-
-            # 遍历该实体的所有 source_id
             for source_id in source_ids:
-                # 如果这个 source_id 是我们关心的目标 tree_id
                 if source_id in target_tree_ids:
-                    # 将该实体的 PageRank 分数累加到对应的 tree_node_scores 中
                     tree_node_scores[source_id] = (
                         tree_node_scores.get(source_id, 0.0) + score
                     )
 
-        # 4.1 将聚合后的分数字典转换为 (id, score) 的元组列表
         aggregated_ranked_list = [
             (tree_id, score)
             for tree_id, score in tree_node_scores.items()
             if score > 0
         ]
-
-        # 4.2 按聚合后的分数降序排序
         sorted_ranked_list = sorted(
             aggregated_ranked_list, key=lambda item: (-item[1], item[0])
         )
@@ -1336,7 +1411,7 @@ class Retriever:
         subgraph: nx.Graph,
         start_ent_map: Dict[str, List[str]],
         requested_node_types: Sequence[str] = (),
-    ) -> Tuple[List[int], List[str]]:
+    ) -> Tuple[List[Tuple[str, int]], List[str]]:
         if len(subtree_nodes) == 0:
             log.info("No subtree nodes available for reranking.")
             return [], []
@@ -1439,16 +1514,16 @@ class Retriever:
 
     @staticmethod
     def _fill_to_limit(
-        selected_ids: List[int],
-        *ranked_results: Iterable[Tuple[int, float]],
+        selected_ids: List[Tuple[str, int]],
+        *ranked_results: Iterable[Tuple[Tuple[str, int], float]],
         limit: int,
-    ) -> List[int]:
+    ) -> List[Tuple[str, int]]:
         """Deterministically fill a skyline without ever exceeding ``limit``."""
 
         result = []
         seen = set()
 
-        def add(node_id: int) -> bool:
+        def add(node_id: Tuple[str, int]) -> bool:
             if node_id in seen:
                 return False
             seen.add(node_id)

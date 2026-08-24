@@ -471,6 +471,12 @@ def entity_vector_scope(
     )
 
 
+def corpus_entity_vector_scope(vdb_cfg: VDBConfig) -> dict[str, str]:
+    """Read-only entity scope spanning every document in the corpus."""
+
+    return {**_validated_tenant_scope(vdb_cfg), "index_kind": "entity"}
+
+
 def _qdrant_state(
     vdb_cfg: VDBConfig,
     scope_filter: dict[str, str],
@@ -2424,9 +2430,8 @@ def compute_mm_embedding(cfg: SystemConfig, tree_index: DocumentTree):
             all_node_data[original_node_data_idx]["embedding_idx"] = embedding_idx
     embedder.clear_cache()
 
-    # --- 保存所有节点元数据到JSON文件 ---
     save_dir = cfg.save_path
-    os.makedirs(save_dir, exist_ok=True)  # 确保保存路径存在
+    os.makedirs(save_dir, exist_ok=True)
     metadata_filepath = os.path.join(save_dir, "mm_node_metadata.json")
     embeddings_filepath = os.path.join(save_dir, "mm_embeddings.npy")
 

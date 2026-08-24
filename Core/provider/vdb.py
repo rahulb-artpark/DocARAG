@@ -153,6 +153,45 @@ def _identity_scalar(value: Any) -> Any:
     return str(value)
 
 
+def _scope_filter_values(scope_filter: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """Validate a VectorStore's own scope, unlike the per-call metadata_filter
+    contract: a field may be one scalar (MatchValue) or a non-empty list of
+    scalars (MatchAny), for a scope spanning more than one document.
+    """
+
+    if scope_filter is not None and not isinstance(scope_filter, Mapping):
+        raise TypeError("scope_filter must be a mapping")
+    combined: dict[str, Any] = {}
+    if scope_filter:
+        for key, value in scope_filter.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("scope_filter keys must be non-empty strings")
+            if key in _RESERVED_PAYLOAD_KEYS:
+                raise ValueError(f"scope_filter may not use reserved key {key!r}")
+            if isinstance(value, (list, tuple, set)):
+                if not value:
+                    raise ValueError(f"scope_filter field {key!r} may not be an empty list")
+                normalized_values = []
+                for item in value:
+                    if not isinstance(item, (Enum, str, int, float, bool)):
+                        raise TypeError(
+                            "scope_filter list values must be exact-match scalars"
+                        )
+                    normalized_item = _identity_scalar(item)
+                    if normalized_item is None:
+                        raise ValueError("scope_filter values may not be null")
+                    normalized_values.append(normalized_item)
+                combined[key] = tuple(dict.fromkeys(normalized_values))
+                continue
+            if not isinstance(value, (Enum, str, int, float, bool)):
+                raise TypeError("scope_filter values must be exact-match scalar values")
+            normalized = _identity_scalar(value)
+            if normalized is None:
+                raise ValueError("scope_filter values may not be null")
+            combined[key] = normalized
+    return combined or None
+
+
 def _canonical_sha256(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         payload,
@@ -677,7 +716,7 @@ class VectorStore:
             else qdrant_url
         )
         qdrant_url = _validate_qdrant_url(effective_qdrant_url)
-        normalized_scope = _metadata_filter(scope_filter, None)
+        normalized_scope = _scope_filter_values(scope_filter)
         if normalized_scope is None:
             normalized_scope = {}
         if normalized_scope:
@@ -969,14 +1008,31 @@ class VectorStore:
         combined = dict(self.scope_filter)
         for key, value in supplied.items():
             existing = combined.get(key)
-            if existing is not None and existing != value:
+            if existing is None:
+                combined[key] = value
+                continue
+            if isinstance(existing, tuple):
+                if value not in existing:
+                    raise ValueError(
+                        f"metadata filter field {key!r} conflicts with vector-store scope"
+                    )
+                # keep the scope's own (wider) list -- value already verified a member
+                continue
+            if existing != value:
                 raise ValueError(
                     f"metadata filter field {key!r} conflicts with vector-store scope"
                 )
             combined[key] = value
         conditions: list[Any] = []
         for key, value in sorted(combined.items()):
-            if isinstance(value, float):
+            if isinstance(value, tuple):
+                conditions.append(
+                    self._models.FieldCondition(
+                        key=key,
+                        match=self._models.MatchAny(any=list(value)),
+                    )
+                )
+            elif isinstance(value, float):
                 conditions.append(
                     self._models.FieldCondition(
                         key=key,
@@ -997,6 +1053,14 @@ class VectorStore:
     def _apply_scope(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
         scoped = dict(metadata)
         for key, value in self.scope_filter.items():
+            if isinstance(value, tuple):
+                # A multi-document (MatchAny) scope reads across documents;
+                # a written point belongs to exactly one, so writing through
+                # it would tag the point with an ambiguous scope.
+                raise ValueError(
+                    f"cannot write through a multi-value scope field {key!r}; "
+                    "open a single-document-scoped VectorStore for writes"
+                )
             supplied = scoped.get(key)
             if supplied is not None and supplied != value:
                 raise ValueError(
@@ -1018,6 +1082,11 @@ class VectorStore:
         """Delete this source scope; reject unscoped collection deletion by default."""
 
         self._require_open()
+        if any(isinstance(value, tuple) for value in self.scope_filter.values()):
+            raise RuntimeError(
+                "cannot reset through a multi-value (MatchAny) scope -- it "
+                "would delete every document the scope spans, not one"
+            )
         if not self._collection_exists():
             return
         if self.scope_filter:
@@ -1812,7 +1881,8 @@ class VectorStore:
             )
         if not self.embedding_model.MM_EMBEDDER:
             raise ValueError(
-                "当前embedding_model不是多模态模型，无法添加图片。请使用支持图片向量化的模型。"
+                "embedding_model is not multimodal; images require a model "
+                "that supports image vectorization"
             )
         source_metadatas = (
             metadatas if metadatas is not None else [{} for _ in image_paths]

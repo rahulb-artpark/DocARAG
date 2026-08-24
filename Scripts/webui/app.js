@@ -18,6 +18,8 @@ const state = {
   libraryTimer: null,
   selectedTreeId: null,
   treeFilteredIds: [],
+  chatScope: "local",
+  globalDocumentCount: null,
 };
 
 const LIBRARY_POLL_MS = 4000;
@@ -396,6 +398,7 @@ async function boot() {
   enableWheelPan("graphNet", () => state.graphNet);
   try {
     const hasRun = await loadRuns();
+    await syncChatScope();
     if (hasRun) await loadData();
     else activateView("library");
   } catch (err) {
@@ -753,6 +756,9 @@ async function loadLibrary() {
     return;
   }
   state.currentRun = data.current;
+  state.chatScope = data.chatScope || state.chatScope || "local";
+  state.globalDocumentCount = data.globalDocumentCount;
+  applyScopeUI();
   const runs = data.runs || [];
   $("libraryCount").textContent = runs.length ? `${runs.length} indexed` : "";
   $("runGrid").innerHTML = runs.length
@@ -2092,6 +2098,9 @@ function wireChat() {
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 160) + "px"; });
   $("newChatBtn").addEventListener("click", startNewChat);
   $("sidebarToggle").addEventListener("click", toggleChatSidebar);
+  $("scopeLocalBtn").addEventListener("click", () => setChatScope("local"));
+  $("scopeGlobalBtn").addEventListener("click", () => setChatScope("global"));
+  applyScopeUI();
   // The collapsed state is a workspace preference, not document state, so it
   // outlives both the conversation and the selected PDF.
   applySidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
@@ -2155,6 +2164,56 @@ function addMessage(role, html) {
   $("messages").appendChild(wrap);
   $("messages").scrollTop = $("messages").scrollHeight;
   return wrap;
+}
+
+/* ------------------------------ Chat scope -------------------------------- */
+// Local answers from the open document only; global pools every indexed
+// document sharing its tenant/corpus. Conversation history is stored
+// separately per scope server-side, so per-document chats stay untouched
+// when switching to global and back.
+
+function applyScopeUI() {
+  const isGlobal = state.chatScope === "global";
+  const localBtn = $("scopeLocalBtn");
+  const globalBtn = $("scopeGlobalBtn");
+  if (localBtn) { localBtn.classList.toggle("active", !isGlobal); localBtn.setAttribute("aria-pressed", String(!isGlobal)); }
+  if (globalBtn) { globalBtn.classList.toggle("active", isGlobal); globalBtn.setAttribute("aria-pressed", String(isGlobal)); }
+  const hint = $("scopeHint");
+  if (hint) {
+    hint.textContent = isGlobal && state.globalDocumentCount != null
+      ? `${state.globalDocumentCount} document${state.globalDocumentCount === 1 ? "" : "s"} in scope`
+      : "";
+  }
+}
+
+async function syncChatScope() {
+  try {
+    const data = await api("/api/library");
+    state.chatScope = data.chatScope || "local";
+    state.globalDocumentCount = data.globalDocumentCount;
+  } catch (err) {
+    state.chatScope = "local";
+  }
+  applyScopeUI();
+}
+
+async function setChatScope(scope) {
+  if (state.chatScope === scope || state.chatBusy) return;
+  let data;
+  try {
+    data = await api("/api/chat-scope", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope }),
+    });
+  } catch (err) {
+    alert("Could not switch chat scope: " + err.message);
+    return;
+  }
+  state.chatScope = data.scope;
+  state.globalDocumentCount = data.documentCount;
+  applyScopeUI();
+  await loadConversations();
 }
 
 /* --------------------------- Saved conversations ------------------------- */

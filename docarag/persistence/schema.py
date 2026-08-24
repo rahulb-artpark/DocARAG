@@ -421,7 +421,7 @@ CREATE TABLE docarag.stage_state (
     error text,
     PRIMARY KEY (revision_key, stage),
     CONSTRAINT stage_state_stage CHECK (
-        stage IN ('parse', 'tree', 'graph', 'vdb', 'persist')
+        stage IN ('parse', 'tree', 'graph', 'vdb', 'persist', 'cross_doc_link')
     ),
     CONSTRAINT stage_state_status CHECK (
         status IN ('pending', 'running', 'succeeded', 'failed', 'stale')
@@ -782,6 +782,90 @@ CREATE TABLE docarag.statement_evidence (
 -- Subgraph induction: given a subtree's nodes, the statements they support.
 CREATE INDEX statement_evidence_node_idx
     ON docarag.statement_evidence (revision_key, node_key) INCLUDE (stmt_key);
+
+-- ============================================================ cross-docs ==
+-- A cross-docs row asserts something about the corpus, not one revision: a
+-- grouping's membership, or a named relation between entities that came from
+-- different documents. Unlike ``statement``, which is wiped and rebuilt
+-- whenever the revision that asserted it re-derives its graph, a cross-docs
+-- row has no single revision to be scoped to or wiped by -- it is produced
+-- by a service that compares entities across many already-persisted
+-- revisions. It mirrors ``statement``'s three-table shape (fact / roles /
+-- properties) so a reader that already knows how to walk a statement can
+-- walk a cross-docs edge the same way, but keys on
+-- (tenant_id, corpus_id, stmt_key) and references docarag.corpora, not
+-- docarag.index_revisions, so deleting one contributing revision can never
+-- cascade into deleting a fact other documents still rely on.
+--
+-- Two role vocabularies share ``cross_doc_statement_role``: a grouping
+-- membership row (predicate='grouping_member') uses role IN ('grouping',
+-- 'member'); a named relation row (any other predicate) uses role IN
+-- ('subject', 'object'), matching ``statement_role``'s own convention.
+--
+-- ``weight`` is stored exactly as the discovery process produced it -- never
+-- pre-discounted. ``link_kind`` ('grouping_membership' | 'inferred_relation')
+-- and, on relation rows, ``link_origin='cross_document_inferred'`` are
+-- properties, not columns, so a reader applies its own discount at
+-- graph-construction time without the raw signal ever being baked into the
+-- stored number.
+CREATE TABLE docarag.cross_doc_statement (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    stmt_key bigint GENERATED ALWAYS AS IDENTITY,
+    predicate text NOT NULL,
+    directed boolean NOT NULL DEFAULT true,
+    weight real,
+    confidence real,
+    producer text,
+    description_blob_key bigint REFERENCES docarag.text_blob(blob_key),
+    attrs jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, corpus_id, stmt_key),
+    FOREIGN KEY (tenant_id, corpus_id)
+        REFERENCES docarag.corpora(tenant_id, corpus_id),
+    CONSTRAINT cross_doc_statement_predicate_len
+        CHECK (char_length(predicate) BETWEEN 1 AND 256)
+);
+
+CREATE INDEX cross_doc_statement_predicate_idx
+    ON docarag.cross_doc_statement (tenant_id, corpus_id, predicate);
+
+CREATE TABLE docarag.cross_doc_statement_role (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    stmt_key bigint NOT NULL,
+    role text NOT NULL,
+    entity_key bigint NOT NULL REFERENCES docarag.entity(entity_key) ON DELETE CASCADE,
+    ordinal smallint NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, corpus_id, stmt_key, role, entity_key, ordinal),
+    FOREIGN KEY (tenant_id, corpus_id, stmt_key)
+        REFERENCES docarag.cross_doc_statement(tenant_id, corpus_id, stmt_key)
+        ON DELETE CASCADE,
+    CONSTRAINT cross_doc_statement_role_len CHECK (char_length(role) BETWEEN 1 AND 64)
+);
+
+CREATE INDEX cross_doc_statement_role_entity_idx
+    ON docarag.cross_doc_statement_role (tenant_id, corpus_id, entity_key)
+    INCLUDE (stmt_key, role);
+
+CREATE TABLE docarag.cross_doc_statement_property (
+    tenant_id text NOT NULL,
+    corpus_id text NOT NULL,
+    stmt_key bigint NOT NULL,
+    name text NOT NULL,
+    text_val text,
+    num_val numeric,
+    time_val timestamptz,
+    PRIMARY KEY (tenant_id, corpus_id, stmt_key, name),
+    FOREIGN KEY (tenant_id, corpus_id, stmt_key)
+        REFERENCES docarag.cross_doc_statement(tenant_id, corpus_id, stmt_key)
+        ON DELETE CASCADE
+);
+
+-- Retrieval's discount filter: every inferred relation, tagged as such,
+-- without scanning every property row for every statement.
+CREATE INDEX cross_doc_statement_property_lookup_idx
+    ON docarag.cross_doc_statement_property (tenant_id, corpus_id, name, text_val);
 
 -- ============================================================== retrieval ==
 -- One row per node holding the single string a reranker scores.  Written when a

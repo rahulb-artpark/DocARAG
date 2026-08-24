@@ -548,6 +548,8 @@ def command_web(args: argparse.Namespace) -> int:
     argv = [args.web_action, "--port", str(args.port)]
     if args.run:
         argv += ["--run", args.run]
+    if args.foreground:
+        argv += ["--foreground"]
     return web_main(argv)
 
 
@@ -1095,6 +1097,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     webui_parser.add_argument("--port", type=int, default=8765)
     webui_parser.add_argument("--run", help="run directory to serve initially")
+    webui_parser.add_argument("-f", "--foreground", action="store_true")
     webui_parser.set_defaults(handler=command_web)
 
     edit_parser = subparsers.add_parser(

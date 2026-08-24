@@ -15,6 +15,7 @@ import json
 import os
 from typing import Any, ContextManager, Protocol, TypeVar
 from urllib.parse import urlsplit
+import uuid
 
 from docarag.domain.base import (
     canonical_json_bytes,
@@ -22,6 +23,7 @@ from docarag.domain.base import (
     json_ready,
     require_non_empty,
 )
+from docarag.corpus_store import CorpusStore, GROUPING_MEMBER_PREDICATE
 from docarag.domain.evidence import DocumentRef
 from docarag.persistence.contracts import (
     ArtifactReceiptRecord,
@@ -1854,6 +1856,193 @@ class PostgresLedger:
                 (revision_key,),
             ).fetchone()
         return str(row["tree_sha256"]) if row else None
+
+    def transaction(self):
+        """One connection/transaction, for a caller that needs several writes atomic."""
+
+        return self._connection()
+
+    def corpus_scope_for_revision(self, revision_key: int) -> CorpusScope:
+        with self._connection() as connection:
+            row = _mapping(
+                connection.execute(
+                    "SELECT tenant_id, corpus_id FROM docarag.index_revisions "
+                    "WHERE revision_key = %s",
+                    (revision_key,),
+                ).fetchone(),
+                operation="corpus scope lookup",
+            )
+        if row is None:
+            raise PostgresLedgerError(f"revision {revision_key} is not in the ledger")
+        return CorpusScope(tenant_id=str(row["tenant_id"]), corpus_id=str(row["corpus_id"]))
+
+    # -- cross-docs writers ---------------------------------------------------
+    #
+    # Corpus-scoped, not revision-scoped: a grouping or a cross-docs relation
+    # outlives any single contributing document. Callers drive their own
+    # transaction via `transaction()` since a link decision spans several of
+    # these calls (e.g. intern_grouping + two write_grouping_membership calls)
+    # that must commit together.
+
+    def intern_grouping(
+        self,
+        connection: _Connection,
+        scope: CorpusScope,
+        *,
+        label: str,
+        description: str | None,
+        founding_members: tuple[int, int],
+        centroid: Sequence[float],
+    ) -> int:
+        """Create one grouping entity and its two founding membership rows."""
+
+        canonical = f"grouping:{uuid.uuid4()}"
+        description_key = self._intern_text(connection, description) if description else None
+        attrs = {
+            "label": label,
+            "centroid": [float(v) for v in centroid],
+            "member_count": 2,
+            "founding_members": list(founding_members),
+        }
+        row = _mapping(
+            connection.execute(
+                "INSERT INTO docarag.entity (tenant_id, corpus_id, entity_kind, "
+                "canonical, description_blob_key, attrs) "
+                "VALUES (%s, %s, 'grouping', %s, %s, %s::jsonb) RETURNING entity_key",
+                (scope.tenant_id, scope.corpus_id, canonical, description_key, _json_text(attrs)),
+            ).fetchone(),
+            operation="grouping creation",
+        )
+        grouping_key = int(row["entity_key"])
+        for member_key in founding_members:
+            self.write_grouping_membership(
+                connection, scope,
+                grouping_key=grouping_key, member_key=member_key,
+                weight=1.0, producer="cross_doc_linker",
+            )
+        return grouping_key
+
+    def write_grouping_membership(
+        self,
+        connection: _Connection,
+        scope: CorpusScope,
+        *,
+        grouping_key: int,
+        member_key: int,
+        weight: float | None,
+        producer: str,
+    ) -> int | None:
+        """Idempotent: a repeat (grouping_key, member_key) pair writes nothing new."""
+
+        store = CorpusStore(lambda: connection, scope.tenant_id, scope.corpus_id)
+        existing = store.grouping_membership_stmt_key(grouping_key, member_key)
+        if existing is not None:
+            return existing
+        row = _mapping(
+            connection.execute(
+                "INSERT INTO docarag.cross_doc_statement "
+                "(tenant_id, corpus_id, predicate, directed, weight, producer) "
+                "VALUES (%s, %s, %s, false, %s, %s) RETURNING stmt_key",
+                (scope.tenant_id, scope.corpus_id, GROUPING_MEMBER_PREDICATE, weight, producer),
+            ).fetchone(),
+            operation="grouping membership write",
+        )
+        stmt_key = int(row["stmt_key"])
+        for role, entity_key in (("grouping", grouping_key), ("member", member_key)):
+            connection.execute(
+                "INSERT INTO docarag.cross_doc_statement_role "
+                "(tenant_id, corpus_id, stmt_key, role, entity_key) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (scope.tenant_id, scope.corpus_id, stmt_key, role, entity_key),
+            )
+        connection.execute(
+            "INSERT INTO docarag.cross_doc_statement_property "
+            "(tenant_id, corpus_id, stmt_key, name, text_val) VALUES (%s, %s, %s, 'link_kind', 'grouping_membership')",
+            (scope.tenant_id, scope.corpus_id, stmt_key),
+        )
+        return stmt_key
+
+    def update_grouping_centroid(
+        self,
+        connection: _Connection,
+        scope: CorpusScope,
+        *,
+        grouping_key: int,
+        centroid: Sequence[float],
+        member_count: int,
+    ) -> None:
+        patch = {"centroid": [float(v) for v in centroid], "member_count": member_count}
+        connection.execute(
+            "UPDATE docarag.entity SET attrs = attrs || %s::jsonb "
+            "WHERE entity_key = %s AND tenant_id = %s AND corpus_id = %s",
+            (_json_text(patch), grouping_key, scope.tenant_id, scope.corpus_id),
+        )
+
+    def update_grouping_description(
+        self,
+        connection: _Connection,
+        scope: CorpusScope,
+        *,
+        grouping_key: int,
+        label: str,
+        description: str,
+    ) -> None:
+        description_key = self._intern_text(connection, description) if description else None
+        connection.execute(
+            "UPDATE docarag.entity SET description_blob_key = %s, "
+            "attrs = attrs || %s::jsonb WHERE entity_key = %s AND tenant_id = %s AND corpus_id = %s",
+            (description_key, _json_text({"label": label}), grouping_key, scope.tenant_id, scope.corpus_id),
+        )
+
+    def write_cross_doc_relation(
+        self,
+        connection: _Connection,
+        scope: CorpusScope,
+        *,
+        predicate: str,
+        directed: bool,
+        subject_key: int,
+        object_key: int,
+        weight: float,
+        confidence: float | None,
+        producer: str,
+        description: str | None,
+        link_origin: str = "cross_document_inferred",
+    ) -> int:
+        """Idempotent on (subject_key, object_key, predicate). Weight is written verbatim."""
+
+        store = CorpusStore(lambda: connection, scope.tenant_id, scope.corpus_id)
+        existing = store.cross_doc_relation_stmt_key(subject_key, object_key, predicate)
+        if existing is not None:
+            return existing
+        description_key = self._intern_text(connection, description) if description else None
+        row = _mapping(
+            connection.execute(
+                "INSERT INTO docarag.cross_doc_statement "
+                "(tenant_id, corpus_id, predicate, directed, weight, confidence, "
+                "producer, description_blob_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING stmt_key",
+                (
+                    scope.tenant_id, scope.corpus_id, predicate, directed,
+                    weight, confidence, producer, description_key,
+                ),
+            ).fetchone(),
+            operation="cross-docs relation write",
+        )
+        stmt_key = int(row["stmt_key"])
+        for role, entity_key in (("subject", subject_key), ("object", object_key)):
+            connection.execute(
+                "INSERT INTO docarag.cross_doc_statement_role "
+                "(tenant_id, corpus_id, stmt_key, role, entity_key) VALUES (%s, %s, %s, %s, %s)",
+                (scope.tenant_id, scope.corpus_id, stmt_key, role, entity_key),
+            )
+        for name, value in (("link_kind", "inferred_relation"), ("link_origin", link_origin)):
+            connection.execute(
+                "INSERT INTO docarag.cross_doc_statement_property "
+                "(tenant_id, corpus_id, stmt_key, name, text_val) VALUES (%s, %s, %s, %s, %s)",
+                (scope.tenant_id, scope.corpus_id, stmt_key, name, value),
+            )
+        return stmt_key
 
 
 _SEAL_DIGEST_ROWS_SQL = """

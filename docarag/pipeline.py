@@ -108,6 +108,42 @@ def stage_status(run: Path) -> list[dict]:
     return [by_stage.get(name, {"stage": name, "status": "pending"}) for name in STAGES]
 
 
+def _cross_doc_link_auto_trigger_enabled(config_path: Path) -> bool:
+    """Whether this run's graph config opts into auto-triggered cross-doc linking."""
+
+    import yaml
+
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return False
+    return bool((data.get("graph") or {}).get("cross_doc_link_auto_trigger"))
+
+
+def run_cross_doc_link_stage(run: Path) -> int:
+    """Manually (re-)run cross-doc linking for one run, outside the driven sequence."""
+
+    run = run.expanduser().resolve()
+    repo = Path(__file__).resolve().parent.parent
+    manifest = json.loads((run / "run-manifest.json").read_text(encoding="utf-8"))
+    env = dict(os.environ)
+    env.update({"DOCARAG_RUNS_DIR": str(run.parent.parent)})
+
+    with _connect() as connection:
+        key = _revision_key(connection, run)
+        with _stage_lock(connection, key, "cross_doc_link"):
+            _record(connection, key, "cross_doc_link", "running")
+            completed = subprocess.run(
+                [sys.executable, "-m", "docarag.cross_doc_link", "--run", str(run)],
+                cwd=str(repo), env=env,
+            )
+            status = "succeeded" if completed.returncode == 0 else "failed"
+            error = None if completed.returncode == 0 else f"exit {completed.returncode}"
+            _record(connection, key, "cross_doc_link", status, error)
+    print(f"[stage] cross_doc_link: {status}")
+    return completed.returncode
+
+
 def run_stage(run: Path, stage: str) -> int:
     """Execute one stage for one revision and record the outcome."""
 
@@ -225,6 +261,25 @@ def run_stage(run: Path, stage: str) -> int:
                 )
                 if part.returncode != 0:
                     status = "failed"
+                if (
+                    stage == "graph"
+                    and part.returncode == 0
+                    and _cross_doc_link_auto_trigger_enabled(config)
+                ):
+                    # Best effort: this document's own tree/graph/vdb/persist
+                    # outcome must never depend on the corpus having anything
+                    # to link against yet, so a failure here is recorded under
+                    # its own stage and never turns `status` into "failed".
+                    _record(connection, key, "cross_doc_link", "running")
+                    link = subprocess.run(
+                        [sys.executable, "-m", "docarag.cross_doc_link", "--run", str(run)],
+                        cwd=str(repo), env=env,
+                    )
+                    _record(
+                        connection, key, "cross_doc_link",
+                        "succeeded" if link.returncode == 0 else "failed",
+                        None if link.returncode == 0 else f"exit {link.returncode}",
+                    )
             if status == "succeeded" and stage in ("tree", "graph", "vdb"):
                 # Only a run whose file state now shows every stage
                 # succeeded is publishable -- mirroring the bash driver,
@@ -434,7 +489,9 @@ def run_all(run: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one pipeline stage from the store's state")
-    parser.add_argument("stage", choices=STAGES + ("status", "all", "overview", "watch"))
+    parser.add_argument(
+        "stage", choices=STAGES + ("cross_doc_link", "status", "all", "overview", "watch")
+    )
     parser.add_argument("--run", type=Path)
     args = parser.parse_args(argv)
     if args.stage == "overview":
@@ -453,6 +510,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.stage == "all":
             return run_all(args.run)
+        if args.stage == "cross_doc_link":
+            return run_cross_doc_link_stage(args.run)
         return run_stage(args.run, args.stage)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)

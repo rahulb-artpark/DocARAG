@@ -43,6 +43,11 @@ class SubStep(BaseModel):
 
     # store the retrieval info for visualization
     retrieval_sec_ids: List[int] = Field(default_factory=list)
+    # Multi-document mode: section selection runs once per document in
+    # scope, so its result is keyed by document_version_id instead of the
+    # single flat list above. Empty/unused in single-document mode.
+    retrieval_sec_ids_by_doc: Dict[str, List[int]] = Field(default_factory=dict)
+    documents_in_scope: List[str] = Field(default_factory=list)
     retrieval_nodes: Union[str | List[Any]] = Field(default_factory=list)
     iteration_text_nodes: Union[str | List[Any]] = Field(default_factory=list)
     iteration_image_nodes: Union[str | List[Any]] = Field(default_factory=list)
@@ -78,7 +83,7 @@ class GBCRAGContext(BaseModel):
     answer_validation: Dict[str, Any] = Field(default_factory=dict)
 
 
-# --- Pydantic Models for Structured Output (已更新) ---
+# --- Pydantic Models for Structured Output ---
 
 
 # A whole-document scope has to fit in the answer model's context *alongside*
@@ -188,22 +193,10 @@ def filter_tree_nodes(
 def merge_ranker_scores(
     *ranker_scores_lists: List[Tuple[int, float]]
 ) -> Dict[int, List[float]]:
-    """
-    将多个评分器（ranker）的评分列表合并为一个字典。
+    """Merge several rankers' (node_id, score) lists into {node_id: [score, ...]}."""
 
-    Args:
-        *ranker_scores_lists: 任意数量的评分列表。
-            每个列表的格式为 [(node_id, score), ...]。
-
-    Returns:
-        一个字典，将每个 node_id 映射到一个包含所有评分器分数的列表。
-        格式: {node_id: [score1, score2, ...]}
-    """
     num_rankers = len(ranker_scores_lists)
-    # 使用 lambda 创建一个长度为 num_rankers 的默认值列表
     merged_scores = defaultdict(lambda: [0.0] * num_rankers)
-
-    # 遍历每个评分列表并填充分数
     for i, scores_list in enumerate(ranker_scores_lists):
         for node_id, score in scores_list:
             merged_scores[node_id][i] = score
@@ -215,19 +208,7 @@ def calculate_skyline(
     merged_scores: Dict[int, List[float]],
     max_results: Optional[int] = None,
 ) -> List[Dict[str, Union[int, List[float]]]]:
-    """
-    根据合并后的分数计算 skyline 集合。
-    一个点 p 被另一个点 s "支配" (dominate)，当且仅当 s 在所有维度上都不劣于 p，
-    并且至少在一个维度上严格优于 p。
-
-    Args:
-        merged_scores: 一个字典，包含节点ID及其多维度的分数。
-            格式: {node_id: [score1, score2, ...]}
-
-    Returns:
-        skyline_nodes: 不被任何其他节点支配的节点列表。
-            格式: [{'node_id': id, 'dims': [score1, score2, ...]}, ...]
-    """
+    """The Pareto frontier of {node_id: [score, ...]}: points no other point dominates in every dimension."""
     if max_results is not None and (
         isinstance(max_results, bool)
         or not isinstance(max_results, int)
@@ -255,14 +236,12 @@ def calculate_skyline(
 
     nodes.sort(key=lambda item: tuple(-score for score in item[1]) + (item[0],))
 
-    # 如果节点数少于2，则它们都在skyline中
     if len(nodes) < 2:
         return [
             {"node_id": nid, "dims": scores}
             for nid, scores in nodes[:max_results]
         ]
 
-    # 获取维度数量
     assert num_dims is not None
 
     # The production fusion path has two dimensions (graph and text). After
@@ -299,32 +278,23 @@ def calculate_skyline(
     skyline = []
     for p_id, p_scores in nodes:
         is_dominated = False
-        # 2. 检查当前节点 p 是否被已有的 skyline 节点 s 支配
         for s_node in skyline:
             s_scores = s_node["dims"]
-
-            # s 在所有维度上都不劣于 p
             all_dims_ge = all(s_scores[i] >= p_scores[i] for i in range(num_dims))
-            # s 至少在一个维度上严格优于 p
             any_dim_gt = any(s_scores[i] > p_scores[i] for i in range(num_dims))
-
             if all_dims_ge and any_dim_gt:
                 is_dominated = True
-                break  # 已被支配，无需再比较
+                break
 
-        # 3. 如果未被任何 skyline 中的节点支配，则将其加入 skyline
         if not is_dominated:
             new_skyline = []
             for s_node in skyline:
                 s_scores = s_node["dims"]
-                # 检查 s 是否被 p 支配
                 if not (
                     all(p_scores[i] >= s_scores[i] for i in range(num_dims))
                     and any(p_scores[i] > s_scores[i] for i in range(num_dims))
                 ):
                     new_skyline.append(s_node)
-
-            # 将 p 加入新的 skyline
             new_skyline.append({"node_id": p_id, "dims": p_scores})
             skyline = new_skyline
 
@@ -365,7 +335,6 @@ def enhance_graph_with_semantic_links(
     nodes = list(graph.nodes())
     n_nodes = len(nodes)
 
-    # 如果节点数不足以添加边，直接返回副本
     if len(nodes) <= 1:
         return enhanced_graph
 
@@ -386,13 +355,10 @@ def enhance_graph_with_semantic_links(
         log.warning("Semantic graph augmentation embedding failed: %s", e)
         return enhanced_graph
 
-    # 计算所有节点对之间的余弦相似度矩阵
-    # sim_matrix[i][j] 是 nodes[i] 和 nodes[j] 之间的相似度
+    # sim_matrix[i][j] is the cosine similarity between nodes[i] and nodes[j].
     sim_matrix = cosine_similarity(node_embeddings)
 
-    # 2.1 创建一个从节点名到矩阵索引的映射，用于高效查找
     node_to_idx = {node_name: i for i, node_name in enumerate(nodes)}
-    # 2.2 遍历原始图的边，提取它们的相似度
     existing_edge_similarities = []
     for u, v in graph.edges():
         if u in node_to_idx and v in node_to_idx:
@@ -401,13 +367,12 @@ def enhance_graph_with_semantic_links(
             similarity = sim_matrix[idx_u, idx_v]
             existing_edge_similarities.append(similarity)
 
-    # 2.3 基于提取出的相似度计算阈值
     if existing_edge_similarities:
         scores_array = np.array(existing_edge_similarities)
         similarity_threshold = np.percentile(scores_array, x_percentile * 100)
     else:
-        # 如果原始图没有边，无法计算基准，设置一个非常高的阈值
-        # 这样就不会添加任何新边，是安全的默认行为
+        # No edges to set a baseline from -- an unreachably high threshold
+        # adds nothing, which is the safe default.
         similarity_threshold = 1.0
 
     log.info(f"Base similarities on {len(existing_edge_similarities)} existing edges.")
@@ -416,12 +381,10 @@ def enhance_graph_with_semantic_links(
     )
 
     if n_nodes > 0:
-        # 平均度数 = 2 * |E| / |V|
         average_degree = (2 * graph.number_of_edges()) / n_nodes
-        # 应用 ceiling 并确保最小值至少为1
         max_new_edges = max(1, math.ceil(average_degree))
     else:
-        max_new_edges = 1  # 对于空图的安全默认值
+        max_new_edges = 1
 
     log.info(f"Original graph average degree: {average_degree:.2f}")
     log.info(f"Global limit for adding new edges per node set to: {max_new_edges}")
@@ -439,8 +402,6 @@ def enhance_graph_with_semantic_links(
             if source_node == target_node:
                 continue
 
-            # 条件1: 相似度高于全局阈值
-            # 条件2: 边在 *原始* 图中不存在
             if sim_score > similarity_threshold and not graph.has_edge(
                 source_node, target_node
             ):

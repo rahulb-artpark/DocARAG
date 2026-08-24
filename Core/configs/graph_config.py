@@ -67,6 +67,18 @@ class GraphConfig:
     embedding_config: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     reranker_config: RerankerConfig = field(default_factory=RerankerConfig)
 
+    # Cross-document linking (grouping nodes + cross-docs relations).
+    # Candidate pairs land in [cross_doc_relatedness_floor, cross_doc_merge_threshold):
+    # above the upper bound is kg_refiner's own same-entity territory, below the
+    # floor is unrelated. Neither bound is coupled to kg_refiner's own threshold --
+    # it never runs cross-document, so there is no existing value to inherit.
+    cross_doc_merge_threshold: float = 0.80
+    cross_doc_relatedness_floor: float = 0.55
+    # Off by default: linking must be opted into, either per-ingest (auto) or
+    # by explicitly selecting documents to link (direct/manual) -- it must
+    # never be an unconditional side effect of ingestion.
+    cross_doc_link_auto_trigger: bool = False
+
     def __post_init__(self):
         if (
             not isinstance(self.entity_collection_name, str)
@@ -104,3 +116,12 @@ class GraphConfig:
             self.refinement_max_in_flight = self.refinement_max_workers
         if self.refinement_max_in_flight < 1:
             raise ValueError("refinement_max_in_flight must be at least 1")
+        for bound_name in ("cross_doc_merge_threshold", "cross_doc_relatedness_floor"):
+            bound = getattr(self, bound_name)
+            if isinstance(bound, bool) or not (0.0 <= bound <= 1.0):
+                raise ValueError(f"{bound_name} must be a number in [0, 1]")
+        if self.cross_doc_relatedness_floor >= self.cross_doc_merge_threshold:
+            raise ValueError(
+                "cross_doc_relatedness_floor must be strictly less than "
+                "cross_doc_merge_threshold"
+            )

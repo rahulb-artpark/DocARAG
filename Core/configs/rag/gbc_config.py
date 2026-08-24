@@ -210,6 +210,24 @@ class GBCRAGConfig(BaseRAGStrategyConfig):
         default=5,
         description="The number of top entities to retrieve from the graph.",
     )
+    max_documents_per_query: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Corpus-scoped queries only: caps how many documents one query "
+            "fans out to, independent of the entity-level topk_ent budget."
+        ),
+    )
+    cross_doc_edge_discount_factor: float = Field(
+        default=0.7,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Multiplier applied to a cross-docs edge's weight at graph-"
+            "construction time, keyed on link_origin='cross_document_inferred'. "
+            "Intra-document edge weights are never discounted."
+        ),
+    )
 
     max_retry: int = Field(
         default=3,

@@ -20,7 +20,7 @@ from typing import Any, Iterable, List, Sequence
 import networkx as nx
 
 from docarag.document_store import DocumentStore
-from docarag.tree_store import TreeNodeView
+from docarag.tree_store import GraphEdge, TreeNodeView
 
 
 def _local_path(source_uri: str) -> str:
@@ -52,6 +52,48 @@ def split_node_name(node_name: str) -> tuple[str, str | None]:
         name, _, kind = text[len("Name: ") :].partition("\nType: ")
         return name.strip(), kind.strip() or None
     return text.strip(), None
+
+
+def _add_graph_edges(
+    graph: nx.Graph,
+    edges: Iterable[Any],
+    *,
+    entity_to_nodes: dict[str, set[int]],
+    document_version_id: str | None,
+    discount_factor: float,
+) -> None:
+    """Add edges to ``graph``, keyed by the combined "Name: x\\nType: y" form.
+
+    Entity search (``entity_vdb``, ``NodeName2TreeNodes``, ``ent_map``) has
+    always keyed entities this way; a subgraph edge's ``source``/``target``
+    are bare canonicals straight from Postgres. Without this conversion, no
+    query-matched entity name can ever equal a subgraph node name, so
+    ``graph_reranker``'s personalization vector is always empty -- upstream
+    of, and independent from, the ``source_ids`` gap this also fixes.
+    """
+
+    for edge in edges:
+        source_name = entity_node_name(edge.source, edge.source_kind)
+        target_name = entity_node_name(edge.target, edge.target_kind)
+        for canonical, name in ((edge.source, source_name), (edge.target, target_name)):
+            node_ids = entity_to_nodes.get(canonical, set())
+            new_source_ids = (
+                {(document_version_id, node_id) for node_id in node_ids}
+                if document_version_id else set(node_ids)
+            )
+            # Union with whatever this node already carries, so a
+            # cross-document edge (entity_to_nodes always empty) never
+            # clobbers source_ids a per-document subgraph already populated.
+            existing = graph.nodes[name].get("source_ids", set()) if graph.has_node(name) else set()
+            graph.add_node(name, entity_name=name, source_ids=existing | new_source_ids)
+        weight = edge.weight if edge.weight is not None else 1.0
+        if getattr(edge, "link_origin", None) == "cross_document_inferred":
+            weight *= discount_factor
+        graph.add_edge(
+            source_name, target_name,
+            relation_name=edge.predicate, weight=weight,
+            description=edge.description, link_origin=getattr(edge, "link_origin", None),
+        )
 
 
 class StoredTreeIndex:
@@ -135,21 +177,94 @@ class StoredGraphIndex:
             return []
         return self._tree.nodes_for_entity(canonical, kind)
 
-    def get_kg_subgraph(self, tree_node_ids: Iterable[int], copy: bool = True):
-        """Build the subgraph those nodes support, and nothing wider."""
+    def get_full_graph(self, *, document_version_id: str | None = None):
+        """The whole document's graph, not one subtree's -- GraphRAG's own shape.
+
+        ``GraphRAG.__init__`` used to read ``self.gbc_index.GraphIndex.kg``,
+        which only ever existed on the legacy in-memory ``Graph`` class; the
+        store-backed ``StoredGraphIndex`` actually used at query time has no
+        ``.kg`` at all, so this raised AttributeError before a query ever ran.
+        Built from ``TreeStore.graph_statements`` (already existed, already
+        unused by any RAG class) through the same node-naming/source_ids/
+        discount path ``get_kg_subgraph`` uses.
+        """
+
+        rows = list(self._tree.graph_statements())
+        entity_to_nodes: dict[str, set[int]] = {}
+        for row in rows:
+            node_ids = set(row.get("node_ids") or ())
+            for canonical in (str(row["source"]), str(row["target"])):
+                entity_to_nodes.setdefault(canonical, set()).update(node_ids)
 
         graph = nx.Graph()
-        for edge in self._tree.induced_subgraph(list(tree_node_ids)):
-            graph.add_node(edge.source, entity_name=edge.source)
-            graph.add_node(edge.target, entity_name=edge.target)
-            graph.add_edge(
-                edge.source,
-                edge.target,
-                relation_name=edge.predicate,
-                weight=edge.weight if edge.weight is not None else 1.0,
-                description=edge.description,
+        edges = (
+            GraphEdge(
+                source=str(row["source"]), target=str(row["target"]),
+                predicate=str(row["predicate"]), weight=row["weight"],
+                description=str(row.get("description") or ""),
+                source_kind=str(row.get("source_kind") or ""),
+                target_kind=str(row.get("target_kind") or ""),
             )
+            for row in rows
+        )
+        _add_graph_edges(
+            graph, edges, entity_to_nodes=entity_to_nodes,
+            document_version_id=document_version_id, discount_factor=1.0,
+        )
         return graph
+
+    def get_kg_subgraph(
+        self,
+        tree_node_ids: Iterable[int],
+        copy: bool = True,
+        *,
+        document_version_id: str | None = None,
+    ):
+        """Build the subgraph those nodes support, and nothing wider.
+
+        Populates ``source_ids`` on each node: the tree nodes that entity is
+        actually mentioned/evidenced in, among ``tree_node_ids``. Without this,
+        ``graph_reranker``'s entity-score to tree-node join has nothing to read
+        and always returns an empty ranking.
+        """
+
+        wanted = list(tree_node_ids)
+        entity_to_nodes: dict[str, set[int]] = {}
+        for node_no, canonicals in self._tree.entities_for_nodes(wanted).items():
+            for canonical in canonicals:
+                entity_to_nodes.setdefault(canonical, set()).add(node_no)
+
+        graph = nx.Graph()
+        _add_graph_edges(
+            graph,
+            self._tree.induced_subgraph(wanted),
+            entity_to_nodes=entity_to_nodes,
+            document_version_id=document_version_id,
+            discount_factor=1.0,
+        )
+        return graph
+
+    def add_cross_document_edges(
+        self,
+        graph: nx.Graph,
+        edges: Iterable[Any],
+        *,
+        discount_factor: float = 1.0,
+    ) -> None:
+        """Merge cross-docs edges into an already-composed multi-document graph.
+
+        No ``entity_to_nodes`` is passed: an edge's endpoints are expected to
+        already be nodes in ``graph`` (populated by each document's own
+        ``get_kg_subgraph``); a cross-docs edge only ever adds the edge and,
+        for the endpoint kind of case where it doesn't, a bare node with no
+        ``source_ids`` -- unreachable from a query-entity seed, but still able
+        to carry weight through the graph.
+        """
+
+        _add_graph_edges(
+            graph, edges, entity_to_nodes={}, document_version_id=None,
+            discount_factor=discount_factor,
+        )
 
     def get_subgraph_data(self, entities: Sequence[str], max_edges: int = 64) -> dict:
         """Return the entities and relations an answer trace should carry."""
