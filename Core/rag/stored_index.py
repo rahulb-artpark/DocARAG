@@ -253,14 +253,15 @@ class StoredGraphIndex:
     ) -> None:
         """Merge cross-docs edges into an already-composed multi-document graph.
 
-        No ``entity_to_nodes`` is passed: an edge's endpoints are expected to
-        already be nodes in ``graph`` (populated by each document's own
-        ``get_kg_subgraph``); a cross-docs edge only ever adds the edge and,
-        for the endpoint kind of case where it doesn't, a bare node with no
-        ``source_ids`` -- unreachable from a query-entity seed, but still able
-        to carry weight through the graph.
+        Only endpoints already evidenced in the selected document subtrees
+        may participate. Cross-document relations cannot widen the graph.
         """
 
+        edges = (
+            edge for edge in edges
+            if entity_node_name(edge.source, edge.source_kind) in graph
+            and entity_node_name(edge.target, edge.target_kind) in graph
+        )
         _add_graph_edges(
             graph, edges, entity_to_nodes={}, document_version_id=None,
             discount_factor=discount_factor,

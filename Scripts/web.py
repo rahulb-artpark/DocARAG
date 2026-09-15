@@ -3,7 +3,7 @@
 Local BookRAG web UI.
 
 Usage:
-    conda run -n gbc-rag python Scripts/web.py [RUN_DIR] [--host 127.0.0.1] [--port 8765]
+    conda run -n gbc-rag python Scripts/web.py [RUN_DIR] [--host 0.0.0.0] [--port 8765]
 or:
     bash Scripts/web.sh [RUN_DIR]
 """
@@ -144,6 +144,15 @@ def _iso_seconds(start, end):
     except ValueError:
         return None
     return max((ended - started).total_seconds(), 0.0)
+
+
+def safe_doc_name(run):
+    try:
+        manifest = read_json(run / "run-manifest.json")
+        source = manifest.get("source") or {}
+        return Path(source.get("path") or "").name or run.name
+    except Exception:
+        return run.name
 
 
 def _read_json_if_present(path):
@@ -379,6 +388,181 @@ def write_run_tag(run_dir, tag):
     return tag
 
 
+LIBRARY_GROUPS_FILE = "library-groups.json"
+GROUPS_REGISTRY_FILE = "groups.json"
+MAX_GROUP_NAME_LENGTH = 64
+
+
+def read_run_groups(run_dir):
+    data = _read_json_if_present(Path(run_dir) / LIBRARY_GROUPS_FILE)
+    ids = data.get("groupIds")
+    if not isinstance(ids, list):
+        return []
+    return [str(g) for g in ids if isinstance(g, str) and g.strip()]
+
+
+def write_run_groups(run_dir, group_ids):
+    """Store a run's full group membership; returns what was stored."""
+
+    path = Path(run_dir) / LIBRARY_GROUPS_FILE
+    ids = sorted({str(g).strip() for g in (group_ids or []) if str(g).strip()})
+    if not ids:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return []
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump({"version": 1, "groupIds": ids}, handle, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+    return ids
+
+
+def _groups_registry_path():
+    directory = runs_root() / "_library"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / GROUPS_REGISTRY_FILE
+
+
+def _write_groups_registry(groups):
+    path = _groups_registry_path()
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump({"version": 1, "groups": groups}, handle, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def list_groups():
+    """Group (folder) definitions only -- membership lives per-run, see read_run_groups.
+
+    A group's ``parentId`` names the folder it sits in; ``None`` is the library root.
+    """
+
+    data = _read_json_if_present(_groups_registry_path())
+    groups = data.get("groups")
+    if not isinstance(groups, list):
+        return []
+    known = {g.get("id") for g in groups}
+    for group in groups:
+        if group.get("parentId") not in known:
+            group["parentId"] = None
+    return groups
+
+
+def normalize_group_name(raw):
+    return " ".join(str(raw or "").split())[:MAX_GROUP_NAME_LENGTH]
+
+
+def group_subtree_ids(group_id, groups=None):
+    """The group and every folder nested below it."""
+
+    groups = list_groups() if groups is None else groups
+    children = {}
+    for group in groups:
+        children.setdefault(group.get("parentId"), []).append(group.get("id"))
+    found, stack = [], [group_id]
+    while stack:
+        current = stack.pop()
+        if current in found:
+            continue
+        found.append(current)
+        stack.extend(children.get(current, []))
+    return found
+
+
+def create_group(name, parent_id=None):
+    name = normalize_group_name(name)
+    if not name:
+        raise ValueError("Group name cannot be empty")
+    groups = list_groups()
+    if parent_id is not None and parent_id not in {g.get("id") for g in groups}:
+        raise KeyError(f"Unknown parent folder: {parent_id}")
+    group = {
+        "id": uuid.uuid4().hex[:12],
+        "name": name,
+        "parentId": parent_id,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+    groups.append(group)
+    _write_groups_registry(groups)
+    return group
+
+
+def move_group(group_id, parent_id):
+    groups = list_groups()
+    group = next((g for g in groups if g.get("id") == group_id), None)
+    if group is None:
+        raise KeyError(f"Unknown group: {group_id}")
+    if parent_id is not None:
+        if parent_id not in {g.get("id") for g in groups}:
+            raise KeyError(f"Unknown parent folder: {parent_id}")
+        if parent_id in group_subtree_ids(group_id, groups):
+            raise ValueError("A folder cannot be moved into itself")
+    group["parentId"] = parent_id
+    _write_groups_registry(groups)
+    return group
+
+
+def rename_group(group_id, name):
+    name = normalize_group_name(name)
+    if not name:
+        raise ValueError("Group name cannot be empty")
+    groups = list_groups()
+    for group in groups:
+        if group.get("id") == group_id:
+            group["name"] = name
+            _write_groups_registry(groups)
+            return group
+    raise KeyError(f"Unknown group: {group_id}")
+
+
+def delete_group(group_id):
+    """Delete a folder and its subfolders; their documents are kept, just unfiled."""
+
+    groups = list_groups()
+    removed = set(group_subtree_ids(group_id, groups))
+    _write_groups_registry([g for g in groups if g.get("id") not in removed])
+    # Best-effort: strip the groups from every run that still references them, so
+    # a deleted group cannot silently keep scoping a chat or graph view.
+    for run_dir in find_run_dirs():
+        ids = read_run_groups(run_dir)
+        if removed.intersection(ids):
+            write_run_groups(run_dir, [g for g in ids if g not in removed])
+    return sorted(removed)
+
+
+def runs_in_group(group_id):
+    """Documents filed in the folder or any of its subfolders."""
+
+    scope = set(group_subtree_ids(group_id))
+    return [run_dir for run_dir in find_run_dirs() if scope.intersection(read_run_groups(run_dir))]
+
+
+CROSS_LINK_PLAN_FILE = "library-cross-link-plan.json"
+
+
+def write_cross_link_plan(run_dir, mode, target_run_dirs):
+    """Persist the ingest-time cross-link decision; docarag/pipeline.py reads
+    this once the new document's graph stage completes."""
+
+    path = Path(run_dir) / CROSS_LINK_PLAN_FILE
+    payload = {"version": 1, "mode": mode, "targetRunDirs": [str(t) for t in target_run_dirs]}
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
 def run_summary(run_dir, history=None):
     progress = run_progress(run_dir, history)
     source = _read_json_if_present(run_dir / "run-manifest.json").get("source") or {}
@@ -388,6 +572,7 @@ def run_summary(run_dir, history=None):
     name = source_name or run_dir.name
     progress["name"] = name
     progress["tag"] = read_run_tag(run_dir)
+    progress["groupIds"] = read_run_groups(run_dir)
     progress["createdAt"] = run_created_at(run_dir)
     # What the library may offer for this run. Computed here so a button is
     # never shown for something the server would refuse.
@@ -433,6 +618,107 @@ def _qdrant_delete_scope(qdrant_url, timeout_seconds, collection, scope):
         return before
     finally:
         client.close()
+
+
+def _revision_key_for_run(ledger, run_dir):
+    from docarag.persistence import DocumentScope
+
+    manifest = _read_json_if_present(Path(run_dir) / "run-manifest.json")
+    return ledger.revision_key(
+        DocumentScope(
+            tenant_id=str(manifest["tenant_id"]),
+            corpus_id=str(manifest["corpus_id"]),
+            document_id=str(manifest["document_id"]),
+            document_version_id=str(manifest["document_version_id"]),
+        ),
+        str(manifest["revision_id"]),
+    )
+
+
+def _cross_link_summaries(runs):
+    """Best-effort, batched: for each run, its cross_doc_link stage status and
+    the other documents it's currently cross-linked with. One Postgres
+    round-trip pass over every run, not one query per card. Never raises --
+    a Postgres hiccup here must not break the library page; it just yields
+    no cross-link info for that load.
+    """
+
+    try:
+        from docarag.corpus_store import CorpusStore
+        from docarag.persistence import PostgresLedger
+        from docarag.settings import load_settings
+
+        ledger = PostgresLedger(load_settings().resolve_database_url())
+    except Exception:
+        return {}
+
+    revision_keys = {}
+    for run_dir in runs:
+        try:
+            revision_keys[run_dir] = _revision_key_for_run(ledger, run_dir)
+        except Exception:
+            continue
+    if not revision_keys:
+        return {}
+    by_key = {key: run_dir for run_dir, key in revision_keys.items()}
+    names = {run_dir: safe_doc_name(run_dir) for run_dir in revision_keys}
+
+    summaries = {}
+    try:
+        with ledger.transaction() as connection:
+            corpus_stores = {}
+            for run_dir, key in revision_keys.items():
+                row = connection.execute(
+                    "SELECT status, error, started_at, ended_at FROM docarag.stage_state "
+                    "WHERE revision_key = %s AND stage = 'cross_doc_link'",
+                    (key,),
+                ).fetchone()
+                manifest = _read_json_if_present(run_dir / "run-manifest.json")
+                tenant_id = str(manifest.get("tenant_id") or "")
+                corpus_id = str(manifest.get("corpus_id") or "")
+                linked_with = []
+                stats = None
+                if tenant_id and corpus_id:
+                    store = corpus_stores.get((tenant_id, corpus_id))
+                    if store is None:
+                        store = CorpusStore(lambda: connection, tenant_id, corpus_id)
+                        corpus_stores[(tenant_id, corpus_id)] = store
+                    for other_key in store.linked_revisions_for_revision(key):
+                        other_run = by_key.get(other_key)
+                        if other_run is not None:
+                            linked_with.append({
+                                "runDir": str(other_run),
+                                "name": names[other_run],
+                                "tag": read_run_tag(other_run),
+                            })
+                    link_stats = store.link_stats_for_revision(key)
+                    stats = {
+                        "nodesConnected": link_stats.nodes_connected,
+                        "groupingHubs": link_stats.grouping_hubs,
+                        "crossEdges": link_stats.cross_edges,
+                    }
+                # No stage_state row at all -- e.g. linked before the hook that
+                # writes it existed -- but Postgres shows real links: report
+                # what's actually true rather than a "pending" that contradicts
+                # the stats and chips sitting right next to it.
+                inferred_status = "succeeded" if linked_with else "pending"
+                summaries[str(run_dir)] = {
+                    "status": row["status"] if row else inferred_status,
+                    "error": row["error"] if row else None,
+                    "startedAt": (
+                        row["started_at"].isoformat()
+                        if row and row["started_at"] else None
+                    ),
+                    "endedAt": (
+                        row["ended_at"].isoformat()
+                        if row and row["ended_at"] else None
+                    ),
+                    "linkedWith": linked_with,
+                    "stats": stats,
+                }
+    except Exception:
+        return {}
+    return summaries
 
 
 def delete_run_everywhere(run_dir):
@@ -489,10 +775,105 @@ def delete_run_everywhere(run_dir):
             from docarag.settings import load_settings
 
             ledger = PostgresLedger(load_settings().resolve_database_url())
-            removed["rows"] = ledger.delete_revision_evidence(
-                DocumentScope(tenant, corpus, document_id, document_version_id),
-                revision_id,
-            )
+            scope = DocumentScope(tenant, corpus, document_id, document_version_id)
+            revision_key = ledger.revision_key(scope, revision_id)
+
+            with ledger.transaction() as connection:
+                mentioned_keys = [
+                    row["entity_key"]
+                    for row in connection.execute(
+                        "SELECT DISTINCT entity_key FROM docarag.entity_mention "
+                        "WHERE revision_key = %s",
+                        (revision_key,),
+                    ).fetchall()
+                ]
+
+            removed["rows"] = ledger.clear_revision_evidence(revision_key)
+
+            # cross_doc_statement isn't revision-scoped (a cross-docs fact has
+            # no single revision to be wiped by -- see schema.py's own note),
+            # so clearing this revision's evidence above can't reach it. An
+            # entity only this revision ever mentioned is now orphaned corpus-
+            # wide; any relation/grouping naming it is left pointing at a
+            # concept no live document contains, and must be removed too --
+            # or a later document could inherit it via entity-name reuse the
+            # same way "Linked with 5 documents" happened for an earlier,
+            # unrelated deletion this session.
+            if mentioned_keys:
+                with ledger.transaction() as connection:
+                    orphaned_keys = [
+                        row["entity_key"]
+                        for row in connection.execute(
+                            "SELECT ek AS entity_key FROM unnest(%s::bigint[]) AS ek "
+                            "WHERE NOT EXISTS ("
+                            "  SELECT 1 FROM docarag.entity_mention em WHERE em.entity_key = ek"
+                            ")",
+                            (mentioned_keys,),
+                        ).fetchall()
+                    ]
+                    affected_grouping_keys = []
+                    if orphaned_keys:
+                        # Which groupings an orphaned member belonged to --
+                        # queried before the DELETE below removes the very
+                        # membership rows this join reads, since afterward
+                        # there is nothing left to find them by.
+                        affected_grouping_keys = [
+                            row["grouping_key"]
+                            for row in connection.execute(
+                                "SELECT DISTINCT grouping_role.entity_key AS grouping_key "
+                                "FROM docarag.cross_doc_statement_role member_role "
+                                "JOIN docarag.cross_doc_statement stmt "
+                                "  ON stmt.tenant_id = member_role.tenant_id "
+                                " AND stmt.corpus_id = member_role.corpus_id "
+                                " AND stmt.stmt_key = member_role.stmt_key "
+                                "JOIN docarag.cross_doc_statement_role grouping_role "
+                                "  ON grouping_role.tenant_id = member_role.tenant_id "
+                                " AND grouping_role.corpus_id = member_role.corpus_id "
+                                " AND grouping_role.stmt_key = member_role.stmt_key "
+                                " AND grouping_role.role = 'grouping' "
+                                "WHERE member_role.tenant_id = %s AND member_role.corpus_id = %s "
+                                "  AND member_role.role = 'member' "
+                                "  AND member_role.entity_key = ANY(%s) "
+                                "  AND stmt.predicate = 'grouping_member'",
+                                (tenant, corpus, orphaned_keys),
+                            ).fetchall()
+                        ]
+                        deleted = connection.execute(
+                            "DELETE FROM docarag.cross_doc_statement "
+                            "WHERE tenant_id = %s AND corpus_id = %s AND stmt_key IN ("
+                            "  SELECT DISTINCT stmt_key FROM docarag.cross_doc_statement_role "
+                            "  WHERE tenant_id = %s AND corpus_id = %s AND entity_key = ANY(%s)"
+                            ")",
+                            (tenant, corpus, tenant, corpus, orphaned_keys),
+                        )
+                        removed["orphanedCrossDocStatements"] = max(
+                            getattr(deleted, "rowcount", 0) or 0, 0
+                        )
+
+                if affected_grouping_keys:
+                    from Core.configs.system_config import SystemConfig
+                    from Core.provider.embedding import TextEmbeddingProvider
+                    from docarag.grouping_maintenance import recalculate_affected_groupings
+                    from docarag.persistence.contracts import CorpusScope
+
+                    embed_cfg = SystemConfig(**config).graph.embedding_config
+                    embedder = TextEmbeddingProvider(
+                        model_name=embed_cfg.model_name,
+                        backend=embed_cfg.backend,
+                        device=embed_cfg.device,
+                        max_length=embed_cfg.max_length,
+                        api_base=embed_cfg.api_base,
+                        api_key=getattr(embed_cfg, "api_key", None),
+                    )
+                    try:
+                        with ledger.transaction() as connection:
+                            removed["groupingsRecalculated"] = recalculate_affected_groupings(
+                                ledger, connection,
+                                CorpusScope(tenant_id=tenant, corpus_id=corpus),
+                                affected_grouping_keys, embedder,
+                            )
+                    finally:
+                        embedder.close()
         except Exception as exc:
             removed["rows"] = {"error": f"{type(exc).__name__}: {exc}"}
     else:
@@ -544,6 +925,16 @@ def is_loopback_host(host):
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def is_allowed_origin(origin, host_header):
+    """Allow no Origin, a loopback Origin, or the page this server itself served."""
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    if host_header and parsed.netloc.lower() == host_header.lower():
+        return True
+    return is_loopback_host(parsed.hostname or "")
 
 
 def runs_root():
@@ -974,14 +1365,20 @@ def normalize_type(value):
     return str(value or "").replace("NodeType.", "")
 
 
-def citations_from_retrieval(retrieval):
+def citations_from_retrieval(retrieval, run_dir_by_document_version_id=None):
     """Flatten each iteration's ordered evidence labels into one reference list.
 
     Labels are already unique and ordered by the answer generator (plain
     E-numbers for a simple question, Q1-E1/Q2-E1 style for a complex one),
     so this only concatenates -- it must not re-derive or re-sort them.
+
+    ``run_dir_by_document_version_id`` resolves each citation's source
+    document to the run directory a UI jump (tree node, graph entity) needs
+    -- absent in single-document scope, where the caller has nothing to
+    disambiguate and the frontend already knows which document is open.
     """
 
+    lookup = run_dir_by_document_version_id or {}
     citations = []
     seen = set()
     for iteration in (retrieval or {}).get("iterations") or []:
@@ -990,6 +1387,8 @@ def citations_from_retrieval(retrieval):
             if not label or label in seen:
                 continue
             seen.add(label)
+            document_version_id = citation.get("document_version_id")
+            run_dir = lookup.get(document_version_id)
             citations.append(
                 {
                     "label": label,
@@ -998,6 +1397,9 @@ def citations_from_retrieval(retrieval):
                     "page": citation.get("page"),
                     "snippet": citation.get("snippet") or "",
                     "hasImage": bool(citation.get("has_image")),
+                    "documentVersionId": document_version_id,
+                    "documentTitle": citation.get("document_title"),
+                    "runDir": str(run_dir) if run_dir is not None else None,
                 }
             )
     return citations
@@ -1020,16 +1422,26 @@ def bind_server(host, port, handler, attempts=20):
 
 class AppState:
     def __init__(self, run_dir=None):
-        self.run_dir = run_dir
-        # "local" (default): chat against self.run_dir, exactly today's
-        # behavior. "global": chat across every completed document sharing
-        # self.run_dir's tenant/corpus. Local state and history are never
-        # touched by global mode -- see conversations_path below.
-        self.chat_scope = "local"
-        self.global_rag_agent = None
-        self._global_rag_identity_key = None
-        self._global_readiness_cache_key = None
-        self._global_readiness_cache = None
+        # The one thing that changes what Library/Graph/Chat/Tree are
+        # viewing. "document" (default): scope_run_dir alone, exactly today's
+        # single-document behavior. "group": every document in
+        # scope_group_id. "all": every completed document sharing
+        # scope_run_dir's tenant/corpus. scope_run_dir is retained across a
+        # switch to group/all (not cleared) -- it's the anchor Tree falls
+        # back to and the tenant/corpus resolves from, not just "the last
+        # thing opened in Document mode". Document-scope history is never
+        # touched by group/all scope -- see conversations_path below.
+        self.scope_kind = "document"
+        self.scope_run_dir = run_dir
+        self.scope_group_id = None
+        self.all_rag_agent = None
+        self._all_rag_identity_key = None
+        self._all_readiness_cache_key = None
+        self._all_readiness_cache = None
+        self.group_rag_agent = None
+        self._group_rag_identity_key = None
+        self._group_readiness_cache_key = None
+        self._group_readiness_cache = None
         self.chat_lock = threading.Lock()
         # Separate from chat_lock on purpose: a question holds chat_lock for the
         # whole retrieval, and the sidebar must stay readable and writable while
@@ -1048,19 +1460,19 @@ class AppState:
     def store(self):
         """The document store for this run; evidence is immutable per revision."""
 
-        self.require_run()
+        self.require_document_scope()
         if self._store is None:
             from docarag.document_store import DocumentStore
 
-            self._store = DocumentStore.open(self.run_dir)
+            self._store = DocumentStore.open(self.scope_run_dir)
         return self._store
 
-    def require_run(self):
-        """Return the selected run or reject document-scoped operations."""
+    def require_document_scope(self):
+        """Return the scoped document or reject document-only operations."""
 
-        if self.run_dir is None:
+        if self.scope_kind != "document" or self.scope_run_dir is None:
             raise RunNotReadyError("Select a document from the Library first")
-        return self.run_dir
+        return self.scope_run_dir
 
     # --- Conversation history ---------------------------------------------
     # Stored inside the run directory, which is what makes a document's chats
@@ -1071,10 +1483,16 @@ class AppState:
 
     @property
     def conversations_path(self):
-        if self.chat_scope == "global":
-            tenant_id, corpus_id = self.global_scope_key()
+        if self.scope_kind == "all":
+            tenant_id, corpus_id = self._scope_tenant_corpus()
             return runs_root() / "_global_chat" / f"{tenant_id}__{corpus_id}" / "conversations.json"
-        return self.require_run() / "web_chat" / "conversations.json"
+        if self.scope_kind == "group":
+            tenant_id, corpus_id = self._scope_tenant_corpus()
+            return (
+                runs_root() / "_group_chat" / f"{tenant_id}__{corpus_id}__{self.scope_group_id}"
+                / "conversations.json"
+            )
+        return self.require_document_scope() / "web_chat" / "conversations.json"
 
     @staticmethod
     def _now():
@@ -1263,12 +1681,25 @@ class AppState:
             self._rag_identity_key = None
             self._readiness_cache_key = None
 
-    def switch_run(self, run_dir):
-        """Rebind every cache and release the agent held for the old run."""
+    def set_scope(self, kind, run_dir=None, group_id=None):
+        """The one place that changes what Library/Graph/Chat/Tree are viewing."""
 
+        if kind not in ("document", "group", "all"):
+            raise ValueError("scope kind must be 'document', 'group' or 'all'")
+        if kind == "document" and run_dir is None and self.scope_run_dir is None:
+            raise ValueError("runDir is required to enter document scope")
+        if kind == "group" and not group_id:
+            raise ValueError("groupId is required for group scope")
         with self.chat_lock:
-            if run_dir == self.run_dir:
+            unchanged = (
+                kind == self.scope_kind
+                and (run_dir is None or run_dir == self.scope_run_dir)
+                and group_id == self.scope_group_id
+            )
+            if unchanged:
                 return
+            # Any scope change can invalidate any cache below -- not just a
+            # document switch -- so all of it is rebuilt, every time.
             if self.rag_agent is not None:
                 close = getattr(self.rag_agent, "close", None)
                 if callable(close):
@@ -1284,46 +1715,53 @@ class AppState:
             self._graph_cache_key = None
             self._readiness_cache_key = None
             self._readiness_cache = None
-            self.run_dir = run_dir
-            # Switching documents can change which corpus "global" means.
-            self._global_readiness_cache_key = None
-            self._global_readiness_cache = None
+            self._all_readiness_cache_key = None
+            self._all_readiness_cache = None
+            self._group_readiness_cache_key = None
+            self._group_readiness_cache = None
+            self.scope_kind = kind
+            if run_dir is not None:
+                self.scope_run_dir = run_dir
+            self.scope_group_id = group_id if kind == "group" else None
 
     def chat_readiness(self):
         """Cache readiness until a query-loaded artifact/store identity changes."""
 
-        if self.chat_scope == "global":
-            return self._global_readiness_summary()
-        self.require_run()
-        key = query_readiness_stat_key(self.run_dir)
+        if self.scope_kind == "all":
+            return self._all_readiness_summary()
+        if self.scope_kind == "group":
+            return self._group_readiness_summary()
+        self.require_document_scope()
+        key = query_readiness_stat_key(self.scope_run_dir)
         if self._readiness_cache_key != key or self._readiness_cache is None:
             self._readiness_cache = inspect_run_readiness(
-                self.run_dir, purpose="ask"
+                self.scope_run_dir, purpose="ask"
             )
             self._readiness_cache_key = key
         return self._readiness_cache
 
-    def set_chat_scope(self, scope):
-        """Toggle between local (this document) and global (every document) chat."""
+    def _scope_tenant_corpus(self):
+        """(tenant_id, corpus_id) that group/all scope currently spans.
 
-        if scope not in ("local", "global"):
-            raise ValueError("scope must be 'local' or 'global'")
-        with self.chat_lock:
-            if scope == self.chat_scope:
-                return
-            self.chat_scope = scope
+        Anchored on scope_run_dir directly, not require_document_scope --
+        group/all scope must resolve a tenant/corpus without a document ever
+        having been "opened" in the document-scope sense. Falls back to the
+        first available run when nothing has been opened yet this session.
+        """
 
-    def global_scope_key(self):
-        """(tenant_id, corpus_id) that 'global' currently spans, from the selected document."""
-
-        self.require_run()
-        manifest = read_json(self.run_dir / "run-manifest.json")
+        anchor = self.scope_run_dir
+        if anchor is None:
+            candidates = find_run_dirs()
+            anchor = candidates[0] if candidates else None
+        if anchor is None:
+            raise RunNotReadyError("No indexed documents yet")
+        manifest = read_json(anchor / "run-manifest.json")
         return str(manifest.get("tenant_id") or ""), str(manifest.get("corpus_id") or "")
 
-    def global_run_dirs(self):
-        """Every completed run sharing the selected document's tenant/corpus."""
+    def all_run_dirs(self):
+        """Every completed run sharing the current scope's tenant/corpus."""
 
-        tenant_id, corpus_id = self.global_scope_key()
+        tenant_id, corpus_id = self._scope_tenant_corpus()
         matches = []
         for run in find_run_dirs():
             if not run_completed(run):
@@ -1339,52 +1777,49 @@ class AppState:
                 matches.append(run)
         return sorted(matches)
 
-    def global_readiness(self):
-        """One RunReadiness per document currently in the global scope."""
+    def all_readiness(self):
+        """One RunReadiness per document currently in scope."""
 
         return [
             (run_dir, inspect_run_readiness(run_dir, purpose="ask"))
-            for run_dir in self.global_run_dirs()
+            for run_dir in self.all_run_dirs()
         ]
 
-    def _global_readiness_summary(self):
-        run_dirs = self.global_run_dirs()
+    def _readiness_summary_for(self, run_dirs, *, source, cache_key_attr, cache_attr, empty_missing):
         key = tuple(str(p) for p in run_dirs)
-        if self._global_readiness_cache_key == key and self._global_readiness_cache is not None:
-            return self._global_readiness_cache
+        if getattr(self, cache_key_attr) == key and getattr(self, cache_attr) is not None:
+            return getattr(self, cache_attr)
         if not run_dirs:
-            summary = RunReadiness(
-                ready=False, purpose="ask", source="global",
-                missing=("No other completed documents share this document's corpus",),
-            )
+            summary = RunReadiness(ready=False, purpose="ask", source=source, missing=(empty_missing,))
         else:
             per_run = [inspect_run_readiness(run_dir, purpose="ask") for run_dir in run_dirs]
             not_ready = [str(run_dirs[i]) for i, r in enumerate(per_run) if not r.ready]
             summary = RunReadiness(
-                ready=not not_ready, purpose="ask", source="global",
+                ready=not not_ready, purpose="ask", source=source,
                 missing=tuple(f"{path} is not ready" for path in not_ready),
             )
-        self._global_readiness_cache = summary
-        self._global_readiness_cache_key = key
+        setattr(self, cache_attr, summary)
+        setattr(self, cache_key_attr, key)
         return summary
 
-    def ensure_global_rag(self):
-        """Build (or reuse) the multi-document RAG agent for the current global scope."""
+    def _all_readiness_summary(self):
+        return self._readiness_summary_for(
+            self.all_run_dirs(), source="all",
+            cache_key_attr="_all_readiness_cache_key", cache_attr="_all_readiness_cache",
+            empty_missing="No other completed documents share this document's corpus",
+        )
 
-        readiness = self._global_readiness_summary()
-        if not readiness.ready:
-            raise RunNotReadyError(
-                "Global chat is not ready: " + ", ".join(readiness.missing)
-            )
-        run_dirs = self.global_run_dirs()
-        identity_key = tuple(str(p) for p in run_dirs)
-        if self.global_rag_agent is not None and self._global_rag_identity_key == identity_key:
-            return self.global_rag_agent
-        if self.global_rag_agent is not None:
-            close = getattr(self.global_rag_agent, "close", None)
-            if callable(close):
-                close()
-            self.global_rag_agent = None
+    def _group_readiness_summary(self):
+        if not self.scope_group_id:
+            return RunReadiness(ready=False, purpose="ask", source="group", missing=("No group selected",))
+        return self._readiness_summary_for(
+            runs_in_group(self.scope_group_id), source="group",
+            cache_key_attr="_group_readiness_cache_key", cache_attr="_group_readiness_cache",
+            empty_missing="No completed documents in this group",
+        )
+
+    def _build_scoped_rag_agent(self, run_dirs):
+        """Build a fresh multi-document RAG agent over exactly these run dirs."""
 
         from Core.configs.system_config import load_system_config
         from Core.rag import create_rag_agent
@@ -1403,19 +1838,61 @@ class AppState:
 
         dependencies = prepare_corpus_rag_dependencies(document_configs)
         base_cfg = document_configs[0]
-        self.global_rag_agent = create_rag_agent(
+        return create_rag_agent(
             strategy_config=base_cfg.rag.strategy_config,
             llm_config=base_cfg.llm,
             vlm_config=base_cfg.vlm,
             **dependencies,
         )
-        self._global_rag_identity_key = identity_key
-        return self.global_rag_agent
+
+    def ensure_all_rag(self):
+        """Build (or reuse) the multi-document RAG agent for the current all-scope."""
+
+        readiness = self._all_readiness_summary()
+        if not readiness.ready:
+            raise RunNotReadyError(
+                "This chat is not ready: " + ", ".join(readiness.missing)
+            )
+        run_dirs = self.all_run_dirs()
+        identity_key = tuple(str(p) for p in run_dirs)
+        if self.all_rag_agent is not None and self._all_rag_identity_key == identity_key:
+            return self.all_rag_agent
+        if self.all_rag_agent is not None:
+            close = getattr(self.all_rag_agent, "close", None)
+            if callable(close):
+                close()
+            self.all_rag_agent = None
+        self.all_rag_agent = self._build_scoped_rag_agent(run_dirs)
+        self._all_rag_identity_key = identity_key
+        return self.all_rag_agent
+
+    def ensure_group_rag(self):
+        """Build (or reuse) the multi-document RAG agent for the current group scope."""
+
+        if not self.scope_group_id:
+            raise RunNotReadyError("No group selected")
+        readiness = self._group_readiness_summary()
+        if not readiness.ready:
+            raise RunNotReadyError(
+                "Group chat is not ready: " + ", ".join(readiness.missing)
+            )
+        run_dirs = runs_in_group(self.scope_group_id)
+        identity_key = (self.scope_group_id, tuple(str(p) for p in run_dirs))
+        if self.group_rag_agent is not None and self._group_rag_identity_key == identity_key:
+            return self.group_rag_agent
+        if self.group_rag_agent is not None:
+            close = getattr(self.group_rag_agent, "close", None)
+            if callable(close):
+                close()
+            self.group_rag_agent = None
+        self.group_rag_agent = self._build_scoped_rag_agent(run_dirs)
+        self._group_rag_identity_key = identity_key
+        return self.group_rag_agent
 
     @property
     def doc_name(self):
-        self.require_run()
-        return Handler._safe_doc_name(self.run_dir)
+        self.require_document_scope()
+        return safe_doc_name(self.scope_run_dir)
 
     def tree_payload(self):
         # Cached only until the run's own state changes -- a query made
@@ -1423,8 +1900,8 @@ class AppState:
         # persisted) must not be served forever afterward as if it were
         # complete. See the matching note on graph_payload for the incident
         # this fixes.
-        self.require_run()
-        key = query_readiness_stat_key(self.run_dir)
+        self.require_document_scope()
+        key = query_readiness_stat_key(self.scope_run_dir)
         if self._tree_cache is not None and self._tree_cache_key == key:
             return self._tree_cache
 
@@ -1440,7 +1917,7 @@ class AppState:
         raw_image_node_ids = {
             item.get("index_id")
             for item in (
-                _read_json_if_present(self.run_dir / "tree.json").get("nodes")
+                _read_json_if_present(self.scope_run_dir / "tree.json").get("nodes")
                 or []
             )
             if isinstance((item.get("meta_info") or {}).get("img_path"), str)
@@ -1493,7 +1970,7 @@ class AppState:
 
         payload = {
             "docName": self.doc_name,
-            "runDir": str(self.run_dir),
+            "runDir": str(self.scope_run_dir),
             "rootId": root_id,
             "nodes": flat,
         }
@@ -1508,8 +1985,8 @@ class AppState:
         # empty payload and keep serving it forever, even long after the
         # real data existed in Postgres: the graph panel would show
         # "not loading" permanently for a run that actually finished fine.
-        self.require_run()
-        key = query_readiness_stat_key(self.run_dir)
+        self.require_document_scope()
+        key = query_readiness_stat_key(self.scope_run_dir)
         if self._graph_cache is not None and self._graph_cache_key == key:
             return self._graph_cache
 
@@ -1572,7 +2049,7 @@ class AppState:
 
         payload = {
             "docName": self.doc_name,
-            "runDir": str(self.run_dir),
+            "runDir": str(self.scope_run_dir),
             "nodes": nodes,
             "links": links,
         }
@@ -1580,9 +2057,154 @@ class AppState:
         self._graph_cache_key = key
         return payload
 
+    def corpus_graph_payload(self, run_dirs, *, source):
+        """Merged multi-document graph: entities/relations from every run_dir,
+        plus grouping hub nodes and cross-docs relation edges.
+
+        Skips per-node source snippets (would need each member document's
+        full tree payload) -- Document scope stays the place to read text.
+        """
+
+        from docarag.corpus_store import CorpusStore
+        from docarag.document_store import DocumentStore
+        from Core.rag.stored_index import entity_node_name
+
+        nodes = {}
+        links = []
+        tenant_id = corpus_id = ""
+        stores = []
+        try:
+            for run_dir in run_dirs:
+                manifest = _read_json_if_present(run_dir / "run-manifest.json")
+                tenant_id = tenant_id or str(manifest.get("tenant_id") or "")
+                corpus_id = corpus_id or str(manifest.get("corpus_id") or "")
+                document_version_id = str(manifest.get("document_version_id") or "")
+                document_title = safe_doc_name(run_dir)
+                store = DocumentStore.open(run_dir)
+                stores.append(store)
+                for entity in store.tree.graph_entities():
+                    node_id = entity_node_name(entity["canonical"], entity["entity_kind"])
+                    node = nodes.setdefault(
+                        node_id,
+                        {
+                            "id": node_id,
+                            "label": entity["canonical"],
+                            "type": entity["entity_kind"] or "UNKNOWN",
+                            "description": entity["description"],
+                            "documentVersionIds": [],
+                            "documentTitles": [],
+                            "crossDocument": False,
+                            "degree": 0,
+                        },
+                    )
+                    node["documentVersionIds"].append(document_version_id)
+                    node["documentTitles"].append(document_title)
+                for idx, statement in enumerate(store.tree.graph_statements()):
+                    source_id = entity_node_name(statement["source"], statement["source_kind"])
+                    target_id = entity_node_name(statement["target"], statement["target_kind"])
+                    links.append(
+                        {
+                            "id": f"rel-{document_version_id}-{idx}",
+                            "source": source_id,
+                            "target": target_id,
+                            "sourceName": statement["source"],
+                            "targetName": statement["target"],
+                            "name": statement["predicate"],
+                            "description": statement["description"],
+                            "weight": statement["weight"],
+                            "crossDocument": False,
+                        }
+                    )
+
+            for node in nodes.values():
+                node["crossDocument"] = len(set(node["documentVersionIds"])) > 1
+
+            if tenant_id and corpus_id and stores:
+                corpus_store = CorpusStore(stores[0].connect, tenant_id, corpus_id)
+                entity_keys = {}
+                for node in nodes.values():
+                    key = corpus_store.entity_key_for_canonical(node["label"], node["type"])
+                    if key is not None:
+                        entity_keys[node["id"]] = key
+
+                seen_groupings = set()
+                for node_id, entity_key in entity_keys.items():
+                    for grouping in corpus_store.groupings_for_entity(entity_key):
+                        hub_id = f"grouping:{grouping.grouping_key}"
+                        if hub_id not in seen_groupings:
+                            seen_groupings.add(hub_id)
+                            nodes[hub_id] = {
+                                "id": hub_id,
+                                "label": grouping.label or "Grouping",
+                                "type": "GROUPING",
+                                "description": grouping.description,
+                                "documentVersionIds": [],
+                                "documentTitles": [],
+                                "crossDocument": True,
+                                "degree": 0,
+                            }
+                        nodes[node_id]["crossDocument"] = True
+                        links.append(
+                            {
+                                "id": f"grouping-{grouping.grouping_key}-{node_id}",
+                                "source": hub_id,
+                                "target": node_id,
+                                "sourceName": nodes[hub_id]["label"],
+                                "targetName": nodes[node_id]["label"],
+                                "name": "grouping_member",
+                                "description": "",
+                                "weight": None,
+                                "crossDocument": True,
+                            }
+                        )
+
+                for idx, edge in enumerate(
+                    corpus_store.inferred_relations_for_entities(entity_keys.values())
+                ):
+                    source_id = entity_node_name(edge.source, edge.source_kind)
+                    target_id = entity_node_name(edge.target, edge.target_kind)
+                    if source_id not in nodes or target_id not in nodes:
+                        continue
+                    nodes[source_id]["crossDocument"] = True
+                    nodes[target_id]["crossDocument"] = True
+                    links.append(
+                        {
+                            "id": f"cross-rel-{idx}",
+                            "source": source_id,
+                            "target": target_id,
+                            "sourceName": edge.source,
+                            "targetName": edge.target,
+                            "name": edge.predicate,
+                            "description": edge.description,
+                            "weight": edge.weight,
+                            "crossDocument": True,
+                        }
+                    )
+
+            degree = {}
+            for link in links:
+                degree[link["source"]] = degree.get(link["source"], 0) + 1
+                degree[link["target"]] = degree.get(link["target"], 0) + 1
+            for node_id, node in nodes.items():
+                node["degree"] = degree.get(node_id, 0)
+
+            return {
+                "scope": source,
+                "documentCount": len(run_dirs),
+                "nodes": list(nodes.values()),
+                "links": links,
+            }
+        finally:
+            for store in stores:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+
     def ensure_rag(self):
-        if self.chat_scope == "global":
-            return self.ensure_global_rag()
+        if self.scope_kind == "all":
+            return self.ensure_all_rag()
+        if self.scope_kind == "group":
+            return self.ensure_group_rag()
         readiness = self.chat_readiness()
         if not readiness.ready:
             raise RunNotReadyError(
@@ -1605,9 +2227,9 @@ class AppState:
         from Core.rag import create_rag_agent
         from Core.utils.resource_loader import prepare_rag_dependencies
 
-        run_config = self.run_dir / "run_config.yaml"
+        run_config = self.scope_run_dir / "run_config.yaml"
         cfg = load_system_config(str(run_config if run_config.is_file() else DEFAULT_CONFIG))
-        cfg.save_path = str(self.run_dir)
+        cfg.save_path = str(self.scope_run_dir)
         refresh_answer_time_budgets(cfg)
         # cfg.graph.refine_type, loaded above from this run's own frozen
         # run_config.yaml, is already exactly what was used to build this
@@ -1619,7 +2241,7 @@ class AppState:
         # artifact's filename to "correct" refine_type was therefore
         # correcting a case that cannot happen, while depending on a JSON
         # file for something the store-backed config already answers.
-        attestation_dir = find_retrieval_artifact_dir(self.run_dir)
+        attestation_dir = find_retrieval_artifact_dir(self.scope_run_dir)
         if attestation_dir is not None:
             cfg.vdb.manifest_dir_name = str(attestation_dir)
         dependencies = prepare_rag_dependencies(cfg=cfg)
@@ -1635,10 +2257,52 @@ class AppState:
     def _chat_query_root(self):
         """Where this scope's retrieval traces live -- never a local document's own folder for global queries."""
 
-        if self.chat_scope == "global":
-            tenant_id, corpus_id = self.global_scope_key()
+        if self.scope_kind == "all":
+            tenant_id, corpus_id = self._scope_tenant_corpus()
             return runs_root() / "_global_chat" / f"{tenant_id}__{corpus_id}" / "web_chat"
-        return self.require_run() / "web_chat"
+        if self.scope_kind == "group":
+            tenant_id, corpus_id = self._scope_tenant_corpus()
+            return (
+                runs_root() / "_group_chat" / f"{tenant_id}__{corpus_id}__{self.scope_group_id}"
+                / "web_chat"
+            )
+        return self.require_document_scope() / "web_chat"
+
+    def _ask_member_run_dirs(self):
+        """Every run directory this scope's chat answers across.
+
+        scope_run_dir alone is document-scope-only -- it stays whatever
+        document was last opened (or None, if none ever was this session)
+        while in group/all scope, so ask() must not use it directly for its
+        provenance/config trace the way it can in document scope.
+        """
+
+        if self.scope_kind == "all":
+            run_dirs = self.all_run_dirs()
+        elif self.scope_kind == "group":
+            run_dirs = runs_in_group(self.scope_group_id) if self.scope_group_id else []
+        else:
+            run_dirs = [self.require_document_scope()]
+        if not run_dirs:
+            raise RunNotReadyError("No documents in scope yet")
+        return run_dirs
+
+    @staticmethod
+    def _run_dir_by_document_version_id(run_dirs):
+        """Resolve each in-scope run's document_version_id, for citation jumps.
+
+        A citation only carries the identity its evidence node was tagged
+        with; turning that into a runDir the frontend can switch to means
+        reading it back out of each candidate run's own manifest.
+        """
+
+        lookup = {}
+        for run_dir in run_dirs:
+            manifest = _read_json_if_present(run_dir / "run-manifest.json")
+            document_version_id = manifest.get("document_version_id")
+            if isinstance(document_version_id, str) and document_version_id:
+                lookup[document_version_id] = run_dir
+        return lookup
 
     def ask(self, question):
         with self.chat_lock:
@@ -1651,8 +2315,17 @@ class AppState:
             q_dir.mkdir(mode=0o700)
             execution_path = q_dir / "execution.json"
             retrieval_path = q_dir / "retrieval_res.json"
-            provenance = run_provenance(self.run_dir)
-            config_path = self.run_dir / "run_config.yaml"
+            member_run_dirs = self._ask_member_run_dirs()
+            primary_run_dir = member_run_dirs[0]
+            provenance = (
+                run_provenance(primary_run_dir) if self.scope_kind == "document"
+                else {
+                    "scope": self.scope_kind,
+                    "group_id": self.scope_group_id if self.scope_kind == "group" else None,
+                    "members": [run_provenance(d) for d in member_run_dirs],
+                }
+            )
+            config_path = primary_run_dir / "run_config.yaml"
             if not config_path.is_file():
                 config_path = Path(DEFAULT_CONFIG).expanduser().resolve()
             try:
@@ -1692,7 +2365,7 @@ class AppState:
                         "status": "failed",
                         "query_id": query_id,
                         "question": question,
-                        "run_dir": str(self.run_dir),
+                        "run_dir": str(primary_run_dir),
                         "stage": stage,
                         "elapsed_seconds": round(time.monotonic() - started, 3),
                         "system_config": str(config_path),
@@ -1736,8 +2409,10 @@ class AppState:
                 "question": question,
                 "answer": answer,
                 "node_ids": normalized_node_ids,
-                "citations": citations_from_retrieval(retrieval),
-                "run_dir": str(self.run_dir),
+                "citations": citations_from_retrieval(
+                    retrieval, self._run_dir_by_document_version_id(member_run_dirs)
+                ),
+                "run_dir": str(primary_run_dir),
                 "elapsed_seconds": elapsed,
                 "system_config": str(config_path),
                 "system_config_sha256": config_sha256,
@@ -1881,39 +2556,44 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/runs":
-            # Only completed indexes belong in the picker. A run whose vector
-            # stage failed still publishes a tree, so it looks selectable while
-            # its chat cannot answer anything.
-            runs = []
-            current = (
-                self.state.run_dir.resolve()
-                if self.state.run_dir is not None
-                else None
-            )
-            for run in find_runs():
-                if not run_completed(run) and run.resolve() != current:
-                    continue
-                runs.append(
-                    {
-                        "path": str(run),
-                        "name": self._safe_doc_name(run),
-                        "hasGraph": True,
-                        "mtime": run.stat().st_mtime,
-                    }
-                )
-            self.send_json(
-                {
-                    "current": None if current is None else str(current),
-                    "runs": runs,
-                }
-            )
-            return
         if parsed.path == "/api/tree":
             self.send_view_payload(self.state.tree_payload)
             return
         if parsed.path == "/api/graph":
-            self.send_view_payload(self.state.graph_payload)
+            # Graph always reflects the one shared scope -- no per-request
+            # override -- so it stays consistent with Library/Chat/Tree.
+            if self.state.scope_kind == "document":
+                self.send_view_payload(self.state.graph_payload)
+            elif self.state.scope_kind == "all":
+                self.send_view_payload(
+                    lambda: self.state.corpus_graph_payload(
+                        self.state.all_run_dirs(), source="all"
+                    )
+                )
+            else:
+                group_id = self.state.scope_group_id
+                if not group_id:
+                    self.send_error_json(HTTPStatus.CONFLICT, "No group selected")
+                    return
+                self.send_view_payload(
+                    lambda: self.state.corpus_graph_payload(
+                        runs_in_group(group_id), source="group"
+                    )
+                )
+            return
+        if parsed.path == "/api/graph-link":
+            # A one-off, read-only view of exactly two documents' merged
+            # graph -- for "what connects these two" from a library card's
+            # cross-link chip. Never touches the shared scope.
+            params = parse_qs(parsed.query)
+            a = self.resolve_run_argument((params.get("a") or [None])[0])
+            b = self.resolve_run_argument((params.get("b") or [None])[0])
+            if a is None or b is None:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "a and b must both be indexed run directories")
+                return
+            self.send_view_payload(
+                lambda: self.state.corpus_graph_payload([a, b], source="link")
+            )
             return
         if parsed.path == "/api/tree-image":
             self.send_tree_image(parsed)
@@ -1924,8 +2604,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "ok": True,
                     "runDir": (
                         None
-                        if self.state.run_dir is None
-                        else str(self.state.run_dir)
+                        if self.state.scope_run_dir is None
+                        else str(self.state.scope_run_dir)
                     ),
                 }
             )
@@ -1953,23 +2633,52 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/library":
             runs = find_run_dirs()
             history = _stage_history(runs)
-            global_document_count = None
-            if self.state.chat_scope == "global" and self.state.run_dir is not None:
+            cross_link_summaries = _cross_link_summaries(runs)
+            all_document_count = None
+            if self.state.scope_kind == "all":
                 try:
-                    global_document_count = len(self.state.global_run_dirs())
+                    all_document_count = len(self.state.all_run_dirs())
                 except RunNotReadyError:
-                    global_document_count = 0
+                    all_document_count = 0
+            group_document_count = None
+            if self.state.scope_kind == "group" and self.state.scope_group_id:
+                group_document_count = len(runs_in_group(self.state.scope_group_id))
             self.send_json(
                 {
-                    "current": (
+                    "scopeKind": self.state.scope_kind,
+                    "scopeRunDir": (
                         None
-                        if self.state.run_dir is None
-                        else str(self.state.run_dir)
+                        if self.state.scope_run_dir is None
+                        else str(self.state.scope_run_dir)
                     ),
-                    "chatScope": self.state.chat_scope,
-                    "globalDocumentCount": global_document_count,
+                    "scopeGroupId": self.state.scope_group_id,
+                    "allDocumentCount": all_document_count,
+                    "groupDocumentCount": group_document_count,
                     "stageHistory": history,
-                    "runs": [run_summary(item, history) for item in runs],
+                    "runs": [
+                        {
+                            **run_summary(item, history),
+                            "crossLink": cross_link_summaries.get(str(item)),
+                        }
+                        for item in runs
+                    ],
+                }
+            )
+            return
+        if parsed.path == "/api/cross-link-status":
+            self.send_cross_link_status(parsed)
+            return
+        if parsed.path == "/api/groups":
+            counts = {}
+            for run_dir in find_run_dirs():
+                for group_id in read_run_groups(run_dir):
+                    counts[group_id] = counts.get(group_id, 0) + 1
+            self.send_json(
+                {
+                    "groups": [
+                        {**group, "memberCount": counts.get(group.get("id"), 0)}
+                        for group in list_groups()
+                    ]
                 }
             )
             return
@@ -2019,7 +2728,7 @@ class Handler(SimpleHTTPRequestHandler):
     def send_progress(self, parsed):
         requested = (parse_qs(parsed.query).get("run") or [""])[0]
         run_dir = (
-            self.state.run_dir
+            self.state.scope_run_dir
             if not requested
             else self.resolve_run_argument(requested)
         )
@@ -2029,7 +2738,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_json(run_summary(run_dir, _stage_history(find_run_dirs())))
 
     def send_tree_image(self, parsed):
-        if self.state.run_dir is None:
+        if self.state.scope_run_dir is None:
             self.send_error_json(
                 HTTPStatus.CONFLICT, "Select a document from the Library first"
             )
@@ -2038,7 +2747,7 @@ class Handler(SimpleHTTPRequestHandler):
         requested_run = (query.get("run") or [""])[0]
         if requested_run:
             resolved_run = self.resolve_run_argument(requested_run)
-            if resolved_run is None or resolved_run.resolve() != self.state.run_dir.resolve():
+            if resolved_run is None or resolved_run.resolve() != self.state.scope_run_dir.resolve():
                 self.send_error_json(
                     HTTPStatus.CONFLICT,
                     "The selected document changed; reload the crop",
@@ -2055,7 +2764,7 @@ class Handler(SimpleHTTPRequestHandler):
             None,
         )
         node_meta = (node or {}).get("meta") or {}
-        run_dir = self.state.run_dir.resolve()
+        run_dir = self.state.scope_run_dir.resolve()
         candidates = [
             node_meta.get("crop_uri"),
             node_meta.get("img_path"),
@@ -2110,11 +2819,11 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         origin = self.headers.get("Origin")
-        if origin and not is_loopback_host(urlparse(origin).hostname or ""):
+        if not is_allowed_origin(origin, self.headers.get("Host")):
             self.send_error_json(HTTPStatus.FORBIDDEN, "Cross-origin request denied")
             return
-        if parsed.path == "/api/run":
-            self.set_run()
+        if parsed.path == "/api/scope":
+            self.set_scope_route()
             return
         if parsed.path == "/api/upload":
             self.upload_document()
@@ -2128,11 +2837,26 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/edit-content":
             self.edit_content()
             return
-        if parsed.path == "/api/chat-scope":
-            self.set_chat_scope()
-            return
         if parsed.path == "/api/run-tag":
             self.set_run_tag()
+            return
+        if parsed.path == "/api/run-groups":
+            self.set_run_groups()
+            return
+        if parsed.path == "/api/groups":
+            self.create_group_route()
+            return
+        if parsed.path == "/api/group-rename":
+            self.rename_group_route()
+            return
+        if parsed.path == "/api/group-delete":
+            self.delete_group_route()
+            return
+        if parsed.path == "/api/group-move":
+            self.move_group_route()
+            return
+        if parsed.path == "/api/cross-link":
+            self.cross_link_route()
             return
         if parsed.path == "/api/run-stop":
             self.stop_run()
@@ -2173,7 +2897,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         parsed = urlparse(self.path)
         origin = self.headers.get("Origin")
-        if origin and not is_loopback_host(urlparse(origin).hostname or ""):
+        if not is_allowed_origin(origin, self.headers.get("Host")):
             self.send_error_json(HTTPStatus.FORBIDDEN, "Cross-origin request denied")
             return
         if parsed.path.startswith("/api/conversations/"):
@@ -2199,8 +2923,8 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
         if (
-            self.state.run_dir is not None
-            and run_dir == self.state.run_dir.resolve()
+            self.state.scope_run_dir is not None
+            and run_dir == self.state.scope_run_dir.resolve()
         ):
             self.send_error_json(
                 HTTPStatus.CONFLICT,
@@ -2226,7 +2950,60 @@ class Handler(SimpleHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, "Delete failed", str(exc)
             )
 
+    def _parse_upload_cross_link_plan(self):
+        """Parse X-Cross-Link-Plan into (mode, target run dir strings).
+
+        Returns None after sending an error response on a bad request. A
+        "group" choice is resolved to concrete run dirs here so the stored
+        plan's shape is always ``{"mode": "auto"|"skip"|"documents", ...}`` --
+        docarag/pipeline.py never needs to know about groups.
+        """
+
+        raw_header = self.headers.get("X-Cross-Link-Plan")
+        if not raw_header:
+            return "skip", []
+        try:
+            payload = json.loads(unquote(raw_header))
+        except ValueError:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "X-Cross-Link-Plan is not valid JSON")
+            return None
+        mode = payload.get("mode") if isinstance(payload, dict) else None
+        if mode not in ("auto", "skip", "documents", "group"):
+            self.send_error_json(
+                HTTPStatus.BAD_REQUEST,
+                "cross-link mode must be auto, skip, documents or group",
+            )
+            return None
+        if mode in ("skip", "auto"):
+            return mode, []
+        if mode == "group":
+            group_id = payload.get("groupId")
+            if not isinstance(group_id, str) or not group_id.strip():
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "groupId is required for group mode")
+                return None
+            return "documents", [str(run_dir) for run_dir in runs_in_group(group_id)]
+        raw_targets = payload.get("targetRunDirs")
+        if not isinstance(raw_targets, list) or not raw_targets:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "targetRunDirs is required for documents mode")
+            return None
+        resolved = []
+        for raw in raw_targets:
+            run_dir = self.resolve_run_argument(raw)
+            if run_dir is None:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, f"Unknown target document: {raw}")
+                return None
+            resolved.append(str(run_dir))
+        return "documents", resolved
+
     def upload_document(self):
+        plan = self._parse_upload_cross_link_plan()
+        if plan is None:
+            return
+        plan_mode, plan_targets = plan
+        folder_id = unquote(self.headers.get("X-Group-Id") or "").strip() or None
+        if folder_id and folder_id not in {g.get("id") for g in list_groups()}:
+            self.send_error_json(HTTPStatus.NOT_FOUND, f"Unknown folder: {folder_id}")
+            return
         name = safe_pdf_name(self.headers.get("X-Filename"))
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -2274,6 +3051,18 @@ class Handler(SimpleHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, "Indexing did not start", str(exc)
             )
             return
+        if run_dir:
+            try:
+                write_cross_link_plan(run_dir, plan_mode, plan_targets)
+            except OSError:
+                # Best effort: the pipeline hook falls back to the global
+                # auto-trigger flag when no plan file is present.
+                pass
+            if folder_id:
+                try:
+                    write_run_groups(run_dir, [folder_id])
+                except OSError:
+                    pass  # indexing started; the document just lands unfiled
         self.send_json(
             {"ok": True, "name": name, "path": str(target), "runDir": run_dir}
         )
@@ -2396,36 +3185,60 @@ class Handler(SimpleHTTPRequestHandler):
             return False
         return True
 
-    def set_chat_scope(self):
-        """Toggle chat between this document (local) and its whole corpus (global)."""
+    def set_scope_route(self):
+        """The one endpoint that changes what Library/Graph/Chat/Tree are viewing."""
 
         try:
             payload = self.read_json_body()
         except RequestBodyError as exc:
             self.send_error_json(exc.status, str(exc))
             return
-        scope = payload.get("scope")
-        if scope not in ("local", "global"):
-            self.send_error_json(HTTPStatus.BAD_REQUEST, "scope must be 'local' or 'global'")
+        kind = payload.get("kind")
+        if kind not in ("document", "group", "all"):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "kind must be 'document', 'group' or 'all'")
+            return
+        run_dir = None
+        if payload.get("runDir") is not None:
+            run_dir = self.resolve_run_argument(payload.get("runDir"))
+            if run_dir is None:
+                self.send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "Run must be an indexed directory below the configured runs directory",
+                )
+                return
+            if not (run_dir / "run-manifest.json").is_file():
+                self.send_error_json(HTTPStatus.CONFLICT, "Run has not been admitted yet")
+                return
+        group_id = payload.get("groupId")
+        if kind == "group" and (not isinstance(group_id, str) or not group_id.strip()):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "groupId is required for group scope")
             return
         try:
-            self.state.set_chat_scope(scope)
-            response = {"ok": True, "scope": scope}
-            if scope == "global":
-                try:
-                    run_dirs = self.state.global_run_dirs()
-                    response["documentCount"] = len(run_dirs)
-                except RunNotReadyError as exc:
-                    self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
-                    return
-            self.send_json(response)
+            self.state.set_scope(kind, run_dir, group_id)
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         except RunNotReadyError as exc:
             self.send_error_json(HTTPStatus.CONFLICT, "No document selected", str(exc))
+            return
         except Exception as exc:
             traceback.print_exc()
-            self.send_error_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not change chat scope", str(exc)
-            )
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Could not change scope", str(exc))
+            return
+        response = {
+            "ok": True,
+            "kind": self.state.scope_kind,
+            "runDir": str(self.state.scope_run_dir) if self.state.scope_run_dir else None,
+            "groupId": self.state.scope_group_id,
+        }
+        if kind == "all":
+            try:
+                response["documentCount"] = len(self.state.all_run_dirs())
+            except RunNotReadyError:
+                response["documentCount"] = 0
+        elif kind == "group":
+            response["documentCount"] = len(runs_in_group(group_id))
+        self.send_json(response)
 
     def set_run_tag(self):
         """Label one document in the library, or clear its label."""
@@ -2455,9 +3268,224 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self.send_json({"ok": True, "runDir": str(run_dir), "tag": tag})
 
+    def set_run_groups(self):
+        """Set one document's full group membership (a document can be in several)."""
+
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        run_dir = self.resolve_run_argument(payload.get("runDir"))
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+            return
+        raw = payload.get("groupIds")
+        if not isinstance(raw, list) or not all(isinstance(g, str) for g in raw):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "groupIds must be a list of strings")
+            return
+        known = {g.get("id") for g in list_groups()}
+        unknown = [g for g in raw if g not in known]
+        if unknown:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, f"Unknown group(s): {', '.join(unknown)}")
+            return
+        try:
+            group_ids = write_run_groups(run_dir, raw)
+        except OSError as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not save group membership", str(exc)
+            )
+            return
+        self.send_json({"ok": True, "runDir": str(run_dir), "groupIds": group_ids})
+
+    def create_group_route(self):
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        parent_id = payload.get("parentId") or None
+        try:
+            group = create_group(payload.get("name"), parent_id)
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except KeyError as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+            return
+        self.send_json({"ok": True, "group": group}, HTTPStatus.CREATED)
+
+    def rename_group_route(self):
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        group_id = payload.get("groupId")
+        if not isinstance(group_id, str) or not group_id.strip():
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "groupId is required")
+            return
+        try:
+            group = rename_group(group_id, payload.get("name"))
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except KeyError as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+            return
+        self.send_json({"ok": True, "group": group})
+
+    def delete_group_route(self):
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        group_id = payload.get("groupId")
+        if not isinstance(group_id, str) or not group_id.strip():
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "groupId is required")
+            return
+        removed = delete_group(group_id)
+        self.send_json({"ok": True, "groupId": group_id, "removedGroupIds": removed})
+
+    def move_group_route(self):
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        group_id = payload.get("groupId")
+        if not isinstance(group_id, str) or not group_id.strip():
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "groupId is required")
+            return
+        try:
+            group = move_group(group_id, payload.get("parentId") or None)
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except KeyError as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+            return
+        self.send_json({"ok": True, "group": group})
+
+    def cross_link_route(self):
+        """Retroactively cross-link an already-indexed document.
+
+        Fires a detached subprocess -- linking can involve several LLM calls
+        and must not hold the HTTP request open. Progress is polled via
+        GET /api/cross-link-status.
+        """
+
+        try:
+            payload = self.read_json_body()
+        except RequestBodyError as exc:
+            self.send_error_json(exc.status, str(exc))
+            return
+        run_dir = self.resolve_run_argument(payload.get("runDir"))
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+            return
+        if not run_completed(run_dir):
+            self.send_error_json(
+                HTTPStatus.CONFLICT,
+                "Document must finish indexing before it can be cross-linked",
+            )
+            return
+        mode = payload.get("mode")
+        if mode not in ("documents", "group", "mesh"):
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "mode must be documents, group or mesh")
+            return
+
+        target_run_dirs = []
+        if mode == "documents":
+            raw_targets = payload.get("targetRunDirs")
+            if not isinstance(raw_targets, list) or not raw_targets:
+                self.send_error_json(
+                    HTTPStatus.BAD_REQUEST, "targetRunDirs is required for documents mode"
+                )
+                return
+            for raw in raw_targets:
+                target = self.resolve_run_argument(raw)
+                if target is None:
+                    self.send_error_json(HTTPStatus.BAD_REQUEST, f"Unknown target document: {raw}")
+                    return
+                target_run_dirs.append(target)
+        elif mode == "group":
+            group_id = payload.get("groupId")
+            if not isinstance(group_id, str) or not group_id.strip():
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "groupId is required for group mode")
+                return
+            target_run_dirs = [
+                r for r in runs_in_group(group_id) if r.resolve() != run_dir.resolve()
+            ]
+        if mode in ("documents", "group") and not target_run_dirs:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "No other documents to link against")
+            return
+
+        command = [sys.executable, "-m", "docarag.cross_doc_link", "--run", str(run_dir)]
+        if mode == "mesh":
+            command += ["--mode", "mesh"]
+        else:
+            for target in target_run_dirs:
+                command += ["--run", str(target)]
+        try:
+            subprocess.Popen(
+                command,
+                cwd=str(REPO),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not start cross-linking", str(exc)
+            )
+            return
+        self.send_json({"ok": True, "runDir": str(run_dir)})
+
+    def send_cross_link_status(self, parsed):
+        raw = (parse_qs(parsed.query).get("run") or [None])[0]
+        run_dir = self.resolve_run_argument(raw)
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+            return
+        try:
+            from docarag.persistence import PostgresLedger
+            from docarag.settings import load_settings
+
+            ledger = PostgresLedger(load_settings().resolve_database_url())
+            revision_key = _revision_key_for_run(ledger, run_dir)
+            with ledger.transaction() as connection:
+                row = connection.execute(
+                    "SELECT status, error FROM docarag.stage_state "
+                    "WHERE revision_key = %s AND stage = 'cross_doc_link'",
+                    (revision_key,),
+                ).fetchone()
+        except Exception as exc:
+            self.send_error_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, "Could not read cross-link status", str(exc)
+            )
+            return
+        self.send_json(
+            {
+                "status": row["status"] if row else "pending",
+                "error": row["error"] if row else None,
+            }
+        )
+
     def edit_summary(self):
         try:
-            self.state.require_run()
+            self.state.require_document_scope()
             payload = self.read_json_body()
             node_id = payload.get("nodeId")
             text = payload.get("text")
@@ -2471,7 +3499,7 @@ class Handler(SimpleHTTPRequestHandler):
             # The vectors are re-derived in place, which needs the attestation
             # build lock this server's own agent holds a shared lease on.
             self.state.release_index_locks()
-            edit_node_summary(self.state.run_dir, node_id, text.strip())
+            edit_node_summary(self.state.scope_run_dir, node_id, text.strip())
             # The tree changed under the viewer; its cache must not outlive it.
             self.state._tree_cache = None
             # The vectors were re-derived by the edit, so the document is
@@ -2488,7 +3516,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def edit_content(self):
         try:
-            self.state.require_run()
+            self.state.require_document_scope()
             payload = self.read_json_body()
             node_id = payload.get("nodeId")
             text = payload.get("text")
@@ -2500,7 +3528,7 @@ class Handler(SimpleHTTPRequestHandler):
             from docarag.edit import edit_node_content
 
             self.state.release_index_locks()
-            edit_node_content(self.state.run_dir, node_id, text.strip())
+            edit_node_content(self.state.scope_run_dir, node_id, text.strip())
             self.state._tree_cache = None
             self.send_json(
                 {
@@ -2525,7 +3553,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def edit_entity(self):
         try:
-            self.state.require_run()
+            self.state.require_document_scope()
             payload = self.read_json_body()
             canonical = payload.get("canonical")
             kind = payload.get("kind")
@@ -2547,7 +3575,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             self.state.release_index_locks()
             edit_entity_description(
-                self.state.run_dir, canonical.strip(), kind.strip(), text.strip()
+                self.state.scope_run_dir, canonical.strip(), kind.strip(), text.strip()
             )
             self.state._tree_cache = None
             self.send_json(
@@ -2569,34 +3597,6 @@ class Handler(SimpleHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "Edit failed",
                 detail=f"{type(exc).__name__}: {exc}",
-            )
-
-    def set_run(self):
-        try:
-            payload = self.read_json_body()
-            run_dir = self.resolve_run_argument(payload.get("runDir"))
-            if run_dir is None:
-                self.send_error_json(
-                    HTTPStatus.NOT_FOUND,
-                    "Run must be an indexed directory below the configured runs "
-                    "directory",
-                )
-                return
-            if not (run_dir / "run-manifest.json").is_file():
-                self.send_error_json(
-                    HTTPStatus.CONFLICT, "Run has not been admitted yet"
-                )
-                return
-            self.state.switch_run(run_dir)
-            self.send_json({"ok": True, "runDir": str(run_dir)})
-        except RequestBodyError as exc:
-            self.send_error_json(exc.status, str(exc))
-        except Exception as exc:
-            traceback.print_exc()
-            self.send_error_json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "Could not switch run",
-                str(exc),
             )
 
     def read_json_body(self):
@@ -2624,12 +3624,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     @staticmethod
     def _safe_doc_name(run):
-        try:
-            manifest = read_json(run / "run-manifest.json")
-            source = manifest.get("source") or {}
-            return Path(source.get("path") or "").name or run.name
-        except Exception:
-            return run.name
+        return safe_doc_name(run)
 
 
 def main():
@@ -2644,15 +3639,16 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run the local BookRAG web UI.")
     parser.add_argument("run_dir", nargs="?", help="BookRAG run directory")
-    parser.add_argument("--host", default=os.environ.get("BOOKRAG_WEB_HOST", "127.0.0.1"))
+    parser.add_argument("--host", default=os.environ.get("BOOKRAG_WEB_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("BOOKRAG_WEB_PORT", "8765")))
     args = parser.parse_args()
 
     if not is_loopback_host(args.host):
-        raise SystemExit(
-            "The compatibility Web UI is intentionally loopback-only because it "
-            "has no authentication. Use 127.0.0.1/localhost and place a production "
-            "API behind authenticated infrastructure."
+        print(
+            "WARNING: binding to a non-loopback host with no authentication. "
+            "Anyone who can reach this port can read, chat with, and delete "
+            "every document.",
+            file=sys.stderr,
         )
     if not 1 <= args.port <= 65535:
         raise SystemExit("Web port must be between 1 and 65535")

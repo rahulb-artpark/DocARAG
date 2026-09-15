@@ -42,6 +42,37 @@ class _SequencedLLM:
 
 
 class PlannerFanoutBoundTests(unittest.TestCase):
+    def test_global_classification_is_disabled_by_default(self):
+        self.assertFalse(GBCRAGConfig().enable_global_classification)
+        llm = _SequencedLLM(QueryTypeResult(query_type="simple"))
+        plan = TaskPlanner(llm).analyze("What is Figure 2?")
+        self.assertEqual("simple", plan.query_type)
+        prompt, schema = llm.calls[0]
+        self.assertIn('two categories: "simple" or "complex"', prompt)
+        self.assertNotIn("3.  **global**", prompt)
+        self.assertEqual(
+            ["simple", "complex"],
+            schema.model_json_schema()["properties"]["query_type"]["enum"],
+        )
+
+    def test_disabled_classifier_rejects_global_provider_response(self):
+        llm = _SequencedLLM(QueryTypeResult(query_type="global"))
+        with self.assertRaises(ValidationError):
+            TaskPlanner(llm).analyze("Count all tables")
+        self.assertEqual(1, len(llm.calls))
+
+    def test_global_classification_can_be_enabled(self):
+        self.assertTrue(GBCRAGConfig(enable_global_classification=True).enable_global_classification)
+        llm = _SequencedLLM(
+            QueryTypeResult(query_type="global"),
+            GlobalResult(filters=[Filter(filter_type="document")], operation="COUNT"),
+        )
+        plan = TaskPlanner(llm, enable_global_classification=True).analyze("Count all tables")
+        self.assertEqual("global", plan.query_type)
+        prompt, schema = llm.calls[0]
+        self.assertIn("3.  **global**", prompt)
+        self.assertIs(QueryTypeResult, schema)
+
     def test_long_query_is_rejected_before_any_model_call(self):
         llm = _SequencedLLM()
         planner = TaskPlanner(llm, max_query_chars=8)
@@ -95,7 +126,7 @@ class PlannerFanoutBoundTests(unittest.TestCase):
                 filters=[Filter(filter_type="document")], operation="ANALYZE"
             ),
         )
-        planner = TaskPlanner(llm)
+        planner = TaskPlanner(llm, enable_global_classification=True)
 
         planner.analyze(
             "What drives the margin gap?",
@@ -118,7 +149,7 @@ class PlannerFanoutBoundTests(unittest.TestCase):
                 filters=[Filter(filter_type="document")], operation="SUMMARIZE"
             ),
         )
-        planner = TaskPlanner(llm)
+        planner = TaskPlanner(llm, enable_global_classification=True)
 
         planner.analyze("Summarize it", section_titles=[])
 
@@ -133,7 +164,7 @@ class PlannerFanoutBoundTests(unittest.TestCase):
                 filters=[Filter(filter_type="document")], operation="COUNT"
             ),
         )
-        planner = TaskPlanner(llm)
+        planner = TaskPlanner(llm, enable_global_classification=True)
 
         planner.analyze(
             "Count the tables",
@@ -150,7 +181,7 @@ class PlannerFanoutBoundTests(unittest.TestCase):
             QueryTypeResult(query_type="global"),
             GlobalResult(filters=filters, operation="COUNT"),
         )
-        planner = TaskPlanner(llm, max_filters=2)
+        planner = TaskPlanner(llm, enable_global_classification=True, max_filters=2)
 
         with self.assertRaisesRegex(PlanningBudgetExceeded, "3 filters"):
             planner.analyze("Count across these pages")
@@ -361,7 +392,7 @@ class SectionSelectionBoundTests(unittest.TestCase):
             )
         )
         rag = self._rag(sections, llm, candidate_limit=4)
-        rag.link_section = lambda _nodes: {2: ["latency"]}
+        rag.link_section = lambda _nodes, **_kwargs: {2: ["latency"]}
         step = SubStep(sub_query="quantum latency", sub_number=1)
 
         rag.llm_section_selection("quantum latency", [], step)
@@ -382,7 +413,7 @@ class SectionSelectionBoundTests(unittest.TestCase):
             SecEXPSelection(supplementary_ids=[3], explanation="Gamma is useful")
         )
         rag = self._rag(sections, llm, candidate_limit=4)
-        rag.link_section = lambda _nodes: {1: ["alpha"]}
+        rag.link_section = lambda _nodes, **_kwargs: {1: ["alpha"]}
         step = SubStep(sub_query="gamma", sub_number=1)
 
         rag.llm_section_selection("gamma", [], step)
@@ -395,7 +426,7 @@ class SectionSelectionBoundTests(unittest.TestCase):
         sections = [_section(index, f"Section {index}") for index in range(1, 8)]
         llm = _SequencedLLM()
         rag = self._rag(sections, llm, candidate_limit=3)
-        rag.link_section = lambda _nodes: {
+        rag.link_section = lambda _nodes, **_kwargs: {
             1: ["a"],
             2: ["b"],
             3: ["c"],
@@ -418,7 +449,7 @@ class SectionSelectionBoundTests(unittest.TestCase):
             SecEXPSelection(supplementary_ids=[9], explanation="hallucinated scope")
         )
         rag = self._rag(sections, llm, candidate_limit=2)
-        rag.link_section = lambda _nodes: {1: ["a"]}
+        rag.link_section = lambda _nodes, **_kwargs: {1: ["a"]}
         step = SubStep(sub_query="unrelated", sub_number=1)
 
         # Determine a definitely omitted ID; the fake output is adjusted after
@@ -435,15 +466,16 @@ class SectionSelectionBoundTests(unittest.TestCase):
             for section in sections[1:]
             if section.index_id != candidates[0].index_id
         )
-        llm.responses[0] = SecEXPSelection(
-            supplementary_ids=[omitted], explanation="outside pool"
-        )
+        llm.responses = [
+            SecEXPSelection(supplementary_ids=[omitted], explanation="outside pool")
+            for _ in range(2)
+        ]
 
         with self.assertRaisesRegex(ValueError, "outside the bounded"):
             rag.llm_section_selection("unrelated", [], step)
 
         self.assertEqual("invalid_out_of_pool_model_ids", step.section_selection_status)
-        self.assertEqual(1, len(llm.calls))
+        self.assertEqual(2, len(llm.calls))
 
     def test_selector_output_count_is_rejected_not_truncated(self):
         sections = [_section(index, f"Section {index}") for index in range(1, 6)]
@@ -459,7 +491,7 @@ class SectionSelectionBoundTests(unittest.TestCase):
             candidate_limit=5,
             supplementary_limit=2,
         )
-        rag.link_section = lambda _nodes: {1: ["a"]}
+        rag.link_section = lambda _nodes, **_kwargs: {1: ["a"]}
         step = SubStep(sub_query="question", sub_number=1)
 
         with self.assertRaisesRegex(PlanningBudgetExceeded, "3 IDs"):

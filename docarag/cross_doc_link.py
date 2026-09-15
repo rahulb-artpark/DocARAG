@@ -1,14 +1,21 @@
 """Cross-link documents' entities: grouping nodes and cross-docs relations.
 
-Two modes, chosen by how many ``--run`` directories are given:
+Chosen by how many ``--run`` directories are given, and ``--mode`` for a
+single ``--run``:
 
-Auto (one ``--run``): cross-link that just-persisted document against the
-whole corpus. This is what ``docarag/pipeline.py`` shells out to automatically
-when ``graph_config.cross_doc_link_auto_trigger`` is on.
+Auto (one ``--run``, default mode): cross-link that just-persisted document
+against the whole corpus. This is what ``docarag/pipeline.py`` shells out to
+automatically when ``graph_config.cross_doc_link_auto_trigger`` is on.
 
-Direct (two or more ``--run``): cross-link exactly the given, already-ingested
-documents against each other, ignoring the rest of the corpus -- the
-user-selects-documents path.
+Mesh (one ``--run``, ``--mode mesh``): cross-link that document only against
+its existing mesh -- its direct matches, plus whatever those documents are
+already cross-linked to -- skipping documents with no existing connection.
+
+Direct (two or more ``--run``): cross-link the first ``--run`` (the focal
+document -- the one just ingested, or the one "Link to..." was clicked on)
+against the rest, ignoring the rest of the corpus -- the user-selects-
+documents or user-selects-group path. One-directional: only the focal
+document's entities are scanned, restricted to the given targets.
 """
 
 from __future__ import annotations
@@ -41,7 +48,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database-url")
     parser.add_argument("--merge-threshold", type=float, default=None)
     parser.add_argument("--relatedness-floor", type=float, default=None)
+    parser.add_argument(
+        "--mode", choices=("auto", "mesh"), default="auto",
+        help="only meaningful with a single --run; mesh restricts linking to "
+        "documents already reachable via an existing cross-doc connection",
+    )
     args = parser.parse_args(argv)
+    if args.mode == "mesh" and len(args.run) != 1:
+        print("cross_doc_link error: --mode mesh requires exactly one --run", file=sys.stderr)
+        return 1
 
     database_url = args.database_url or os.environ.get("DOCARAG_DATABASE_URL")
     if not database_url:
@@ -85,17 +100,21 @@ def main(argv: list[str] | None = None) -> int:
             merge_threshold=args.merge_threshold, relatedness_floor=args.relatedness_floor,
         )
         try:
-            stats = (
-                linker.link_document(revision_keys[0]) if len(revision_keys) == 1
-                else linker.link_documents(revision_keys)
-            )
+            if len(revision_keys) == 1:
+                stats = (
+                    linker.link_document_expanding(revision_keys[0])
+                    if args.mode == "mesh"
+                    else linker.link_document(revision_keys[0])
+                )
+            else:
+                stats = linker.link_documents(revision_keys)
         finally:
             linker.close()
     except Exception as exc:  # noqa: BLE001 - CLI boundary reports a clean message
         print(f"cross_doc_link error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    mode = "auto" if len(revision_keys) == 1 else "direct"
+    mode = args.mode if len(revision_keys) == 1 else "direct"
     print(f"[cross_doc_link:{mode}] {stats}")
     return 0
 

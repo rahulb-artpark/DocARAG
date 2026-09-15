@@ -27,6 +27,7 @@ class SubStep(BaseModel):
 
     supplementary_ids: List[int] = Field(default_factory=list)
     selected_explanation: str = ""
+    section_selection_by_doc: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     section_selection_status: str = "not_started"
     section_selection_policy: str = ""
     section_total_count: int = 0

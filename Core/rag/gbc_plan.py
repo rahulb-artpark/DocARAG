@@ -114,6 +114,12 @@ class QueryTypeResult(BaseModel):
     )
 
 
+class LocalQueryTypeResult(QueryTypeResult):
+    """Classification schema used while global classification is disabled."""
+
+    query_type: Literal["simple", "complex"]
+
+
 # Step 2 'complex' Output Model
 class SubQuestion(BaseModel):
     question: str = Field(
@@ -308,13 +314,15 @@ class TaskPlanner:
         self,
         llm: LLM,
         *,
+        enable_global_classification: bool = False,
         max_query_chars: int = 4_096,
-        max_subquestions: int = 8,
+        max_subquestions: int = 16,
         max_subquestion_chars: int = 1_024,
         max_filters: int = 8,
         max_filter_value_chars: int = 256,
     ):
         self.llm = llm
+        self.enable_global_classification = enable_global_classification
         limits = {
             "max_query_chars": (max_query_chars, ABSOLUTE_MAX_QUERY_CHARS),
             "max_subquestions": (max_subquestions, ABSOLUTE_MAX_SUBQUESTIONS),
@@ -401,10 +409,25 @@ class TaskPlanner:
         return plan
 
     def _get_classification_prompt(self, query: str) -> str:
-        # Prompt for Step 1: Classification Only
-        # 强调了 "simple" 和 "global" 的区别
+        categories = (
+            'three categories: "simple", "complex", or "global"'
+            if self.enable_global_classification
+            else 'two categories: "simple" or "complex"'
+        )
+        global_category = ""
+        if self.enable_global_classification:
+            global_category = """3.  **global**: The question requires an **aggregation operation** (e.g., counting, listing, summarizing) over a set of items that are identified by a **clear structural filter**. The available filters are by layout type (such as `table`, `image`, `section`) or by a document range (such as `page` or `section`). This operation must be performed across all items that match the specified filter(s).
+    - Example: "How many tables are in the document?" -> This is GLOBAL because the process is to **filter** for all items of type 'table' across the document, and then **aggregate** by counting them.
+    - Example: "Summarize the discussion about 'data augmentation' in the 'Methodology' section." -> This is GLOBAL because the process is to first apply a **structural filter** (retrieve all content from the 'Methodology' section), and then perform an **aggregation** (summarize that content) with a focus on 'data augmentation'."""
+        else:
+            global_category = (
+                "Questions requiring counting, listing, or summarizing across "
+                "multiple locations must be classified as complex and decomposed "
+                "into retrieval sub-questions. If all required information is in "
+                "one contiguous location, classify as simple."
+            )
         return f"""
-You are an expert query analyzer. Your *only* task is to classify the user's question into one of three categories: "simple", "complex", or "global". Respond only with the specified JSON object.
+You are an expert query analyzer. Your *only* task is to classify the user's question into one of {categories}. Respond only with the specified JSON object.
 
 Category Definitions:
 1.  **simple**: The question can be fully answered by retrieving information from a **SINGLE, contiguous location** in the document (e.g., one specific paragraph, one complete table, or one figure).
@@ -417,9 +440,7 @@ Category Definitions:
     - The key is that **no single location contains all the necessary information** to answer the original query in one go.
     - Example: "What is the color of the personality vector in the soft-labled personality embedding matrix that with the highest Receptiviti score for User A2GBIFL43U1LKJ?" -> This is COMPLEX because it requires two **separate retrieval actions**: 1) A retrieval to find the vector with the 'highest score', and 2) a separate retrieval to find the 'color' associated with that vector.
 
-3.  **global**: The question requires an **aggregation operation** (e.g., counting, listing, summarizing) over a set of items that are identified by a **clear structural filter**. The available filters are by layout type (such as `table`, `image`, `section`) or by a document range (such as `page` or `section`). This operation must be performed across all items that match the specified filter(s).
-    - Example: "How many tables are in the document?" -> This is GLOBAL because the process is to **filter** for all items of type 'table' across the document, and then **aggregate** by counting them.
-    - Example: "Summarize the discussion about 'data augmentation' in the 'Methodology' section." -> This is GLOBAL because the process is to first apply a **structural filter** (retrieve all content from the 'Methodology' section), and then perform an **aggregation** (summarize that content) with a focus on 'data augmentation'.
+{global_category}
 
 {self._requested_node_types_rules()}
 
@@ -600,7 +621,14 @@ Assistant:
 
     def _classify_query_type(self, query: str) -> QueryTypeResult:
         prompt = self._get_classification_prompt(query)
-        return self.llm.get_json_completion(prompt, schema=QueryTypeResult)
+        schema = (
+            QueryTypeResult
+            if self.enable_global_classification
+            else LocalQueryTypeResult
+        )
+        result = self.llm.get_json_completion(prompt, schema=schema)
+        # Validate again for providers that return an already constructed model.
+        return schema.model_validate(result.model_dump())
 
     def _process_complex_query(self, query: str) -> List[SubQuestion]:
         prompt = self._get_complex_prompt(query)

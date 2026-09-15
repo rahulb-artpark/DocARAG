@@ -55,6 +55,10 @@ _EVIDENCE_SCOPE = re.compile(r"Q[1-9][0-9]*")
 _CANONICAL_CITATION_ID = re.compile(r"citation_[0-9a-f]{32}")
 
 
+class ComplexContextBudgetExceeded(ValueError):
+    """Findings cannot be safely fitted into the synthesis input budget."""
+
+
 class EvidencePromptMemory(Memory):
     """A model prompt plus provenance captured before rendering document text."""
 
@@ -109,6 +113,12 @@ def _citation_index(evidence_nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 "page": node.get("page"),
                 "snippet": snippet[:400],
                 "has_image": bool(node.get("img_path")),
+                # Which document this evidence came from -- a corpus-scoped
+                # (group/all) answer draws on more than one, and a UI grouping
+                # or cross-document jump needs both the display name and the
+                # identity to resolve a runDir from.
+                "document_version_id": node.get("document_version_id"),
+                "document_title": node.get("document_title"),
             }
         )
     return citations
@@ -453,10 +463,12 @@ class AnswerAgent:
         vlm: VLM,
         variant: str = None,
         evidence_hydrator: object | None = None,
+        complex_synthesis_input_tokens: int = 12000,
     ):
         self.llm = llm
         self.vlm = vlm
         self.variant = variant
+        self.complex_synthesis_input_tokens = complex_synthesis_input_tokens
         self.evidence_hydrator = evidence_hydrator
 
     def _prepare_evidence(
@@ -1113,6 +1125,53 @@ class AnswerAgent:
         )
         return final_answer
 
+    def _fit_complex_findings(self, findings: str, render) -> tuple[str, int]:
+        """Reduce all findings in bounded passes; never silently truncate them."""
+        config = getattr(self.llm, "config", None)
+        budget = self.complex_synthesis_input_tokens
+        window = getattr(config, "num_ctx", None)
+        output = getattr(config, "max_tokens", 5000)
+        if isinstance(window, int) and window > 0:
+            budget = min(budget, window - output - 512)
+        overhead = num_tokens(render(""))
+        if budget <= overhead + 256:
+            raise ComplexContextBudgetExceeded("Complex synthesis context budget has no room for findings")
+        passes = 0
+        while num_tokens(render(findings)) > budget:
+            if passes >= 3:
+                raise ComplexContextBudgetExceeded("Complex synthesis findings still exceed context budget after 3 compaction passes")
+            instruction = (
+                "Compress these findings for answering the original question below. "
+                "Preserve relevant facts, numbers, qualifications and disagreements. "
+                "Preserve EVERY bracketed evidence label exactly, attached to its fact. "
+                "Do not add evidence labels or facts. Aim for less than half the input length.\n"
+            )
+            # The rendered empty prompt retains the original query and final task.
+            prefix = instruction + render("") + "\nFindings to compress:\n"
+            chunk_budget = budget - num_tokens(prefix) - 64
+            if chunk_budget < 256:
+                raise ComplexContextBudgetExceeded("Complex synthesis context budget is too small for compaction")
+            chunks = TextProcessor.split_text_into_chunks(findings, max_length=chunk_budget)
+            summaries = []
+            for chunk in chunks:
+                prompt = prefix + chunk
+                if num_tokens(prompt) > budget:
+                    raise ComplexContextBudgetExceeded("Compaction chunk exceeds context budget")
+                summary = self.llm.get_completion(prompt)
+                if not isinstance(summary, str) or not summary.strip():
+                    raise ComplexContextBudgetExceeded("Compaction returned empty findings")
+                if set(_EVIDENCE_MARKER.findall(summary)) != set(_EVIDENCE_MARKER.findall(chunk)):
+                    raise ComplexContextBudgetExceeded("Compaction changed evidence labels")
+                summaries.append(summary)
+            reduced = "\n\n".join(summaries)
+            if set(_EVIDENCE_MARKER.findall(reduced)) != set(_EVIDENCE_MARKER.findall(findings)):
+                raise ComplexContextBudgetExceeded("Compaction lost evidence labels across chunks")
+            if num_tokens(reduced) >= num_tokens(findings):
+                raise ComplexContextBudgetExceeded("Compaction did not reduce the findings")
+            findings = reduced
+            passes += 1
+        return findings, passes
+
     def answer_complex_question_with_validation(
         self,
         original_query: str,
@@ -1249,7 +1308,8 @@ class AnswerAgent:
                 "question."
             )
         )
-        synthesis_prompt = f"""
+        def render_synthesis(findings):
+            return f"""
 You are an expert AI assistant synthesizing findings for a complex question.
 Use ONLY the gathered findings. {CITATION_INSTRUCTION}
 
@@ -1263,7 +1323,7 @@ answer.
 {original_query}
 
 --- GATHERED FINDINGS ---
-{intermediate_findings}
+{findings}
 
 --- FINAL TASK ---
 {final_task}
@@ -1272,12 +1332,20 @@ Final Answer:
 """
 
         generation_failed = False
+        compaction_passes = 0
+        context_error = None
         try:
+            fitted_findings, compaction_passes = self._fit_complex_findings(
+                intermediate_findings, render_synthesis
+            )
+            synthesis_prompt = render_synthesis(fitted_findings)
             final_answer = self.llm.get_completion(synthesis_prompt)
             if not isinstance(final_answer, str):
                 final_answer = str(final_answer)
         except Exception as error:
             generation_failed = True
+            if isinstance(error, ComplexContextBudgetExceeded):
+                context_error = str(error)
             log.error("Error during complex synthesis step: %s", error)
             final_answer = (
                 "I encountered an error while trying to synthesize the final "
@@ -1298,6 +1366,7 @@ Final Answer:
                 "subquestion_count": len(sub_question_results),
             }
         )
+        validation["compaction_passes"] = compaction_passes
         if binding_errors:
             validation["binding_errors"] = binding_errors
         if generation_failed:
@@ -1310,6 +1379,17 @@ Final Answer:
                         "be structurally accepted."
                     ),
                 }
+            )
+
+        if context_error is not None:
+            validation.update(
+                status="context_budget_exceeded", valid=False, message=context_error
+            )
+            return (
+                "The gathered findings could not be safely condensed to fit the "
+                "answer model's context window. Narrow the question or increase "
+                "the configured context budget. " + context_error,
+                validation,
             )
 
         if require_citations and (

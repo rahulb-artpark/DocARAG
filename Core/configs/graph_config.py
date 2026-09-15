@@ -78,6 +78,19 @@ class GraphConfig:
     # by explicitly selecting documents to link (direct/manual) -- it must
     # never be an unconditional side effect of ingestion.
     cross_doc_link_auto_trigger: bool = False
+    # Each entity's candidate search + LLM judgment is independent of every
+    # other entity's, the same way each tree node's KG extraction is -- so it
+    # gets the same bounded-concurrency treatment as extraction_max_workers/
+    # extraction_max_in_flight above, instead of running one entity at a time.
+    cross_doc_link_max_workers: int = 4
+    cross_doc_link_max_in_flight: Optional[int] = None
+    # A restricted link (documents/group mode) already knows exactly which
+    # document(s) it's comparing against and searches each one individually
+    # (see cross_doc_linker.py::_search_cross_document_matches) -- "up to 20
+    # similar things" per query entity is sized for a whole-corpus discovery
+    # search, not for combing a single small target document, where it mostly
+    # just inflates the number of candidates that need an LLM judgment.
+    cross_doc_link_restricted_candidate_top_k: int = 6
 
     def __post_init__(self):
         if (
@@ -125,3 +138,11 @@ class GraphConfig:
                 "cross_doc_relatedness_floor must be strictly less than "
                 "cross_doc_merge_threshold"
             )
+        if self.cross_doc_link_max_workers < 1:
+            raise ValueError("cross_doc_link_max_workers must be at least 1")
+        if self.cross_doc_link_max_in_flight is None:
+            self.cross_doc_link_max_in_flight = self.cross_doc_link_max_workers
+        if self.cross_doc_link_max_in_flight < 1:
+            raise ValueError("cross_doc_link_max_in_flight must be at least 1")
+        if self.cross_doc_link_restricted_candidate_top_k < 1:
+            raise ValueError("cross_doc_link_restricted_candidate_top_k must be at least 1")

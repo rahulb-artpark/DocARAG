@@ -24,6 +24,31 @@ log = logging.getLogger(__name__)
 _MIN_SEMANTIC_MARGIN = 0.20
 
 
+def _local_or_remote_model_ref(model_name: str) -> str:
+    """A model_name ModelScope can load without a network round-trip, when
+    the exact same weights already sit in the Hugging Face cache.
+
+    ModelScope's own cache (~/.cache/modelscope) is entirely separate from
+    Hugging Face's (~/.cache/huggingface) -- the same model name downloaded
+    once via one is invisible to the other, so a machine that already has a
+    model's weights (e.g. pulled by a different loader elsewhere in this
+    codebase) still re-downloads the same multi-GB file the first time
+    ModelScope's AutoModel/AutoTokenizer loads it. ModelScope's loaders
+    accept a raw local directory in place of a repo id, so resolving one
+    here first -- only when every file is already present locally -- turns
+    that into an instant local load instead. Falls back to model_name
+    itself (today's behavior, a normal ModelScope download) whenever no
+    complete local snapshot exists.
+    """
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(repo_id=model_name, local_files_only=True)
+    except Exception:
+        return model_name
+
+
 class BaseEmbedder(ABC):
     MM_EMBEDDER: bool = False
 
@@ -840,11 +865,12 @@ class TextEmbeddingProvider(BaseEmbedder):
                 log.info("Loading model: %s...", self.model_name)
 
                 # 根据官方示例，使用AutoTokenizer和AutoModel，并设置padding_side
+                model_ref = _local_or_remote_model_ref(self.model_name)
                 self.tokenizer = AutoTokenizer.from_pretrained(
-                    self.model_name, padding_side="left", trust_remote_code=True
+                    model_ref, padding_side="left", trust_remote_code=True
                 )
                 self.model = AutoModel.from_pretrained(
-                    self.model_name, trust_remote_code=True
+                    model_ref, trust_remote_code=True
                 ).to(self.device)
                 self.model.eval()
             except Exception:

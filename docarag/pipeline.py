@@ -120,6 +120,80 @@ def _cross_doc_link_auto_trigger_enabled(config_path: Path) -> bool:
     return bool((data.get("graph") or {}).get("cross_doc_link_auto_trigger"))
 
 
+def _cross_doc_link_plan(run: Path, config_path: Path) -> tuple[str, list[str]]:
+    """The ingest-time cross-link decision for this run: (mode, target run dirs).
+
+    Reads the per-run plan the web UI wrote at upload time (Scripts/web.py's
+    ``library-cross-link-plan.json``); falls back to the global auto-trigger
+    config flag when no plan was recorded, e.g. a CLI-driven run.
+    """
+
+    plan_path = run / "library-cross-link-plan.json"
+    try:
+        data = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict) and data.get("mode") in ("auto", "skip", "documents"):
+        targets = data.get("targetRunDirs")
+        return str(data["mode"]), [str(t) for t in targets] if isinstance(targets, list) else []
+    return ("auto" if _cross_doc_link_auto_trigger_enabled(config_path) else "skip"), []
+
+
+def _trigger_planned_cross_doc_link(run: Path, config: Path, env: dict, connection, key: int) -> None:
+    """Best effort: this document's own tree/graph/vdb/persist outcome must
+    never depend on the corpus having anything to link against yet, so a
+    failure here is recorded under its own stage and never turns the calling
+    stage's own status into "failed"."""
+
+    mode, targets = _cross_doc_link_plan(run, config)
+    if mode == "skip":
+        return
+    if mode == "documents" and not targets:
+        # A "documents"/"group" plan resolved to nothing to link against yet
+        # (e.g. the chosen group has no other indexed members). Falling
+        # through to a single `--run` below would silently hit
+        # cross_doc_link.py's own default: one --run with no --mode is
+        # "auto", which links against the WHOLE corpus -- exactly the
+        # unscoped behavior the user explicitly did not choose. Nothing to
+        # do is a successful (empty) outcome, not a fallback to auto.
+        _record(connection, key, "cross_doc_link", "succeeded")
+        return
+    repo = Path(__file__).resolve().parent.parent
+    link_command = [sys.executable, "-m", "docarag.cross_doc_link", "--run", str(run)]
+    for target in targets:
+        link_command += ["--run", target]
+    _record(connection, key, "cross_doc_link", "running")
+    link = subprocess.run(link_command, cwd=str(repo), env=env)
+    _record(
+        connection, key, "cross_doc_link",
+        "succeeded" if link.returncode == 0 else "failed",
+        None if link.returncode == 0 else f"exit {link.returncode}",
+    )
+
+
+def run_cross_doc_link_hook(run: Path) -> int:
+    """Bash driver entrypoint for the automatic, plan-aware ingest-time hook.
+
+    docarag/pipeline.py::run_stage already calls _trigger_planned_cross_doc_link
+    from the Python-driven stage sequence, but Scripts/index_pdf.sh (the bash
+    driver docarag/cli.py's `index` command actually uses) is a separate
+    orchestration path that never calls run_stage -- so this hook was
+    unreachable from real document uploads until this entrypoint existed.
+    Always returns 0: a cross-link failure must never fail the document's own
+    indexing, mirroring _trigger_planned_cross_doc_link's own contract.
+    """
+
+    run = run.expanduser().resolve()
+    config = run / "run_config.yaml"
+    env = dict(os.environ)
+    env.update({"DOCARAG_RUNS_DIR": str(run.parent.parent)})
+    with _connect() as connection:
+        key = _revision_key(connection, run)
+        with _stage_lock(connection, key, "cross_doc_link"):
+            _trigger_planned_cross_doc_link(run, config, env, connection, key)
+    return 0
+
+
 def run_cross_doc_link_stage(run: Path) -> int:
     """Manually (re-)run cross-doc linking for one run, outside the driven sequence."""
 
@@ -261,25 +335,6 @@ def run_stage(run: Path, stage: str) -> int:
                 )
                 if part.returncode != 0:
                     status = "failed"
-                if (
-                    stage == "graph"
-                    and part.returncode == 0
-                    and _cross_doc_link_auto_trigger_enabled(config)
-                ):
-                    # Best effort: this document's own tree/graph/vdb/persist
-                    # outcome must never depend on the corpus having anything
-                    # to link against yet, so a failure here is recorded under
-                    # its own stage and never turns `status` into "failed".
-                    _record(connection, key, "cross_doc_link", "running")
-                    link = subprocess.run(
-                        [sys.executable, "-m", "docarag.cross_doc_link", "--run", str(run)],
-                        cwd=str(repo), env=env,
-                    )
-                    _record(
-                        connection, key, "cross_doc_link",
-                        "succeeded" if link.returncode == 0 else "failed",
-                        None if link.returncode == 0 else f"exit {link.returncode}",
-                    )
             if status == "succeeded" and stage in ("tree", "graph", "vdb"):
                 # Only a run whose file state now shows every stage
                 # succeeded is publishable -- mirroring the bash driver,
@@ -290,6 +345,13 @@ def run_stage(run: Path, stage: str) -> int:
                     for name in STAGE_NAMES
                 )
                 if all_succeeded:
+                    # Deliberately gated on the whole run, not just graph's
+                    # own persist: cross-linking is the last, capstone step
+                    # for a document, so it must never start while vdb --
+                    # this document's own retrieval index -- is still
+                    # pending, even though its candidate search only reads
+                    # what graph already persisted.
+                    _trigger_planned_cross_doc_link(run, config, env, connection, key)
                     republish = _republish(run, repo, env)
                     if republish != 0:
                         _record(
@@ -490,7 +552,10 @@ def run_all(run: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one pipeline stage from the store's state")
     parser.add_argument(
-        "stage", choices=STAGES + ("cross_doc_link", "status", "all", "overview", "watch")
+        "stage",
+        choices=STAGES + (
+            "cross_doc_link", "cross_doc_link_auto", "status", "all", "overview", "watch",
+        ),
     )
     parser.add_argument("--run", type=Path)
     args = parser.parse_args(argv)
@@ -512,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_all(args.run)
         if args.stage == "cross_doc_link":
             return run_cross_doc_link_stage(args.run)
+        if args.stage == "cross_doc_link_auto":
+            return run_cross_doc_link_hook(args.run)
         return run_stage(args.run, args.stage)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)

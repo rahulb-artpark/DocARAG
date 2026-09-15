@@ -25,10 +25,19 @@
       <div class="brand">
         <h1>NoeticsRAG&nbsp;Explorer</h1>
       </div>
-      <label class="runPicker">
-        <span>PDF</span>
-        <select id="runSelect"></select>
-      </label>
+      <div class="scopeGroup headerScope">
+        <div class="scopeToggle" id="headerScopeToggle" role="group" aria-label="Scope">
+          <button type="button" class="scopeBtn active" id="headerScopeDocumentBtn" data-kind="document"
+                  aria-pressed="true" title="View and chat about one document">Document</button>
+          <button type="button" class="scopeBtn" id="headerScopeGroupBtn" data-kind="group"
+                  aria-pressed="false" title="View and chat about a group's documents together">Group</button>
+          <button type="button" class="scopeBtn" id="headerScopeAllBtn" data-kind="all"
+                  aria-pressed="false" title="View and chat about every indexed document">All</button>
+        </div>
+        <select class="select" id="headerDocumentPicker"></select>
+        <select class="select" id="headerGroupPicker" hidden></select>
+        <span class="scopeHint" id="headerScopeHint"></span>
+      </div>
       <nav class="tabs" aria-label="Views">
         <button class="tab active" data-view="library">Library</button>
         <button class="tab" data-view="graph" disabled>Graph</button>
@@ -51,6 +60,11 @@
             <div class="uploadStatus" id="uploadStatus" hidden></div>
           </form>
 
+          <div class="groupBar" id="groupBar">
+            <div class="groupChips" id="groupFilterChips"></div>
+            <button id="newGroupBtn" class="btn" type="button" title="Create a group to organize and cross-link documents">+ Group</button>
+          </div>
+
           <div class="libraryHead">
             <h2>Documents</h2>
             <span class="libraryCount" id="libraryCount"></span>
@@ -59,9 +73,81 @@
         </div>
       </section>
 
+      <!-- ================= CROSS-LINK MODAL (ingest + retroactive) ======= -->
+      <div class="modalOverlay" id="crossLinkModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="crossLinkTitle">
+          <h3 id="crossLinkTitle">Cross-link this document?</h3>
+          <p class="modalHint" id="crossLinkHint">
+            Connect matching entities in this document to others already indexed,
+            so chat and the graph can answer across documents.
+          </p>
+          <div class="modalOptions" id="crossLinkOptions">
+            <label class="modalOption" id="crossLinkAutoOption">
+              <input type="radio" name="crossLinkMode" value="auto" checked />
+              <span><strong>Auto</strong> — compare against every indexed document</span>
+            </label>
+            <label class="modalOption" id="crossLinkMeshOption">
+              <input type="radio" name="crossLinkMode" value="mesh" />
+              <span><strong>Join existing mesh</strong> — only documents already cross-linked to something</span>
+            </label>
+            <label class="modalOption">
+              <input type="radio" name="crossLinkMode" value="documents" />
+              <span><strong>Pick documents</strong></span>
+            </label>
+            <label class="modalOption">
+              <input type="radio" name="crossLinkMode" value="group" />
+              <span><strong>Pick a group</strong></span>
+            </label>
+            <label class="modalOption" id="crossLinkSkipOption">
+              <input type="radio" name="crossLinkMode" value="skip" />
+              <span><strong>Skip</strong> — link later from the document's card</span>
+            </label>
+          </div>
+          <div class="modalPicker" id="crossLinkDocsPicker" hidden></div>
+          <select class="select" id="crossLinkGroupPicker" hidden></select>
+          <div class="modalActions">
+            <button class="btn" type="button" id="crossLinkCancel">Cancel</button>
+            <button class="btn primary" type="button" id="crossLinkConfirm">Confirm</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================== GROUP MEMBERS MODAL ======================= -->
+      <div class="modalOverlay" id="groupMembersModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="groupMembersTitle">
+          <div class="modalTitleRow">
+            <h3 id="groupMembersTitle">Documents in this group</h3>
+            <button class="btn" type="button" id="groupMembersRename">Rename</button>
+          </div>
+          <p class="modalHint">Check the documents that belong to this group.</p>
+          <div class="modalPicker" id="groupMembersPicker"></div>
+          <div class="modalActions">
+            <button class="btn" type="button" id="groupMembersCancel">Cancel</button>
+            <button class="btn primary" type="button" id="groupMembersSave">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================== RUN GROUPS MODAL =========================== -->
+      <div class="modalOverlay" id="runGroupsModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="runGroupsTitle">
+          <h3 id="runGroupsTitle">Groups for this document</h3>
+          <p class="modalHint">Check the groups this document belongs to, or add a new one below.</p>
+          <div class="modalPicker" id="runGroupsPicker"></div>
+          <input id="runGroupsNewName" class="search runGroupsNewName" type="text" placeholder="New group name…" />
+          <div class="modalActions">
+            <button class="btn" type="button" id="runGroupsCancel">Cancel</button>
+            <button class="btn primary" type="button" id="runGroupsSave">Save</button>
+          </div>
+        </div>
+      </div>
+
       <!-- ============================ GRAPH ============================ -->
       <section id="graphView" class="view">
         <aside class="rail">
+          <label class="check" id="graphCrossDocOnlyRow" hidden>
+            <input id="graphCrossDocOnly" type="checkbox" /> Cross-document only
+          </label>
           <input id="graphSearch" class="search" type="search" placeholder="Search entities…" />
           <select id="entityTypeFilter" class="select">
             <option value="">All entity types</option>
@@ -71,6 +157,10 @@
         </aside>
 
         <section class="stage">
+          <div class="graphLinkBanner" id="graphLinkBanner" hidden>
+            <span id="graphLinkBannerText"></span>
+            <button type="button" class="btn" id="graphLinkBannerBack">Back to scope</button>
+          </div>
           <div class="stageBar">
             <button id="graphFit" class="btn">Fit</button>
             <button id="graphPhysics" class="btn">Freeze</button>
@@ -112,10 +202,15 @@
 
         <section class="stage">
           <div class="stageBar">
+            <select class="select" id="treeDocumentPicker" title="Choose which document's tree to view"></select>
             <button id="treeFit" class="btn">Fit</button>
             <button id="treeFocus" class="btn">Focus selected</button>
             <label class="check"><input id="treeLabels" type="checkbox" checked /> Labels</label>
             <span class="stageHint">Scroll to pan · Shift+scroll = sideways · Ctrl+scroll = zoom · click a node for details · click empty space to clear a legend scope</span>
+          </div>
+          <div id="treeScopeEmpty" class="viewEmptyState" hidden>
+            <h2>Tree needs one document</h2>
+            <p>Pick a document above to view its tree.</p>
           </div>
           <div id="treeNet" class="net"></div>
           <div id="treeLegend" class="legend"></div>
@@ -151,20 +246,11 @@
               <span aria-hidden="true">+</span> New chat
             </button>
             <div class="conversationList" id="conversationList"></div>
-            <div class="chatSidebarFoot">Conversations are saved for this PDF.</div>
+            <div class="chatSidebarFoot" id="chatSidebarFoot">Conversations are saved per scope.</div>
           </aside>
           <section class="chatShell" id="chatShell">
             <div class="messages" id="messages"></div>
             <div class="chatToolbar">
-              <div class="scopeGroup">
-                <div class="scopeToggle" id="scopeToggle" role="group" aria-label="Chat scope">
-                  <button type="button" class="scopeBtn active" id="scopeLocalBtn" data-scope="local"
-                          aria-pressed="true" title="Answer using only the open document">This document</button>
-                  <button type="button" class="scopeBtn" id="scopeGlobalBtn" data-scope="global"
-                          aria-pressed="false" title="Answer using every indexed document in this corpus">All documents</button>
-                </div>
-                <span class="scopeHint" id="scopeHint"></span>
-              </div>
               <label class="citeToggle" for="citeToggle" title="Show or hide the [E1] markers inside answers">
                 <input type="checkbox" id="citeToggle" checked />
                 <span>Inline references</span>

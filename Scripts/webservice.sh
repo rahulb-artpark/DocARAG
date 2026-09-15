@@ -9,12 +9,12 @@
 # 'run' is an alias for start; 'close'/'end' are aliases for stop.
 #
 # Override defaults with env vars, e.g.:
-#   HOST=0.0.0.0 PORT=9000 RUN=runs/<uuid> bash Scripts/webservice.sh start
+#   HOST=127.0.0.1 PORT=9000 RUN=runs/<uuid> bash Scripts/webservice.sh start
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 
-HOST="${HOST:-172.25.61.3}"                                   # VPN address to share on
+HOST="${HOST:-0.0.0.0}"                                       # all interfaces (LAN + NetBird)
 PORT="${PORT:-8765}"
 RUN="${RUN:-runs/666bc8af-5c07-5487-8511-68a6029324e2}"       # document to open (dropdown can switch)
 ENVN="${ENVN:-gbc-rag}"
@@ -22,7 +22,7 @@ LOG="$REPO/Scripts/logs/web.log"
 mkdir -p "$REPO/Scripts/logs"
 
 port_pids() { ss -tlnp 2>/dev/null | grep -E "[.:]$PORT " | grep -oE 'pid=[0-9]+' | grep -oE '[0-9]+' | sort -u; }
-show_url() { echo "  Share:  http://$HOST:$PORT"; echo "  Local:  http://127.0.0.1:$PORT"; }
+show_url() { [ "$HOST" != 0.0.0.0 ] && echo "  Share:  http://$HOST:$PORT"; echo "  Local:  http://127.0.0.1:$PORT"; }
 
 start() {
   if [ -n "$(port_pids)" ]; then

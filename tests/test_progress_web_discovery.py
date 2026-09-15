@@ -77,10 +77,19 @@ class WebDiscoveryTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     self.web.pick_run(outside)
 
-    def test_compatibility_web_is_loopback_only(self):
+    def test_is_loopback_host(self):
         self.assertTrue(self.web.is_loopback_host("127.0.0.1"))
         self.assertTrue(self.web.is_loopback_host("::1"))
         self.assertFalse(self.web.is_loopback_host("0.0.0.0"))
+
+    def test_origin_allows_same_origin_and_loopback_only(self):
+        host = "100.108.234.193:8765"
+        allowed = self.web.is_allowed_origin
+        self.assertTrue(allowed(None, host))
+        self.assertTrue(allowed(f"http://{host}", host))
+        self.assertTrue(allowed("http://localhost:5173", host))
+        self.assertFalse(allowed("http://evil.example", host))
+        self.assertFalse(allowed("http://100.108.234.193:9999", host))
 
     def test_web_query_traces_are_unique_and_owner_only(self):
         tracker = self.web.TokenTracker.get_instance()

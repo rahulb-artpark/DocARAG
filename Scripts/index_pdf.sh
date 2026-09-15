@@ -1286,6 +1286,17 @@ PY
         return "$status"
       fi
     fi
+    if [[ "$stage" == "vdb" ]]; then
+      # Best effort: applies the ingest-time cross-link plan (or the global
+      # auto-trigger flag) once this document has finished every stage of its
+      # own ingestion -- deliberately gated on vdb, the last stage, not graph,
+      # so cross-linking is the capstone step for a document, never a mid-
+      # pipeline side effect that runs while vdb is still pending. Never
+      # fails the driver -- see docarag.pipeline's own
+      # _trigger_planned_cross_doc_link docstring for why.
+      echo "[driver] $(date) cross-doc-link hook"
+      "${python_runner[@]}" -m docarag.pipeline cross_doc_link_auto --run "$run_dir" || true
+    fi
     # The tree the graph and vector stages read is the stored one, so it is
     # checked here -- once it exists, and before hours of extraction are spent
     # on a tree whose figures nothing can open.

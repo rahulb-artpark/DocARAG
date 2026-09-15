@@ -1,50 +1,6 @@
 # -*- coding: utf-8 -*-
-from typing import List
+from typing import List, Literal
 from pydantic import BaseModel, Field
-
-
-class ExtractEntity(BaseModel):
-    entity_name: str  # Primary key for entity
-    entity_type: str = Field(default="")  # Entity type
-    description: str = Field(default="")  # The description of this entity
-
-
-class ExtractRelationship(BaseModel):
-    src_entity_name: str  # Name of the entity on the left side of the edge
-    tgt_entity_name: str  # Name of the entity on the right side of the edge
-    weight: float = Field(
-        default=1.0
-    )  # Weight of the edge, used in GraphRAG and LightRAG
-    description: str = Field(
-        default=""
-    )  # Description of the edge, used in GraphRAG and LightRAG
-
-
-class ExtractionResult(BaseModel):
-    entities: List[ExtractEntity]
-    relationships: List[ExtractRelationship]
-
-
-class FormulaEntity(BaseModel):
-    entity_name: str  # Primary key for entity
-    description: str = Field(default="")  # The description of this entity
-
-
-class FormulaExtractionResult(BaseModel):
-    entities: List[FormulaEntity]
-
-
-class EntityExtractionResult(BaseModel):
-    entities: List[ExtractEntity]
-
-
-# This file is part of the Knowledge Graph Prompting project.
-# Our KG construction is build on the JayLZhou/GraphRAG projects.
-# Please refer to the following references:
-# 1. https://github.com/JayLZhou/GraphRAG
-# 2. https://github.com/gusye1234/nano-graphrag
-# 3. https://github.com/HKUDS/LightRAG
-
 
 DEFAULT_ENTITY_TYPES = [
     "PERSON",
@@ -107,12 +63,66 @@ DEFAULT_ENTITY_TYPES = [
     "BENCHMARK",
     "RESEARCH_FIELD",
     "PUBLICATION_VENUE",
+    # A cited paper/article is neither its venue (PUBLICATION_VENUE) nor
+    # generically a BOOK -- without its own category the model was filling
+    # this gap by inventing the paper's own title as the entity_type
+    # (e.g. entity_type="MAMBA__LINEAR_TIME_SEQUENCE_MODELING_..."), which
+    # entity_type's Literal constraint below no longer allows through.
+    "PUBLICATION",
+    # Catch-alls actually observed in extracted data before this type was
+    # constrained -- keeping them are real, valid escape hatches, not gaps.
+    "CONCEPT",
+    "UNKNOWN",
     # Document Structure Entities
     "SECTION_TITLE",
     "EQUATION_OR_FORMULA",
     "TABLE",
     "IMAGE",
 ]
+
+
+class ExtractEntity(BaseModel):
+    entity_name: str  # Primary key for entity
+    entity_type: Literal[tuple(DEFAULT_ENTITY_TYPES)]  # Entity type
+    description: str = Field(default="")  # The description of this entity
+
+
+class ExtractRelationship(BaseModel):
+    src_entity_name: str  # Name of the entity on the left side of the edge
+    tgt_entity_name: str  # Name of the entity on the right side of the edge
+    weight: float = Field(
+        default=1.0
+    )  # Weight of the edge, used in GraphRAG and LightRAG
+    description: str = Field(
+        default=""
+    )  # Description of the edge, used in GraphRAG and LightRAG
+
+
+class ExtractionResult(BaseModel):
+    entities: List[ExtractEntity]
+    relationships: List[ExtractRelationship]
+
+
+class FormulaEntity(BaseModel):
+    entity_name: str  # Primary key for entity
+    description: str = Field(default="")  # The description of this entity
+
+
+class FormulaExtractionResult(BaseModel):
+    entities: List[FormulaEntity]
+
+
+class EntityExtractionResult(BaseModel):
+    entities: List[ExtractEntity]
+
+
+# This file is part of the Knowledge Graph Prompting project.
+# Our KG construction is build on the JayLZhou/GraphRAG projects.
+# Please refer to the following references:
+# 1. https://github.com/JayLZhou/GraphRAG
+# 2. https://github.com/gusye1234/nano-graphrag
+# 3. https://github.com/HKUDS/LightRAG
+
 
 # DEFAULT_ENTITY_TYPES = ["organization", "person", "geo", "event"]
 DEFAULT_TUPLE_DELIMITER = "<|>"

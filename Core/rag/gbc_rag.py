@@ -3,7 +3,9 @@ from bisect import bisect_left
 import heapq
 import itertools
 import re
-from typing import Any, Callable, List, Mapping, Tuple, Dict, Optional
+from typing import Any, Callable, List, Literal, Mapping, Tuple, Dict, Optional
+
+from pydantic import Field, create_model
 
 from Core.Index.Tree import TreeNode, NodeType
 from Core.rag.base_rag import BaseRAG
@@ -210,6 +212,7 @@ class GBCRAG(BaseRAG):
         # Agents
         self.planner = TaskPlanner(
             llm=self.llm,
+            enable_global_classification=self.cfg.enable_global_classification,
             max_query_chars=self.cfg.planner_max_query_chars,
             max_subquestions=self.cfg.planner_max_subquestions,
             max_subquestion_chars=self.cfg.planner_max_subquestion_chars,
@@ -246,6 +249,7 @@ class GBCRAG(BaseRAG):
             )
         self.evidence_hydrator = evidence_hydrator
         self.answer = AnswerAgent(
+            complex_synthesis_input_tokens=self.cfg.complex_synthesis_input_tokens,
             llm=self.llm,
             vlm=self.vlm,
             variant=self.variant,
@@ -339,6 +343,7 @@ class GBCRAG(BaseRAG):
 
         self.planner = TaskPlanner(
             llm=self.llm,
+            enable_global_classification=self.cfg.enable_global_classification,
             max_query_chars=self.cfg.planner_max_query_chars,
             max_subquestions=self.cfg.planner_max_subquestions,
             max_subquestion_chars=self.cfg.planner_max_subquestion_chars,
@@ -381,7 +386,10 @@ class GBCRAG(BaseRAG):
             any_document_store.connect, corpus_bundle.tenant_id, corpus_bundle.corpus_id,
         )
 
-        self.answer = AnswerAgent(llm=self.llm, vlm=self.vlm, variant=self.variant)
+        self.answer = AnswerAgent(
+            llm=self.llm, vlm=self.vlm, variant=self.variant,
+            complex_synthesis_input_tokens=self.cfg.complex_synthesis_input_tokens,
+        )
         self.retriever = Retriever(
             variant=self.variant,
             reranker=self.reranker,
@@ -607,6 +615,12 @@ class GBCRAG(BaseRAG):
         # and stops one past the limit, which is what keeps a misbehaving store
         # from being drained. Collapsing first would materialise it.
         bounded = self._bounded_results(hits, limit=top_k, label=label)
+        bundle = getattr(self, "corpus_bundle", None)
+        if bundle is not None:
+            for hit in bounded:
+                metadata = hit.get("metadata", {})
+                if not isinstance(metadata, Mapping) or metadata.get("document_version_id") not in bundle.documents:
+                    raise ValueError("entity search returned evidence outside the permitted document scope")
         return collapse_entity_hits(bounded, limit=top_k)
 
     def _get_entity_embed_text(self, entity: QuestionEntity) -> str:
@@ -890,6 +904,9 @@ class GBCRAG(BaseRAG):
         added = 0
         for grouping in surviving_groupings:
             for member in self._corpus_store.members_for_grouping(grouping.grouping_key):
+                member_documents = self._corpus_store.document_versions_for_entity(member.entity_key)
+                if not set(member_documents).intersection(self.corpus_bundle.documents):
+                    continue
                 member_node_name = entity_node_name(member.canonical, member.entity_kind)
                 if member_node_name in p1_node_names:
                     continue
@@ -1283,6 +1300,43 @@ class GBCRAG(BaseRAG):
         else:
             iter_context.retrieval_sec_ids = ids
 
+    def _select_supplementary_sections(self, prompt, primary_ids, remaining_ids):
+        """Constrain IDs to this document's prompt and allow one correction."""
+        allowed = sorted(set(primary_ids) | set(remaining_ids))
+        schema = create_model(
+            "ScopedSectionSelection",
+            __base__=SecEXPSelection,
+            supplementary_ids=(List[Literal[tuple(allowed)]], Field(max_length=32)),
+        )
+        last_error = None
+        for attempt in range(2):
+            correction = (
+                "\nCORRECTION: Return supplementary_ids only from "
+                + json.dumps(sorted(remaining_ids))
+                + ". Copy the actual id values, not list positions. "
+                "Return [] if none apply. Primary sections are already included."
+            ) if attempt else ""
+            if len(prompt + correction) > self._configured_int("section_selection_prompt_chars", 65536):
+                break
+            try:
+                result = self.llm.get_json_completion(prompt + correction, schema)
+                if result is None:
+                    raise ValueError("section selection returned no response")
+                invalid = set(result.supplementary_ids) - set(allowed)
+                if invalid:
+                    raise ValueError(
+                        "section selection returned IDs outside the bounded prompt candidate pool: "
+                        + ", ".join(map(str, sorted(invalid)))
+                    )
+                # Selecting a primary section again adds no new scope.
+                return SecEXPSelection(
+                    supplementary_ids=[value for value in result.supplementary_ids if value not in primary_ids],
+                    explanation=result.explanation,
+                )
+            except (ValueError, RuntimeError) as error:
+                last_error = error
+        raise ValueError(str(last_error or "section selection correction exceeds prompt budget"))
+
     def llm_section_selection(
         self,
         query: str,
@@ -1297,6 +1351,12 @@ class GBCRAG(BaseRAG):
         """
         if iter_context is None:
             raise ValueError("iter_context is required for traced section selection")
+        if getattr(self, "corpus_bundle", None) is not None:
+            if document_version_id not in self.corpus_bundle.documents:
+                raise ValueError("section selection document is outside the permitted document scope")
+            expected_tree = self.gbc_index[document_version_id].TreeIndex
+            if tree_index is not expected_tree:
+                raise ValueError("section selection tree does not belong to its document")
         tree_index = tree_index if tree_index is not None else self.gbc_index.TreeIndex
         sec_entity_map = self.link_section(tree_nodes, tree_index=tree_index)
         requested_link_ids = set(sec_entity_map)
@@ -1415,8 +1475,8 @@ class GBCRAG(BaseRAG):
 
         prompt_remain_ids = {sec.index_id for sec in prompt_remain_secs}
         try:
-            res: SecEXPSelection = self.llm.get_json_completion(
-                query_prompt, SecEXPSelection
+            res = self._select_supplementary_sections(
+                query_prompt, set(link_section_ids), prompt_remain_ids
             )
             if res:
                 explanation = res.explanation
@@ -1465,6 +1525,8 @@ class GBCRAG(BaseRAG):
                     log.info("LLM did not select any supplementary sections.")
 
         except (PlanningBudgetExceeded, ValueError):
+            if iter_context.section_selection_status == "not_started":
+                iter_context.section_selection_status = "invalid_out_of_pool_model_ids"
             raise
         except Exception as e:
             log.error(f"Error occurred during section selection: {e}")
@@ -1789,20 +1851,44 @@ class GBCRAG(BaseRAG):
                         location["asset_materialization_attestations"] = matched
 
     def _section_titles(self) -> List[str]:
-        """Return the heading titles the planner is allowed to filter on."""
+        """Return the heading titles the planner is allowed to filter on.
 
-        return [
-            node.meta_info.content
-            for node in self.gbc_index.TreeIndex.get_nodes(hasRoot=False)
-            if node.type == NodeType.TITLE
-            and isinstance(node.meta_info.content, str)
-            and node.meta_info.content.strip()
-        ]
+        Corpus mode has no single ``.TreeIndex`` -- ``self.gbc_index`` is a
+        dict of per-document StoredIndex objects there (see
+        ``from_corpus_bundle``) -- so the planner's filter vocabulary is the
+        union of every document's titles instead of one document's own.
+        """
+
+        tree_indexes = (
+            [stored_index.TreeIndex for stored_index in self.gbc_index.values()]
+            if self.corpus_bundle is not None
+            else [self.gbc_index.TreeIndex]
+        )
+        seen: Dict[str, None] = {}
+        for tree_index in tree_indexes:
+            for node in tree_index.get_nodes(hasRoot=False):
+                if (
+                    node.type == NodeType.TITLE
+                    and isinstance(node.meta_info.content, str)
+                    and node.meta_info.content.strip()
+                ):
+                    seen[node.meta_info.content] = None
+        return list(seen)
+
+    def _validate_evidence_document_scope(self, rows, step):
+        bundle = getattr(self, "corpus_bundle", None)
+        if bundle is None:
+            return
+        allowed = set(bundle.documents).intersection(step.documents_in_scope)
+        for row in rows:
+            if row.get("document_version_id") not in allowed:
+                raise ValueError("answer evidence is outside the permitted document scope")
 
     def _process_retrieved_nodes(
         self, tree_data: List[Dict[str, Any]], iter_context: SubStep
     ) -> None:
         """Processes and categorizes retrieved nodes into the iteration context."""
+        self._validate_evidence_document_scope(tree_data, iter_context)
         if self.evidence_hydrator is not None:
             tree_data = self.evidence_hydrator.hydrate(tree_data)
         elif self.evidence_hydrators:
@@ -1819,8 +1905,12 @@ class GBCRAG(BaseRAG):
                     unhydrated.append(node)
             hydrated: List[Dict[str, Any]] = list(unhydrated)
             for doc_id, nodes in by_doc.items():
-                hydrated.extend(self.evidence_hydrators[doc_id].hydrate(nodes))
+                document_rows = self.evidence_hydrators[doc_id].hydrate(nodes)
+                if any(row.get("document_version_id") != doc_id for row in document_rows):
+                    raise ValueError("hydrated answer evidence belongs to a different document")
+                hydrated.extend(document_rows)
             tree_data = hydrated
+        self._validate_evidence_document_scope(tree_data, iter_context)
         if self.evidence_hydrator is not None or self.evidence_hydrators:
             self._materialize_answer_assets(tree_data)
         iter_context.retrieval_nodes = tree_data
@@ -1981,16 +2071,33 @@ class GBCRAG(BaseRAG):
         iter_context.iteration_graph_nodes = Graph_data.get("nodes", [])
         iter_context.iteration_graph_edges = Graph_data.get("edges", [])
 
-        tree_node_ids = self._with_section_titles(tree_node_ids)
-        tree_data = self.gbc_index.TreeIndex.get_nodes_data(tree_node_ids)
+        # skyline_filter returns (document_version_id, index_id) pairs; only one document here.
+        tree_node_index_ids = [index_id for _doc_id, index_id in tree_node_ids]
+        tree_node_index_ids = self._with_section_titles(tree_node_index_ids)
+        tree_data = self.gbc_index.TreeIndex.get_nodes_data(tree_node_index_ids)
         self._attach_candidate_fusion_trace(tree_data)
         self._process_retrieved_nodes(tree_data, iter_context)
+
+    @staticmethod
+    def _merge_document_graph(combined_graph, doc_subgraph):
+        sources = {
+            name: set(combined_graph.nodes[name].get("source_ids", ()))
+            | set(data.get("source_ids", ()))
+            for name, data in doc_subgraph.nodes(data=True)
+            if name in combined_graph
+        }
+        merged = nx.compose(combined_graph, doc_subgraph)
+        for name, source_ids in sources.items():
+            merged.nodes[name]["source_ids"] = source_ids
+        return merged
 
     def _get_GBC_info_corpus(self, iter_context: SubStep) -> None:
         """Corpus-mode counterpart to ``get_GBC_info``: one real ranking pass
         across every document in scope, not one per document merged after."""
 
         documents = iter_context.documents_in_scope
+        if not set(documents).issubset(self.corpus_bundle.documents):
+            raise ValueError("retrieval document is outside the permitted document scope")
         if not documents:
             iter_context.iteration_graph_nodes = []
             iter_context.iteration_graph_edges = []
@@ -2010,12 +2117,20 @@ class GBCRAG(BaseRAG):
                 else:
                     sec_ids = iter_context.retrieval_sec_ids_by_doc.get(doc_id, [])
                     subtree_nodes = stored_index.TreeIndex.get_subtree_nodes(sec_ids)
+                if any(node.document_version_id != doc_id for node in subtree_nodes):
+                    raise ValueError("subtree node belongs to a different document")
                 all_subtree_nodes.extend(subtree_nodes)
                 subtree_ids = [node.index_id for node in subtree_nodes]
                 doc_subgraph = stored_index.GraphIndex.get_kg_subgraph(
                     subtree_ids, document_version_id=doc_id,
                 )
-                combined_graph = nx.compose(combined_graph, doc_subgraph)
+                allowed_sources = {(doc_id, index_id) for index_id in subtree_ids}
+                if any(
+                    not set(data.get("source_ids", ())).issubset(allowed_sources)
+                    for _, data in doc_subgraph.nodes(data=True)
+                ):
+                    raise ValueError("graph source node is outside its document subtree")
+                combined_graph = self._merge_document_graph(combined_graph, doc_subgraph)
                 entities_by_doc[doc_id] = set(doc_subgraph.nodes)
 
             entity_keys: set[int] = set()
@@ -2032,7 +2147,7 @@ class GBCRAG(BaseRAG):
                             entity_keys.add(entity_key)
                 if entity_keys:
                     cross_edges = self._corpus_store.inferred_relations_for_entities(
-                        entity_keys
+                        entity_keys, document_version_ids=documents
                     )
                     any_graph_index = next(iter(self.gbc_index.values())).GraphIndex
                     any_graph_index.add_cross_document_edges(
@@ -2067,7 +2182,10 @@ class GBCRAG(BaseRAG):
         ][:64]
 
         by_doc_ids: Dict[str, List[int]] = defaultdict(list)
+        allowed_node_keys = {(node.document_version_id, node.index_id) for node in all_subtree_nodes}
         for doc_id, index_id in tree_node_keys:
+            if (doc_id, index_id) not in allowed_node_keys:
+                raise ValueError("ranked tree node is outside the permitted document subtrees")
             by_doc_ids[doc_id].append(index_id)
         tree_data: List[Dict[str, Any]] = []
         for doc_id, ids in by_doc_ids.items():
@@ -2076,7 +2194,8 @@ class GBCRAG(BaseRAG):
             rows = stored_index.TreeIndex.get_nodes_data(ids)
             title = self.corpus_bundle.document_titles.get(doc_id, "") if self.corpus_bundle else ""
             for row in rows:
-                row.setdefault("document_version_id", doc_id)
+                if row.get("document_version_id") != doc_id:
+                    raise ValueError("retrieved tree row belongs to a different document")
                 row["document_title"] = title
             tree_data.extend(rows)
 
@@ -2132,10 +2251,23 @@ class GBCRAG(BaseRAG):
                             row for row in all_tree_nodes
                             if row.get("document_version_id") == doc_id
                         ]
-                        self.llm_section_selection(
-                            query, doc_tree_nodes, iter_context,
-                            tree_index=self.gbc_index[doc_id].TreeIndex,
-                            document_version_id=doc_id,
+                        selection_step = SubStep(
+                            sub_query=query, sub_number=iter_context.sub_number
+                        )
+                        try:
+                            self.llm_section_selection(
+                                query, doc_tree_nodes, selection_step,
+                                tree_index=self.gbc_index[doc_id].TreeIndex,
+                                document_version_id=doc_id,
+                            )
+                        finally:
+                            iter_context.section_selection_by_doc[doc_id] = {
+                                key: value for key, value in selection_step.model_dump().items()
+                                if (key.startswith("section_") and key != "section_selection_by_doc")
+                                or key in {"linked_section_ids", "supplementary_ids", "selected_explanation"}
+                            }
+                        iter_context.retrieval_sec_ids_by_doc.update(
+                            selection_step.retrieval_sec_ids_by_doc
                         )
         else:
             with timings.time("link_tree_nodes"):
@@ -2439,6 +2571,19 @@ class GBCRAG(BaseRAG):
         with open(retrieval_save_res, "w", encoding="utf-8") as f:
             json.dump(context_dict, f, indent=2, ensure_ascii=False)
         log.info(f"Retrieval results saved to {retrieval_save_res}")
+
+        # Bare tree numbers are local to a document. Preserve both identities
+        # in group/all chat results, including equal node numbers in two books.
+        if getattr(self, "corpus_bundle", None) is not None:
+            keys = {
+                (node["document_version_id"], node["index_id"])
+                for step in context.iterations
+                for node in step.retrieval_nodes
+            }
+            return [
+                {"document_version_id": doc_id, "index_id": index_id}
+                for doc_id, index_id in sorted(keys)
+            ]
 
         # use the tree nodes as retrieval ids
         retrieval_ids = []

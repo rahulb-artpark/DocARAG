@@ -18,8 +18,22 @@ const state = {
   libraryTimer: null,
   selectedTreeId: null,
   treeFilteredIds: [],
-  chatScope: "local",
-  globalDocumentCount: null,
+  // The one shared scope -- drives Library, Graph, Chat and Tree together.
+  scopeKind: "document",
+  scopeGroupId: null,
+  allDocumentCount: null,
+  groupDocumentCount: null,
+  documentRuns: [],
+  groups: [],
+  libraryRuns: [],
+  groupFilter: null,
+  groupMembersEditing: null,
+  runGroupsEditing: null,
+  runGroupsOriginalIds: [],
+  // Scope to restore when returning to Chat after a citation jump.
+  pendingScopeRestore: null,
+  crossLink: null,
+  graphCrossDocOnly: false,
 };
 
 const LIBRARY_POLL_MS = 4000;
@@ -38,6 +52,20 @@ function colorForType(type) {
     typeColorCache.set(key, PALETTE[h % PALETTE.length]);
   }
   return typeColorCache.get(key);
+}
+
+// Same palette, a decorrelated hash -- node fill already encodes entity TYPE
+// via colorForType, so a node's border can encode which DOCUMENT it came
+// from without the two channels fighting for the same color on the same node.
+const docColorCache = new Map();
+function colorForDocument(title) {
+  const key = String(title || "");
+  if (!docColorCache.has(key)) {
+    let h = 2166136261;
+    for (let i = 0; i < key.length; i++) h = (h ^ key.charCodeAt(i)) * 16777619 >>> 0;
+    docColorCache.set(key, PALETTE[h % PALETTE.length]);
+  }
+  return docColorCache.get(key);
 }
 
 const $ = (id) => document.getElementById(id);
@@ -388,19 +416,29 @@ document.addEventListener("DOMContentLoaded", boot);
 async function boot() {
   wireTabs();
   wireGraphControls();
+  wireGraphLinkBanner();
   wireTreeControls();
   wireChat();
   wireLibrary();
+  wireScopeBar();
   wireResizers();
+  updateHeaderScopeVisibility("library"); // matches index.html's default active tab
   attachNetControls("#graphView .stage", () => state.graphNet);
   attachNetControls("#treeView .stage", () => state.treeNet);
   enableWheelPan("treeNet", () => state.treeNet);
   enableWheelPan("graphNet", () => state.graphNet);
   try {
-    const hasRun = await loadRuns();
-    await syncChatScope();
-    if (hasRun) await loadData();
-    else activateView("library");
+    // loadLibrary() bootstraps the shared scope (kind/document/group),
+    // the group list, and the header's document picker together.
+    await loadLibrary();
+    if (state.scopeKind === "document" && state.currentRun) {
+      await loadData();
+    } else if (state.scopeKind !== "document") {
+      await loadGraph();
+      await loadConversations();
+    } else {
+      activateView("library");
+    }
   } catch (err) {
     console.error("NoeticsRAG load failed:", err);
     alert("Failed to load index: " + err.message);
@@ -409,7 +447,10 @@ async function boot() {
 
 function wireTabs() {
   document.querySelectorAll(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => activateView(tab.dataset.view));
+    tab.addEventListener("click", () => {
+      if (tab.dataset.view === "chat" && state.pendingScopeRestore) returnToChatScope();
+      else activateView(tab.dataset.view);
+    });
   });
 }
 
@@ -545,18 +586,30 @@ function wireResizers() {
   });
 }
 
+// The header's Document/Group/All control only means something where "which
+// documents am I looking at" actually changes what's shown: Graph and Chat.
+// Library already shows every document (with its own group-filter chips) and
+// Tree only ever shows one document (via its own picker in the stage bar,
+// see renderTreeScopeState) -- the header control there was just noise that
+// looked like it was scoping something it wasn't.
+function updateHeaderScopeVisibility(view) {
+  const bar = document.querySelector(".headerScope");
+  if (bar) bar.hidden = view === "library" || view === "tree";
+}
+
 function activateView(name) {
   document.querySelectorAll(".tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   $(name + "View").classList.add("active");
+  updateHeaderScopeVisibility(name);
 
   // vis-network must be (re)fit once its container becomes visible
   if (name === "graph" && state.graph) {
     if (!state.graphBuilt) buildGraphNetwork();
     else { state.graphNet.redraw(); state.graphNet.fit(); }
   }
-  if (name === "tree" && state.tree) {
+  if (name === "tree" && state.scopeKind === "document" && state.tree) {
     if (!state.treeBuilt) buildTreeNetwork();
     else {
       state.treeNet.redraw();
@@ -630,6 +683,64 @@ function stageRows(stage, waitingOn) {
         .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`)
         .join("")}</dl>`
     : `<p class="prose">Nothing recorded for this stage yet.</p>`;
+}
+
+// Cross-linking isn't one of the driver's own stages (STAGE_ORDER on the
+// backend) -- it's a separate, best-effort process against Postgres that
+// most documents never had requested at all. Unlike Tree/Graph/Vdb, which
+// always run and so always earn a place in the stage row, this card only
+// appears once linking has actually been requested (running/succeeded/
+// failed) -- a permanent "pending" tile for something nobody asked for reads
+// as a stuck process, not as "nothing to show yet".
+function crossLinkCardHtml(run) {
+  const cl = run.crossLink;
+  if (!cl || cl.status === "pending") return "";
+  const status = cl.status;
+  const seconds = cl.startedAt && cl.endedAt
+    ? (new Date(cl.endedAt) - new Date(cl.startedAt)) / 1000
+    : null;
+  const elapsed = status === "running" && cl.startedAt
+    ? (Date.now() - new Date(cl.startedAt).getTime()) / 1000
+    : null;
+  const title = status === "running"
+    ? '<span class="spinner"></span>Cross-linking…'
+    : status === "failed" ? "Cross-linking failed" : "Cross-linked";
+  const meta = seconds != null ? fmtDuration(seconds)
+    : elapsed != null ? `${fmtDuration(elapsed)} elapsed` : "";
+
+  const statsHtml = cl.stats
+    ? `<div class="crossLinkStats">
+        <span><b>${cl.stats.nodesConnected}</b> nodes connected</span>
+        <span><b>${cl.stats.groupingHubs}</b> grouping hubs</span>
+        <span><b>${cl.stats.crossEdges}</b> cross edges</span>
+      </div>`
+    : "";
+
+  const seenDirs = new Set();
+  const links = (cl.linkedWith || []).filter((d) => (seenDirs.has(d.runDir) ? false : seenDirs.add(d.runDir)));
+  // Different documents can share a filename (re-uploads, near-duplicate
+  // sources) -- a bare name would make two distinct links look like one.
+  const nameCounts = {};
+  links.forEach((d) => { nameCounts[d.name] = (nameCounts[d.name] || 0) + 1; });
+  const chipsHtml = links.length
+    ? `<div class="crossLinkChips"><span class="crossLinkLabel">Linked with ${links.length} document${links.length === 1 ? "" : "s"}:</span>${links
+        .map((d) => {
+          const suffix = nameCounts[d.name] > 1 ? ` (${d.tag || d.runDir.slice(-6)})` : "";
+          return `<button type="button" class="crossLinkChip" data-link-a="${escapeHtml(run.runDir)}" data-link-b="${escapeHtml(d.runDir)}"
+                    title="View what connects this to ${escapeHtml(d.name)}">${escapeHtml(d.name + suffix)}</button>`;
+        })
+        .join("")}</div>`
+    : "";
+
+  return `<div class="crossLinkCard ${escapeHtml(status)}">
+    <div class="crossLinkCardHead">
+      <span>${title}</span>
+      ${meta ? `<span class="crossLinkCardMeta">${escapeHtml(meta)}</span>` : ""}
+    </div>
+    ${cl.error ? `<div class="runError">${escapeHtml(String(cl.error))}</div>` : ""}
+    ${statsHtml}
+    ${chipsHtml}
+  </div>`;
 }
 
 function stageStepHtml(stage, waitingOn) {
@@ -716,6 +827,14 @@ function runLifecycleHtml(run) {
     <button class="btn startRun">Start</button>`;
 }
 
+function groupChipsHtml(run) {
+  const names = (run.groupIds || [])
+    .map((id) => (state.groups.find((g) => g.id === id) || {}).name)
+    .filter(Boolean);
+  return `<button class="runGroups${names.length ? "" : " empty"}" type="button" title="Edit groups">
+    ${names.length ? escapeHtml(names.join(", ")) : "+ groups"}</button>`;
+}
+
 function runCardHtml(run) {
   const status = run.overallStatus || (run.viewable ? "succeeded" : "pending");
   const isCurrent = run.runDir === state.currentRun;
@@ -729,10 +848,12 @@ function runCardHtml(run) {
     <div class="runCardTop">
       <span class="runName" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
       ${runTagHtml(run.tag)}
+      ${groupChipsHtml(run)}
       <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
       ${isCurrent ? '<span class="pill">open</span>' : ""}
       ${runLifecycleHtml(run)}
       ${canOpen ? '<button class="btn openRun">Open</button>' : ""}
+      ${run.viewable ? '<button class="btn linkRun" type="button" title="Cross-link this document with others">Link to…</button>' : ""}
       <button class="btn danger deleteRun" ${isCurrent ? "disabled title='Open another document first'" : ""}>Delete</button>
     </div>
     <div class="runMeta">Started ${escapeHtml(fmtWhen(run.startedAt))}</div>
@@ -743,8 +864,21 @@ function runCardHtml(run) {
       <div class="runStat"><div class="k">Tokens</div><div class="v">${escapeHtml(fmtTokens(run.metrics.totalTokens))}</div></div>
       <div class="runStat"><div class="k">Viewable</div><div class="v">${run.viewable ? "yes" : "no"}</div></div>
     </div>
+    ${crossLinkCardHtml(run)}
     ${run.error ? `<div class="runError">${escapeHtml(String(run.error))}</div>` : ""}
   </article>`;
+}
+
+async function openRunByDir(runDir, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Opening…"; }
+  try {
+    await setScope("document", { runDir });
+    activateView("tree");
+  } catch (err) {
+    alert("Could not open document: " + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Open"; }
+  }
 }
 
 async function loadLibrary() {
@@ -755,15 +889,33 @@ async function loadLibrary() {
     $("runGrid").innerHTML = `<div class="libraryEmpty">Could not load documents: ${escapeHtml(err.message)}</div>`;
     return;
   }
-  state.currentRun = data.current;
-  state.chatScope = data.chatScope || state.chatScope || "local";
-  state.globalDocumentCount = data.globalDocumentCount;
-  applyScopeUI();
-  const runs = data.runs || [];
-  $("libraryCount").textContent = runs.length ? `${runs.length} indexed` : "";
+  state.currentRun = data.scopeRunDir;
+  state.scopeKind = data.scopeKind || state.scopeKind || "document";
+  state.scopeGroupId = data.scopeGroupId || null;
+  state.allDocumentCount = data.allDocumentCount;
+  state.groupDocumentCount = data.groupDocumentCount;
+  const allRuns = data.runs || [];
+  state.libraryRuns = allRuns;
+  await loadGroups();
+  loadScopeBar();
+  const runs = state.groupFilter
+    ? allRuns.filter((r) => (r.groupIds || []).includes(state.groupFilter))
+    : allRuns;
+  $("libraryCount").textContent = runs.length
+    ? `${runs.length} indexed${state.groupFilter ? " (filtered)" : ""}`
+    : "";
   $("runGrid").innerHTML = runs.length
     ? runs.map(runCardHtml).join("")
-    : '<div class="libraryEmpty">No documents yet. Drop a PDF above to index one.</div>';
+    : allRuns.length
+      ? '<div class="libraryEmpty">No documents in this group yet. Click the ✎ next to its chip above to add some.</div>'
+      : '<div class="libraryEmpty">No documents yet. Drop a PDF above to index one.</div>';
+
+  $("runGrid").querySelectorAll(".runGroups").forEach((btn) => {
+    btn.addEventListener("click", () => editRunGroups(btn.closest(".runCard")));
+  });
+  $("runGrid").querySelectorAll(".linkRun").forEach((btn) => {
+    btn.addEventListener("click", () => openCrossLinkModal({ kind: "retroactive", runDir: btn.closest(".runCard").dataset.run }));
+  });
 
   $("runGrid").querySelectorAll(".stopRun").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -812,27 +964,11 @@ async function loadLibrary() {
   });
 
   $("runGrid").querySelectorAll(".openRun").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const runDir = btn.closest(".runCard").dataset.run;
-      btn.disabled = true;
-      btn.textContent = "Opening…";
-      try {
-        await api("/api/run", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runDir }),
-        });
-        resetForNewRun();
-        await loadRuns();
-        await loadData();
-        await loadLibrary();
-        activateView("tree");
-      } catch (err) {
-        alert("Could not open document: " + err.message);
-        btn.disabled = false;
-        btn.textContent = "Open";
-      }
-    });
+    btn.addEventListener("click", () => openRunByDir(btn.closest(".runCard").dataset.run, btn));
+  });
+
+  $("runGrid").querySelectorAll("[data-link-a]").forEach((btn) => {
+    btn.addEventListener("click", () => viewGraphLink(btn.dataset.linkA, btn.dataset.linkB));
   });
 
   $("runGrid").querySelectorAll(".deleteRun").forEach((btn) => {
@@ -850,7 +986,6 @@ async function loadLibrary() {
       btn.textContent = "Deleting…";
       try {
         await api(`/api/run?run=${encodeURIComponent(runDir)}`, { method: "DELETE" });
-        await loadRuns();
         await loadLibrary();
       } catch (err) {
         alert("Could not delete: " + err.message);
@@ -860,7 +995,13 @@ async function loadLibrary() {
     });
   });
 
-  const active = runs.some((r) => r.phase === "indexing" || r.overallStatus === "running");
+  // Cross-linking runs after tree/graph/vdb/persist already report
+  // "succeeded", so it needs its own liveness check -- otherwise the poll
+  // stops the moment the main pipeline finishes and a still-running link job
+  // never gets its status refreshed without a manual reload.
+  const active = allRuns.some((r) =>
+    r.phase === "indexing" || r.overallStatus === "running"
+    || (r.crossLink && r.crossLink.status === "running"));
   scheduleLibraryPoll(active);
 }
 
@@ -879,7 +1020,7 @@ function setUploadStatus(message, isError) {
   box.innerHTML = message;
 }
 
-async function uploadPdf(file) {
+async function uploadPdf(file, plan) {
   if (!file) return;
   if (!/\.pdf$/i.test(file.name)) {
     setUploadStatus("Only PDF files can be indexed.", true);
@@ -889,14 +1030,12 @@ async function uploadPdf(file) {
   zone.classList.add("busy");
   setUploadStatus(`<span class="spinner"></span>Uploading and starting <b>${escapeHtml(file.name)}</b>…`);
   try {
-    const res = await api("/api/upload", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/pdf",
-        "X-Filename": encodeURIComponent(file.name),
-      },
-      body: file,
-    });
+    const headers = {
+      "Content-Type": "application/pdf",
+      "X-Filename": encodeURIComponent(file.name),
+    };
+    if (plan) headers["X-Cross-Link-Plan"] = encodeURIComponent(JSON.stringify(plan));
+    const res = await api("/api/upload", { method: "POST", headers, body: file });
     setUploadStatus(`Indexing <b>${escapeHtml(res.name)}</b> — progress appears below.`);
     await loadLibrary();
   } catch (err) {
@@ -914,61 +1053,588 @@ function wireLibrary() {
   zone.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
   });
-  input.addEventListener("change", () => uploadPdf(input.files[0]));
+  input.addEventListener("change", () => {
+    const file = input.files[0];
+    if (file) openCrossLinkModal({ kind: "ingest", file });
+  });
   ["dragenter", "dragover"].forEach((evt) =>
     zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.add("dragging"); }));
   ["dragleave", "drop"].forEach((evt) =>
     zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.remove("dragging"); }));
-  zone.addEventListener("drop", (e) => uploadPdf(e.dataTransfer.files[0]));
+  zone.addEventListener("drop", (e) => {
+    const file = e.dataTransfer.files[0];
+    if (file) openCrossLinkModal({ kind: "ingest", file });
+  });
+  wireGroups();
+  wireCrossLinkModal();
 }
 
-/* ============================== run picker =============================== */
-async function loadRuns() {
-  const data = await api("/api/runs");
-  state.currentRun = data.current || null;
-  const sel = $("runSelect");
-  sel.innerHTML = "";
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = data.runs.length
-    ? "Select a document…"
-    : "No indexed documents";
-  placeholder.selected = !state.currentRun;
-  sel.appendChild(placeholder);
-  for (const run of data.runs) {
-    const opt = document.createElement("option");
-    opt.value = run.path;
-    opt.textContent = run.name + (run.hasGraph ? "" : "  (no graph)");
-    if (run.path === data.current) opt.selected = true;
-    sel.appendChild(opt);
+/* ------------------------------ Groups ------------------------------------ */
+
+async function loadGroups() {
+  try {
+    const data = await api("/api/groups");
+    state.groups = data.groups || [];
+  } catch (err) {
+    state.groups = [];
   }
-  setDocumentViewsEnabled(Boolean(state.currentRun));
-  sel.disabled = data.runs.length === 0;
-  sel.onchange = async () => {
-    if (!sel.value) return;
-    sel.disabled = true;
+  renderGroupFilterChips();
+}
+
+function renderGroupFilterChips() {
+  const box = $("groupFilterChips");
+  if (!box) return;
+  // "All documents" is always present and never gets stuck: it's the only
+  // way back out of a filter on an empty group, so it isn't just the same
+  // chip toggled off.
+  const allChip = `
+    <button type="button" class="groupChip${state.groupFilter ? "" : " active"}" data-group="">
+      All documents
+    </button>`;
+  const chips = state.groups.map((g) => `
+    <span class="groupChipWrap">
+      <button type="button" class="groupChip${state.groupFilter === g.id ? " active" : ""}" data-group="${escapeHtml(g.id)}">
+        ${escapeHtml(g.name)} <span class="groupChipCount">${g.memberCount}</span>
+      </button>
+      <button type="button" class="groupChipEdit" data-group-edit="${escapeHtml(g.id)}" title="Add or remove documents in this group">✎</button>
+    </span>`).join("");
+  box.innerHTML = allChip + chips;
+  box.querySelectorAll(".groupChip[data-group]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.groupFilter = btn.dataset.group || null;
+      loadLibrary();
+    });
+  });
+  box.querySelectorAll(".groupChipEdit").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openGroupMembersModal(btn.dataset.groupEdit);
+    });
+  });
+}
+
+function wireGroups() {
+  $("newGroupBtn").addEventListener("click", async () => {
+    const name = prompt("New group name (e.g. \"Legal\", \"Q1 reports\")");
+    if (name === null || !name.trim()) return;
+    let created;
     try {
-      const result = await api("/api/run", {
+      created = await api("/api/groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ runDir: sel.value }),
+        body: JSON.stringify({ name }),
       });
-      state.currentRun = result.runDir;
-      setDocumentViewsEnabled(true);
-      resetForNewRun();
-      await loadData();
     } catch (err) {
-      alert("Could not switch document: " + err.message);
-    } finally {
-      sel.disabled = false;
+      alert("Could not create the group: " + err.message);
+      return;
     }
-  };
-  return Boolean(state.currentRun);
+    await loadLibrary();
+    // A brand-new group has no members yet -- go straight to adding some
+    // instead of leaving the reader to find the tiny ✎ on their own.
+    if (created && created.group) openGroupMembersModal(created.group.id);
+  });
+  $("groupMembersCancel").addEventListener("click", closeGroupMembersModal);
+  $("groupMembersSave").addEventListener("click", saveGroupMembers);
+  $("groupMembersRename").addEventListener("click", renameCurrentGroup);
+  $("groupMembersModal").addEventListener("click", (e) => {
+    if (e.target === $("groupMembersModal")) closeGroupMembersModal();
+  });
+  $("runGroupsCancel").addEventListener("click", closeRunGroupsModal);
+  $("runGroupsSave").addEventListener("click", saveRunGroups);
+  $("runGroupsModal").addEventListener("click", (e) => {
+    if (e.target === $("runGroupsModal")) closeRunGroupsModal();
+  });
 }
 
-function setDocumentViewsEnabled(enabled) {
+/* ------------------------- Group membership modal -------------------------- */
+// Adding a document to a group from the document's own card works, but
+// requires a document to already be visible -- which breaks down the moment
+// a group filter with zero members hides every card. This modal is the other
+// direction: manage a group's whole membership from the group itself.
+
+function openGroupMembersModal(groupId) {
+  const group = state.groups.find((g) => g.id === groupId);
+  if (!group) return;
+  state.groupMembersEditing = groupId;
+  $("groupMembersTitle").textContent = `Documents in “${group.name}”`;
+  const runs = state.libraryRuns || [];
+  $("groupMembersPicker").innerHTML = runs.length
+    ? runs.map((r) => `
+        <label class="modalCheck">
+          <input type="checkbox" value="${escapeHtml(r.runDir)}" ${(r.groupIds || []).includes(groupId) ? "checked" : ""} />
+          <span>${escapeHtml(r.name)}</span>
+        </label>`).join("")
+    : '<div class="modalHint">No documents indexed yet.</div>';
+  $("groupMembersModal").hidden = false;
+}
+
+function closeGroupMembersModal() {
+  $("groupMembersModal").hidden = true;
+  state.groupMembersEditing = null;
+}
+
+async function renameCurrentGroup() {
+  const groupId = state.groupMembersEditing;
+  const group = state.groups.find((g) => g.id === groupId);
+  if (!group) return;
+  const name = prompt("Rename group", group.name);
+  if (name === null || !name.trim() || name.trim() === group.name) return;
+  try {
+    const result = await api("/api/group-rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ groupId, name: name.trim() }),
+    });
+    Object.assign(group, result.group);
+  } catch (err) {
+    alert("Could not rename the group: " + err.message);
+    return;
+  }
+  $("groupMembersTitle").textContent = `Documents in “${group.name}”`;
+  renderGroupFilterChips();
+  await loadLibrary();
+}
+
+async function saveGroupMembers() {
+  const groupId = state.groupMembersEditing;
+  if (!groupId) return;
+  const checked = new Set(
+    Array.from($("groupMembersPicker").querySelectorAll("input:checked")).map((i) => i.value),
+  );
+  const changes = [];
+  for (const run of state.libraryRuns || []) {
+    const has = (run.groupIds || []).includes(groupId);
+    const want = checked.has(run.runDir);
+    if (has === want) continue;
+    const groupIds = want
+      ? [...(run.groupIds || []), groupId]
+      : (run.groupIds || []).filter((g) => g !== groupId);
+    changes.push(
+      api("/api/run-groups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runDir: run.runDir, groupIds }),
+      }),
+    );
+  }
+  try {
+    await Promise.all(changes);
+  } catch (err) {
+    alert("Could not save some changes: " + err.message);
+  }
+  closeGroupMembersModal();
+  await loadLibrary();
+}
+
+function editRunGroups(card) {
+  openRunGroupsModal(card.dataset.run);
+}
+
+// Checkbox picker of every existing group for one document, plus a
+// new-group field -- the reverse direction of openGroupMembersModal (one
+// group -> all documents). Replaces a blind comma-separated prompt() that
+// only showed existing group names as plain text in a hint line, with
+// nothing to actually click.
+function openRunGroupsModal(runDir) {
+  const run = state.libraryRuns.find((r) => r.runDir === runDir);
+  if (!run) return;
+  state.runGroupsEditing = runDir;
+  $("runGroupsTitle").textContent = `Groups for "${(run && run.name) || ""}"`;
+  const memberOf = new Set(run.groupIds || []);
+  state.runGroupsOriginalIds = Array.from(memberOf);
+  $("runGroupsPicker").innerHTML = state.groups.length
+    ? state.groups.map((g) => `
+        <label class="modalCheck">
+          <input type="checkbox" value="${escapeHtml(g.id)}" ${memberOf.has(g.id) ? "checked" : ""} />
+          <span>${escapeHtml(g.name)}</span>
+        </label>`).join("")
+    : '<div class="modalHint">No groups yet -- add one below.</div>';
+  $("runGroupsNewName").value = "";
+  $("runGroupsModal").hidden = false;
+}
+
+function closeRunGroupsModal() {
+  $("runGroupsModal").hidden = true;
+  state.runGroupsEditing = null;
+}
+
+async function saveRunGroups() {
+  const runDir = state.runGroupsEditing;
+  if (!runDir) return;
+  const groupIds = Array.from(
+    $("runGroupsPicker").querySelectorAll("input:checked"),
+  ).map((i) => i.value);
+  const newName = $("runGroupsNewName").value.trim();
+  if (newName) {
+    let group = state.groups.find((g) => g.name.toLowerCase() === newName.toLowerCase());
+    if (!group) {
+      try {
+        const created = await api("/api/groups", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: newName }),
+        });
+        group = created.group;
+        state.groups.push(group);
+      } catch (err) {
+        alert(`Could not create group “${newName}”: ` + err.message);
+        return;
+      }
+    }
+    groupIds.push(group.id);
+  }
+  const originalIds = new Set(state.runGroupsOriginalIds);
+  const addedGroupIds = groupIds.filter((id) => !originalIds.has(id));
+  try {
+    await api("/api/run-groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ runDir, groupIds }),
+    });
+  } catch (err) {
+    alert("Could not save groups: " + err.message);
+    return;
+  }
+  closeRunGroupsModal();
+  await loadLibrary();
+  if (addedGroupIds.length) promptLinkToNewGroupmates(runDir, addedGroupIds);
+}
+
+// After adding a document to one or more groups, offer to catch it up with
+// whatever it isn't cross-linked to yet in those groups -- group membership
+// itself never links anything (see set_run_groups in Scripts/web.py), so
+// without this a newly grouped document silently sits unlinked until someone
+// notices and runs "Link to..." by hand.
+function promptLinkToNewGroupmates(runDir, addedGroupIds) {
+  const self = state.libraryRuns.find((r) => r.runDir === runDir);
+  const linkedWith = new Set(
+    ((self && self.crossLink && self.crossLink.linkedWith) || []).map((l) => l.runDir),
+  );
+  const addedSet = new Set(addedGroupIds);
+  const candidates = new Map();
+  for (const r of state.libraryRuns) {
+    if (r.runDir === runDir || !r.viewable || linkedWith.has(r.runDir)) continue;
+    if ((r.groupIds || []).some((id) => addedSet.has(id))) candidates.set(r.runDir, r);
+  }
+  if (!candidates.size) return;
+  openCrossLinkModal({
+    kind: "group-add",
+    runDir,
+    candidateRunDirs: Array.from(candidates.keys()),
+  });
+}
+
+/* --------------------------- Cross-link modal ------------------------------ */
+// One modal, two contexts: "ingest" (shown before /api/upload, the choice is
+// sent as a header and applied once the new document's graph stage finishes)
+// and "retroactive" (an already-indexed document, applied immediately via
+// POST /api/cross-link). Mesh mode needs an already-indexed document to find
+// matches from, so it's hidden in ingest context.
+
+function crossLinkOtherRuns() {
+  if (state.crossLink && state.crossLink.kind === "group-add") {
+    const allowed = new Set(state.crossLink.candidateRunDirs);
+    return state.libraryRuns.filter((r) => allowed.has(r.runDir));
+  }
+  const excluded = state.crossLink && state.crossLink.kind === "retroactive" ? state.crossLink.runDir : null;
+  return state.libraryRuns.filter((r) => r.viewable && r.runDir !== excluded);
+}
+
+function renderCrossLinkDocsPicker() {
+  const box = $("crossLinkDocsPicker");
+  const others = crossLinkOtherRuns();
+  // group-add: every listed document is missing from this run's existing
+  // links, so all of them start checked -- the point of the prompt is
+  // catching up the gap, not picking a subset.
+  const preChecked = state.crossLink && state.crossLink.kind === "group-add";
+  box.innerHTML = others.length
+    ? others.map((r) => `
+        <label class="modalCheck">
+          <input type="checkbox" value="${escapeHtml(r.runDir)}"${preChecked ? " checked" : ""} />
+          <span>${escapeHtml(r.name)}</span>
+        </label>`).join("")
+    : '<div class="modalHint">No other indexed documents yet.</div>';
+}
+
+function renderCrossLinkGroupPicker() {
+  const sel = $("crossLinkGroupPicker");
+  sel.innerHTML = state.groups.length
+    ? state.groups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)} (${g.memberCount})</option>`).join("")
+    : '<option value="">No groups yet</option>';
+}
+
+function updateCrossLinkModeUI() {
+  const mode = document.querySelector('input[name="crossLinkMode"]:checked').value;
+  $("crossLinkDocsPicker").hidden = mode !== "documents";
+  $("crossLinkGroupPicker").hidden = mode !== "group";
+}
+
+function openCrossLinkModal(context) {
+  state.crossLink = context;
+  const isIngest = context.kind === "ingest";
+  const isGroupAdd = context.kind === "group-add";
+  $("crossLinkTitle").textContent = isGroupAdd
+    ? "Link to the rest of this group?"
+    : isIngest
+    ? "Cross-link this document?"
+    : "Cross-link this document with…";
+  $("crossLinkHint").textContent = isGroupAdd
+    ? `Not yet cross-linked with ${context.candidateRunDirs.length} document(s) in the group(s) you just added it to.`
+    : isIngest
+    ? "Connect matching entities in this document to others already indexed, so chat and the graph can answer across documents."
+    : "Extend this already-indexed document's cross-document connections.";
+  // group-add always means "pick documents" against a fixed, already-known
+  // candidate list -- the mode choice itself is moot, so the radios are
+  // hidden rather than shown with only one real option.
+  $("crossLinkOptions").hidden = isGroupAdd;
+  $("crossLinkMeshOption").hidden = isIngest;
+  $("crossLinkAutoOption").hidden = !isIngest;
+  $("crossLinkSkipOption").hidden = !isIngest;
+  document.querySelector(
+    `input[name="crossLinkMode"][value="${isGroupAdd || !isIngest ? "documents" : "auto"}"]`,
+  ).checked = true;
+  renderCrossLinkDocsPicker();
+  renderCrossLinkGroupPicker();
+  updateCrossLinkModeUI();
+  $("crossLinkModal").hidden = false;
+}
+
+function closeCrossLinkModal() {
+  $("crossLinkModal").hidden = true;
+  state.crossLink = null;
+  $("fileInput").value = "";
+}
+
+async function confirmCrossLink() {
+  const mode = document.querySelector('input[name="crossLinkMode"]:checked').value;
+  const context = state.crossLink;
+  if (!context) return;
+
+  let targetRunDirs, groupId;
+  if (mode === "documents") {
+    targetRunDirs = Array.from($("crossLinkDocsPicker").querySelectorAll("input:checked")).map((i) => i.value);
+    if (!targetRunDirs.length) { alert("Pick at least one document."); return; }
+  } else if (mode === "group") {
+    groupId = $("crossLinkGroupPicker").value;
+    if (!groupId) { alert("Pick a group."); return; }
+  }
+
+  if (context.kind === "ingest") {
+    const plan = { mode, targetRunDirs, groupId };
+    $("crossLinkModal").hidden = true;
+    const file = context.file;
+    state.crossLink = null;
+    await uploadPdf(file, plan);
+    return;
+  }
+
+  try {
+    await api("/api/cross-link", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ runDir: context.runDir, mode, targetRunDirs, groupId }),
+    });
+  } catch (err) {
+    alert("Could not start cross-linking: " + err.message);
+    return;
+  }
+  $("crossLinkModal").hidden = true;
+  state.crossLink = null;
+  pollCrossLinkStatus(context.runDir);
+}
+
+// Cross-linking runs detached (it can involve several LLM calls), so this
+// polls the status Scripts/pipeline.py records in Postgres and surfaces it
+// through the same status box the upload flow uses.
+const CROSS_LINK_POLL_MS = 2000;
+const CROSS_LINK_POLL_MAX = 45;
+
+async function pollCrossLinkStatus(runDir, attempt) {
+  attempt = attempt || 0;
+  let status;
+  try {
+    status = await api(`/api/cross-link-status?run=${encodeURIComponent(runDir)}`);
+  } catch (err) {
+    return; // best-effort; the library grid still reflects the outcome next poll
+  }
+  if (status.status === "running" || status.status === "pending") {
+    if (attempt >= CROSS_LINK_POLL_MAX) return;
+    setUploadStatus(`<span class="spinner"></span>Cross-linking…`);
+    setTimeout(() => pollCrossLinkStatus(runDir, attempt + 1), CROSS_LINK_POLL_MS);
+    return;
+  }
+  if (status.status === "failed") {
+    setUploadStatus("Cross-linking failed: " + escapeHtml(status.error || "unknown error"), true);
+  } else if (status.status === "succeeded") {
+    setUploadStatus("Cross-linking complete.");
+  }
+  await loadLibrary();
+}
+
+function wireCrossLinkModal() {
+  document.querySelectorAll('input[name="crossLinkMode"]').forEach((radio) =>
+    radio.addEventListener("change", updateCrossLinkModeUI));
+  $("crossLinkCancel").addEventListener("click", closeCrossLinkModal);
+  $("crossLinkConfirm").addEventListener("click", confirmCrossLink);
+  $("crossLinkModal").addEventListener("click", (e) => {
+    if (e.target === $("crossLinkModal")) closeCrossLinkModal();
+  });
+}
+
+/* ============================== scope bar ================================= */
+// One shared control -- Document / Group / All -- drives Library, Graph,
+// Chat and Tree together. Tree is the one view that only makes sense in
+// Document scope; the others read whatever this is set to.
+
+function loadScopeBar() {
+  // Only completed documents belong in the picker -- chat/graph can't do
+  // anything with one still indexing. Derived from state.libraryRuns
+  // (kept fresh by loadLibrary()'s own polling) rather than a second fetch.
+  state.documentRuns = state.libraryRuns.filter((r) => r.viewable);
+  renderScopeBar();
+}
+
+function renderScopeBar() {
+  [["headerScopeDocumentBtn", "document"], ["headerScopeGroupBtn", "group"], ["headerScopeAllBtn", "all"]]
+    .forEach(([id, value]) => {
+      const btn = $(id);
+      const active = state.scopeKind === value;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", String(active));
+    });
+
+  const docPicker = $("headerDocumentPicker");
+  docPicker.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = state.documentRuns.length ? "Select a document…" : "No indexed documents";
+  placeholder.selected = !state.currentRun;
+  docPicker.appendChild(placeholder);
+  for (const run of state.documentRuns) {
+    const opt = document.createElement("option");
+    opt.value = run.runDir;
+    opt.textContent = run.name;
+    if (run.runDir === state.currentRun) opt.selected = true;
+    docPicker.appendChild(opt);
+  }
+  docPicker.disabled = state.documentRuns.length === 0;
+  docPicker.hidden = state.scopeKind !== "document";
+
+  const groupPicker = $("headerGroupPicker");
+  groupPicker.innerHTML = state.groups.length
+    ? state.groups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("")
+    : '<option value="">No groups yet</option>';
+  if (state.scopeGroupId) groupPicker.value = state.scopeGroupId;
+  groupPicker.hidden = state.scopeKind !== "group";
+
+  const hint = $("headerScopeHint");
+  if (state.scopeKind === "all" && state.allDocumentCount != null) {
+    hint.textContent = `${state.allDocumentCount} document${state.allDocumentCount === 1 ? "" : "s"}`;
+  } else if (state.scopeKind === "group" && state.groupDocumentCount != null) {
+    hint.textContent = `${state.groupDocumentCount} document${state.groupDocumentCount === 1 ? "" : "s"}`;
+  } else {
+    hint.textContent = "";
+  }
+
+  const hasAnyDocs = state.documentRuns.length > 0;
   document.querySelectorAll('.tab[data-view="graph"], .tab[data-view="tree"], .tab[data-view="chat"]')
-    .forEach((tab) => { tab.disabled = !enabled; });
+    .forEach((tab) => { tab.disabled = !hasAnyDocs; });
+
+  const crossDocRow = $("graphCrossDocOnlyRow");
+  if (crossDocRow) crossDocRow.hidden = state.scopeKind === "document";
+
+  renderTreeScopeState();
+
+  const foot = $("chatSidebarFoot");
+  if (foot) {
+    foot.textContent = state.scopeKind === "all"
+      ? "Conversations are saved for all documents."
+      : state.scopeKind === "group"
+        ? "Conversations are saved for this group."
+        : "Conversations are saved for this document.";
+  }
+}
+
+function wireScopeBar() {
+  $("headerScopeDocumentBtn").addEventListener("click", () => setScope("document", {
+    runDir: state.currentRun || (state.documentRuns[0] && state.documentRuns[0].runDir),
+  }));
+  $("headerScopeGroupBtn").addEventListener("click", () =>
+    setScope("group", { groupId: state.scopeGroupId || (state.groups[0] && state.groups[0].id) }));
+  $("headerScopeAllBtn").addEventListener("click", () => setScope("all"));
+  $("headerDocumentPicker").addEventListener("change", (e) => {
+    if (e.target.value) setScope("document", { runDir: e.target.value });
+  });
+  $("headerGroupPicker").addEventListener("change", (e) => setScope("group", { groupId: e.target.value }));
+}
+
+async function setScope(kind, { runDir, groupId, fromJump = false } = {}) {
+  if (kind === "group" && !groupId) {
+    alert("Create a group first (Library → + Group).");
+    return;
+  }
+  const unchanged = kind === state.scopeKind
+    && (runDir === undefined || runDir === state.currentRun)
+    && (kind !== "group" || groupId === state.scopeGroupId);
+  if (unchanged) return;
+  if (!fromJump) state.pendingScopeRestore = null;
+
+  let data;
+  try {
+    data = await api("/api/scope", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind, runDir, groupId }),
+    });
+  } catch (err) {
+    alert("Could not switch scope: " + err.message);
+    return;
+  }
+  state.scopeKind = data.kind;
+  if (data.runDir) state.currentRun = data.runDir;
+  state.scopeGroupId = data.groupId || null;
+  if (data.kind === "all") state.allDocumentCount = data.documentCount;
+  if (data.kind === "group") state.groupDocumentCount = data.documentCount;
+  // Group/All defaults to showing only what actually connects the
+  // documents -- the full merged entity soup isn't the point of a
+  // cross-document view. Still togglable per view session.
+  state.graphCrossDocOnly = data.kind !== "document";
+  const crossDocCheckbox = $("graphCrossDocOnly");
+  if (crossDocCheckbox) crossDocCheckbox.checked = state.graphCrossDocOnly;
+
+  renderScopeBar();
+  await loadLibrary();
+
+  if (data.kind === "document") {
+    resetForNewRun();
+    await loadData();
+  } else {
+    await loadGraph();
+    await loadConversations();
+  }
+}
+
+function renderTreeScopeState() {
+  const needsDocument = state.scopeKind !== "document";
+  const empty = $("treeScopeEmpty");
+  if (empty) empty.hidden = !needsDocument;
+  const net = $("treeNet");
+  const legend = $("treeLegend");
+  if (net) net.style.display = needsDocument ? "none" : "";
+  if (legend) legend.style.display = needsDocument ? "none" : "";
+
+  // Tree only ever needs one document -- it carries its own picker in the
+  // stage bar rather than relying on the header's Document/Group/All
+  // control (which is hidden on this tab; see updateHeaderScopeVisibility),
+  // since Group/All are never valid choices for a tree.
+  const picker = $("treeDocumentPicker");
+  if (picker) {
+    picker.innerHTML = state.documentRuns.length
+      ? state.documentRuns.map((r) => `<option value="${escapeHtml(r.runDir)}">${escapeHtml(r.name)}</option>`).join("")
+      : '<option value="">No indexed documents</option>';
+    picker.disabled = state.documentRuns.length === 0;
+    if (!needsDocument && state.currentRun) picker.value = state.currentRun;
+  }
 }
 
 function resetForNewRun() {
@@ -990,16 +1656,38 @@ function resetForNewRun() {
 
 /* ============================== load data ================================ */
 async function loadData() {
+  $("graphLinkBanner").hidden = true;
   const [tree, graph] = await Promise.all([api("/api/tree"), api("/api/graph")]);
   state.tree = tree;
-  state.graph = graph;
 
   state.treeNodesById = new Map(tree.nodes.map((n) => [n.id, n]));
   state.treeDepthById = computeTreeDepths(tree.nodes);
-  state.graphNodesById = new Map((graph.nodes || []).map((n) => [n.id, n]));
   state.treeLevelById = computeTreeLevels(tree.nodes);
 
+  buildTypeFilter($("treeTypeFilter"), tree.nodes.map((n) => n.type));
+  renderTreeList();
+  renderTreeLegend();
+
+  applyGraphPayload(graph);
+
+  const active = document.querySelector(".tab.active").dataset.view;
+  if (active === "tree") buildTreeNetwork();
+
+  // Saved history belongs to this run, so it loads with the run's data. The
+  // most recent conversation is reopened rather than leaving an empty pane.
+  await loadConversations();
+}
+
+// Applies a fetched /api/graph payload (any scope) to graph-related state and
+// re-renders whatever's already visible, so a scope switch never needs a
+// full loadData() re-run of the tree side.
+function applyGraphPayload(graph) {
+  state.graph = graph;
+  state.graphNodesById = new Map((graph.nodes || []).map((n) => [n.id, n]));
+
   // reverse index: which entities were extracted from each tree node
+  // (only meaningful in Document scope -- corpus scope nodes carry
+  // documentVersionIds instead of tree-node sourceIds).
   state.entitiesBySourceNode = new Map();
   for (const ent of graph.nodes || []) {
     for (const sid of ent.sourceIds || []) {
@@ -1008,21 +1696,59 @@ async function loadData() {
     }
   }
 
-
   buildTypeFilter($("entityTypeFilter"), (graph.nodes || []).map((n) => n.type));
-  buildTypeFilter($("treeTypeFilter"), tree.nodes.map((n) => n.type));
   renderEntityList();
-  renderTreeList();
   renderGraphLegend();
-  renderTreeLegend();
 
-  const active = document.querySelector(".tab.active").dataset.view;
-  if (active === "graph") buildGraphNetwork();
-  if (active === "tree") buildTreeNetwork();
+  if ($("graphView").classList.contains("active")) buildGraphNetwork();
+  else state.graphBuilt = false;
+}
 
-  // Saved history belongs to this run, so it loads with the run's data. The
-  // most recent conversation is reopened rather than leaving an empty pane.
-  await loadConversations();
+// Cross-link chips open a one-off, read-only view of exactly two documents'
+// merged graph -- what actually connects them -- without touching the
+// shared scope. "Back to scope" restores the normal scoped view.
+async function viewGraphLink(a, b) {
+  activateView("graph");
+  const nameOf = (dir) => {
+    const run = state.libraryRuns.find((r) => r.runDir === dir);
+    return (run && run.name) || dir;
+  };
+  $("graphHint").textContent = "Loading…";
+  let graph;
+  try {
+    graph = await api(`/api/graph-link?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+  } catch (err) {
+    $("graphHint").textContent = "Could not load link: " + err.message;
+    return;
+  }
+  state.graphCrossDocOnly = true;
+  const crossDocCheckbox = $("graphCrossDocOnly");
+  if (crossDocCheckbox) crossDocCheckbox.checked = true;
+  applyGraphPayload(graph);
+  $("graphLinkBannerText").textContent = `Showing what connects ${nameOf(a)} and ${nameOf(b)}`;
+  $("graphLinkBanner").hidden = false;
+}
+
+function wireGraphLinkBanner() {
+  $("graphLinkBannerBack").addEventListener("click", () => {
+    $("graphLinkBanner").hidden = true;
+    loadGraph();
+  });
+}
+
+async function loadGraph() {
+  // No params: the server always builds the graph for the one shared scope
+  // (state.scopeKind/scopeGroupId), set via setScope().
+  $("graphLinkBanner").hidden = true;
+  $("graphHint").textContent = "Loading…";
+  let graph;
+  try {
+    graph = await api("/api/graph");
+  } catch (err) {
+    $("graphHint").textContent = "Could not load graph: " + err.message;
+    return;
+  }
+  applyGraphPayload(graph);
 }
 
 function buildTypeFilter(sel, types) {
@@ -1044,6 +1770,10 @@ function wireGraphControls() {
   $("graphLabels").addEventListener("change", () => { if (state.graphBuilt) applyGraphFilter(); });
   $("graphFit").addEventListener("click", () => state.graphNet && state.graphNet.fit({ animation: true }));
   $("graphPhysics").addEventListener("click", toggleGraphPhysics);
+  $("graphCrossDocOnly").addEventListener("change", (e) => {
+    state.graphCrossDocOnly = e.target.checked;
+    if (state.graphBuilt) applyGraphFilter();
+  });
 }
 
 let graphPhysicsOn = true;
@@ -1062,10 +1792,12 @@ const GRAPH_RENDER_BUDGET = 400;
 function visibleEntities() {
   const q = $("graphSearch").value.trim().toLowerCase();
   const type = $("entityTypeFilter").value;
+  const crossOnly = state.graphCrossDocOnly;
   const matched = (state.graph.nodes || []).filter((n) => {
     const okType = !type || (n.type || "UNKNOWN") === type;
+    const okCross = !crossOnly || n.crossDocument;
     const hay = `${n.label} ${n.type} ${n.description}`.toLowerCase();
-    return okType && (!q || hay.includes(q));
+    return okType && okCross && (!q || hay.includes(q));
   });
   if (matched.length <= GRAPH_RENDER_BUDGET) return matched;
   return [...matched]
@@ -1073,14 +1805,39 @@ function visibleEntities() {
     .slice(0, GRAPH_RENDER_BUDGET);
 }
 
+// Node fill = entity type (colorForType). Node border = provenance: which
+// document(s) it came from -- only meaningful once more than one document is
+// in play (Group/All scope with 2+ documents). A single-document border color
+// identifies that document; a thick accent ring flags an entity whose own
+// name/type recurred across documents (merged into one node), which reads
+// differently from a merely cross-linked entity.
 function toVisEntity(n, labelsOn) {
+  const isHub = n.type === "GROUPING";
+  const docTitles = [...new Set(n.documentTitles || [])];
+  const docLine = docTitles.length ? `\nDocuments: ${docTitles.join(", ")}` : "";
+  const multiDocScope = (state.graph.documentCount || 0) > 1;
+
+  let borderColor = isHub ? "#111" : "#ffffff";
+  let borderWidth = isHub ? 2 : 1.5;
+  if (multiDocScope && !isHub) {
+    if (docTitles.length > 1) {
+      borderColor = "#0f766e"; // this entity itself spans multiple documents
+      borderWidth = 3;
+    } else if (docTitles.length === 1) {
+      borderColor = colorForDocument(docTitles[0]);
+      borderWidth = 2.5;
+    }
+  }
+
   return {
     id: n.id,
     label: labelsOn ? clip(n.label, 26) : undefined,
-    title: `${n.label}\n[${n.type}]  ·  degree ${n.degree}\n${clip(n.description, 160)}`,
+    title: `${n.label}\n[${n.type}]  ·  degree ${n.degree}\n${clip(n.description, 160)}${docLine}`,
     value: (n.degree || 0) + 1,
-    color: { background: colorForType(n.type), border: "#ffffff",
-      highlight: { background: colorForType(n.type), border: "#111" } },
+    shape: isHub ? "box" : "dot",
+    borderWidth,
+    color: { background: colorForType(n.type), border: borderColor,
+      highlight: { background: colorForType(n.type), border: borderColor } },
   };
 }
 
@@ -1104,6 +1861,35 @@ function graphPhysicsFor(nodes) {
   };
 }
 
+// Same-document relation: default grey, solid (set at the network level).
+// Cross-document relation (two different documents' entities, LLM-judged):
+// amber, dashed, arrowed -- these are the ones a document-scoped graph could
+// never show. Grouping membership (an entity attached to a topic hub): violet,
+// dotted -- a looser, structural link, not a factual claim, so it reads
+// differently from an actual relation even though both cross documents.
+const CROSS_DOC_RELATION_COLOR = "#d97706";
+const GROUPING_EDGE_COLOR = "#7c3aed";
+
+function toVisEdge(l) {
+  const isGrouping = l.name === "grouping_member";
+  const cross = !!l.crossDocument;
+  const kindLabel = isGrouping ? "Grouping" : cross ? "Cross-document" : "";
+  return {
+    id: l.id, from: l.source, to: l.target,
+    value: Number(l.weight) || 1,
+    length: edgeLength(l),   // varies per edge by endpoint degrees (hubs longer)
+    title: `${kindLabel ? kindLabel + " · " : ""}${l.sourceName} → ${l.targetName}\n${clip(l.description, 160)}`,
+    dashes: isGrouping ? [2, 4] : cross ? [8, 4] : false,
+    color: isGrouping
+      ? { color: GROUPING_EDGE_COLOR, highlight: GROUPING_EDGE_COLOR, opacity: 0.55 }
+      : cross
+      ? { color: CROSS_DOC_RELATION_COLOR, highlight: CROSS_DOC_RELATION_COLOR, opacity: 0.85 }
+      : undefined,
+    width: cross && !isGrouping ? 2.25 : undefined,
+    arrows: cross && !isGrouping ? "to" : undefined,
+  };
+}
+
 // Per-edge rest length, driven by BOTH endpoints' degree (their sum) so lengths
 // vary edge-to-edge: hub↔hub longest, hub↔leaf medium, leaf↔leaf shortest.
 function edgeLength(l) {
@@ -1113,6 +1899,7 @@ function edgeLength(l) {
 }
 
 function buildGraphNetwork() {
+  if (state.graphNet) { state.graphNet.destroy(); state.graphNet = null; }
   const container = $("graphNet");
   const nodes = new vis.DataSet();
   const edges = new vis.DataSet();
@@ -1182,7 +1969,9 @@ function applyGraphFilter() {
   const visN = visibleEntities();
   const ids = new Set(visN.map((n) => n.id));
   const labelsOn = $("graphLabels").checked || visN.length <= 70;
-  const links = (state.graph.links || []).filter((l) => ids.has(l.source) && ids.has(l.target));
+  const links = (state.graph.links || []).filter(
+    (l) => ids.has(l.source) && ids.has(l.target) && (!state.graphCrossDocOnly || l.crossDocument),
+  );
 
   // re-tune physics for the current node count / degree, then re-layout
   state.graphNet.setOptions({ physics: graphPhysicsFor(visN) });
@@ -1192,18 +1981,18 @@ function applyGraphFilter() {
   state.graphNodes.clear();
   state.graphEdges.clear();
   state.graphNodes.add(visN.map((n) => toVisEntity(n, labelsOn)));
-  state.graphEdges.add(links.map((l) => ({
-    id: l.id, from: l.source, to: l.target,
-    value: Number(l.weight) || 1,
-    length: edgeLength(l),   // varies per edge by endpoint degrees (hubs longer)
-    title: `${l.sourceName} → ${l.targetName}\n${clip(l.description, 160)}`,
-  })));
+  state.graphEdges.add(links.map((l) => toVisEdge(l)));
 
   const total = (state.graph.nodes || []).length;
   const capped = visN.length >= GRAPH_RENDER_BUDGET && total > GRAPH_RENDER_BUDGET;
-  $("graphStats").textContent =
-    `${visN.length} of ${total} entities · ${links.length} relationships shown`
-    + (capped ? " · most-connected first; search or filter to see others" : "");
+  if (visN.length === 0 && state.graphCrossDocOnly && total > 0) {
+    $("graphStats").textContent =
+      `0 of ${total} entities shown — none are cross-document yet in this scope. Uncheck "Cross-document only" to see everything.`;
+  } else {
+    $("graphStats").textContent =
+      `${visN.length} of ${total} entities · ${links.length} relationships shown`
+      + (capped ? " · most-connected first; search or filter to see others" : "");
+  }
   renderEntityList(visN);
   $("graphHint").textContent = labelsOn
     ? "scroll to pan · Ctrl+scroll = zoom"
@@ -1227,10 +2016,32 @@ function renderEntityList(list) {
 
 function renderGraphLegend() {
   const types = [...new Set((state.graph.nodes || []).map((n) => n.type || "UNKNOWN"))].sort();
-  $("graphLegend").innerHTML = types.map((t) =>
+  const typeSwatches = types.map((t) =>
     `<span class="swatch" data-type="${escapeHtml(t)}"><span class="dot" style="background:${colorForType(t)}"></span>${escapeHtml(t)}</span>`
   ).join("");
-  $("graphLegend").querySelectorAll(".swatch").forEach((sw) => {
+
+  // Node fill already keys off entity type (above); border and edge style key
+  // off document/cross-document status, which only means anything once more
+  // than one document is actually in the graph (Group/All scope, 2+ docs).
+  const multiDoc = (state.graph.documentCount || 0) > 1;
+  let edgeKey = "";
+  let docSwatches = "";
+  if (multiDoc) {
+    edgeKey = `<span class="legendDivider"></span>
+      <span class="legendLine"><span class="ln"></span>Same-document relation</span>
+      <span class="legendLine"><span class="ln cross"></span>Cross-document relation</span>
+      <span class="legendLine"><span class="ln grouping"></span>Grouping membership</span>
+      <span class="legendLine"><span class="dot ring" style="border-color:#0f766e"></span>Entity spans documents</span>`;
+    const docTitles = [...new Set((state.graph.nodes || []).flatMap((n) => n.documentTitles || []))].sort();
+    if (docTitles.length) {
+      docSwatches = `<span class="legendDivider"></span>` + docTitles.map((title) =>
+        `<span class="swatch static"><span class="dot ring" style="border-color:${colorForDocument(title)}"></span>${escapeHtml(title)}</span>`
+      ).join("");
+    }
+  }
+
+  $("graphLegend").innerHTML = typeSwatches + edgeKey + docSwatches;
+  $("graphLegend").querySelectorAll(".swatch:not(.static)").forEach((sw) => {
     sw.onclick = () => {
       const cur = $("entityTypeFilter").value;
       $("entityTypeFilter").value = cur === sw.dataset.type ? "" : sw.dataset.type;
@@ -1249,12 +2060,19 @@ function selectEntity(id) {
   const rels = (state.graph.links || []).filter((l) => l.source === id || l.target === id)
     .sort((a, b) => (Number(b.weight) || 0) - (Number(a.weight) || 0));
 
-  const sources = (ent.sourceIds || []).map((sid, i) => {
-    const snip = (ent.sourceSnippets || [])[i] || "";
-    return `<div class="card"><div class="h">source node §${escapeHtml(sid)}
-      <a class="linkish" data-tree="${escapeHtml(sid)}">view in tree →</a></div>
-      <div class="b">${escapeHtml(clip(snip, 260))}</div></div>`;
-  }).join("") || `<p class="prose">No source node recorded.</p>`;
+  const isCorpusNode = !ent.sourceIds && ent.documentTitles;
+  const sources = isCorpusNode
+    ? (
+        [...new Set(ent.documentTitles)].map((title) =>
+          `<div class="card"><div class="h">${escapeHtml(title)}</div></div>`).join("")
+        || `<p class="prose">No document recorded.</p>`
+      )
+    : (ent.sourceIds || []).map((sid, i) => {
+        const snip = (ent.sourceSnippets || [])[i] || "";
+        return `<div class="card"><div class="h">source node §${escapeHtml(sid)}
+          <a class="linkish" data-tree="${escapeHtml(sid)}">view in tree →</a></div>
+          <div class="b">${escapeHtml(clip(snip, 260))}</div></div>`;
+      }).join("") || `<p class="prose">No source node recorded.</p>`;
 
   const relHtml = rels.slice(0, 40).map((l) => {
     const other = l.source === id ? l.targetName : l.sourceName;
@@ -1269,7 +2087,9 @@ function selectEntity(id) {
     <span class="pill">degree ${ent.degree}</span>
     <div class="section-h">Description (LLM-extracted)</div>
     <div class="prose">${escapeHtml(ent.description || "—")}</div>
-    <div class="section-h">Created from ${ent.sourceIds?.length || 0} source node(s)</div>
+    <div class="section-h">${isCorpusNode
+      ? `Appears in ${new Set(ent.documentTitles).size} document(s)`
+      : `Created from ${ent.sourceIds?.length || 0} source node(s)`}</div>
     ${sources}
     <div class="section-h">Relationships (${rels.length})</div>
     ${relHtml}`;
@@ -1302,6 +2122,9 @@ function wireTreeJumpLinks(root) {
 
 /* =============================== TREE ==================================== */
 function wireTreeControls() {
+  $("treeDocumentPicker").addEventListener("change", (e) => {
+    if (e.target.value) setScope("document", { runDir: e.target.value });
+  });
   $("treeSearch").addEventListener("input", renderTreeList);
   $("treeSearch").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && state.treeFilteredIds.length) {
@@ -2098,9 +2921,6 @@ function wireChat() {
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 160) + "px"; });
   $("newChatBtn").addEventListener("click", startNewChat);
   $("sidebarToggle").addEventListener("click", toggleChatSidebar);
-  $("scopeLocalBtn").addEventListener("click", () => setChatScope("local"));
-  $("scopeGlobalBtn").addEventListener("click", () => setChatScope("global"));
-  applyScopeUI();
   // The collapsed state is a workspace preference, not document state, so it
   // outlives both the conversation and the selected PDF.
   applySidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
@@ -2166,55 +2986,6 @@ function addMessage(role, html) {
   return wrap;
 }
 
-/* ------------------------------ Chat scope -------------------------------- */
-// Local answers from the open document only; global pools every indexed
-// document sharing its tenant/corpus. Conversation history is stored
-// separately per scope server-side, so per-document chats stay untouched
-// when switching to global and back.
-
-function applyScopeUI() {
-  const isGlobal = state.chatScope === "global";
-  const localBtn = $("scopeLocalBtn");
-  const globalBtn = $("scopeGlobalBtn");
-  if (localBtn) { localBtn.classList.toggle("active", !isGlobal); localBtn.setAttribute("aria-pressed", String(!isGlobal)); }
-  if (globalBtn) { globalBtn.classList.toggle("active", isGlobal); globalBtn.setAttribute("aria-pressed", String(isGlobal)); }
-  const hint = $("scopeHint");
-  if (hint) {
-    hint.textContent = isGlobal && state.globalDocumentCount != null
-      ? `${state.globalDocumentCount} document${state.globalDocumentCount === 1 ? "" : "s"} in scope`
-      : "";
-  }
-}
-
-async function syncChatScope() {
-  try {
-    const data = await api("/api/library");
-    state.chatScope = data.chatScope || "local";
-    state.globalDocumentCount = data.globalDocumentCount;
-  } catch (err) {
-    state.chatScope = "local";
-  }
-  applyScopeUI();
-}
-
-async function setChatScope(scope) {
-  if (state.chatScope === scope || state.chatBusy) return;
-  let data;
-  try {
-    data = await api("/api/chat-scope", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scope }),
-    });
-  } catch (err) {
-    alert("Could not switch chat scope: " + err.message);
-    return;
-  }
-  state.chatScope = data.scope;
-  state.globalDocumentCount = data.documentCount;
-  applyScopeUI();
-  await loadConversations();
-}
 
 /* --------------------------- Saved conversations ------------------------- */
 // History lives in the run directory server-side, so it follows the document:
@@ -2448,13 +3219,14 @@ function inlineFigureHtml(citation) {
     .filter(Boolean)
     .map((part) => escapeHtml(String(part)))
     .join(" · ");
+  const run = escapeHtml(citation.runDir || "");
   // Keyed by node, not by label: one crop belongs to one node however many
   // evidence scopes cite it.
   return `<figure class="answerFigure" data-figure="${escapeHtml(String(citation.nodeId))}">
     <img src="${treeImageUrl(citation.nodeId)}" alt="${escapeHtml(citation.label)}" loading="lazy" />
     <figcaption>${caption}${
       citation.nodeId != null
-        ? ` · <a class="linkish" data-tree="${escapeHtml(citation.nodeId)}">view in tree →</a>`
+        ? ` · <a class="linkish" data-tree="${escapeHtml(citation.nodeId)}" data-run="${run}">view in tree →</a>`
         : ""
     }</figcaption>
   </figure>`;
@@ -2526,30 +3298,55 @@ function inlineCitedFigures(scope, citations) {
   }
 }
 
+function renderReferenceCard(c) {
+  const img = c.hasImage && c.nodeId != null
+    ? `<img class="refThumb" src="${treeImageUrl(c.nodeId)}" alt="" loading="lazy" />`
+    : "";
+  const run = escapeHtml(c.runDir || "");
+  const jumps = c.nodeId != null
+    ? `<a class="linkish refJump" data-tree="${escapeHtml(c.nodeId)}" data-run="${run}">view in tree →</a>
+       <a class="linkish refJump" data-graph-from-tree="${escapeHtml(c.nodeId)}" data-run="${run}">view in graph →</a>`
+    : "";
+  return `<div class="refCard" id="ref-${escapeHtml(c.label)}">
+    <div class="refHead">
+      <span class="refLabel">${escapeHtml(c.label)}</span>
+      ${c.type ? `<span class="refType">${escapeHtml(c.type)}</span>` : ""}
+      ${c.page ? `<span class="refPage">p${escapeHtml(c.page)}</span>` : ""}
+    </div>
+    ${img}
+    ${renderSnippet(c)}
+    ${jumps}
+  </div>`;
+}
+
 function renderReferences(citations) {
   if (!citations || !citations.length) return "";
-  const cards = citations.map((c) => {
-    const img = c.hasImage && c.nodeId != null
-      ? `<img class="refThumb" src="${treeImageUrl(c.nodeId)}" alt="" loading="lazy" />`
-      : "";
-    const jump = c.nodeId != null
-      ? `<a class="linkish refJump" data-tree="${escapeHtml(c.nodeId)}">view in tree →</a>`
-      : "";
-    return `<div class="refCard" id="ref-${escapeHtml(c.label)}">
-      <div class="refHead">
-        <span class="refLabel">${escapeHtml(c.label)}</span>
-        ${c.type ? `<span class="refType">${escapeHtml(c.type)}</span>` : ""}
-        ${c.page ? `<span class="refPage">p${escapeHtml(c.page)}</span>` : ""}
-      </div>
-      ${img}
-      ${renderSnippet(c)}
-      ${jump}
-    </div>`;
-  }).join("");
+  // A single-document answer's references all share one source -- grouping
+  // by it would just repeat the same heading over every card. A group/all-
+  // scope answer draws on more than one document, and the reader has to be
+  // able to tell which source backs which citation at a glance.
+  const titles = new Set(citations.map((c) => c.documentTitle).filter(Boolean));
+  let body;
+  if (titles.size > 1) {
+    const order = [];
+    const byTitle = new Map();
+    for (const c of citations) {
+      const title = c.documentTitle || "Unknown document";
+      if (!byTitle.has(title)) { byTitle.set(title, []); order.push(title); }
+      byTitle.get(title).push(c);
+    }
+    body = order.map((title) => `
+      <div class="refGroup">
+        <div class="refGroupTitle">${escapeHtml(title)}</div>
+        <div class="refList">${byTitle.get(title).map(renderReferenceCard).join("")}</div>
+      </div>`).join("");
+  } else {
+    body = `<div class="refList">${citations.map(renderReferenceCard).join("")}</div>`;
+  }
   // Closed by default, like every other evidence panel. Reopening it on every
   // answer buried the next question under a full reference list each time the
   // reader switched conversations; clicking a citation still opens it.
-  return `<details class="evidence"><summary>References (${citations.length})</summary><div class="refList">${cards}</div></details>`;
+  return `<details class="evidence"><summary>References (${citations.length})</summary>${body}</details>`;
 }
 
 // Entities the retrieval touched but that the answer may not have named
@@ -2637,6 +3434,45 @@ function linkifyCitations(scope, citations) {
   }
 }
 
+async function jumpToDocumentScope(runDir) {
+  if (!runDir) return state.scopeKind === "document";
+  if (state.scopeKind !== "document" || state.currentRun !== runDir) {
+    if (!state.pendingScopeRestore) {
+      state.pendingScopeRestore = {
+        kind: state.scopeKind, runDir: state.currentRun, groupId: state.scopeGroupId,
+      };
+    }
+    await setScope("document", { runDir, fromJump: true });
+  }
+  return true;
+}
+
+async function returnToChatScope() {
+  const restore = state.pendingScopeRestore;
+  state.pendingScopeRestore = null;
+  if (restore) {
+    await setScope(restore.kind, { runDir: restore.runDir, groupId: restore.groupId, fromJump: true });
+  }
+  activateView("chat");
+}
+
+async function jumpToTreeNode(runDir, nodeId) {
+  activateView("tree");
+  if (!(await jumpToDocumentScope(runDir))) return;
+  selectTreeNode(Number(nodeId));
+}
+
+async function jumpToGraphFromTreeNode(runDir, nodeId) {
+  activateView("graph");
+  if (!(await jumpToDocumentScope(runDir))) return;
+  const ents = state.entitiesBySourceNode.get(Number(nodeId)) || [];
+  if (!ents.length) {
+    alert("No graph entity was extracted from this specific passage.");
+    return;
+  }
+  selectEntity(ents[0].id);
+}
+
 function wireEvidenceLinks(scope) {
   // A figure, chart or table crop cited in an answer is thumbnail-sized, which
   // is too small to read. The tree panel already zooms its crop on click; an
@@ -2646,7 +3482,9 @@ function wireEvidenceLinks(scope) {
     img.onclick = () => openLightbox(img.src);
   });
   scope.querySelectorAll("[data-tree]").forEach((a) =>
-    a.onclick = () => { activateView("tree"); selectTreeNode(Number(a.dataset.tree)); });
+    a.onclick = () => jumpToTreeNode(a.dataset.run, a.dataset.tree));
+  scope.querySelectorAll("[data-graph-from-tree]").forEach((a) =>
+    a.onclick = () => jumpToGraphFromTreeNode(a.dataset.run, a.dataset.graphFromTree));
   scope.querySelectorAll("[data-entity]").forEach((a) =>
     a.onclick = () => {
       const ent = (state.graph.nodes || []).find((n) => n.label === a.dataset.entity);

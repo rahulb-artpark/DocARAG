@@ -593,7 +593,7 @@ class CorpusIndexBundle:
 
     __slots__ = (
         "tenant_id", "corpus_id", "documents", "tree_vdb", "entity_vdb",
-        "embedder", "document_titles", "_closed",
+        "tree_embedder", "embedder", "document_titles", "_closed",
     )
 
     def __init__(
@@ -604,6 +604,7 @@ class CorpusIndexBundle:
         documents: Dict[str, Any],
         tree_vdb: Any,
         entity_vdb: Any,
+        tree_embedder: Any,
         embedder: Any,
         document_titles: Dict[str, str],
     ) -> None:
@@ -614,6 +615,12 @@ class CorpusIndexBundle:
         self.documents = documents
         self.tree_vdb = tree_vdb
         self.entity_vdb = entity_vdb
+        # tree_embedder feeds tree_vdb (config.vdb.embedding_config); embedder
+        # is the entity/graph-side one (config.graph.embedding_config) --
+        # StoredIndex._open_entity_search keeps these two separate for the
+        # same reason (they are independently configured models, frequently
+        # of different dimensionality), so a corpus bundle must too.
+        self.tree_embedder = tree_embedder
         self.embedder = embedder
         self.document_titles = document_titles
         self._closed = False
@@ -627,7 +634,7 @@ class CorpusIndexBundle:
                 stored_index.close()
             except Exception:
                 log.exception("Failed to close a corpus bundle's document index")
-        for resource in (self.tree_vdb, self.entity_vdb, self.embedder):
+        for resource in (self.tree_vdb, self.entity_vdb, self.tree_embedder, self.embedder):
             if resource is not None:
                 try:
                     resource.close()
@@ -714,21 +721,38 @@ def prepare_corpus_rag_dependencies(
         from Core.provider.embedding import TextEmbeddingProvider
         from Core.provider.vdb import VectorSchema, VectorStore
 
-        embed_cfg: EmbeddingConfig = base_vdb_cfg.embedding_config
-        shared_embedder = TextEmbeddingProvider(
-            model_name=embed_cfg.model_name,
-            backend=embed_cfg.backend,
-            device=embed_cfg.device,
-            max_length=embed_cfg.max_length,
-            api_base=embed_cfg.api_base,
-            api_key=getattr(embed_cfg, "api_key", None),
-            num_ctx=getattr(embed_cfg, "num_ctx", None),
+        # Two independently configured embedders, matching the single-document
+        # path (StoredIndex._open_entity_search): tree_vdb uses vdb.embedding_
+        # config, entity_vdb uses graph.embedding_config -- these are commonly
+        # different models of different dimensionality (e.g. a Qwen3-VL tree
+        # embedder alongside an Ollama qwen3-embedding entity embedder), and
+        # entity_vdb's collection is created at whichever dimension its own
+        # config's embedder produces.
+        tree_embed_cfg: EmbeddingConfig = base_vdb_cfg.embedding_config
+        tree_embedder = TextEmbeddingProvider(
+            model_name=tree_embed_cfg.model_name,
+            backend=tree_embed_cfg.backend,
+            device=tree_embed_cfg.device,
+            max_length=tree_embed_cfg.max_length,
+            api_base=tree_embed_cfg.api_base,
+            api_key=getattr(tree_embed_cfg, "api_key", None),
+            num_ctx=getattr(tree_embed_cfg, "num_ctx", None),
+        )
+        entity_embed_cfg: EmbeddingConfig = base_cfg.graph.embedding_config
+        entity_embedder = TextEmbeddingProvider(
+            model_name=entity_embed_cfg.model_name,
+            backend=entity_embed_cfg.backend,
+            device=entity_embed_cfg.device,
+            max_length=entity_embed_cfg.max_length,
+            api_base=entity_embed_cfg.api_base,
+            api_key=getattr(entity_embed_cfg, "api_key", None),
+            num_ctx=getattr(entity_embed_cfg, "num_ctx", None),
         )
         tree_vdb = None
         entity_vdb = None
         try:
             tree_vdb = VectorStore(
-                embedding_model=shared_embedder,
+                embedding_model=tree_embedder,
                 **_vector_store_kwargs(
                     base_vdb_cfg, merged_tree_scope, vector_schema=VectorSchema.TREE_NODE
                 ),
@@ -742,18 +766,19 @@ def prepare_corpus_rag_dependencies(
 
             entity_vdb = VectorStore(
                 qdrant_url=base_vdb_cfg.qdrant_url,
-                embedding_model=shared_embedder,
+                embedding_model=entity_embedder,
                 collection_name=base_cfg.graph.entity_collection_name,
                 api_key_env=base_vdb_cfg.api_key_env,
                 timeout_seconds=base_vdb_cfg.timeout_seconds,
-                scope_filter=corpus_entity_vector_scope(base_vdb_cfg),
+                scope_filter=corpus_entity_vector_scope(base_vdb_cfg, document_version_ids),
                 hybrid_entity_schema=True,
             )
         except BaseException:
             _close_partial_resources(
                 ("corpus tree_vdb", tree_vdb),
                 ("corpus entity_vdb", entity_vdb),
-                ("corpus shared embedder", shared_embedder),
+                ("corpus tree embedder", tree_embedder),
+                ("corpus entity embedder", entity_embedder),
             )
             raise
 
@@ -767,7 +792,8 @@ def prepare_corpus_rag_dependencies(
             documents=documents,
             tree_vdb=tree_vdb,
             entity_vdb=entity_vdb,
-            embedder=shared_embedder,
+            tree_embedder=tree_embedder,
+            embedder=entity_embedder,
             document_titles=document_titles,
         )
         log.info(

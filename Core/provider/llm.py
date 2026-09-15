@@ -710,17 +710,27 @@ class LLM:
         think_mode: Optional[bool] = None,
     ) -> dict:
         last_exception: Optional[Exception] = None
+        # A reasoning model left to its own default (think_mode=None here)
+        # can spend the entire num_predict budget on <think> content for a
+        # sufficiently broad/complex prompt, returning a truly empty
+        # message.content -- "model returned an empty structured response".
+        # That's deterministic at temperature=0.1: retrying with the exact
+        # same call just repeats it 3 times for nothing. Once observed, force
+        # thinking off for the remaining attempts instead -- a plain,
+        # unreasoned JSON answer that actually returns beats 3 identical
+        # empty ones.
+        effective_think_mode = think_mode
         for attempt in range(1, self.config.max_retries + 1):
             try:
                 admission = getattr(self, "_admission", None)
                 if admission is None:
                     res = self.llm.get_json_completion(
-                        prompt, schema, images, think_mode=think_mode
+                        prompt, schema, images, think_mode=effective_think_mode
                     )
                 else:
                     with admission:
                         res = self.llm.get_json_completion(
-                            prompt, schema, images, think_mode=think_mode
+                            prompt, schema, images, think_mode=effective_think_mode
                         )
                 if not res:
                     raise ValueError("Empty response from LLM")
@@ -733,6 +743,8 @@ class LLM:
                     self.config.max_retries,
                     type(e).__name__,
                 )
+                if "empty" in str(e).lower() and effective_think_mode is not False:
+                    effective_think_mode = False
                 if (
                     attempt < self.config.max_retries
                     and self.config.retry_delay_seconds

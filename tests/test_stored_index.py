@@ -93,6 +93,10 @@ class _FakeTree:
         self._record("nodes_for_entity", canonical, entity_kind)
         return list(self._entity_nodes)
 
+    def entities_for_nodes(self, node_ids):
+        canonicals = {edge.source for edge in self._edges} | {edge.target for edge in self._edges}
+        return {node_id: canonicals for node_id in node_ids if node_id in self._entity_nodes}
+
     def induced_subgraph(self, node_ids):
         self._record("induced_subgraph", tuple(node_ids))
         return self._edges
@@ -202,7 +206,7 @@ class StoredGraphIndexTests(unittest.TestCase):
         self.assertEqual(3, graph.number_of_nodes())
         self.assertEqual(2, graph.number_of_edges())
         self.assertEqual(
-            "drives", graph.edges["amplifier", "speaker"]["relation_name"]
+            "drives", graph.edges[entity_node_name("amplifier", ""), entity_node_name("speaker", "")]["relation_name"]
         )
 
     def test_subgraph_data_is_bounded_by_the_caller(self):

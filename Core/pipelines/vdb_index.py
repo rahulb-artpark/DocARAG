@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from itertools import chain
-from typing import Dict, Iterator, List, Literal, Mapping, Tuple
+from typing import Dict, Iterator, List, Literal, Mapping, Sequence, Tuple
 from pathlib import Path
 import hashlib
 import stat
@@ -471,10 +471,29 @@ def entity_vector_scope(
     )
 
 
-def corpus_entity_vector_scope(vdb_cfg: VDBConfig) -> dict[str, str]:
-    """Read-only entity scope spanning every document in the corpus."""
+def corpus_entity_vector_scope(
+    vdb_cfg: VDBConfig, document_version_ids: Sequence[str] | None = None
+) -> dict[str, object]:
+    """Read-only entity scope spanning either the whole corpus or a document set.
 
-    return {**_validated_tenant_scope(vdb_cfg), "index_kind": "entity"}
+    ``document_version_ids`` is a MatchAny restriction, the same mechanism
+    ``merged_tree_scope`` already uses for its TreeVDB scope -- omitted, this
+    reaches every document in the tenant/corpus (whole-corpus cross-doc
+    linking's own auto/restricted split narrows per-call instead, see
+    ``cross_doc_linker.py::_search_cross_document_matches``, so its caller
+    must keep getting the unrestricted scope here). Passed, entity search is
+    confined to exactly those documents -- for a group/all-scope chat, so an
+    entity from outside the current scope never competes for a retrieval slot
+    that belongs to the documents actually being asked about.
+    """
+
+    scope: dict[str, object] = {**_validated_tenant_scope(vdb_cfg), "index_kind": "entity"}
+    if document_version_ids is not None:
+        ids = list(document_version_ids)
+        if not ids:
+            raise ValueError("document_version_ids must not be empty when provided")
+        scope["document_version_id"] = ids
+    return scope
 
 
 def _qdrant_state(

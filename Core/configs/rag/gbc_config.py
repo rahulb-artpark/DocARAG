@@ -84,6 +84,13 @@ class GBCRAGConfig(BaseRAGStrategyConfig):
             "on its own only when the backend declares no context window."
         ),
     )
+    enable_global_classification: bool = Field(
+        default=False,
+        description=(
+            "Allow the query planner to classify queries as global. When false, "
+            "classification is restricted to simple and complex."
+        ),
+    )
     planner_max_query_chars: int = Field(
         default=4096,
         ge=1,
@@ -94,13 +101,19 @@ class GBCRAGConfig(BaseRAGStrategyConfig):
         ),
     )
     planner_max_subquestions: int = Field(
-        default=8,
+        default=16,
         ge=1,
         le=ABSOLUTE_MAX_SUBQUESTIONS,
         description=(
             "Maximum model-produced sub-questions in a complex query plan. "
             "Oversized plans are rejected rather than partially executed."
         ),
+    )
+    complex_synthesis_input_tokens: int = Field(
+        default=12000,
+        ge=1024,
+        le=128000,
+        description="Input token ceiling for complex synthesis and compaction; further limited by num_ctx minus output tokens and safety margin.",
     )
     planner_max_subquestion_chars: int = Field(
         default=1024,

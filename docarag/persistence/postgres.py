@@ -1978,6 +1978,23 @@ class PostgresLedger:
             (_json_text(patch), grouping_key, scope.tenant_id, scope.corpus_id),
         )
 
+    def delete_grouping(
+        self, connection: _Connection, scope: CorpusScope, *, grouping_key: int,
+    ) -> None:
+        """Remove a grouping hub that has lost every member.
+
+        Its last membership statement (and the 'grouping'-role row naming it)
+        is already gone by the time this runs -- deleting a member's last
+        mention deletes that statement first, see Scripts/web.py's document-
+        delete path -- so this is just the bare entity row.
+        """
+
+        connection.execute(
+            "DELETE FROM docarag.entity WHERE entity_key = %s AND tenant_id = %s "
+            "AND corpus_id = %s AND entity_kind = 'grouping'",
+            (grouping_key, scope.tenant_id, scope.corpus_id),
+        )
+
     def update_grouping_description(
         self,
         connection: _Connection,
@@ -2008,8 +2025,19 @@ class PostgresLedger:
         producer: str,
         description: str | None,
         link_origin: str = "cross_document_inferred",
+        source_document_version_id_subject: str | None = None,
+        source_document_version_id_object: str | None = None,
     ) -> int:
-        """Idempotent on (subject_key, object_key, predicate). Weight is written verbatim."""
+        """Idempotent on (subject_key, object_key, predicate). Weight is written verbatim.
+
+        The two source_document_version_id_* properties record which document
+        actually anchored each side of the relation AT WRITE TIME -- entity_key
+        alone can't answer that later, since entity resolution (a separate,
+        per-document process) can merge an entity with an unrelated document's
+        own mention of the same canonical name at any point. Only set in
+        restricted (documents/group) linking, where the search was scoped to
+        one target document; auto mode has no single document to record.
+        """
 
         store = CorpusStore(lambda: connection, scope.tenant_id, scope.corpus_id)
         existing = store.cross_doc_relation_stmt_key(subject_key, object_key, predicate)
@@ -2036,7 +2064,16 @@ class PostgresLedger:
                 "(tenant_id, corpus_id, stmt_key, role, entity_key) VALUES (%s, %s, %s, %s, %s)",
                 (scope.tenant_id, scope.corpus_id, stmt_key, role, entity_key),
             )
-        for name, value in (("link_kind", "inferred_relation"), ("link_origin", link_origin)):
+        properties = [("link_kind", "inferred_relation"), ("link_origin", link_origin)]
+        if source_document_version_id_subject:
+            properties.append((
+                "source_document_version_id_subject", source_document_version_id_subject,
+            ))
+        if source_document_version_id_object:
+            properties.append((
+                "source_document_version_id_object", source_document_version_id_object,
+            ))
+        for name, value in properties:
             connection.execute(
                 "INSERT INTO docarag.cross_doc_statement_property "
                 "(tenant_id, corpus_id, stmt_key, name, text_val) VALUES (%s, %s, %s, %s, %s)",
