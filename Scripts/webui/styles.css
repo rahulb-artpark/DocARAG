@@ -246,34 +246,6 @@ main { flex: 1; min-height: 0; position: relative; }
 .lightbox .lbClose { position: absolute; top: 14px; right: 22px; color: #fff; font-size: 32px; line-height: 1; cursor: pointer; }
 pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px; border-radius: 8px; overflow: auto; }
 
-/* ---------------- groups ---------------- */
-.groupBar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 14px 0 4px; }
-.groupChips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.groupChip {
-  padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px;
-  background: #fff; color: var(--ink); font: 600 11.5px/1.5 inherit; cursor: pointer;
-}
-.groupChip:hover { border-color: var(--accent); color: var(--accent); }
-.groupChip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
-.groupChipCount { color: var(--muted); font-weight: 600; }
-.groupChip.active .groupChipCount { color: var(--accent); }
-.groupChipWrap { display: inline-flex; align-items: center; gap: 2px; }
-.groupChipEdit {
-  border: none; background: transparent; color: var(--muted); cursor: pointer;
-  font-size: 12px; padding: 2px 5px; border-radius: 6px; line-height: 1;
-}
-.groupChipEdit:hover { color: var(--accent); background: var(--accent-soft); }
-
-.runGroups {
-  flex: none; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px;
-  background: #fff; color: var(--ink);
-  font: 600 11px/1.5 inherit; letter-spacing: .02em; cursor: pointer;
-}
-.runGroups:hover { border-color: var(--accent); color: var(--accent); }
-.runGroups.empty { border-style: dashed; color: var(--muted); font-weight: 600; opacity: .75; }
-.runGroups.empty:hover { opacity: 1; color: var(--accent); }
-
 /* ---------------- cross-link modal ---------------- */
 .modalOverlay {
   position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center;
@@ -290,7 +262,6 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .modal h3 { margin: 0 0 6px; font-size: 17px; }
 .modalTitleRow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .modalTitleRow h3 { margin: 0 0 6px; }
-.runGroupsNewName { margin-top: 10px; }
 .modalHint { color: var(--muted); font-size: 13px; margin: 0 0 14px; line-height: 1.5; }
 .modalOptions { display: flex; flex-direction: column; gap: 8px; }
 .modalOption {
@@ -308,6 +279,24 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .modalCheck input { accent-color: var(--accent); }
 #crossLinkGroupPicker { margin-top: 12px; width: 100%; }
 .modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.modalSpacer { flex: 1; }
+.modalCheck svg { width: 18px; height: 18px; flex: none; }
+.pickNote { margin-left: auto; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+
+.folderPicker {
+  max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 4px;
+}
+.pickRow {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px 7px calc(10px + var(--depth, 0) * 18px);
+  border: 0; border-radius: 6px; background: transparent; color: var(--ink);
+  font: 500 13px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; text-align: left; cursor: pointer;
+}
+.pickRow svg { width: 18px; height: 18px; flex: none; }
+.pickRow:hover:not(:disabled) { background: #f0f2f4; }
+.pickRow.selected { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+.pickRow.selected svg { fill: var(--accent); }
+.pickRow:disabled { color: #9aa3ad; cursor: not-allowed; }
 
 /* ---------------- chat ---------------- */
 .srOnly {
@@ -554,42 +543,316 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
   border-top-color: var(--accent); border-radius:50%; animation: spin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---------------- library ---------------- */
-#libraryView.active { display: block; overflow-y: auto; }
-.library { max-width: 1080px; margin: 0 auto; padding: 26px 22px 40px; }
+/* ---------------- library (Drive-style folder browser) ---------------- */
+#libraryView.active { display: grid; grid-template-columns: 256px minmax(0, 1fr) 0; }
+#libraryView.active.detailOpen { grid-template-columns: 256px minmax(0, 1fr) var(--detail-w); }
 
-.uploader { margin-bottom: 30px; }
-.dropZone {
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
-  padding: 30px; border: 2px dashed var(--line); border-radius: var(--radius);
-  background: var(--panel); cursor: pointer; text-align: center;
-  transition: border-color .15s, background .15s;
+.icoFolder { fill: #5f6368; }
+.icoPdf rect { fill: #ea4335; }
+.icoPdf text { fill: #fff; font: 800 6.5px system-ui, sans-serif; }
+.icoNav { fill: currentColor; }
+
+/* sidebar */
+.driveNav {
+  display: flex; flex-direction: column; min-height: 0;
+  padding: 14px 10px 12px; background: var(--bg);
 }
-.dropZone:hover, .dropZone:focus-visible { border-color: var(--accent); background: var(--accent-soft); outline: none; }
-.dropZone.dragging { border-color: var(--accent); background: var(--accent-soft); }
-.dropZone.busy { pointer-events: none; opacity: .6; }
-.dropZone strong { font-size: 15px; }
-.dropZone span { font-size: 12.5px; color: var(--muted); }
-.uploadStatus { margin-top: 10px; font-size: 13px; padding: 9px 12px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
+.driveNewWrap { padding: 2px 4px 14px; }
+.driveNew {
+  display: inline-flex; align-items: center; gap: 12px;
+  padding: 14px 22px 14px 16px; border: 0; border-radius: 16px;
+  background: var(--panel); color: var(--ink); font: 600 14px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; cursor: pointer;
+  box-shadow: 0 1px 2px rgba(20, 30, 45, .2), 0 1px 4px 1px rgba(20, 30, 45, .1);
+  transition: box-shadow .15s, background .15s;
+}
+.driveNew:hover { background: #f3f8f7; box-shadow: 0 1px 3px rgba(20, 30, 45, .25), 0 4px 8px 3px rgba(20, 30, 45, .1); }
+.driveNewPlus { font-size: 24px; font-weight: 400; color: var(--accent); line-height: 16px; }
+.driveTree { flex: 1; overflow: auto; min-height: 0; }
+.navItem {
+  display: flex; align-items: center; gap: 8px; min-height: 34px;
+  padding: 0 12px 0 calc(4px + var(--depth, 0) * 16px);
+  border-radius: 999px; cursor: pointer; font-size: 13.5px; color: var(--ink);
+  user-select: none;
+}
+.navItem:hover { background: #e6e9ed; }
+.navItem.active { background: var(--accent-soft); color: #0b4f49; font-weight: 700; }
+.navItem.active .icoFolder, .navItem.active .icoNav { fill: var(--accent); }
+.navItem > svg { width: 18px; height: 18px; flex: none; }
+.navLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.navCaret {
+  width: 22px; height: 22px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 50%; background: transparent; padding: 0; cursor: pointer; color: var(--muted);
+}
+.navCaret svg { width: 18px; height: 18px; fill: currentColor; transition: transform .12s; }
+.navCaret.open svg { transform: rotate(90deg); }
+.navCaret:hover { background: rgba(0, 0, 0, .06); }
+.navCaret.none { visibility: hidden; pointer-events: none; }
+.driveNavFoot { padding: 10px 14px 0; font-size: 12px; color: var(--muted); line-height: 1.6; border-top: 1px solid var(--line); margin-top: 8px; }
+.driveNavFoot b { color: var(--ink); }
+
+/* main column */
+.driveMain {
+  position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  margin: 10px 10px 10px 0; background: var(--panel); border-radius: 16px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.driveTop { padding: 12px 18px 4px; }
+.driveSearch {
+  display: flex; align-items: center; gap: 10px; max-width: 720px;
+  padding: 0 16px; height: 44px; border-radius: 999px; background: #eef1f4;
+  transition: background .15s, box-shadow .15s;
+}
+.driveSearch:focus-within { background: var(--panel); box-shadow: 0 1px 3px rgba(20, 30, 45, .25); }
+.driveSearch svg { width: 20px; height: 20px; fill: var(--muted); flex: none; }
+.driveSearch input { flex: 1; border: 0; background: transparent; font: 15px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); outline: none; min-width: 0; }
+
+.driveHead { display: flex; align-items: center; gap: 12px; padding: 8px 18px 4px; min-height: 52px; }
+.driveCrumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; min-width: 0; flex: 1; }
+.crumbLink, .crumbNow {
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  font: 400 21px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 5px 10px; border-radius: 999px; white-space: nowrap;
+  max-width: 280px; overflow: hidden; text-overflow: ellipsis;
+}
+.crumbLink:hover { background: #eef1f4; color: var(--ink); }
+.crumbNow { color: var(--ink); cursor: default; }
+.crumbMenu { cursor: pointer; }
+.crumbMenu:hover { background: #eef1f4; }
+.crumbMenu span { font-size: 13px; color: var(--muted); }
+.crumbChevron { width: 20px; height: 20px; fill: var(--muted); flex: none; }
+.driveTools { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.viewToggle { display: inline-flex; border: 1px solid #c7cfd6; border-radius: 999px; overflow: hidden; }
+.viewToggle button {
+  display: inline-flex; align-items: center; justify-content: center; width: 46px; height: 32px;
+  border: 0; background: transparent; cursor: pointer; color: var(--ink);
+}
+.viewToggle button + button { border-left: 1px solid #c7cfd6; }
+.viewToggle button.active { background: var(--accent-soft); color: var(--accent); }
+.viewToggle svg { width: 18px; height: 18px; fill: currentColor; }
+.driveIconBtn {
+  display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; flex: none;
+  border: 0; border-radius: 50%; background: transparent; cursor: pointer; color: var(--muted); font-size: 22px; line-height: 1;
+}
+.driveIconBtn:hover { background: #eef1f4; color: var(--ink); }
+.driveIconBtn.active { color: var(--accent); }
+.driveIconBtn svg { width: 22px; height: 22px; fill: currentColor; }
+
+.driveFilters { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 18px 10px; }
+.driveFilters[hidden] { display: none; }
+.filterChip {
+  display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px;
+  border: 1px solid #c7cfd6; border-radius: 8px; background: var(--panel); color: var(--ink);
+  font: 600 13px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; cursor: pointer;
+}
+.filterChip:hover { background: #f3f5f7; }
+.filterChip.active { background: var(--accent-soft); border-color: transparent; color: #0b4f49; }
+.filterCount { color: var(--muted); font-weight: 500; }
+.uploadStatus { margin: 0 18px 10px; font-size: 13px; padding: 9px 12px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
 .uploadStatus.err { color: #b91c1c; border-color: #f3c9c9; }
 
-.libraryHead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
-.libraryHead h2 { margin: 0; font-size: 16px; }
-.libraryCount { font-size: 12.5px; color: var(--muted); }
+.driveBody { flex: 1; min-height: 0; overflow: auto; padding: 0 12px 12px; }
 
-.runGrid { display: grid; gap: 12px; }
-.runCard {
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 14px 16px; box-shadow: var(--shadow);
+/* list layout */
+.dTable { --cols: minmax(220px, 1fr) 150px 110px 90px 100px 44px; min-width: 640px; }
+.driveBody.withLoc .dTable { --cols: minmax(220px, 1fr) 150px minmax(120px, 190px) 110px 90px 100px 44px; min-width: 820px; }
+.dRow {
+  display: grid; grid-template-columns: var(--cols); align-items: center;
+  min-height: 48px; border-bottom: 1px solid var(--line); border-radius: 0; cursor: default;
+  font-size: 13.5px; outline: none;
 }
-.runCard.current { border-color: var(--accent); }
-.runCardTop { display: flex; align-items: center; gap: 10px; }
-/* The name takes the slack so the tag, the status and the buttons all sit
-   against the right edge, and a long filename ellipsises instead of shoving
-   them off the card. */
-.runName {
-  flex: 1; min-width: 0;
-  font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.dRow:not(.dHeadRow):hover { background: #f1f3f4; }
+.dRow:not(.dHeadRow):focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.dRow.selected, .dRow.selected:hover { background: var(--accent-soft); }
+.dHeadRow {
+  position: sticky; top: 0; z-index: 2; background: var(--panel); min-height: 44px;
+  font-size: 13px; font-weight: 600; color: var(--ink);
+}
+.dHeadRow .dCell { color: var(--ink); }
+.dCell { padding: 0 10px; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.dName { display: flex; align-items: center; gap: 14px; padding-left: 12px; }
+.dName > svg { width: 22px; height: 22px; flex: none; }
+.dLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.dRow.folder .dLabel { font-weight: 600; }
+.rowTag, .rowOpen {
+  flex: none; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--line); color: var(--muted); max-width: 140px; overflow: hidden; text-overflow: ellipsis;
+}
+.rowOpen { border-color: transparent; background: var(--accent); color: #fff; }
+.dStatus { display: flex; align-items: center; gap: 6px; }
+.statusSub { font-size: 11.5px; color: #92400e; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; }
+.dLoc { display: flex; gap: 4px; }
+.dWhen, .dTokens, .dTime { color: var(--muted); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.dMore { display: flex; justify-content: center; padding: 0; overflow: visible; }
+.moreBtn {
+  width: 32px; height: 32px; flex: none; border: 0; border-radius: 50%; background: transparent;
+  color: var(--muted); font-size: 18px; font-weight: 700; line-height: 1; cursor: pointer;
+}
+.moreBtn:hover { background: rgba(0, 0, 0, .08); color: var(--ink); }
+.colSort {
+  display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; padding: 4px 6px; margin-left: -6px;
+  font: 600 13px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); cursor: pointer; border-radius: 6px;
+}
+.colSort:hover { background: #eef1f4; }
+.sortArrow { color: var(--accent); font-size: 15px; min-width: 10px; }
+.locChip {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+  padding: 2px 9px 2px 6px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel);
+  font: 500 12px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.locChip svg { width: 14px; height: 14px; flex: none; }
+.locChip:hover { border-color: var(--accent); color: var(--accent); }
+.locChip.root { cursor: default; color: var(--muted); padding-left: 9px; }
+.locChip.root:hover { border-color: var(--line); color: var(--muted); }
+
+/* grid layout */
+.gridHead { margin: 10px 6px 10px; font-size: 13.5px; font-weight: 600; }
+.dGrid { display: grid; gap: 14px; padding: 0 6px 8px; }
+.dGrid.folders { grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
+.dGrid.files { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.dCard { border-radius: 12px; background: #eef1f4; cursor: default; outline: none; }
+.dCard:hover { background: #e4e8eb; }
+.dCard:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.dCard.selected, .dCard.selected:hover { background: var(--accent-soft); }
+.dCard.folder { display: flex; align-items: center; gap: 12px; height: 50px; padding: 0 4px 0 16px; }
+.dCard.folder > svg { width: 22px; height: 22px; flex: none; }
+.dCard.folder .dLabel, .dCardTitle .dLabel { flex: 1; font-weight: 600; font-size: 13.5px; }
+.dCard.file { padding: 0 10px 10px; }
+.dCardTitle { display: flex; align-items: center; gap: 10px; height: 48px; padding-left: 6px; }
+.dCardTitle > svg { width: 20px; height: 20px; flex: none; }
+.dThumb {
+  display: flex; flex-direction: column; justify-content: space-between; gap: 10px;
+  height: 138px; padding: 12px; border-radius: 8px; background: var(--panel);
+}
+.dThumbStages { display: grid; gap: 6px; }
+.thumbStage {
+  font-size: 11px; font-weight: 700; text-transform: capitalize; padding: 5px 8px; border-radius: 6px;
+  background: #f3f5f7; color: var(--muted); border-left: 3px solid var(--line);
+}
+.thumbStage.succeeded { border-left-color: var(--accent); color: var(--ink); }
+.thumbStage.running { border-left-color: #f59e0b; background: #fffbeb; color: #92400e; }
+.thumbStage.failed { border-left-color: #b91c1c; background: #fef4f4; color: #b91c1c; }
+.dThumbFoot { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12px; }
+
+.driveEmpty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+  gap: 4px; padding: 64px 20px; color: var(--muted);
+}
+.driveEmpty > svg { width: 64px; height: 64px; fill: #d5dade; }
+.driveEmpty h3 { margin: 10px 0 0; color: var(--ink); font-size: 17px; font-weight: 600; }
+.driveEmpty p { margin: 0 0 12px; font-size: 13.5px; }
+
+/* drag and drop */
+.dragging { opacity: .45; }
+.dropTarget, .dropTarget:hover, .dRow.dropTarget {
+  background: var(--accent-soft) !important; box-shadow: inset 0 0 0 2px var(--accent);
+}
+.dropBar {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  margin: 0 18px 14px; padding: 12px; border: 2px dashed var(--line); border-radius: 10px;
+  color: var(--muted); font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s, color .15s;
+}
+.dropBar:hover, .dropBar:focus-visible { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); outline: none; }
+.dropBar.busy { pointer-events: none; opacity: .6; }
+.dropBar b { color: var(--ink); }
+.dropBarPlus {
+  display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  border: 2px solid currentColor; border-radius: 50%; font-weight: 700; line-height: 1;
+}
+.dropOverlay {
+  position: absolute; inset: 0; z-index: 10; display: flex; align-items: flex-end; justify-content: center;
+  padding-bottom: 36px; pointer-events: none;
+  background: rgba(15, 118, 110, .07); box-shadow: inset 0 0 0 2px var(--accent); border-radius: 16px;
+}
+.dropOverlay[hidden] { display: none; }
+.dropOverlay span {
+  padding: 12px 22px; border-radius: 10px; background: #0b4f49; color: #fff; font-weight: 600; font-size: 14px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25);
+}
+
+/* context menu */
+.driveMenu {
+  position: absolute; z-index: 40; min-width: 220px; padding: 6px 0;
+  background: var(--panel); border-radius: 8px;
+  box-shadow: 0 2px 6px 2px rgba(20, 30, 45, .15), 0 1px 2px rgba(20, 30, 45, .3);
+}
+.driveMenu[hidden] { display: none; }
+.menuItem {
+  display: block; width: 100%; padding: 8px 20px; border: 0; background: transparent; text-align: left;
+  font: 400 14px/1.3 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); cursor: pointer;
+}
+.menuItem:hover:not(:disabled), .menuItem:focus-visible { background: #f1f3f4; outline: none; }
+.menuItem:disabled { color: #aab2bb; cursor: default; }
+.menuItem.danger { color: #b91c1c; }
+.menuSep { height: 1px; margin: 6px 0; background: var(--line); }
+
+/* PDF preview (Drive-style full-screen viewer) */
+.pdfPreview {
+  position: fixed; inset: 0; z-index: 70; display: flex; flex-direction: column;
+  background: rgba(20, 22, 25, .92);
+}
+.pdfPreview[hidden] { display: none; }
+.pdfPreviewBar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 16px; color: #fff; background: linear-gradient(rgba(0, 0, 0, .55), rgba(0, 0, 0, 0));
+}
+.pdfPreviewBar .icoPdf { width: 24px; height: 24px; flex: none; }
+.pdfPreviewName { font-size: 16px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pdfPreviewSpacer { flex: 1; }
+.pdfPreviewClose {
+  width: 40px; height: 40px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 50%; background: transparent; color: #fff; cursor: pointer;
+}
+.pdfPreviewClose svg { width: 24px; height: 24px; fill: currentColor; }
+.pdfPreviewClose:hover, .pdfPreviewClose:focus-visible { background: rgba(255, 255, 255, .14); outline: none; }
+.pdfPreviewBtn {
+  display: inline-flex; align-items: center; height: 36px; padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, .35); border-radius: 999px; background: transparent; color: #fff;
+  font: 600 13px/1 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; text-decoration: none; cursor: pointer;
+}
+.pdfPreviewBtn:hover, .pdfPreviewBtn:focus-visible { background: rgba(255, 255, 255, .14); outline: none; }
+.pdfPreviewBtn[hidden] { display: none; }
+.pdfPreviewFrame {
+  flex: 1; width: min(1100px, calc(100% - 32px)); margin: 0 auto 16px; border: 0; border-radius: 6px;
+  background: #fff; box-shadow: 0 8px 40px rgba(0, 0, 0, .5);
+}
+
+/* details panel */
+.driveDetail { min-width: 0; min-height: 0; overflow: auto; margin: 10px 10px 10px 0; background: var(--panel); border-radius: 16px; box-shadow: var(--shadow); }
+#libraryView:not(.detailOpen) .driveDetail { display: none; }
+.detailBody { padding: 14px 18px 18px; }
+.detailHead { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
+.detailHead > svg { width: 26px; height: 26px; flex: none; margin-top: 3px; }
+.detailTitles { flex: 1; min-width: 0; }
+.detailHead h2 { margin: 0; font-size: 17px; font-weight: 600; line-height: 1.35; word-break: break-word; }
+.detailSub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.detailPills { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 12px; }
+.detailActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.detailActions.compact .btn { padding: 5px 11px; font-size: 12.5px; }
+.detailSection {
+  margin: 20px 0 8px; padding-top: 14px; border-top: 1px solid var(--line);
+  font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+}
+.detailLocation { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.detailNote { font-size: 12.5px; color: var(--muted); margin: 8px 0 0; }
+.detailDanger { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--line); }
+.driveDetail .stages { grid-template-columns: 1fr; margin-top: 0; }
+.driveDetail .stageBody { min-height: 0; }
+.driveDetail .kv { grid-template-columns: 130px 1fr; }
+
+@media (max-width: 1100px) {
+  #libraryView.active.detailOpen { grid-template-columns: 220px minmax(0, 1fr); }
+  #libraryView.detailOpen:not(.hasSelection) .driveDetail { display: none; }
+  #libraryView.detailOpen .driveDetail {
+    position: absolute; top: 0; right: 0; bottom: 0; z-index: 30; width: min(var(--detail-w), 92vw);
+    box-shadow: -8px 0 24px rgba(20, 30, 45, .18);
+  }
+  #libraryView.active { grid-template-columns: 220px minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  #libraryView.active, #libraryView.active.detailOpen { grid-template-columns: minmax(0, 1fr); }
+  .driveNav { display: none; }
+  .driveMain { margin: 8px; }
+  .crumbLink, .crumbNow { font-size: 17px; }
 }
 
 /* The reader's own label, immediately left of the status pill. Deliberately not
@@ -606,7 +869,6 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
   border-style: dashed; color: var(--muted); font-weight: 600; opacity: .75;
 }
 .runTag.empty:hover { opacity: 1; color: var(--accent); }
-.runCardTop .btn { margin-left: auto; }
 .pill {
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   padding: 3px 9px; border-radius: 999px; background: #eef1f4; color: var(--muted); white-space: nowrap;
@@ -614,7 +876,6 @@ pre.meta { background: #0f172a; color: #d7e0ea; font-size: 11.5px; padding: 10px
 .pill.succeeded { background: var(--accent-soft); color: var(--accent); }
 .pill.running { background: #fef3c7; color: #92400e; }
 .pill.failed { background: #fde8e8; color: #b91c1c; }
-.runMeta { margin-top: 4px; font-size: 12px; color: var(--muted); }
 
 .stages { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; align-items: start; }
 .stageStep {

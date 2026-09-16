@@ -30,7 +30,7 @@
           <button type="button" class="scopeBtn active" id="headerScopeDocumentBtn" data-kind="document"
                   aria-pressed="true" title="View and chat about one document">Document</button>
           <button type="button" class="scopeBtn" id="headerScopeGroupBtn" data-kind="group"
-                  aria-pressed="false" title="View and chat about a group's documents together">Group</button>
+                  aria-pressed="false" title="View and chat about a folder's documents together">Folder</button>
           <button type="button" class="scopeBtn" id="headerScopeAllBtn" data-kind="all"
                   aria-pressed="false" title="View and chat about every indexed document">All</button>
         </div>
@@ -49,28 +49,52 @@
     <main>
       <!-- =========================== LIBRARY =========================== -->
       <section id="libraryView" class="view active">
-        <div class="library">
-          <form id="uploadForm" class="uploader" aria-label="Add a document">
-            <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
-            <div class="dropZone" id="dropZone" tabindex="0" role="button"
-                 aria-label="Choose a PDF or drop one here">
-              <strong>Drop a PDF here</strong>
-              <span>or click to choose · indexing starts immediately</span>
+        <aside class="driveNav" aria-label="Folders">
+          <div class="driveNewWrap">
+            <button id="driveNewBtn" class="driveNew" type="button" aria-haspopup="menu">
+              <span class="driveNewPlus" aria-hidden="true">+</span> New
+            </button>
+          </div>
+          <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
+          <nav class="driveTree" id="driveTree"></nav>
+          <div class="driveNavFoot" id="driveNavFoot"></div>
+        </aside>
+
+        <section class="driveMain" id="driveMain">
+          <div class="driveTop">
+            <label class="driveSearch">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg>
+              <input id="driveSearch" type="search" placeholder="Search in library" autocomplete="off" />
+            </label>
+          </div>
+          <div class="driveHead">
+            <nav class="driveCrumbs" id="driveCrumbs" aria-label="Location"></nav>
+            <div class="driveTools">
+              <div class="viewToggle" role="group" aria-label="Layout">
+                <button type="button" data-layout="list" title="List layout" aria-label="List layout">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v2H3zm0 6h18v2H3zm0 6h18v2H3z"/></svg>
+                </button>
+                <button type="button" data-layout="grid" title="Grid layout" aria-label="Grid layout">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zm10 0h8v8h-8zM3 13h8v8H3zm10 0h8v8h-8z"/></svg>
+                </button>
+              </div>
+              <button type="button" class="driveIconBtn" id="driveInfoBtn" title="Details" aria-label="Toggle details" aria-pressed="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16z"/></svg>
+              </button>
             </div>
-            <div class="uploadStatus" id="uploadStatus" hidden></div>
-          </form>
-
-          <div class="groupBar" id="groupBar">
-            <div class="groupChips" id="groupFilterChips"></div>
-            <button id="newGroupBtn" class="btn" type="button" title="Create a group to organize and cross-link documents">+ Group</button>
           </div>
-
-          <div class="libraryHead">
-            <h2>Documents</h2>
-            <span class="libraryCount" id="libraryCount"></span>
+          <div class="driveFilters" id="driveFilters" role="group" aria-label="Filter by status"></div>
+          <div class="uploadStatus" id="uploadStatus" hidden></div>
+          <div class="driveBody" id="driveBody"></div>
+          <div class="dropBar" id="dropZone" tabindex="0" role="button" aria-label="Choose a PDF or drop one here">
+            <span class="dropBarPlus" aria-hidden="true">+</span>
+            <span id="dropBarText">Drop a PDF here or click to upload</span>
           </div>
-          <div class="runGrid" id="runGrid"></div>
-        </div>
+          <div class="dropOverlay" id="dropOverlay" hidden><span id="dropOverlayText">Drop to upload</span></div>
+        </section>
+
+        <aside class="driveDetail" id="driveDetail" aria-label="Details"></aside>
+        <div class="driveMenu" id="driveMenu" role="menu" hidden></div>
       </section>
 
       <!-- ================= CROSS-LINK MODAL (ingest + retroactive) ======= -->
@@ -96,7 +120,7 @@
             </label>
             <label class="modalOption">
               <input type="radio" name="crossLinkMode" value="group" />
-              <span><strong>Pick a group</strong></span>
+              <span><strong>Pick a folder</strong> — its documents, subfolders included</span>
             </label>
             <label class="modalOption" id="crossLinkSkipOption">
               <input type="radio" name="crossLinkMode" value="skip" />
@@ -112,34 +136,48 @@
         </div>
       </div>
 
-      <!-- ===================== GROUP MEMBERS MODAL ======================= -->
-      <div class="modalOverlay" id="groupMembersModal" hidden>
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="groupMembersTitle">
-          <div class="modalTitleRow">
-            <h3 id="groupMembersTitle">Documents in this group</h3>
-            <button class="btn" type="button" id="groupMembersRename">Rename</button>
-          </div>
-          <p class="modalHint">Check the documents that belong to this group.</p>
-          <div class="modalPicker" id="groupMembersPicker"></div>
+      <!-- ===================== FOLDER PICKER MODAL ===================== -->
+      <div class="modalOverlay" id="folderPickerModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="folderPickerTitle">
+          <h3 id="folderPickerTitle">Move</h3>
+          <p class="modalHint" id="folderPickerHint"></p>
+          <div class="folderPicker" id="folderPickerTree" role="listbox" aria-labelledby="folderPickerTitle"></div>
           <div class="modalActions">
-            <button class="btn" type="button" id="groupMembersCancel">Cancel</button>
-            <button class="btn primary" type="button" id="groupMembersSave">Save</button>
+            <button class="btn" type="button" id="folderPickerNew">New folder</button>
+            <span class="modalSpacer"></span>
+            <button class="btn" type="button" id="folderPickerCancel">Cancel</button>
+            <button class="btn primary" type="button" id="folderPickerConfirm">Move here</button>
           </div>
         </div>
       </div>
 
-      <!-- ===================== RUN GROUPS MODAL =========================== -->
-      <div class="modalOverlay" id="runGroupsModal" hidden>
-        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="runGroupsTitle">
-          <h3 id="runGroupsTitle">Groups for this document</h3>
-          <p class="modalHint">Check the groups this document belongs to, or add a new one below.</p>
-          <div class="modalPicker" id="runGroupsPicker"></div>
-          <input id="runGroupsNewName" class="search runGroupsNewName" type="text" placeholder="New group name…" />
+      <!-- ===================== ADD DOCUMENTS MODAL ======================= -->
+      <div class="modalOverlay" id="addDocsModal" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="addDocsTitle">
+          <h3 id="addDocsTitle">Add documents</h3>
+          <p class="modalHint">Check the documents to file in this folder. They stay in any other folders they're in.</p>
+          <div class="modalPicker" id="addDocsPicker"></div>
           <div class="modalActions">
-            <button class="btn" type="button" id="runGroupsCancel">Cancel</button>
-            <button class="btn primary" type="button" id="runGroupsSave">Save</button>
+            <button class="btn" type="button" id="addDocsCancel">Cancel</button>
+            <button class="btn primary" type="button" id="addDocsSave">Add</button>
           </div>
         </div>
+      </div>
+
+      <!-- ========================= PDF PREVIEW =========================== -->
+      <div class="pdfPreview" id="pdfPreview" role="dialog" aria-modal="true" aria-labelledby="pdfPreviewName" hidden>
+        <div class="pdfPreviewBar">
+          <button type="button" class="pdfPreviewClose" id="pdfPreviewClose" aria-label="Close preview" title="Close (Esc)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20z"/></svg>
+          </button>
+          <svg class="icoPdf" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><text x="12" y="15.2" text-anchor="middle">PDF</text></svg>
+          <span class="pdfPreviewName" id="pdfPreviewName"></span>
+          <span class="pdfPreviewSpacer"></span>
+          <button type="button" class="pdfPreviewBtn" id="pdfPreviewOpen">Open in Tree</button>
+          <a class="pdfPreviewBtn" id="pdfPreviewTab" target="_blank" rel="noopener">Open in new tab</a>
+          <a class="pdfPreviewBtn" id="pdfPreviewDownload" download>Download</a>
+        </div>
+        <iframe class="pdfPreviewFrame" id="pdfPreviewFrame" title="PDF preview"></iframe>
       </div>
 
       <!-- ============================ GRAPH ============================ -->

@@ -26,10 +26,23 @@ const state = {
   documentRuns: [],
   groups: [],
   libraryRuns: [],
-  groupFilter: null,
-  groupMembersEditing: null,
-  runGroupsEditing: null,
-  runGroupsOriginalIds: [],
+  // Drive-style library: folder being browsed ("" = My Library root), selection, layout.
+  library: {
+    folder: "",
+    selected: null,
+    search: "",
+    status: "",
+    sort: { key: "name", dir: "asc" },
+    layout: "list",
+    detailOpen: true,
+    expanded: new Set([""]),
+    menuItems: [],
+  },
+  libraryDragging: false,
+  libraryRenderPending: false,
+  folderPicker: null,
+  addDocsFolder: null,
+  pdfPreviewRun: null,
   // Scope to restore when returning to Chat after a citation jump.
   pendingScopeRestore: null,
   crossLink: null,
@@ -414,6 +427,8 @@ async function api(path, opts) {
 document.addEventListener("DOMContentLoaded", boot);
 
 async function boot() {
+  state.library.layout = readPref("noetics.libraryLayout", "list") === "grid" ? "grid" : "list";
+  state.library.detailOpen = readPref("noetics.libraryDetail", "open") !== "closed";
   wireTabs();
   wireGraphControls();
   wireGraphLinkBanner();
@@ -588,7 +603,7 @@ function wireResizers() {
 
 // The header's Document/Group/All control only means something where "which
 // documents am I looking at" actually changes what's shown: Graph and Chat.
-// Library already shows every document (with its own group-filter chips) and
+// Library already shows every document (browsed through its own folders) and
 // Tree only ever shows one document (via its own picker in the stage bar,
 // see renderTreeScopeState) -- the header control there was just noise that
 // looked like it was scoping something it wasn't.
@@ -764,35 +779,29 @@ function stageStepHtml(stage, waitingOn) {
   </section>`;
 }
 
-// The reader's own label for a document, shown just before the status pill so
-// the eye reaches it on the way to the status rather than hunting for it. An
-// untagged document offers a quiet "+ tag" affordance instead of a chip, so the
-// row does not fill with placeholders.
+// The reader's own label for a document. An untagged document offers a quiet
+// "+ tag" affordance instead of a chip, so the details panel does not fill with
+// placeholders.
 const MAX_TAG_LENGTH = 32;
 
 function runTagHtml(tag) {
   const label = String(tag || "").trim();
   return label
-    ? `<button class="runTag" type="button" title="Edit tag">${escapeHtml(label)}</button>`
-    : `<button class="runTag empty" type="button" title="Add a tag">+ tag</button>`;
+    ? `<button class="runTag" type="button" data-act="tag" title="Edit tag">${escapeHtml(label)}</button>`
+    : `<button class="runTag empty" type="button" data-act="tag" title="Add a tag">+ tag</button>`;
 }
 
-async function editRunTag(card) {
-  const runDir = card.dataset.run;
-  const button = card.querySelector(".runTag");
-  const current = button.classList.contains("empty") ? "" : button.textContent.trim();
+async function editRunTag(runDir) {
+  const run = findRun(runDir);
+  if (!run) return;
   const entered = prompt(
-    `Tag for “${card.querySelector(".runName").textContent}”\n` +
+    `Tag for “${run.name}”\n` +
       `Up to ${MAX_TAG_LENGTH} characters. Leave empty to remove the tag.`,
-    current,
+    run.tag || "",
   );
   if (entered === null) return; // cancelled, not cleared
   try {
-    await api("/api/run-tag", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ runDir, tag: entered }),
-    });
+    await postJson("/api/run-tag", { runDir, tag: entered });
   } catch (err) {
     alert("Could not save the tag: " + err.message);
     return;
@@ -827,66 +836,130 @@ function runLifecycleHtml(run) {
     <button class="btn startRun">Start</button>`;
 }
 
-function groupChipsHtml(run) {
-  const names = (run.groupIds || [])
-    .map((id) => (state.groups.find((g) => g.id === id) || {}).name)
-    .filter(Boolean);
-  return `<button class="runGroups${names.length ? "" : " empty"}" type="button" title="Edit groups">
-    ${names.length ? escapeHtml(names.join(", ")) : "+ groups"}</button>`;
-}
+const postJson = (path, body) => api(path, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
 
-function runCardHtml(run) {
-  const status = run.overallStatus || (run.viewable ? "succeeded" : "pending");
-  const isCurrent = run.runDir === state.currentRun;
-  const canOpen = run.viewable && !isCurrent;
-  const stages = run.stages
-    .map((stage, index) =>
-      stageStepHtml(stage, index ? run.stages[index - 1].name : null))
-    .join("");
-  const total = run.stages.reduce((a, s) => a + (s.seconds || 0), 0);
-  return `<article class="runCard ${isCurrent ? "current" : ""}" data-run="${escapeHtml(run.runDir)}">
-    <div class="runCardTop">
-      <span class="runName" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
-      ${runTagHtml(run.tag)}
-      ${groupChipsHtml(run)}
-      <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
-      ${isCurrent ? '<span class="pill">open</span>' : ""}
-      ${runLifecycleHtml(run)}
-      ${canOpen ? '<button class="btn openRun">Open</button>' : ""}
-      ${run.viewable ? '<button class="btn linkRun" type="button" title="Cross-link this document with others">Link to…</button>' : ""}
-      <button class="btn danger deleteRun" ${isCurrent ? "disabled title='Open another document first'" : ""}>Delete</button>
-    </div>
-    <div class="runMeta">Started ${escapeHtml(fmtWhen(run.startedAt))}</div>
-    <div class="stages">${stages}</div>
-    <div class="runStats">
-      <div class="runStat"><div class="k">Index time</div><div class="v">${escapeHtml(fmtDuration(total || null))}</div></div>
-      <div class="runStat"><div class="k">Tree build</div><div class="v">${escapeHtml(fmtDuration(run.metrics.buildTreeSeconds))}</div></div>
-      <div class="runStat"><div class="k">Tokens</div><div class="v">${escapeHtml(fmtTokens(run.metrics.totalTokens))}</div></div>
-      <div class="runStat"><div class="k">Viewable</div><div class="v">${run.viewable ? "yes" : "no"}</div></div>
-    </div>
-    ${crossLinkCardHtml(run)}
-    ${run.error ? `<div class="runError">${escapeHtml(String(run.error))}</div>` : ""}
-  </article>`;
-}
-
-async function openRunByDir(runDir, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = "Opening…"; }
+async function openRunByDir(runDir) {
   try {
     await setScope("document", { runDir });
     activateView("tree");
   } catch (err) {
     alert("Could not open document: " + err.message);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "Open"; }
   }
 }
+
+/* ------------------------------ folders ----------------------------------- */
+// Groups are folders: each has a parentId (null = the library root) and a
+// document can be filed in one or more of them. A folder's scope -- chat,
+// graph, cross-link -- covers its subfolders too (runs_in_group on the server).
+
+const LIBRARY_ROOT = "";
+const LIBRARY_ALL = "__all__";
+
+const ICONS = {
+  folder: '<svg class="icoFolder" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z"/></svg>',
+  pdf: '<svg class="icoPdf" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><text x="12" y="15.2" text-anchor="middle">PDF</text></svg>',
+  library: '<svg class="icoNav" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 16H5v-4h3.6a3.5 3.5 0 0 0 6.8 0H19v4zm0-6h-5a2 2 0 0 1-4 0H5V5h14v8z"/></svg>',
+  all: '<svg class="icoNav" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h2v2H3zm4 0h14v2H7zM3 11h2v2H3zm4 0h14v2H7zM3 17h2v2H3zm4 0h14v2H7z"/></svg>',
+  caret: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 7l5 5-5 5z"/></svg>',
+  chevron: '<svg class="crumbChevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9.3 6.7l1.4-1.4L17.4 12l-6.7 6.7-1.4-1.4 5.3-5.3z"/></svg>',
+};
+
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+const folderById = (id) => state.groups.find((g) => g.id === id) || null;
+const childFolders = (parentId) =>
+  state.groups.filter((g) => (g.parentId || LIBRARY_ROOT) === parentId).sort(byName);
+const findRun = (runDir) => state.libraryRuns.find((r) => r.runDir === runDir) || null;
+const runFolderIds = (run) => (run.groupIds || []).filter((id) => folderById(id));
+
+function folderSubtreeIds(id) {
+  const found = [];
+  const stack = [id];
+  while (stack.length) {
+    const current = stack.pop();
+    if (found.includes(current)) continue;
+    found.push(current);
+    childFolders(current).forEach((c) => stack.push(c.id));
+  }
+  return found;
+}
+
+function folderTrail(id) {
+  const trail = [];
+  for (let f = folderById(id); f && !trail.includes(f); f = folderById(f.parentId)) trail.unshift(f);
+  return trail;
+}
+
+const folderPath = (id) => folderTrail(id).map((f) => f.name).join(" / ");
+
+function runsInFolder(id) {
+  return state.libraryRuns.filter((r) => {
+    const ids = runFolderIds(r);
+    return id === LIBRARY_ROOT ? ids.length === 0 : ids.includes(id);
+  });
+}
+
+function runsInFolderTree(id) {
+  const scope = new Set(folderSubtreeIds(id));
+  return state.libraryRuns.filter((r) => runFolderIds(r).some((g) => scope.has(g)));
+}
+
+const foldersSortedByPath = () =>
+  state.groups.map((g) => ({ ...g, path: folderPath(g.id) }))
+    .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: "base" }));
+
+const runStatus = (run) => run.overallStatus || (run.viewable ? "succeeded" : "pending");
+
+function runStatusBucket(run) {
+  const status = runStatus(run);
+  if (run.isIndexing || status === "running" || status === "pending") return "indexing";
+  if (status === "failed" || status === "interrupted" || run.error) return "attention";
+  return "ready";
+}
+
+const STATUS_FILTERS = [
+  ["", "All"],
+  ["ready", "Ready"],
+  ["indexing", "Indexing"],
+  ["attention", "Needs attention"],
+];
+
+// createdAt is epoch seconds from the server; startedAt is ISO.
+const runAddedAt = (run) => (run.createdAt ? new Date(run.createdAt * 1000) : run.startedAt || null);
+
+const runIndexSeconds = (run) => run.stages.reduce((a, s) => a + (s.seconds || 0), 0) || null;
+
+function fmtDay(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return "—";
+  const now = new Date();
+  if (d.toDateString() === now.toDateString())
+    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  return d.toLocaleDateString(undefined, {
+    month: "short", day: "numeric",
+    ...(d.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+  });
+}
+
+function readPref(key, fallback) {
+  try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
+}
+function writePref(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* per-viewer nicety only */ }
+}
+
+/* ------------------------------ library ----------------------------------- */
 
 async function loadLibrary() {
   let data;
   try {
     data = await api("/api/library");
   } catch (err) {
-    $("runGrid").innerHTML = `<div class="libraryEmpty">Could not load documents: ${escapeHtml(err.message)}</div>`;
+    $("driveBody").innerHTML = `<div class="libraryEmpty">Could not load documents: ${escapeHtml(err.message)}</div>`;
     return;
   }
   state.currentRun = data.scopeRunDir;
@@ -894,115 +967,28 @@ async function loadLibrary() {
   state.scopeGroupId = data.scopeGroupId || null;
   state.allDocumentCount = data.allDocumentCount;
   state.groupDocumentCount = data.groupDocumentCount;
-  const allRuns = data.runs || [];
-  state.libraryRuns = allRuns;
+  state.libraryRuns = data.runs || [];
   await loadGroups();
   loadScopeBar();
-  const runs = state.groupFilter
-    ? allRuns.filter((r) => (r.groupIds || []).includes(state.groupFilter))
-    : allRuns;
-  $("libraryCount").textContent = runs.length
-    ? `${runs.length} indexed${state.groupFilter ? " (filtered)" : ""}`
-    : "";
-  $("runGrid").innerHTML = runs.length
-    ? runs.map(runCardHtml).join("")
-    : allRuns.length
-      ? '<div class="libraryEmpty">No documents in this group yet. Click the ✎ next to its chip above to add some.</div>'
-      : '<div class="libraryEmpty">No documents yet. Drop a PDF above to index one.</div>';
-
-  $("runGrid").querySelectorAll(".runGroups").forEach((btn) => {
-    btn.addEventListener("click", () => editRunGroups(btn.closest(".runCard")));
-  });
-  $("runGrid").querySelectorAll(".linkRun").forEach((btn) => {
-    btn.addEventListener("click", () => openCrossLinkModal({ kind: "retroactive", runDir: btn.closest(".runCard").dataset.run }));
-  });
-
-  $("runGrid").querySelectorAll(".stopRun").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const card = btn.closest(".runCard");
-      if (!confirm("Stop indexing this document? Finished stages are kept and it can be started again.")) return;
-      btn.disabled = true;
-      btn.textContent = "Stopping…";
-      try {
-        await api("/api/run-stop", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runDir: card.dataset.run }),
-        });
-      } catch (err) {
-        alert("Could not stop this run: " + err.message);
-      }
-      await loadLibrary();
-    });
-  });
-
-  $("runGrid").querySelectorAll(".startRun").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const card = btn.closest(".runCard");
-      const select = card.querySelector(".rebuildSelect");
-      const fromStage = select && select.value ? select.value : null;
-      if (fromStage && !confirm(
-        `Rebuild from the ${fromStage} stage? That stage and every stage after it ` +
-        `will be discarded and built again.`)) return;
-      btn.disabled = true;
-      btn.textContent = "Starting…";
-      try {
-        await api("/api/run-start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runDir: card.dataset.run, fromStage }),
-        });
-      } catch (err) {
-        alert("Could not start this run: " + err.message);
-      }
-      await loadLibrary();
-    });
-  });
-
-  $("runGrid").querySelectorAll(".runTag").forEach((btn) => {
-    btn.addEventListener("click", () => editRunTag(btn.closest(".runCard")));
-  });
-
-  $("runGrid").querySelectorAll(".openRun").forEach((btn) => {
-    btn.addEventListener("click", () => openRunByDir(btn.closest(".runCard").dataset.run, btn));
-  });
-
-  $("runGrid").querySelectorAll("[data-link-a]").forEach((btn) => {
-    btn.addEventListener("click", () => viewGraphLink(btn.dataset.linkA, btn.dataset.linkB));
-  });
-
-  $("runGrid").querySelectorAll(".deleteRun").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const card = btn.closest(".runCard");
-      const runDir = card.dataset.run;
-      const name = card.querySelector(".runName").textContent;
-      const ok = confirm(
-        `Delete "${name}" completely?\n\n` +
-          "This removes its vectors from Qdrant, its rows from PostgreSQL, and " +
-          "its extracted content from disk. This cannot be undone."
-      );
-      if (!ok) return;
-      btn.disabled = true;
-      btn.textContent = "Deleting…";
-      try {
-        await api(`/api/run?run=${encodeURIComponent(runDir)}`, { method: "DELETE" });
-        await loadLibrary();
-      } catch (err) {
-        alert("Could not delete: " + err.message);
-        btn.disabled = false;
-        btn.textContent = "Delete";
-      }
-    });
-  });
+  renderLibrary();
 
   // Cross-linking runs after tree/graph/vdb/persist already report
   // "succeeded", so it needs its own liveness check -- otherwise the poll
   // stops the moment the main pipeline finishes and a still-running link job
   // never gets its status refreshed without a manual reload.
-  const active = allRuns.some((r) =>
+  const active = state.libraryRuns.some((r) =>
     r.phase === "indexing" || r.overallStatus === "running"
     || (r.crossLink && r.crossLink.status === "running"));
   scheduleLibraryPoll(active);
+}
+
+async function loadGroups() {
+  try {
+    const data = await api("/api/groups");
+    state.groups = data.groups || [];
+  } catch (err) {
+    state.groups = [];
+  }
 }
 
 function scheduleLibraryPoll(active) {
@@ -1013,6 +999,852 @@ function scheduleLibraryPoll(active) {
   }
 }
 
+function renderLibrary() {
+  // A poll must not pull the row out from under a drag in progress.
+  if (state.libraryDragging) { state.libraryRenderPending = true; return; }
+  const lib = state.library;
+  if (lib.folder !== LIBRARY_ROOT && lib.folder !== LIBRARY_ALL && !folderById(lib.folder)) {
+    lib.folder = LIBRARY_ROOT;
+  }
+  if (lib.selected && !(lib.selected.kind === "run" ? findRun(lib.selected.id) : folderById(lib.selected.id))) {
+    lib.selected = null;
+  }
+  if (lib.folder !== LIBRARY_ALL) folderTrail(lib.folder).forEach((f) => lib.expanded.add(f.id).add(f.parentId || LIBRARY_ROOT));
+  lib.expanded.add(LIBRARY_ROOT);
+
+  renderDriveTree();
+  renderDriveCrumbs();
+  renderDriveFilters();
+  renderDriveBody();
+  renderDriveDetail();
+
+  const where = lib.folder === LIBRARY_ROOT || lib.folder === LIBRARY_ALL ? null : folderById(lib.folder);
+  $("dropBarText").innerHTML = where
+    ? `Drop a PDF here or click to upload into <b>${escapeHtml(where.name)}</b>`
+    : "Drop a PDF here or click to upload";
+  document.querySelectorAll(".viewToggle [data-layout]").forEach((b) => {
+    const on = b.dataset.layout === lib.layout;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", String(on));
+  });
+  $("libraryView").classList.toggle("detailOpen", lib.detailOpen);
+  $("driveInfoBtn").setAttribute("aria-pressed", String(lib.detailOpen));
+  $("driveInfoBtn").classList.toggle("active", lib.detailOpen);
+}
+
+function navigateFolder(id) {
+  const lib = state.library;
+  lib.folder = id;
+  lib.selected = null;
+  lib.search = "";
+  $("driveSearch").value = "";
+  renderLibrary();
+}
+
+// Selection toggles classes in place: re-rendering the list between the two
+// clicks of a double-click would swap the element and swallow the dblclick.
+function selectItem(kind, id) {
+  state.library.selected = kind ? { kind, id } : null;
+  $("driveBody").querySelectorAll("[data-kind]").forEach((el) =>
+    el.classList.toggle("selected", el.dataset.kind === kind && el.dataset.id === id));
+  renderDriveDetail();
+}
+
+/* sidebar */
+
+function navFolderHtml(folder, depth) {
+  const lib = state.library;
+  const kids = childFolders(folder.id);
+  const open = lib.expanded.has(folder.id);
+  const active = lib.folder === folder.id;
+  return `<div class="navItem${active ? " active" : ""}" style="--depth:${depth}" data-nav="${escapeHtml(folder.id)}"
+      data-drop-folder="${escapeHtml(folder.id)}" data-kind="folder" data-id="${escapeHtml(folder.id)}" draggable="true" title="${escapeHtml(folder.name)}">
+      <button type="button" class="navCaret${kids.length ? "" : " none"}${open ? " open" : ""}" data-toggle="${escapeHtml(folder.id)}"
+        aria-label="${open ? "Collapse" : "Expand"} ${escapeHtml(folder.name)}" aria-expanded="${open}">${ICONS.caret}</button>
+      ${ICONS.folder}<span class="navLabel">${escapeHtml(folder.name)}</span>
+    </div>
+    ${open ? kids.map((k) => navFolderHtml(k, depth + 1)).join("") : ""}`;
+}
+
+function renderDriveTree() {
+  const lib = state.library;
+  const rootKids = childFolders(LIBRARY_ROOT);
+  const rootOpen = lib.expanded.has(LIBRARY_ROOT);
+  $("driveTree").innerHTML = `
+    <div class="navItem${lib.folder === LIBRARY_ROOT ? " active" : ""}" style="--depth:0" data-nav="" data-drop-folder="">
+      <button type="button" class="navCaret${rootKids.length ? "" : " none"}${rootOpen ? " open" : ""}" data-toggle=""
+        aria-label="${rootOpen ? "Collapse" : "Expand"} My Library" aria-expanded="${rootOpen}">${ICONS.caret}</button>
+      ${ICONS.library}<span class="navLabel">My Library</span>
+    </div>
+    ${rootOpen ? rootKids.map((f) => navFolderHtml(f, 1)).join("") : ""}
+    <div class="navItem${lib.folder === LIBRARY_ALL ? " active" : ""}" style="--depth:0" data-nav="${LIBRARY_ALL}">
+      <span class="navCaret none"></span>${ICONS.all}<span class="navLabel">All documents</span>
+    </div>`;
+  const runs = state.libraryRuns;
+  const tokens = runs.reduce((a, r) => a + ((r.metrics && r.metrics.totalTokens) || 0), 0);
+  $("driveNavFoot").innerHTML = `
+    <div><b>${runs.length}</b> document${runs.length === 1 ? "" : "s"} · <b>${state.groups.length}</b> folder${state.groups.length === 1 ? "" : "s"}</div>
+    <div>${escapeHtml(fmtTokens(tokens))} tokens indexed</div>`;
+}
+
+/* breadcrumbs + filters */
+
+function renderDriveCrumbs() {
+  const lib = state.library;
+  const box = $("driveCrumbs");
+  if (lib.search.trim()) {
+    box.innerHTML = `<span class="crumbNow">Search results for “${escapeHtml(lib.search.trim())}”</span>`;
+    return;
+  }
+  if (lib.folder === LIBRARY_ALL) {
+    box.innerHTML = '<span class="crumbNow">All documents</span>';
+    return;
+  }
+  const trail = folderTrail(lib.folder);
+  const items = [{ id: LIBRARY_ROOT, name: "My Library" }, ...trail];
+  box.innerHTML = items.map((f, i) => {
+    const last = i === items.length - 1;
+    return last
+      ? `<button type="button" class="crumbNow crumbMenu" data-crumb-menu="${escapeHtml(f.id)}" aria-haspopup="menu">
+           ${escapeHtml(f.name)} <span aria-hidden="true">▾</span></button>`
+      : `<button type="button" class="crumbLink" data-nav="${escapeHtml(f.id)}" data-drop-folder="${escapeHtml(f.id)}">${escapeHtml(f.name)}</button>${ICONS.chevron}`;
+  }).join("");
+}
+
+function renderDriveFilters() {
+  const lib = state.library;
+  const pool = visibleRuns({ ignoreStatus: true });
+  $("driveFilters").hidden = !pool.length && !lib.status;
+  $("driveFilters").innerHTML = STATUS_FILTERS.map(([key, label]) => {
+    const count = key ? pool.filter((r) => runStatusBucket(r) === key).length : pool.length;
+    if (key && !count && lib.status !== key) return "";
+    const on = lib.status === key;
+    return `<button type="button" class="filterChip${on ? " active" : ""}" data-status="${key}" aria-pressed="${on}">
+      ${on && key ? "✓ " : ""}${escapeHtml(label)} <span class="filterCount">${count}</span></button>`;
+  }).join("");
+}
+
+/* the file list */
+
+function visibleFolders() {
+  const lib = state.library;
+  const q = lib.search.trim().toLowerCase();
+  if (q) return state.groups.filter((g) => g.name.toLowerCase().includes(q)).sort(byName);
+  if (lib.folder === LIBRARY_ALL) return [];
+  return childFolders(lib.folder);
+}
+
+function visibleRuns({ ignoreStatus = false } = {}) {
+  const lib = state.library;
+  const q = lib.search.trim().toLowerCase();
+  let runs = q
+    ? state.libraryRuns.filter((r) => `${r.name} ${r.tag || ""}`.toLowerCase().includes(q))
+    : lib.folder === LIBRARY_ALL ? state.libraryRuns.slice() : runsInFolder(lib.folder);
+  if (!ignoreStatus && lib.status) runs = runs.filter((r) => runStatusBucket(r) === lib.status);
+  const dir = lib.sort.dir === "asc" ? 1 : -1;
+  const key = lib.sort.key;
+  return runs.sort((a, b) => {
+    if (key === "created") return dir * (new Date(runAddedAt(a) || 0) - new Date(runAddedAt(b) || 0));
+    if (key === "tokens") return dir * (((a.metrics || {}).totalTokens || 0) - ((b.metrics || {}).totalTokens || 0));
+    return dir * byName(a, b);
+  });
+}
+
+const showLocation = () => state.library.folder === LIBRARY_ALL || !!state.library.search.trim();
+
+function runStatusHtml(run) {
+  const status = runStatus(run);
+  const live = run.stages.find((s) => s.status === "running");
+  let sub = "";
+  if (live) {
+    const pct = live.progress ? ` ${Math.round((live.progress.done / live.progress.total) * 100)}%` : "";
+    sub = `<span class="statusSub">${escapeHtml(live.name)}${pct}</span>`;
+  } else if (run.crossLink && run.crossLink.status === "running") {
+    sub = '<span class="statusSub">cross-linking</span>';
+  }
+  return `<span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>${sub}`;
+}
+
+function locationHtml(run) {
+  const ids = runFolderIds(run);
+  if (!ids.length) return '<span class="locChip root">My Library</span>';
+  return ids.map((id) => `<button type="button" class="locChip" data-nav="${escapeHtml(id)}" title="${escapeHtml(folderPath(id))}">
+    ${ICONS.folder}${escapeHtml(folderById(id).name)}</button>`).join("");
+}
+
+function sortHeadHtml(key, label) {
+  const { sort } = state.library;
+  const on = sort.key === key;
+  const arrow = on ? (sort.dir === "asc" ? "↑" : "↓") : "";
+  return `<button type="button" class="colSort${on ? " active" : ""}" data-sort="${key}">${label}<span class="sortArrow">${arrow}</span></button>`;
+}
+
+function folderRowHtml(folder) {
+  const lib = state.library;
+  const selected = lib.selected && lib.selected.kind === "folder" && lib.selected.id === folder.id;
+  const items = childFolders(folder.id).length + runsInFolder(folder.id).length;
+  return `<div class="dRow folder${selected ? " selected" : ""}" role="row" tabindex="0" draggable="true"
+      data-kind="folder" data-id="${escapeHtml(folder.id)}" data-drop-folder="${escapeHtml(folder.id)}">
+    <div class="dCell dName">${ICONS.folder}<span class="dLabel">${escapeHtml(folder.name)}</span></div>
+    <div class="dCell dStatus muted">${items} item${items === 1 ? "" : "s"}</div>
+    ${showLocation() ? `<div class="dCell dLoc">${folder.parentId ? `<button type="button" class="locChip" data-nav="${escapeHtml(folder.parentId)}">${ICONS.folder}${escapeHtml(folderById(folder.parentId).name)}</button>` : '<span class="locChip root">My Library</span>'}</div>` : ""}
+    <div class="dCell dWhen">${escapeHtml(fmtDay(folder.createdAt))}</div>
+    <div class="dCell dTokens muted">—</div>
+    <div class="dCell dTime muted">—</div>
+    <div class="dCell dMore"><button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(folder.name)}">⋮</button></div>
+  </div>`;
+}
+
+function runRowHtml(run) {
+  const lib = state.library;
+  const selected = lib.selected && lib.selected.kind === "run" && lib.selected.id === run.runDir;
+  const isCurrent = run.runDir === state.currentRun;
+  return `<div class="dRow file${selected ? " selected" : ""}" role="row" tabindex="0" draggable="true"
+      data-kind="run" data-id="${escapeHtml(run.runDir)}">
+    <div class="dCell dName">${ICONS.pdf}<span class="dLabel" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
+      ${run.tag ? `<span class="rowTag">${escapeHtml(run.tag)}</span>` : ""}
+      ${isCurrent ? '<span class="rowOpen" title="Open in Graph, Tree and Chat">open</span>' : ""}</div>
+    <div class="dCell dStatus">${runStatusHtml(run)}</div>
+    ${showLocation() ? `<div class="dCell dLoc">${locationHtml(run)}</div>` : ""}
+    <div class="dCell dWhen">${escapeHtml(fmtDay(runAddedAt(run)))}</div>
+    <div class="dCell dTokens">${escapeHtml(fmtTokens(run.metrics && run.metrics.totalTokens))}</div>
+    <div class="dCell dTime">${escapeHtml(fmtDuration(runIndexSeconds(run)))}</div>
+    <div class="dCell dMore"><button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(run.name)}">⋮</button></div>
+  </div>`;
+}
+
+function folderCardHtml(folder) {
+  const lib = state.library;
+  const selected = lib.selected && lib.selected.kind === "folder" && lib.selected.id === folder.id;
+  return `<div class="dCard folder${selected ? " selected" : ""}" tabindex="0" draggable="true"
+      data-kind="folder" data-id="${escapeHtml(folder.id)}" data-drop-folder="${escapeHtml(folder.id)}">
+    ${ICONS.folder}<span class="dLabel" title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</span>
+    <button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(folder.name)}">⋮</button>
+  </div>`;
+}
+
+function runCardHtml(run) {
+  const lib = state.library;
+  const selected = lib.selected && lib.selected.kind === "run" && lib.selected.id === run.runDir;
+  return `<div class="dCard file${selected ? " selected" : ""}" tabindex="0" draggable="true"
+      data-kind="run" data-id="${escapeHtml(run.runDir)}">
+    <div class="dCardTitle">${ICONS.pdf}<span class="dLabel" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
+      <button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(run.name)}">⋮</button></div>
+    <div class="dThumb">
+      <div class="dThumbStages">${run.stages.map((s) => `<span class="thumbStage ${escapeHtml(s.status)}" title="${escapeHtml(s.name)}: ${escapeHtml(s.status)}">${escapeHtml(s.name)}</span>`).join("")}</div>
+      <div class="dThumbFoot">${runStatusHtml(run)}<span class="muted">${escapeHtml(fmtDay(runAddedAt(run)))}</span></div>
+    </div>
+  </div>`;
+}
+
+function renderDriveBody() {
+  if (state.libraryDragging) { state.libraryRenderPending = true; return; }
+  const lib = state.library;
+  const body = $("driveBody");
+  const focused = document.activeElement && body.contains(document.activeElement)
+    ? document.activeElement.closest("[data-kind]") : null;
+  const refocus = focused ? { kind: focused.dataset.kind, id: focused.dataset.id } : null;
+  body.classList.toggle("withLoc", showLocation());
+  body.innerHTML = driveBodyHtml();
+  if (refocus) {
+    const again = body.querySelector(`[data-kind="${refocus.kind}"][data-id="${CSS.escape(refocus.id)}"]`);
+    if (again) again.focus({ preventScroll: true });
+  }
+}
+
+function driveBodyHtml() {
+  const lib = state.library;
+  const folders = lib.status ? [] : visibleFolders();
+  const runs = visibleRuns();
+
+  if (!folders.length && !runs.length) {
+    const q = lib.search.trim();
+    return `<div class="driveEmpty">
+      ${ICONS.folder}
+      <h3>${q ? "No matches" : lib.status ? "Nothing with this status here" : lib.folder === LIBRARY_ROOT || lib.folder === LIBRARY_ALL ? "Your library is empty" : "This folder is empty"}</h3>
+      <p>${q ? "Try a different name or tag." : lib.status ? "Clear the filter to see everything." : "Drop a PDF here, or move documents in from another folder."}</p>
+      ${!q && !lib.status && folderById(lib.folder) && state.libraryRuns.length
+        ? '<button type="button" class="btn" data-act="add-existing">Add existing documents…</button>' : ""}
+    </div>`;
+  }
+
+  if (lib.layout === "grid") {
+    return `
+      ${folders.length ? `<h4 class="gridHead">Folders</h4><div class="dGrid folders">${folders.map(folderCardHtml).join("")}</div>` : ""}
+      ${runs.length ? `<h4 class="gridHead">Files</h4><div class="dGrid files">${runs.map(runCardHtml).join("")}</div>` : ""}`;
+  }
+
+  return `<div class="dTable" role="table" aria-label="Library contents">
+    <div class="dRow dHeadRow" role="row">
+      <div class="dCell dName">${sortHeadHtml("name", "Name")}</div>
+      <div class="dCell dStatus">Status</div>
+      ${showLocation() ? '<div class="dCell dLoc">Location</div>' : ""}
+      <div class="dCell dWhen">${sortHeadHtml("created", "Added")}</div>
+      <div class="dCell dTokens">${sortHeadHtml("tokens", "Tokens")}</div>
+      <div class="dCell dTime">Index time</div>
+      <div class="dCell dMore"></div>
+    </div>
+    ${folders.map(folderRowHtml).join("")}
+    ${runs.map(runRowHtml).join("")}
+  </div>`;
+}
+
+/* details panel */
+
+function renderDriveDetail() {
+  const lib = state.library;
+  const panel = $("driveDetail");
+  if (!lib.detailOpen) { panel.innerHTML = ""; return; }
+  const sel = lib.selected;
+  // Keep a half-made Rebuild choice and the scroll position across polls.
+  const shownRun = (panel.querySelector("[data-run]") || {}).dataset?.run;
+  const pendingRebuild = panel.querySelector(".rebuildSelect")?.value;
+  const scroll = panel.scrollTop;
+  $("libraryView").classList.toggle("hasSelection", !!sel);
+  if (sel && sel.kind === "run") panel.innerHTML = runDetailHtml(findRun(sel.id));
+  else if (sel && sel.kind === "folder") panel.innerHTML = folderDetailHtml(folderById(sel.id));
+  else panel.innerHTML = placeDetailHtml();
+  if (sel && sel.kind === "run" && shownRun === sel.id) {
+    const select = panel.querySelector(".rebuildSelect");
+    if (select && pendingRebuild) select.value = pendingRebuild;
+    panel.scrollTop = scroll;
+  }
+}
+
+function detailHeadHtml(icon, name, sub) {
+  return `<div class="detailHead">
+    ${icon}<div class="detailTitles"><h2 title="${escapeHtml(name)}">${escapeHtml(name)}</h2>${sub ? `<div class="detailSub">${sub}</div>` : ""}</div>
+    <button type="button" class="driveIconBtn" data-act="close-detail" aria-label="Close details">×</button>
+  </div>`;
+}
+
+function runDetailHtml(run) {
+  const status = runStatus(run);
+  const isCurrent = run.runDir === state.currentRun;
+  const stages = run.stages
+    .map((stage, index) => stageStepHtml(stage, index ? run.stages[index - 1].name : null))
+    .join("");
+  const inFolder = folderById(state.library.folder) && runFolderIds(run).includes(state.library.folder);
+  return `<div class="detailBody" data-run="${escapeHtml(run.runDir)}">
+    ${detailHeadHtml(ICONS.pdf, run.name, `Added ${escapeHtml(fmtWhen(runAddedAt(run)))}`)}
+    <div class="detailPills">
+      <span class="pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
+      ${isCurrent ? '<span class="pill">open</span>' : ""}
+      ${runTagHtml(run.tag)}
+    </div>
+    <div class="detailActions">
+      ${run.hasPdf ? '<button class="btn primary" data-act="preview">Preview</button>' : ""}
+      ${run.viewable ? `<button class="btn${run.hasPdf ? "" : " primary"}" data-act="open">Open in Tree</button><button class="btn" data-act="chat">Chat</button>` : ""}
+      ${runLifecycleHtml(run)}
+      ${run.viewable ? '<button class="btn" data-act="link" title="Cross-link this document with others">Link to…</button>' : ""}
+    </div>
+
+    <h3 class="detailSection">Location</h3>
+    <div class="detailLocation">${locationHtml(run)}</div>
+    <div class="detailActions compact">
+      <button class="btn" data-act="move">Move to…</button>
+      <button class="btn" data-act="add-to">Add to folder…</button>
+      ${inFolder ? '<button class="btn" data-act="remove-from">Remove from this folder</button>' : ""}
+    </div>
+
+    <h3 class="detailSection">Indexing</h3>
+    <div class="stages">${stages}</div>
+    <div class="runStats">
+      <div class="runStat"><div class="k">Index time</div><div class="v">${escapeHtml(fmtDuration(runIndexSeconds(run)))}</div></div>
+      <div class="runStat"><div class="k">Tree build</div><div class="v">${escapeHtml(fmtDuration(run.metrics.buildTreeSeconds))}</div></div>
+      <div class="runStat"><div class="k">Tokens</div><div class="v">${escapeHtml(fmtTokens(run.metrics.totalTokens))}</div></div>
+      <div class="runStat"><div class="k">Viewable</div><div class="v">${run.viewable ? "yes" : "no"}</div></div>
+    </div>
+    ${crossLinkCardHtml(run)}
+    ${run.error ? `<div class="runError">${escapeHtml(String(run.error))}</div>` : ""}
+
+    <div class="detailDanger">
+      <button class="btn danger" data-act="delete" ${isCurrent ? "disabled title='Open another document first'" : ""}>Delete document</button>
+    </div>
+  </div>`;
+}
+
+function folderStatsHtml(direct, nested, subfolders) {
+  const ready = nested.filter((r) => runStatusBucket(r) === "ready").length;
+  return `<dl class="kv">
+    <dt>Here</dt><dd>${direct.length} document${direct.length === 1 ? "" : "s"}</dd>
+    <dt>Subfolders</dt><dd>${subfolders}</dd>
+    <dt>In total</dt><dd>${nested.length} document${nested.length === 1 ? "" : "s"}, ${ready} ready</dd>
+  </dl>`;
+}
+
+function folderDetailHtml(folder) {
+  const nested = runsInFolderTree(folder.id);
+  const canQuery = nested.some((r) => r.viewable);
+  const parent = folder.parentId ? folderPath(folder.parentId) : "My Library";
+  return `<div class="detailBody" data-folder="${escapeHtml(folder.id)}">
+    ${detailHeadHtml(ICONS.folder, folder.name, `in ${escapeHtml(parent)}`)}
+    <div class="detailActions">
+      <button class="btn primary" data-act="open-folder">Open</button>
+      <button class="btn" data-act="chat-folder" ${canQuery ? "" : "disabled title='No indexed documents in this folder yet'"}>Chat</button>
+      <button class="btn" data-act="graph-folder" ${canQuery ? "" : "disabled title='No indexed documents in this folder yet'"}>Graph</button>
+    </div>
+    <h3 class="detailSection">Contents</h3>
+    ${folderStatsHtml(runsInFolder(folder.id), nested, folderSubtreeIds(folder.id).length - 1)}
+    <p class="detailNote">Chat and Graph cover every document in this folder and its subfolders.</p>
+    <h3 class="detailSection">Organize</h3>
+    <div class="detailActions compact">
+      <button class="btn" data-act="new-subfolder">New subfolder</button>
+      <button class="btn" data-act="add-existing">Add documents…</button>
+      <button class="btn" data-act="rename-folder">Rename</button>
+      <button class="btn" data-act="move-folder">Move to…</button>
+    </div>
+    <div class="detailDanger">
+      <button class="btn danger" data-act="delete-folder">Delete folder</button>
+    </div>
+  </div>`;
+}
+
+function placeDetailHtml() {
+  const lib = state.library;
+  if (lib.folder === LIBRARY_ALL || lib.search.trim()) {
+    const runs = state.libraryRuns;
+    return `<div class="detailBody">
+      ${detailHeadHtml(ICONS.all, "All documents", "")}
+      <dl class="kv">
+        ${STATUS_FILTERS.slice(1).map(([key, label]) =>
+          `<dt>${escapeHtml(label)}</dt><dd>${runs.filter((r) => runStatusBucket(r) === key).length}</dd>`).join("")}
+      </dl>
+      <p class="detailNote">Select a file or folder to see its details.</p>
+    </div>`;
+  }
+  const folder = folderById(lib.folder);
+  if (folder) return folderDetailHtml(folder);
+  const nested = state.libraryRuns;
+  return `<div class="detailBody">
+    ${detailHeadHtml(ICONS.library, "My Library", "")}
+    ${folderStatsHtml(runsInFolder(LIBRARY_ROOT), nested, state.groups.length)}
+    <p class="detailNote">Select a file or folder to see its details. Drag documents onto a folder to file them.</p>
+  </div>`;
+}
+
+/* actions */
+
+async function createFolder(parentId) {
+  const name = prompt(parentId ? `New folder in “${folderById(parentId).name}”` : "New folder");
+  if (name === null || !name.trim()) return null;
+  try {
+    const created = await postJson("/api/groups", { name, parentId: parentId || null });
+    await loadLibrary();
+    return created.group;
+  } catch (err) {
+    alert("Could not create the folder: " + err.message);
+    return null;
+  }
+}
+
+async function renameFolder(id) {
+  const folder = folderById(id);
+  if (!folder) return;
+  const name = prompt("Rename folder", folder.name);
+  if (name === null || !name.trim() || name.trim() === folder.name) return;
+  try {
+    await postJson("/api/group-rename", { groupId: id, name: name.trim() });
+  } catch (err) {
+    alert("Could not rename the folder: " + err.message);
+    return;
+  }
+  await loadLibrary();
+}
+
+async function deleteFolder(id) {
+  const folder = folderById(id);
+  if (!folder) return;
+  const subfolders = folderSubtreeIds(id).length - 1;
+  const ok = confirm(
+    `Delete the folder “${folder.name}”${subfolders ? ` and its ${subfolders} subfolder${subfolders === 1 ? "" : "s"}` : ""}?\n\n` +
+      "Documents inside are not deleted -- they stay in the library.",
+  );
+  if (!ok) return;
+  try {
+    await postJson("/api/group-delete", { groupId: id });
+  } catch (err) {
+    alert("Could not delete the folder: " + err.message);
+    return;
+  }
+  const lib = state.library;
+  if (folderSubtreeIds(id).includes(lib.folder)) lib.folder = folder.parentId || LIBRARY_ROOT;
+  lib.selected = null;
+  await loadLibrary();
+}
+
+async function moveFolder(id, parentId) {
+  const folder = folderById(id);
+  if (!folder || (folder.parentId || LIBRARY_ROOT) === parentId) return;
+  try {
+    await postJson("/api/group-move", { groupId: id, parentId: parentId || null });
+  } catch (err) {
+    alert("Could not move the folder: " + err.message);
+    return;
+  }
+  if (parentId) state.library.expanded.add(parentId);
+  await loadLibrary();
+}
+
+async function setRunFolders(runDir, groupIds) {
+  await postJson("/api/run-groups", { runDir, groupIds: Array.from(new Set(groupIds)) });
+}
+
+// Move replaces the folder the document is being viewed in (Drive's
+// single-parent move); from anywhere else it files the document in the target
+// alone. Moving to My Library unfiles it.
+async function moveRun(runDir, toId) {
+  const run = findRun(runDir);
+  if (!run) return;
+  const current = runFolderIds(run);
+  const from = state.library.folder;
+  let next;
+  if (folderById(from) && current.includes(from)) next = current.filter((g) => g !== from);
+  else next = [];
+  if (toId) next.push(toId);
+  if (next.length === current.length && next.every((g) => current.includes(g))) return;
+  try {
+    await setRunFolders(runDir, next);
+  } catch (err) {
+    alert("Could not move the document: " + err.message);
+    return;
+  }
+  await loadLibrary();
+  if (toId) promptLinkToNewFolderMates(runDir, [toId]);
+}
+
+async function addRunToFolder(runDir, toId) {
+  const run = findRun(runDir);
+  if (!run || runFolderIds(run).includes(toId)) return;
+  try {
+    await setRunFolders(runDir, [...runFolderIds(run), toId]);
+  } catch (err) {
+    alert("Could not add the document to the folder: " + err.message);
+    return;
+  }
+  await loadLibrary();
+  promptLinkToNewFolderMates(runDir, [toId]);
+}
+
+async function removeRunFromFolder(runDir, folderId) {
+  const run = findRun(runDir);
+  if (!run) return;
+  try {
+    await setRunFolders(runDir, runFolderIds(run).filter((g) => g !== folderId));
+  } catch (err) {
+    alert("Could not remove the document from the folder: " + err.message);
+    return;
+  }
+  await loadLibrary();
+}
+
+async function deleteRun(runDir) {
+  const run = findRun(runDir);
+  if (!run) return;
+  const ok = confirm(
+    `Delete "${run.name}" completely?\n\n` +
+      "This removes its vectors from Qdrant, its rows from PostgreSQL, and " +
+      "its extracted content from disk. This cannot be undone."
+  );
+  if (!ok) return;
+  try {
+    await api(`/api/run?run=${encodeURIComponent(runDir)}`, { method: "DELETE" });
+  } catch (err) {
+    alert("Could not delete: " + err.message);
+    return;
+  }
+  state.library.selected = null;
+  await loadLibrary();
+}
+
+async function stopRun(runDir) {
+  if (!confirm("Stop indexing this document? Finished stages are kept and it can be started again.")) return;
+  try {
+    await postJson("/api/run-stop", { runDir });
+  } catch (err) {
+    alert("Could not stop this run: " + err.message);
+  }
+  await loadLibrary();
+}
+
+async function startRun(runDir, fromStage) {
+  if (fromStage && !confirm(
+    `Rebuild from the ${fromStage} stage? That stage and every stage after it ` +
+    `will be discarded and built again.`)) return;
+  try {
+    await postJson("/api/run-start", { runDir, fromStage });
+  } catch (err) {
+    alert("Could not start this run: " + err.message);
+  }
+  await loadLibrary();
+}
+
+async function chatAbout(kind, id) {
+  await setScope(kind, kind === "group" ? { groupId: id } : { runDir: id });
+  if (state.scopeKind === kind) activateView("chat");
+}
+
+async function graphOfFolder(id) {
+  await setScope("group", { groupId: id });
+  if (state.scopeKind === "group") activateView("graph");
+}
+
+// Like Drive, opening a file previews it; Tree/Graph/Chat stay one click away.
+function openItem(kind, id) {
+  if (kind === "folder") return navigateFolder(id);
+  const run = findRun(id);
+  if (run && run.hasPdf) openPdfPreview(id);
+  else if (run && run.viewable) openRunByDir(id);
+  else selectItem("run", id);
+}
+
+/* PDF preview */
+
+const sourcePdfUrl = (runDir) => `/api/source-pdf?run=${encodeURIComponent(runDir)}`;
+
+function openPdfPreview(runDir) {
+  const run = findRun(runDir);
+  if (!run || !run.hasPdf) return;
+  closeDriveMenu();
+  state.pdfPreviewRun = runDir;
+  const url = sourcePdfUrl(runDir);
+  $("pdfPreviewName").textContent = run.name;
+  $("pdfPreviewTab").href = url;
+  $("pdfPreviewDownload").href = url;
+  $("pdfPreviewDownload").setAttribute("download", run.name);
+  $("pdfPreviewOpen").hidden = !run.viewable;
+  $("pdfPreviewFrame").src = url;
+  $("pdfPreview").hidden = false;
+  $("pdfPreviewClose").focus();
+}
+
+function closePdfPreview() {
+  if ($("pdfPreview").hidden) return;
+  $("pdfPreview").hidden = true;
+  // Unload the document so a large PDF does not stay in memory behind the library.
+  $("pdfPreviewFrame").src = "about:blank";
+  const runDir = state.pdfPreviewRun;
+  state.pdfPreviewRun = null;
+  const row = runDir && $("driveBody").querySelector(`[data-kind="run"][data-id="${CSS.escape(runDir)}"]`);
+  if (row) row.focus({ preventScroll: true });
+}
+
+function wirePdfPreview() {
+  $("pdfPreviewClose").addEventListener("click", closePdfPreview);
+  $("pdfPreviewOpen").addEventListener("click", () => {
+    const runDir = state.pdfPreviewRun;
+    closePdfPreview();
+    if (runDir) openRunByDir(runDir);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("pdfPreview").hidden) closePdfPreview();
+  });
+}
+
+/* context menu */
+
+function runMenuItems(run) {
+  const inFolder = folderById(state.library.folder) && runFolderIds(run).includes(state.library.folder);
+  return [
+    run.hasPdf && { label: "Preview", act: () => openPdfPreview(run.runDir) },
+    run.viewable && { label: "Open in Tree", act: () => openRunByDir(run.runDir) },
+    run.viewable && { label: "Chat about this document", act: () => chatAbout("document", run.runDir) },
+    { sep: true },
+    { label: "Move to…", act: () => openFolderPicker({ mode: "move-run", id: run.runDir }) },
+    { label: "Add to folder…", act: () => openFolderPicker({ mode: "add-run", id: run.runDir }) },
+    inFolder && { label: "Remove from this folder", act: () => removeRunFromFolder(run.runDir, state.library.folder) },
+    { sep: true },
+    run.viewable && { label: "Link to…", act: () => openCrossLinkModal({ kind: "retroactive", runDir: run.runDir }) },
+    { label: run.tag ? "Edit tag" : "Add tag", act: () => editRunTag(run.runDir) },
+    run.isIndexing && { label: "Stop indexing", act: () => stopRun(run.runDir) },
+    { label: "Details", act: () => { state.library.detailOpen = true; selectItem("run", run.runDir); renderLibrary(); } },
+    { sep: true },
+    { label: "Delete", danger: true, disabled: run.runDir === state.currentRun, act: () => deleteRun(run.runDir) },
+  ];
+}
+
+function folderMenuItems(folder) {
+  const canQuery = runsInFolderTree(folder.id).some((r) => r.viewable);
+  return [
+    { label: "Open", act: () => navigateFolder(folder.id) },
+    { label: "Chat with this folder", disabled: !canQuery, act: () => chatAbout("group", folder.id) },
+    { label: "View graph", disabled: !canQuery, act: () => graphOfFolder(folder.id) },
+    { sep: true },
+    { label: "New subfolder", act: () => createFolder(folder.id) },
+    { label: "Add documents…", act: () => openAddDocsModal(folder.id) },
+    { label: "Rename", act: () => renameFolder(folder.id) },
+    { label: "Move to…", act: () => openFolderPicker({ mode: "move-folder", id: folder.id }) },
+    { sep: true },
+    { label: "Delete folder", danger: true, act: () => deleteFolder(folder.id) },
+  ];
+}
+
+function placeMenuItems() {
+  const here = folderById(state.library.folder) ? state.library.folder : LIBRARY_ROOT;
+  return [
+    { label: "New folder", act: () => createFolder(here) },
+    { label: "Upload PDF", act: () => $("fileInput").click() },
+    here && { sep: true },
+    here && { label: "Add existing documents…", act: () => openAddDocsModal(here) },
+  ];
+}
+
+function openDriveMenu(items, anchor) {
+  const menu = $("driveMenu");
+  const clean = items.filter(Boolean).filter((it, i, arr) =>
+    !it.sep || (i > 0 && i < arr.length - 1 && !arr[i - 1].sep));
+  state.library.menuItems = clean;
+  menu.innerHTML = clean.map((it, i) => it.sep
+    ? '<div class="menuSep" role="separator"></div>'
+    : `<button type="button" role="menuitem" class="menuItem${it.danger ? " danger" : ""}" data-menu="${i}" ${it.disabled ? "disabled" : ""}>${escapeHtml(it.label)}</button>`,
+  ).join("");
+  menu.hidden = false;
+  const view = $("libraryView").getBoundingClientRect();
+  const box = menu.getBoundingClientRect();
+  let x, y;
+  if (anchor instanceof Element) {
+    const r = anchor.getBoundingClientRect();
+    x = r.left; y = r.bottom + 4;
+  } else {
+    ({ x, y } = anchor);
+  }
+  x = Math.max(view.left + 8, Math.min(x, view.right - box.width - 8));
+  if (y + box.height > view.bottom - 8) y = Math.max(view.top + 8, y - box.height - 8);
+  menu.style.left = `${x - view.left}px`;
+  menu.style.top = `${y - view.top}px`;
+  const first = menu.querySelector(".menuItem:not([disabled])");
+  if (first) first.focus();
+}
+
+function closeDriveMenu() {
+  $("driveMenu").hidden = true;
+  state.library.menuItems = [];
+}
+
+function itemMenu(kind, id) {
+  if (kind === "folder") return folderMenuItems(folderById(id));
+  return runMenuItems(findRun(id));
+}
+
+/* folder picker (move / add) */
+
+function openFolderPicker(context) {
+  const picker = state.folderPicker = { ...context, target: null };
+  const run = context.mode !== "move-folder" ? findRun(context.id) : null;
+  const folder = context.mode === "move-folder" ? folderById(context.id) : null;
+  const name = run ? run.name : folder.name;
+  $("folderPickerTitle").textContent = context.mode === "add-run" ? `Add “${name}” to a folder` : `Move “${name}”`;
+  $("folderPickerHint").textContent = context.mode === "add-run"
+    ? "The document stays in the folders it's already in."
+    : run
+      ? `Currently in ${runFolderIds(run).map((id) => folderPath(id)).join(", ") || "My Library"}.`
+      : `Currently in ${folder.parentId ? folderPath(folder.parentId) : "My Library"}.`;
+  $("folderPickerConfirm").textContent = context.mode === "add-run" ? "Add here" : "Move here";
+  picker.target = context.mode === "add-run" ? null
+    : folderById(state.library.folder) ? state.library.folder : LIBRARY_ROOT;
+  renderFolderPicker();
+  $("folderPickerModal").hidden = false;
+}
+
+function renderFolderPicker() {
+  const picker = state.folderPicker;
+  const run = picker.mode !== "move-folder" ? findRun(picker.id) : null;
+  const blocked = new Set(picker.mode === "move-folder" ? folderSubtreeIds(picker.id) : []);
+  const already = new Set(picker.mode === "add-run" && run ? runFolderIds(run) : []);
+  const rowHtml = (id, name, depth, icon) => {
+    const disabled = blocked.has(id) || already.has(id);
+    const note = blocked.has(id) ? "" : already.has(id) ? '<span class="pickNote">already here</span>' : "";
+    const selected = picker.target === id;
+    return `<button type="button" role="option" class="pickRow${selected ? " selected" : ""}" style="--depth:${depth}"
+        data-pick="${escapeHtml(id)}" aria-selected="${selected}" ${disabled ? "disabled" : ""}>
+      ${icon}<span>${escapeHtml(name)}</span>${note}</button>`;
+  };
+  const walk = (parentId, depth) => childFolders(parentId)
+    .map((f) => rowHtml(f.id, f.name, depth, ICONS.folder) + (blocked.has(f.id) ? "" : walk(f.id, depth + 1)))
+    .join("");
+  const rows = (picker.mode === "add-run" ? "" : rowHtml(LIBRARY_ROOT, "My Library", 0, ICONS.library))
+    + walk(LIBRARY_ROOT, picker.mode === "add-run" ? 0 : 1);
+  $("folderPickerTree").innerHTML = rows || '<div class="modalHint">No folders yet — create one below.</div>';
+  $("folderPickerConfirm").disabled = picker.target === null;
+}
+
+function closeFolderPicker() {
+  $("folderPickerModal").hidden = true;
+  state.folderPicker = null;
+}
+
+async function confirmFolderPicker() {
+  const picker = state.folderPicker;
+  if (!picker || picker.target === null) return;
+  closeFolderPicker();
+  if (picker.mode === "move-folder") await moveFolder(picker.id, picker.target);
+  else if (picker.mode === "add-run") await addRunToFolder(picker.id, picker.target);
+  else await moveRun(picker.id, picker.target);
+}
+
+/* add existing documents to a folder */
+
+function openAddDocsModal(folderId) {
+  const folder = folderById(folderId);
+  if (!folder) return;
+  state.addDocsFolder = folderId;
+  $("addDocsTitle").textContent = `Add documents to “${folder.name}”`;
+  const runs = state.libraryRuns.filter((r) => !runFolderIds(r).includes(folderId)).sort(byName);
+  $("addDocsPicker").innerHTML = runs.length
+    ? runs.map((r) => `
+        <label class="modalCheck">
+          <input type="checkbox" value="${escapeHtml(r.runDir)}" />
+          ${ICONS.pdf}<span>${escapeHtml(r.name)}</span>
+          <span class="pickNote">${escapeHtml(runFolderIds(r).map((id) => folderById(id).name).join(", ") || "My Library")}</span>
+        </label>`).join("")
+    : '<div class="modalHint">Every document is already in this folder.</div>';
+  $("addDocsModal").hidden = false;
+}
+
+function closeAddDocsModal() {
+  $("addDocsModal").hidden = true;
+  state.addDocsFolder = null;
+}
+
+async function saveAddDocs() {
+  const folderId = state.addDocsFolder;
+  if (!folderId) return;
+  const picked = Array.from($("addDocsPicker").querySelectorAll("input:checked")).map((i) => i.value);
+  closeAddDocsModal();
+  try {
+    await Promise.all(picked.map((runDir) =>
+      setRunFolders(runDir, [...runFolderIds(findRun(runDir)), folderId])));
+  } catch (err) {
+    alert("Could not add some documents: " + err.message);
+  }
+  await loadLibrary();
+}
+
+// After filing a document in a folder, offer to catch it up with whatever it
+// isn't cross-linked to yet in that folder -- membership itself never links
+// anything (see set_run_groups in Scripts/web.py).
+function promptLinkToNewFolderMates(runDir, folderIds) {
+  const self = findRun(runDir);
+  const linkedWith = new Set(
+    ((self && self.crossLink && self.crossLink.linkedWith) || []).map((l) => l.runDir),
+  );
+  const candidates = new Map();
+  for (const id of folderIds) {
+    for (const r of runsInFolderTree(id)) {
+      if (r.runDir === runDir || !r.viewable || linkedWith.has(r.runDir)) continue;
+      candidates.set(r.runDir, r);
+    }
+  }
+  if (!self || !self.viewable || !candidates.size) return;
+  openCrossLinkModal({
+    kind: "group-add",
+    runDir,
+    candidateRunDirs: Array.from(candidates.keys()),
+  });
+}
+
+/* upload */
+
 function setUploadStatus(message, isError) {
   const box = $("uploadStatus");
   box.hidden = false;
@@ -1020,7 +1852,7 @@ function setUploadStatus(message, isError) {
   box.innerHTML = message;
 }
 
-async function uploadPdf(file, plan) {
+async function uploadPdf(file, plan, folderId) {
   if (!file) return;
   if (!/\.pdf$/i.test(file.name)) {
     setUploadStatus("Only PDF files can be indexed.", true);
@@ -1035,8 +1867,10 @@ async function uploadPdf(file, plan) {
       "X-Filename": encodeURIComponent(file.name),
     };
     if (plan) headers["X-Cross-Link-Plan"] = encodeURIComponent(JSON.stringify(plan));
+    if (folderId) headers["X-Group-Id"] = encodeURIComponent(folderId);
     const res = await api("/api/upload", { method: "POST", headers, body: file });
-    setUploadStatus(`Indexing <b>${escapeHtml(res.name)}</b> — progress appears below.`);
+    const where = folderById(folderId);
+    setUploadStatus(`Indexing <b>${escapeHtml(res.name)}</b>${where ? ` in <b>${escapeHtml(where.name)}</b>` : ""} — progress appears in its row.`);
     await loadLibrary();
   } catch (err) {
     setUploadStatus("Upload failed: " + escapeHtml(err.message), true);
@@ -1046,281 +1880,308 @@ async function uploadPdf(file, plan) {
   }
 }
 
+function startUpload(file, folderId) {
+  if (!file) return;
+  const target = folderById(folderId) ? folderId : null;
+  openCrossLinkModal({ kind: "ingest", file, folderId: target });
+}
+
+/* wiring */
+
+const DRAG_TYPE = "application/x-noetics-item";
+
 function wireLibrary() {
-  const zone = $("dropZone");
+  const lib = state.library;
   const input = $("fileInput");
-  zone.addEventListener("click", () => input.click());
-  zone.addEventListener("keydown", (e) => {
+  const uploadTarget = () => (folderById(lib.folder) ? lib.folder : null);
+
+  $("dropZone").addEventListener("click", () => input.click());
+  $("dropZone").addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); }
   });
-  input.addEventListener("change", () => {
-    const file = input.files[0];
-    if (file) openCrossLinkModal({ kind: "ingest", file });
+  input.addEventListener("change", () => startUpload(input.files[0], uploadTarget()));
+
+  $("driveNewBtn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    openDriveMenu(placeMenuItems(), $("driveNewBtn"));
   });
-  ["dragenter", "dragover"].forEach((evt) =>
-    zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.add("dragging"); }));
-  ["dragleave", "drop"].forEach((evt) =>
-    zone.addEventListener(evt, (e) => { e.preventDefault(); zone.classList.remove("dragging"); }));
-  zone.addEventListener("drop", (e) => {
-    const file = e.dataTransfer.files[0];
-    if (file) openCrossLinkModal({ kind: "ingest", file });
+
+  $("driveSearch").addEventListener("input", (e) => {
+    lib.search = e.target.value;
+    lib.selected = null;
+    renderLibrary();
   });
-  wireGroups();
+  $("driveFilters").addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-status]");
+    if (!chip) return;
+    lib.status = lib.status === chip.dataset.status ? "" : chip.dataset.status;
+    renderLibrary();
+  });
+  document.querySelectorAll(".viewToggle [data-layout]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      lib.layout = btn.dataset.layout;
+      writePref("noetics.libraryLayout", lib.layout);
+      renderLibrary();
+    }));
+  $("driveInfoBtn").addEventListener("click", () => {
+    lib.detailOpen = !lib.detailOpen;
+    writePref("noetics.libraryDetail", lib.detailOpen ? "open" : "closed");
+    renderLibrary();
+  });
+
+  // Navigation shared by the sidebar, breadcrumbs and location chips.
+  $("libraryView").addEventListener("click", (e) => {
+    const toggle = e.target.closest("[data-toggle]");
+    if (toggle) {
+      e.stopPropagation();
+      const id = toggle.dataset.toggle;
+      if (lib.expanded.has(id)) lib.expanded.delete(id); else lib.expanded.add(id);
+      renderDriveTree();
+      return;
+    }
+    const menuBtn = e.target.closest("[data-menu]");
+    if (menuBtn) {
+      const item = lib.menuItems[Number(menuBtn.dataset.menu)];
+      closeDriveMenu();
+      if (item && item.act) item.act();
+      return;
+    }
+    if (!e.target.closest("#driveMenu")) closeDriveMenu();
+    const crumbMenu = e.target.closest("[data-crumb-menu]");
+    if (crumbMenu) {
+      e.stopPropagation();
+      const folder = folderById(crumbMenu.dataset.crumbMenu);
+      openDriveMenu(folder ? folderMenuItems(folder) : placeMenuItems(), crumbMenu);
+      return;
+    }
+    const nav = e.target.closest("[data-nav]");
+    if (nav && !e.target.closest(".dRow, .dCard, #driveDetail")) {
+      navigateFolder(nav.dataset.nav);
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!$("driveMenu").hidden) closeDriveMenu();
+  });
+
+  // Rows and cards: click selects, double-click / Enter opens, ⋮ or right-click menus.
+  const body = $("driveBody");
+  body.addEventListener("click", (e) => {
+    if (e.target.closest("[data-act='add-existing']")) { openAddDocsModal(lib.folder); return; }
+    if (e.target.closest("[data-sort]")) {
+      const key = e.target.closest("[data-sort]").dataset.sort;
+      lib.sort = lib.sort.key === key
+        ? { key, dir: lib.sort.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "name" ? "asc" : "desc" };
+      renderDriveBody();
+      return;
+    }
+    const item = e.target.closest("[data-kind]");
+    if (!item) { selectItem(null); return; }
+    const locNav = e.target.closest(".locChip[data-nav]");
+    if (locNav) { navigateFolder(locNav.dataset.nav); return; }
+    if (e.target.closest("[data-more]")) {
+      e.stopPropagation();
+      selectItem(item.dataset.kind, item.dataset.id);
+      const fresh = body.querySelector(`[data-kind="${item.dataset.kind}"][data-id="${CSS.escape(item.dataset.id)}"] [data-more]`);
+      openDriveMenu(itemMenu(item.dataset.kind, item.dataset.id), fresh || { x: e.clientX, y: e.clientY });
+      return;
+    }
+    selectItem(item.dataset.kind, item.dataset.id);
+  });
+  body.addEventListener("dblclick", (e) => {
+    const item = e.target.closest(".dRow[data-kind], .dCard[data-kind]");
+    if (item && !e.target.closest("[data-more], .locChip[data-nav]")) openItem(item.dataset.kind, item.dataset.id);
+  });
+  body.addEventListener("keydown", (e) => {
+    const item = e.target.closest(".dRow[data-kind], .dCard[data-kind]");
+    if (!item) return;
+    if (e.key === "Enter") { e.preventDefault(); openItem(item.dataset.kind, item.dataset.id); }
+    if (e.key === " ") { e.preventDefault(); selectItem(item.dataset.kind, item.dataset.id); }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const all = Array.from(body.querySelectorAll(".dRow[data-kind], .dCard[data-kind]"));
+      const next = all[all.indexOf(item) + (e.key === "ArrowDown" ? 1 : -1)];
+      if (next) next.focus();
+    }
+  });
+  $("driveMain").addEventListener("contextmenu", (e) => {
+    if (e.target.closest("input, #driveFilters")) return;
+    e.preventDefault();
+    const item = e.target.closest(".dRow[data-kind], .dCard[data-kind]");
+    if (item) {
+      selectItem(item.dataset.kind, item.dataset.id);
+      openDriveMenu(itemMenu(item.dataset.kind, item.dataset.id), { x: e.clientX, y: e.clientY });
+    } else {
+      openDriveMenu(placeMenuItems(), { x: e.clientX, y: e.clientY });
+    }
+  });
+  $("driveTree").addEventListener("contextmenu", (e) => {
+    const item = e.target.closest(".navItem[data-kind='folder']");
+    if (!item) return;
+    e.preventDefault();
+    openDriveMenu(folderMenuItems(folderById(item.dataset.id)), { x: e.clientX, y: e.clientY });
+  });
+
+  // Details panel actions.
+  $("driveDetail").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-act], .stopRun, .startRun, [data-link-a], .locChip[data-nav]");
+    if (!btn) return;
+    const runDir = (btn.closest("[data-run]") || {}).dataset?.run;
+    const folderId = (btn.closest("[data-folder]") || {}).dataset?.folder;
+    if (btn.matches(".locChip[data-nav]")) return navigateFolder(btn.dataset.nav);
+    if (btn.dataset.linkA) return viewGraphLink(btn.dataset.linkA, btn.dataset.linkB);
+    if (btn.classList.contains("stopRun")) return stopRun(runDir);
+    if (btn.classList.contains("startRun")) {
+      const select = btn.closest(".detailActions").querySelector(".rebuildSelect");
+      return startRun(runDir, select && select.value ? select.value : null);
+    }
+    const actions = {
+      "close-detail": () => { lib.detailOpen = false; writePref("noetics.libraryDetail", "closed"); renderLibrary(); },
+      preview: () => openPdfPreview(runDir),
+      open: () => openRunByDir(runDir),
+      chat: () => chatAbout("document", runDir),
+      link: () => openCrossLinkModal({ kind: "retroactive", runDir }),
+      tag: () => editRunTag(runDir),
+      move: () => openFolderPicker({ mode: "move-run", id: runDir }),
+      "add-to": () => openFolderPicker({ mode: "add-run", id: runDir }),
+      "remove-from": () => removeRunFromFolder(runDir, lib.folder),
+      delete: () => deleteRun(runDir),
+      "open-folder": () => navigateFolder(folderId),
+      "chat-folder": () => chatAbout("group", folderId),
+      "graph-folder": () => graphOfFolder(folderId),
+      "new-subfolder": () => createFolder(folderId),
+      "add-existing": () => openAddDocsModal(folderId),
+      "rename-folder": () => renameFolder(folderId),
+      "move-folder": () => openFolderPicker({ mode: "move-folder", id: folderId }),
+      "delete-folder": () => deleteFolder(folderId),
+    };
+    const act = actions[btn.dataset.act];
+    if (act) act();
+  });
+
+  wireLibraryDragAndDrop();
+  wireFolderPicker();
+  wirePdfPreview();
   wireCrossLinkModal();
 }
 
-/* ------------------------------ Groups ------------------------------------ */
+// Drag a row onto a folder (row, card, sidebar or breadcrumb) to move it there;
+// drop a PDF from the desktop anywhere on the list to upload into this folder.
+function wireLibraryDragAndDrop() {
+  const lib = state.library;
+  const view = $("libraryView");
+  const overlay = $("dropOverlay");
+  let dragItem = null;
+  let fileDragDepth = 0;
 
-async function loadGroups() {
-  try {
-    const data = await api("/api/groups");
-    state.groups = data.groups || [];
-  } catch (err) {
-    state.groups = [];
-  }
-  renderGroupFilterChips();
-}
+  const isFileDrag = (e) => Array.from(e.dataTransfer.types || []).includes("Files");
+  const dropFolderOf = (e) => {
+    const el = e.target.closest("[data-drop-folder]");
+    return el ? { el, id: el.dataset.dropFolder } : null;
+  };
+  const canDrop = (target) => {
+    if (!dragItem || !target) return false;
+    if (dragItem.kind === "folder") return !folderSubtreeIds(dragItem.id).includes(target.id)
+      && (folderById(dragItem.id).parentId || LIBRARY_ROOT) !== target.id;
+    return true;
+  };
+  const clearHighlights = () => view.querySelectorAll(".dropTarget").forEach((el) => el.classList.remove("dropTarget"));
+  const finishDrag = () => {
+    dragItem = null;
+    state.libraryDragging = false;
+    clearHighlights();
+    view.querySelectorAll(".dragging").forEach((el) => el.classList.remove("dragging"));
+    if (state.libraryRenderPending) { state.libraryRenderPending = false; renderLibrary(); }
+  };
 
-function renderGroupFilterChips() {
-  const box = $("groupFilterChips");
-  if (!box) return;
-  // "All documents" is always present and never gets stuck: it's the only
-  // way back out of a filter on an empty group, so it isn't just the same
-  // chip toggled off.
-  const allChip = `
-    <button type="button" class="groupChip${state.groupFilter ? "" : " active"}" data-group="">
-      All documents
-    </button>`;
-  const chips = state.groups.map((g) => `
-    <span class="groupChipWrap">
-      <button type="button" class="groupChip${state.groupFilter === g.id ? " active" : ""}" data-group="${escapeHtml(g.id)}">
-        ${escapeHtml(g.name)} <span class="groupChipCount">${g.memberCount}</span>
-      </button>
-      <button type="button" class="groupChipEdit" data-group-edit="${escapeHtml(g.id)}" title="Add or remove documents in this group">✎</button>
-    </span>`).join("");
-  box.innerHTML = allChip + chips;
-  box.querySelectorAll(".groupChip[data-group]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      state.groupFilter = btn.dataset.group || null;
-      loadLibrary();
-    });
+  view.addEventListener("dragstart", (e) => {
+    const item = e.target.closest("[draggable='true'][data-kind]");
+    if (!item) return;
+    dragItem = { kind: item.dataset.kind, id: item.dataset.id };
+    state.libraryDragging = true;
+    item.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData(DRAG_TYPE, JSON.stringify(dragItem));
+    e.dataTransfer.setData("text/plain", item.dataset.kind === "run" ? findRun(item.dataset.id).name : folderById(item.dataset.id).name);
   });
-  box.querySelectorAll(".groupChipEdit").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openGroupMembersModal(btn.dataset.groupEdit);
-    });
-  });
-}
+  view.addEventListener("dragend", finishDrag);
 
-function wireGroups() {
-  $("newGroupBtn").addEventListener("click", async () => {
-    const name = prompt("New group name (e.g. \"Legal\", \"Q1 reports\")");
-    if (name === null || !name.trim()) return;
-    let created;
-    try {
-      created = await api("/api/groups", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-    } catch (err) {
-      alert("Could not create the group: " + err.message);
+  view.addEventListener("dragover", (e) => {
+    if (isFileDrag(e)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
       return;
     }
-    await loadLibrary();
-    // A brand-new group has no members yet -- go straight to adding some
-    // instead of leaving the reader to find the tiny ✎ on their own.
-    if (created && created.group) openGroupMembersModal(created.group.id);
+    const target = dropFolderOf(e);
+    clearHighlights();
+    if (!canDrop(target)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    target.el.classList.add("dropTarget");
   });
-  $("groupMembersCancel").addEventListener("click", closeGroupMembersModal);
-  $("groupMembersSave").addEventListener("click", saveGroupMembers);
-  $("groupMembersRename").addEventListener("click", renameCurrentGroup);
-  $("groupMembersModal").addEventListener("click", (e) => {
-    if (e.target === $("groupMembersModal")) closeGroupMembersModal();
+
+  view.addEventListener("dragenter", (e) => {
+    if (!isFileDrag(e)) return;
+    fileDragDepth += 1;
+    const where = folderById(lib.folder);
+    $("dropOverlayText").textContent = `Drop to upload to ${where ? where.name : "My Library"}`;
+    overlay.hidden = false;
   });
-  $("runGroupsCancel").addEventListener("click", closeRunGroupsModal);
-  $("runGroupsSave").addEventListener("click", saveRunGroups);
-  $("runGroupsModal").addEventListener("click", (e) => {
-    if (e.target === $("runGroupsModal")) closeRunGroupsModal();
+  view.addEventListener("dragleave", (e) => {
+    if (!isFileDrag(e)) return;
+    fileDragDepth = Math.max(0, fileDragDepth - 1);
+    if (!fileDragDepth) overlay.hidden = true;
   });
-}
 
-/* ------------------------- Group membership modal -------------------------- */
-// Adding a document to a group from the document's own card works, but
-// requires a document to already be visible -- which breaks down the moment
-// a group filter with zero members hides every card. This modal is the other
-// direction: manage a group's whole membership from the group itself.
-
-function openGroupMembersModal(groupId) {
-  const group = state.groups.find((g) => g.id === groupId);
-  if (!group) return;
-  state.groupMembersEditing = groupId;
-  $("groupMembersTitle").textContent = `Documents in “${group.name}”`;
-  const runs = state.libraryRuns || [];
-  $("groupMembersPicker").innerHTML = runs.length
-    ? runs.map((r) => `
-        <label class="modalCheck">
-          <input type="checkbox" value="${escapeHtml(r.runDir)}" ${(r.groupIds || []).includes(groupId) ? "checked" : ""} />
-          <span>${escapeHtml(r.name)}</span>
-        </label>`).join("")
-    : '<div class="modalHint">No documents indexed yet.</div>';
-  $("groupMembersModal").hidden = false;
-}
-
-function closeGroupMembersModal() {
-  $("groupMembersModal").hidden = true;
-  state.groupMembersEditing = null;
-}
-
-async function renameCurrentGroup() {
-  const groupId = state.groupMembersEditing;
-  const group = state.groups.find((g) => g.id === groupId);
-  if (!group) return;
-  const name = prompt("Rename group", group.name);
-  if (name === null || !name.trim() || name.trim() === group.name) return;
-  try {
-    const result = await api("/api/group-rename", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ groupId, name: name.trim() }),
-    });
-    Object.assign(group, result.group);
-  } catch (err) {
-    alert("Could not rename the group: " + err.message);
-    return;
-  }
-  $("groupMembersTitle").textContent = `Documents in “${group.name}”`;
-  renderGroupFilterChips();
-  await loadLibrary();
-}
-
-async function saveGroupMembers() {
-  const groupId = state.groupMembersEditing;
-  if (!groupId) return;
-  const checked = new Set(
-    Array.from($("groupMembersPicker").querySelectorAll("input:checked")).map((i) => i.value),
-  );
-  const changes = [];
-  for (const run of state.libraryRuns || []) {
-    const has = (run.groupIds || []).includes(groupId);
-    const want = checked.has(run.runDir);
-    if (has === want) continue;
-    const groupIds = want
-      ? [...(run.groupIds || []), groupId]
-      : (run.groupIds || []).filter((g) => g !== groupId);
-    changes.push(
-      api("/api/run-groups", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ runDir: run.runDir, groupIds }),
-      }),
-    );
-  }
-  try {
-    await Promise.all(changes);
-  } catch (err) {
-    alert("Could not save some changes: " + err.message);
-  }
-  closeGroupMembersModal();
-  await loadLibrary();
-}
-
-function editRunGroups(card) {
-  openRunGroupsModal(card.dataset.run);
-}
-
-// Checkbox picker of every existing group for one document, plus a
-// new-group field -- the reverse direction of openGroupMembersModal (one
-// group -> all documents). Replaces a blind comma-separated prompt() that
-// only showed existing group names as plain text in a hint line, with
-// nothing to actually click.
-function openRunGroupsModal(runDir) {
-  const run = state.libraryRuns.find((r) => r.runDir === runDir);
-  if (!run) return;
-  state.runGroupsEditing = runDir;
-  $("runGroupsTitle").textContent = `Groups for "${(run && run.name) || ""}"`;
-  const memberOf = new Set(run.groupIds || []);
-  state.runGroupsOriginalIds = Array.from(memberOf);
-  $("runGroupsPicker").innerHTML = state.groups.length
-    ? state.groups.map((g) => `
-        <label class="modalCheck">
-          <input type="checkbox" value="${escapeHtml(g.id)}" ${memberOf.has(g.id) ? "checked" : ""} />
-          <span>${escapeHtml(g.name)}</span>
-        </label>`).join("")
-    : '<div class="modalHint">No groups yet -- add one below.</div>';
-  $("runGroupsNewName").value = "";
-  $("runGroupsModal").hidden = false;
-}
-
-function closeRunGroupsModal() {
-  $("runGroupsModal").hidden = true;
-  state.runGroupsEditing = null;
-}
-
-async function saveRunGroups() {
-  const runDir = state.runGroupsEditing;
-  if (!runDir) return;
-  const groupIds = Array.from(
-    $("runGroupsPicker").querySelectorAll("input:checked"),
-  ).map((i) => i.value);
-  const newName = $("runGroupsNewName").value.trim();
-  if (newName) {
-    let group = state.groups.find((g) => g.name.toLowerCase() === newName.toLowerCase());
-    if (!group) {
-      try {
-        const created = await api("/api/groups", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: newName }),
-        });
-        group = created.group;
-        state.groups.push(group);
-      } catch (err) {
-        alert(`Could not create group “${newName}”: ` + err.message);
-        return;
-      }
+  view.addEventListener("drop", async (e) => {
+    if (isFileDrag(e)) {
+      e.preventDefault();
+      fileDragDepth = 0;
+      overlay.hidden = true;
+      const target = dropFolderOf(e);
+      const folderId = target ? target.id : lib.folder;
+      startUpload(e.dataTransfer.files[0], folderId);
+      return;
     }
-    groupIds.push(group.id);
-  }
-  const originalIds = new Set(state.runGroupsOriginalIds);
-  const addedGroupIds = groupIds.filter((id) => !originalIds.has(id));
-  try {
-    await api("/api/run-groups", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ runDir, groupIds }),
-    });
-  } catch (err) {
-    alert("Could not save groups: " + err.message);
-    return;
-  }
-  closeRunGroupsModal();
-  await loadLibrary();
-  if (addedGroupIds.length) promptLinkToNewGroupmates(runDir, addedGroupIds);
+    const target = dropFolderOf(e);
+    const item = dragItem;
+    if (!canDrop(target)) return finishDrag();
+    e.preventDefault();
+    finishDrag();
+    if (item.kind === "folder") await moveFolder(item.id, target.id);
+    else await moveRun(item.id, target.id);
+  });
 }
 
-// After adding a document to one or more groups, offer to catch it up with
-// whatever it isn't cross-linked to yet in those groups -- group membership
-// itself never links anything (see set_run_groups in Scripts/web.py), so
-// without this a newly grouped document silently sits unlinked until someone
-// notices and runs "Link to..." by hand.
-function promptLinkToNewGroupmates(runDir, addedGroupIds) {
-  const self = state.libraryRuns.find((r) => r.runDir === runDir);
-  const linkedWith = new Set(
-    ((self && self.crossLink && self.crossLink.linkedWith) || []).map((l) => l.runDir),
-  );
-  const addedSet = new Set(addedGroupIds);
-  const candidates = new Map();
-  for (const r of state.libraryRuns) {
-    if (r.runDir === runDir || !r.viewable || linkedWith.has(r.runDir)) continue;
-    if ((r.groupIds || []).some((id) => addedSet.has(id))) candidates.set(r.runDir, r);
-  }
-  if (!candidates.size) return;
-  openCrossLinkModal({
-    kind: "group-add",
-    runDir,
-    candidateRunDirs: Array.from(candidates.keys()),
+function wireFolderPicker() {
+  $("folderPickerTree").addEventListener("click", (e) => {
+    const row = e.target.closest("[data-pick]");
+    if (!row || row.disabled) return;
+    state.folderPicker.target = row.dataset.pick;
+    renderFolderPicker();
+  });
+  $("folderPickerTree").addEventListener("dblclick", (e) => {
+    if (e.target.closest("[data-pick]:not([disabled])")) confirmFolderPicker();
+  });
+  $("folderPickerNew").addEventListener("click", async () => {
+    const picker = state.folderPicker;
+    const parent = picker.target && folderById(picker.target) ? picker.target : null;
+    const created = await createFolder(parent);
+    if (created && state.folderPicker) {
+      state.folderPicker.target = created.id;
+      renderFolderPicker();
+    }
+  });
+  $("folderPickerCancel").addEventListener("click", closeFolderPicker);
+  $("folderPickerConfirm").addEventListener("click", confirmFolderPicker);
+  $("folderPickerModal").addEventListener("click", (e) => {
+    if (e.target === $("folderPickerModal")) closeFolderPicker();
+  });
+  $("addDocsCancel").addEventListener("click", closeAddDocsModal);
+  $("addDocsSave").addEventListener("click", saveAddDocs);
+  $("addDocsModal").addEventListener("click", (e) => {
+    if (e.target === $("addDocsModal")) closeAddDocsModal();
   });
 }
 
@@ -1359,8 +2220,9 @@ function renderCrossLinkDocsPicker() {
 function renderCrossLinkGroupPicker() {
   const sel = $("crossLinkGroupPicker");
   sel.innerHTML = state.groups.length
-    ? state.groups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)} (${g.memberCount})</option>`).join("")
-    : '<option value="">No groups yet</option>';
+    ? foldersSortedByPath().map((g) =>
+        `<option value="${escapeHtml(g.id)}">${escapeHtml(g.path)} (${runsInFolderTree(g.id).length})</option>`).join("")
+    : '<option value="">No folders yet</option>';
 }
 
 function updateCrossLinkModeUI() {
@@ -1374,12 +2236,12 @@ function openCrossLinkModal(context) {
   const isIngest = context.kind === "ingest";
   const isGroupAdd = context.kind === "group-add";
   $("crossLinkTitle").textContent = isGroupAdd
-    ? "Link to the rest of this group?"
+    ? "Link to the rest of this folder?"
     : isIngest
     ? "Cross-link this document?"
     : "Cross-link this document with…";
   $("crossLinkHint").textContent = isGroupAdd
-    ? `Not yet cross-linked with ${context.candidateRunDirs.length} document(s) in the group(s) you just added it to.`
+    ? `Not yet cross-linked with ${context.candidateRunDirs.length} document(s) in the folder you just filed it in.`
     : isIngest
     ? "Connect matching entities in this document to others already indexed, so chat and the graph can answer across documents."
     : "Extend this already-indexed document's cross-document connections.";
@@ -1390,11 +2252,15 @@ function openCrossLinkModal(context) {
   $("crossLinkMeshOption").hidden = isIngest;
   $("crossLinkAutoOption").hidden = !isIngest;
   $("crossLinkSkipOption").hidden = !isIngest;
-  document.querySelector(
-    `input[name="crossLinkMode"][value="${isGroupAdd || !isIngest ? "documents" : "auto"}"]`,
-  ).checked = true;
+  // Uploading into a folder that already holds indexed documents defaults to
+  // linking against that folder.
+  const intoFolder = isIngest && context.folderId
+    && runsInFolderTree(context.folderId).some((r) => r.viewable);
+  const defaultMode = isGroupAdd || !isIngest ? "documents" : intoFolder ? "group" : "auto";
+  document.querySelector(`input[name="crossLinkMode"][value="${defaultMode}"]`).checked = true;
   renderCrossLinkDocsPicker();
   renderCrossLinkGroupPicker();
+  if (intoFolder) $("crossLinkGroupPicker").value = context.folderId;
   updateCrossLinkModeUI();
   $("crossLinkModal").hidden = false;
 }
@@ -1416,15 +2282,15 @@ async function confirmCrossLink() {
     if (!targetRunDirs.length) { alert("Pick at least one document."); return; }
   } else if (mode === "group") {
     groupId = $("crossLinkGroupPicker").value;
-    if (!groupId) { alert("Pick a group."); return; }
+    if (!groupId) { alert("Pick a folder."); return; }
   }
 
   if (context.kind === "ingest") {
     const plan = { mode, targetRunDirs, groupId };
     $("crossLinkModal").hidden = true;
-    const file = context.file;
+    const { file, folderId } = context;
     state.crossLink = null;
-    await uploadPdf(file, plan);
+    await uploadPdf(file, plan, folderId);
     return;
   }
 
@@ -1482,7 +2348,7 @@ function wireCrossLinkModal() {
 }
 
 /* ============================== scope bar ================================= */
-// One shared control -- Document / Group / All -- drives Library, Graph,
+// One shared control -- Document / Folder / All -- drives Library, Graph,
 // Chat and Tree together. Tree is the one view that only makes sense in
 // Document scope; the others read whatever this is set to.
 
@@ -1522,8 +2388,8 @@ function renderScopeBar() {
 
   const groupPicker = $("headerGroupPicker");
   groupPicker.innerHTML = state.groups.length
-    ? state.groups.map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join("")
-    : '<option value="">No groups yet</option>';
+    ? foldersSortedByPath().map((g) => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.path)}</option>`).join("")
+    : '<option value="">No folders yet</option>';
   if (state.scopeGroupId) groupPicker.value = state.scopeGroupId;
   groupPicker.hidden = state.scopeKind !== "group";
 
@@ -1550,7 +2416,7 @@ function renderScopeBar() {
     foot.textContent = state.scopeKind === "all"
       ? "Conversations are saved for all documents."
       : state.scopeKind === "group"
-        ? "Conversations are saved for this group."
+        ? "Conversations are saved for this folder."
         : "Conversations are saved for this document.";
   }
 }
@@ -1560,7 +2426,7 @@ function wireScopeBar() {
     runDir: state.currentRun || (state.documentRuns[0] && state.documentRuns[0].runDir),
   }));
   $("headerScopeGroupBtn").addEventListener("click", () =>
-    setScope("group", { groupId: state.scopeGroupId || (state.groups[0] && state.groups[0].id) }));
+    setScope("group", { groupId: state.scopeGroupId || (foldersSortedByPath()[0] || {}).id }));
   $("headerScopeAllBtn").addEventListener("click", () => setScope("all"));
   $("headerDocumentPicker").addEventListener("change", (e) => {
     if (e.target.value) setScope("document", { runDir: e.target.value });
@@ -1570,7 +2436,7 @@ function wireScopeBar() {
 
 async function setScope(kind, { runDir, groupId, fromJump = false } = {}) {
   if (kind === "group" && !groupId) {
-    alert("Create a group first (Library → + Group).");
+    alert("Create a folder first (Library → New → New folder).");
     return;
   }
   const unchanged = kind === state.scopeKind

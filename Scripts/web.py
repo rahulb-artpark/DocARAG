@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,7 +29,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import yaml
 
@@ -563,13 +564,17 @@ def write_cross_link_plan(run_dir, mode, target_run_dirs):
     os.replace(temp_path, path)
 
 
-def run_summary(run_dir, history=None):
-    progress = run_progress(run_dir, history)
-    source = _read_json_if_present(run_dir / "run-manifest.json").get("source") or {}
+def run_summary_name(run_dir):
+    source = _read_json_if_present(Path(run_dir) / "run-manifest.json").get("source") or {}
     source_name = source.get("display_name")
     if not source_name and source.get("path"):
         source_name = Path(str(source["path"])).name
-    name = source_name or run_dir.name
+    return source_name
+
+
+def run_summary(run_dir, history=None):
+    progress = run_progress(run_dir, history)
+    name = run_summary_name(run_dir) or run_dir.name
     progress["name"] = name
     progress["tag"] = read_run_tag(run_dir)
     progress["groupIds"] = read_run_groups(run_dir)
@@ -581,6 +586,7 @@ def run_summary(run_dir, history=None):
     )
     resumable = run_code_fingerprint_matches(run_dir)
     progress["codeChanged"] = resumable is False
+    progress["hasPdf"] = run_indexed_pdf(run_dir) is not None
     progress["canResume"] = bool(
         not progress["isIndexing"]
         and resumable is not False
@@ -1098,6 +1104,17 @@ def run_source_pdf(run_dir):
 
     source = _read_json_if_present(Path(run_dir) / "run-manifest.json").get("source") or {}
     for key in ("path", "snapshot_path", "snapshot"):
+        candidate = source.get(key)
+        if isinstance(candidate, str) and Path(candidate).is_file():
+            return Path(candidate)
+    return None
+
+
+def run_indexed_pdf(run_dir):
+    """The exact bytes a run indexed: the content-addressed snapshot, else the source."""
+
+    source = _read_json_if_present(Path(run_dir) / "run-manifest.json").get("source") or {}
+    for key in ("snapshot_path", "snapshot", "path"):
         candidate = source.get(key)
         if isinstance(candidate, str) and Path(candidate).is_file():
             return Path(candidate)
@@ -2598,6 +2615,9 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/tree-image":
             self.send_tree_image(parsed)
             return
+        if parsed.path == "/api/source-pdf":
+            self.send_source_pdf(parsed)
+            return
         if parsed.path == "/api/health":
             self.send_json(
                 {
@@ -2736,6 +2756,41 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error_json(HTTPStatus.NOT_FOUND, "Unknown run")
             return
         self.send_json(run_summary(run_dir, _stage_history(find_run_dirs())))
+
+    def send_source_pdf(self, parsed):
+        """Stream a library document's PDF inline, for the browser's own viewer."""
+
+        run_dir = self.resolve_run_argument((parse_qs(parsed.query).get("run") or [""])[0])
+        if run_dir is None:
+            self.send_error_json(
+                HTTPStatus.NOT_FOUND,
+                "Run must be a directory below the configured runs directory",
+            )
+            return
+        path = run_indexed_pdf(run_dir)
+        if path is None:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "The source PDF is no longer on disk")
+            return
+        try:
+            handle = open(path, "rb")
+        except OSError as exc:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "The source PDF could not be read", str(exc))
+            return
+        with handle:
+            if handle.read(len(PDF_MAGIC)) != PDF_MAGIC:
+                self.send_error_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Source is not a PDF")
+                return
+            handle.seek(0)
+            name = run_summary_name(run_dir) or path.name
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{quote(name)}")
+            self.end_headers()
+            try:
+                shutil.copyfileobj(handle, self.wfile, 1024 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the viewer was closed mid-transfer
 
     def send_tree_image(self, parsed):
         if self.state.scope_run_dir is None:
@@ -3314,7 +3369,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         except KeyError as exc:
-            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+            self.send_error_json(HTTPStatus.NOT_FOUND, exc.args[0])
             return
         self.send_json({"ok": True, "group": group}, HTTPStatus.CREATED)
 
@@ -3367,7 +3422,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         except KeyError as exc:
-            self.send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+            self.send_error_json(HTTPStatus.NOT_FOUND, exc.args[0])
             return
         self.send_json({"ok": True, "group": group})
 
