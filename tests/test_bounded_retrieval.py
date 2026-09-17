@@ -7,11 +7,11 @@ from unittest.mock import patch
 import networkx as nx
 from pydantic import ValidationError
 
-from Core.Index.Tree import NodeType
-from Core.configs.rag.gbc_config import GBCRAGConfig
-from Core.rag.gbc_rag import GBCRAG
-from Core.rag.gbc_retrieval import HybridRetrievalBinding, Retriever
-from Core.rag.gbc_utils import calculate_skyline
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.configuration.strategies.gbc import GBCRAGConfig
+from retrieval_engine.rag.gbc.agent import GBCRAG
+from retrieval_engine.rag.gbc.retrieval import HybridRetrievalBinding, Retriever
+from retrieval_engine.rag.gbc.context import calculate_skyline
 
 
 class _RecordingReranker:
@@ -458,11 +458,11 @@ class CandidatePoolTests(unittest.TestCase):
 
         with (
             patch(
-                "Core.rag.gbc_retrieval.enhance_graph_with_semantic_links",
+                "retrieval_engine.rag.gbc.retrieval.enhance_graph_with_semantic_links",
                 return_value=graph,
             ),
             patch(
-                "Core.rag.gbc_retrieval.nx.pagerank",
+                "retrieval_engine.rag.gbc.retrieval.nx.pagerank",
                 return_value={"entity-a": 0.6, "entity-b": 0.4},
             ),
         ):

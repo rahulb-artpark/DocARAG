@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from Core.Index.Tree import DocumentTree, NodeType
-from Core.configs.figure_config import FigureConfig
-from Core.pipelines.doc_tree_builder import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType
+from retrieval_engine.configuration.figures import FigureConfig
+from retrieval_engine.indexing.tree.builder import (
     CANONICAL_EVIDENCE_FILE,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
     PARSER_OBSERVATION_SCHEMA_VERSION,
@@ -18,10 +18,10 @@ from Core.pipelines.doc_tree_builder import (
     bind_canonical_evidence,
     merge_canonical_evidence_shards,
 )
-from Core.pipelines.tree_node_builder import create_node_by_type
-from docarag.bookrag_projection import project_canonical_blocks
-from docarag.domain import CanonicalBlock, DocumentRef, ParseResult, RelationType
-from docarag.evidence_hydration import CanonicalEvidenceCatalog
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
+from document_services.evidence.projections.bookrag import project_canonical_blocks
+from document_services.domain import CanonicalBlock, DocumentRef, ParseResult, RelationType
+from document_services.evidence.hydration import CanonicalEvidenceCatalog
 
 
 class CanonicalBookRAGBindingTests(unittest.TestCase):

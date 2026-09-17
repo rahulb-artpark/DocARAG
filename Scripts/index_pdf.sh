@@ -66,7 +66,7 @@ repo = Path(sys.argv[1]).resolve()
 controller = Path(sys.argv[2]).resolve()
 files = set()
 
-for root_name in ("Core", "docarag"):
+for root_name in ("retrieval_engine", "document_services"):
     root = repo / root_name
     if root.is_dir():
         for candidate in root.rglob("*"):
@@ -388,8 +388,8 @@ else:
                 "file_count": code_file_count,
                 "scope": [
                     "main.py",
-                    "Core/**",
-                    "docarag/**",
+                    "retrieval_engine/**",
+                    "document_services/**",
                     "Scripts/index_pdf.sh",
                     "root dependency manifests",
                 ],
@@ -726,8 +726,8 @@ from pathlib import Path
 import json
 import sys
 
-from docarag.compat import inspect_run_readiness
-from docarag.provenance import verify_artifact_manifest
+from document_services.runtime.bookrag_bridge import inspect_run_readiness
+from document_services.evidence.provenance import verify_artifact_manifest
 
 run_dir = Path(sys.argv[1]).resolve()
 config = run_dir / "run_config.yaml"
@@ -1051,7 +1051,7 @@ PY
     python_runner=(conda run --no-capture-output -n "${DOCARAG_ENV:-docarag}" python)
   fi
 
-  if run_tracked "runtime fingerprint" "${python_runner[@]}" "$repo/docarag/runtime_probe.py" \
+  if run_tracked "runtime fingerprint" "${python_runner[@]}" "$repo/document_services/operations/environment_probe.py" \
     --output "$DRIVER_ATTEMPT_DIR/runtime.json" \
     --revision-id "$revision_id" --attempt-id "$DRIVER_ATTEMPT_ID"; then
     :
@@ -1066,7 +1066,7 @@ PY
 
   role_manifest="$DRIVER_ATTEMPT_DIR/expected-artifact-roles.json"
   if run_tracked "configured artifact role resolution" \
-    "${python_runner[@]}" -m docarag.artifact_roles \
+    "${python_runner[@]}" -m document_services.evidence.artifact_roles \
     --config "$system_config" --run "$run_dir" --output "$role_manifest"; then
     mapfile -t resolved_roles < <(
       python3 - "$role_manifest" <<'PY'
@@ -1112,7 +1112,7 @@ PY
   fi
 
   if run_tracked "artifact recovery assessment" \
-    python3 -m docarag.recovery \
+    python3 -m document_services.indexing.recovery \
     --run "$run_dir" --attempt-dir "$DRIVER_ATTEMPT_DIR" \
     --retrieval-artifact "$expected_retrieval_artifact"; then
     :
@@ -1136,7 +1136,7 @@ PY
           return 1
         }
         run_tracked "tree pickle/JSON integrity verification" \
-          "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir"
+          "${python_runner[@]}" -m document_services.evidence.tree_integrity --run "$run_dir"
         ;;
       graph)
         graph_artifact="$expected_graph_artifact"
@@ -1169,7 +1169,7 @@ PY
           return 1
         }
         if ! run_tracked "entity Qdrant readiness verification" \
-          "${python_runner[@]}" -m docarag.qdrant_readiness \
+          "${python_runner[@]}" -m document_services.persistence.qdrant_readiness \
           --config "$run_dir/run_config.yaml" \
           --attestation "$expected_entity_attestation" \
           --revision-id "$revision_id" \
@@ -1192,7 +1192,7 @@ PY
           return 1
         }
         run_tracked "retrieval Qdrant readiness verification" \
-          "${python_runner[@]}" -m docarag.qdrant_readiness \
+          "${python_runner[@]}" -m document_services.persistence.qdrant_readiness \
           --config "$run_dir/run_config.yaml" \
           --attestation "$expected_retrieval_artifact" \
           --revision-id "$revision_id" \
@@ -1227,12 +1227,12 @@ PY
       -e "$run_dir/tree.json" || -L "$run_dir/tree.json" \
     ) ]]; then
       if run_tracked "existing tree integrity verification" \
-        "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir"; then
+        "${python_runner[@]}" -m document_services.evidence.tree_integrity --run "$run_dir"; then
         :
       else
         echo "[driver] existing tree pair is inconsistent; quarantining tree and dependent outputs" >&2
         if run_tracked "tree recovery quarantine" \
-          python3 -m docarag.recovery \
+          python3 -m document_services.indexing.recovery \
           --run "$run_dir" --attempt-dir "$DRIVER_ATTEMPT_DIR" \
           --retrieval-artifact "$expected_retrieval_artifact" --from-stage tree; then
           :
@@ -1277,7 +1277,7 @@ PY
     # A stage's output belongs to the store the moment the stage ends; the
     # vector stage reads the tree from PostgreSQL, not from a file.
     if [[ "$stage" == "tree" || "$stage" == "graph" ]]; then
-      if ! "${python_runner[@]}" -m docarag.evidence_persist         --run "$run_dir" --part "$stage"; then
+      if ! "${python_runner[@]}" -m document_services.persistence.evidence_writer         --run "$run_dir" --part "$stage"; then
         status=$?
         error="$stage evidence persistence failed"
         update_index_state "$state_file" "$revision_id" "$$" stage_failed "$stage" "$status" "$error"
@@ -1292,17 +1292,17 @@ PY
       # own ingestion -- deliberately gated on vdb, the last stage, not graph,
       # so cross-linking is the capstone step for a document, never a mid-
       # pipeline side effect that runs while vdb is still pending. Never
-      # fails the driver -- see docarag.pipeline's own
+      # fails the driver -- see document_services.indexing.pipeline's own
       # _trigger_planned_cross_doc_link docstring for why.
       echo "[driver] $(date) cross-doc-link hook"
-      "${python_runner[@]}" -m docarag.pipeline cross_doc_link_auto --run "$run_dir" || true
+      "${python_runner[@]}" -m document_services.indexing.pipeline cross_doc_link_auto --run "$run_dir" || true
     fi
     # The tree the graph and vector stages read is the stored one, so it is
     # checked here -- once it exists, and before hours of extraction are spent
     # on a tree whose figures nothing can open.
     if [[ "$stage" == "tree" ]]; then
       if ! run_tracked "stored tree integrity verification" \
-        "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir" --check store; then
+        "${python_runner[@]}" -m document_services.evidence.tree_integrity --run "$run_dir" --check store; then
         status=1
         error="the stored tree is unsound; see $run_dir/logs/index-driver.log"
         update_index_state "$state_file" "$revision_id" "$$" stage_failed "$stage" "$status" "$error"
@@ -1328,7 +1328,7 @@ PY
     return "$status"
   fi
   if run_tracked "final tree integrity verification" \
-    "${python_runner[@]}" -m docarag.tree_integrity --run "$run_dir" --check all; then
+    "${python_runner[@]}" -m document_services.evidence.tree_integrity --run "$run_dir" --check all; then
     :
   else
     status=$?
@@ -1354,7 +1354,7 @@ PY
     publication_retrieval_args=(--retrieval-attestation "$expected_retrieval_artifact")
   fi
   if run_tracked "artifact manifest publication" \
-    "${python_runner[@]}" -m docarag.provenance publish \
+    "${python_runner[@]}" -m document_services.evidence.provenance publish \
     --run "$run_dir" \
     --revision-id "$revision_id" \
     --attempt-id "$DRIVER_ATTEMPT_ID" \
@@ -1372,7 +1372,7 @@ PY
   fi
   # Retrieval reads the tree and the graph from the store, so a run that does
   # not persist its evidence has not produced a usable index.
-  if "${python_runner[@]}" -m docarag.evidence_persist --run "$run_dir"; then
+  if "${python_runner[@]}" -m document_services.persistence.evidence_writer --run "$run_dir"; then
     echo "[driver] $(date) evidence persisted to PostgreSQL"
   else
     status=$?
@@ -1417,7 +1417,7 @@ finalize_run() {
   fi
   export DRIVER_ATTEMPT_ID="$attempt_id"
 
-  if ! python3 -m docarag.evidence_persist --run "$run_dir"; then
+  if ! python3 -m document_services.persistence.evidence_writer --run "$run_dir"; then
     echo "[finalize] evidence persistence failed; the index cannot be queried" >&2
     return 1
   fi
@@ -1475,7 +1475,7 @@ if [[ -n "$ROUTED_PROFILE" ]]; then
   mapfile -t ROUTED_PROFILE_BINDING < <(python3 - "$ROUTED_PROFILE" <<'PY'
 import sys
 
-from docarag.routed_profile import load_routed_runtime_profile
+from document_services.runtime.routing_profile import load_routed_runtime_profile
 
 profile = load_routed_runtime_profile(sys.argv[1])
 issues = profile.configuration_issues()
@@ -1540,7 +1540,7 @@ mapfile -t DERIVED_DOCUMENT_IDENTITY < <(python3 - "$PDF" "$PDF_SHA256" <<'PY'
 from pathlib import Path
 import sys
 
-from docarag.domain.evidence import DocumentRef
+from document_services.domain.evidence import DocumentRef
 
 source_uri = Path(sys.argv[1]).resolve().as_uri()
 document = DocumentRef.identified(
@@ -1664,7 +1664,7 @@ if GIT_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"; then
 else
   GIT_COMMIT="unknown"
 fi
-if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no -- main.py Core docarag Scripts/index_pdf.sh 2>/dev/null || true)" ]]; then
+if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no -- main.py retrieval_engine document_services Scripts/index_pdf.sh 2>/dev/null || true)" ]]; then
   GIT_DIRTY=true
 else
   GIT_DIRTY=false

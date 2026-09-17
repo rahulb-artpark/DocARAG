@@ -18,18 +18,19 @@ dependencies = [
 ]
 
 [project.scripts]
-docarag = "docarag.cli:main"
+docarag = "document_services.cli:main"
 
 [tool.setuptools.dynamic]
-version = {attr = "docarag.__version__"}
+version = {attr = "document_services.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["docarag*"]
-exclude = ["Core*", "Eval*", "Scripts*", "tests*"]
+include = ["document_services*"]
+exclude = ["retrieval_engine*", "Core*", "Eval*", "Scripts*", "tests*"]
 
 [tool.setuptools.package-data]
-docarag = [
-    "runtime_compatibility.toml",
+document_services = [
+    "runtime/runtime_compatibility.toml",
     "profiles/*.toml",
+    "persistence/migrations/*.sql",
 ]

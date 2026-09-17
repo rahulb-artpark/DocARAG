@@ -8,8 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag.domain import DocumentRef
-from docarag.persistence import (
+from document_services.domain import DocumentRef
+from document_services.persistence import (
     ArtifactAvailability,
     ArtifactReceiptRecord,
     CorpusScope,
@@ -28,8 +28,8 @@ from docarag.persistence import (
     resolve_database_url,
     safe_database_endpoint,
 )
-from docarag.persistence.schema import EVIDENCE_TABLES, SCHEMA_SHA256, SCHEMA_SQL
-from docarag.settings import RuntimeSettings, initialize_settings, load_settings
+from document_services.persistence.schema import EVIDENCE_TABLES, SCHEMA_SHA256, SCHEMA_SQL
+from document_services.runtime.settings import RuntimeSettings, initialize_settings, load_settings
 
 
 class _Result:
@@ -592,7 +592,7 @@ class PostgresTruthRecordTests(unittest.TestCase):
             status=StageEventStatus.PROGRESS,
             payload={"page_index": 0},
         )
-        from docarag.domain.base import content_sha256
+        from document_services.domain.base import content_sha256
 
         def handler(query, _params):
             if query.startswith("SELECT event_id"):
@@ -623,7 +623,7 @@ class PostgresWorkQueueTests(unittest.TestCase):
             priority=10,
             max_attempts=4,
         )
-        from docarag.domain.base import content_sha256
+        from document_services.domain.base import content_sha256
 
         def handler(query, _params):
             if query.startswith("SELECT work_item_id"):
@@ -713,7 +713,7 @@ class PostgresWorkQueueTests(unittest.TestCase):
         self.assertIn("attempt_count = work.attempt_count + 1", query)
 
     def test_stale_fencing_token_cannot_complete_work(self):
-        from docarag.persistence import WorkLease
+        from document_services.persistence import WorkLease
 
         lease = WorkLease(
             scope=_scope(),
@@ -737,7 +737,7 @@ class PostgresWorkQueueTests(unittest.TestCase):
         self.assertIn("lease_expires_at > clock_timestamp()", update)
 
     def test_failed_attempt_is_requeued_until_attempt_budget_is_exhausted(self):
-        from docarag.persistence import WorkLease
+        from document_services.persistence import WorkLease
 
         lease = WorkLease(
             scope=_scope(),

@@ -26,17 +26,17 @@ class ControllerWheelBoundaryTests(unittest.TestCase):
             class CheckoutImportBlocker(importlib.abc.MetaPathFinder):
                 def find_spec(self, fullname, path=None, target=None):
                     root = fullname.partition(".")[0]
-                    if root in {"Core", "yaml"}:
+                    if root in {"Core", "retrieval_engine", "yaml"}:
                         raise AssertionError(f"forbidden controller import: {fullname}")
                     return None
 
             sys.meta_path.insert(0, CheckoutImportBlocker())
 
-            from docarag import cli
+            from document_services import cli
 
-            assert "docarag.compat" not in sys.modules
+            assert "document_services.runtime.bookrag_bridge" not in sys.modules
             assert not any(
-                name == "Core" or name.startswith("Core.") for name in sys.modules
+                name == "retrieval_engine" or name.startswith("retrieval_engine.") for name in sys.modules
             )
             assert not any(
                 name == "yaml" or name.startswith("yaml.") for name in sys.modules
@@ -75,7 +75,7 @@ class ControllerWheelBoundaryTests(unittest.TestCase):
                     raise AssertionError("storage --help did not exit through argparse")
             assert "status" in storage_help.getvalue()
 
-            assert "docarag.compat" not in sys.modules
+            assert "document_services.runtime.bookrag_bridge" not in sys.modules
             print("controller-boundary-ok")
             """
         )

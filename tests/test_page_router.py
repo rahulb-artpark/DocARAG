@@ -4,7 +4,7 @@ import subprocess
 import sys
 import unittest
 
-from docarag.domain import (
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     ContractValidationError,
@@ -12,8 +12,8 @@ from docarag.domain import (
     ParserCapabilityManifest,
     ParserModality,
 )
-from docarag.ports import ParserRegistry
-from docarag.routing import (
+from document_services.ports import ParserRegistry
+from document_services.parsing.routing import (
     AdapterRoutingProfile,
     DeterministicPageRouter,
     NoCapableParserError,
@@ -480,8 +480,8 @@ class DeterministicPageRouterTests(unittest.TestCase):
     def test_import_is_free_of_vendor_model_and_bookrag_core_modules(self):
         script = """
 import json, sys
-import docarag.routing
-forbidden = ('Core', 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
+import document_services.parsing.routing
+forbidden = ("retrieval_engine", 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """
         completed = subprocess.run(

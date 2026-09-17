@@ -4,15 +4,15 @@ from collections.abc import Mapping
 import copy
 import unittest
 
-from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
-from docarag.adapters.paddleocr_vl import PaddleOCRVLPageAdapter
-from docarag.adapters.semantic_normalization import (
+from document_services.parser_adapters.mineru_compat import MinerUNormalizedAdapter
+from document_services.parser_adapters.paddleocr_vl import PaddleOCRVLPageAdapter
+from document_services.parser_adapters.semantic_normalization import (
     MAX_MATHML_BYTES,
     MAX_MATHML_DEPTH,
     MAX_MATHML_ELEMENTS,
     explicit_diagram_substructure,
 )
-from docarag.domain import (
+from document_services.domain import (
     ParseErrorCode,
     ParseStatus,
     RelationType,
@@ -22,11 +22,15 @@ from docarag.domain import (
     SemanticRelationKind,
     SemanticStructureKind,
 )
-from tests.test_docling_adapter import adapter as docling_adapter
-from tests.test_docling_adapter import export_fixture as docling_export_fixture
-from tests.test_docling_adapter import request_fixture as docling_request_fixture
-from tests.test_paddleocr_vl_adapter import page_results_fixture
-from tests.test_paddleocr_vl_adapter import request_fixture as paddle_request_fixture
+from tests.test_docling_adapter import (
+    adapter as docling_adapter,
+    export_fixture as docling_export_fixture,
+    request_fixture as docling_request_fixture,
+)
+from tests.test_paddleocr_vl_adapter import (
+    page_results_fixture,
+    request_fixture as paddle_request_fixture,
+)
 from tests.test_parser_contracts import request_fixture as generic_request_fixture
 
 

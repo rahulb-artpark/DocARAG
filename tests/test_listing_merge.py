@@ -22,7 +22,7 @@ that both are already whole keeps them apart.
 
 import unittest
 
-from Core.pipelines.pdf_refiner import listing_merger
+from retrieval_engine.parsing.pdf_refinement import listing_merger
 
 
 def _text(text, *, top, left=95, right=480, lines=1, level=None, page=6):

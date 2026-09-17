@@ -10,18 +10,18 @@ import tempfile
 import unittest
 from unittest import mock
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.pipelines import doc_tree_builder
-from Core.pipelines.doc_tree_builder import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.indexing.tree import builder as doc_tree_builder
+from retrieval_engine.indexing.tree.builder import (
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
     CanonicalIngestionBindingError,
     CanonicalIngestionPolicy,
     CanonicalIngestionResult,
     build_tree_from_pdf,
 )
-from docarag.domain.base import CONTRACT_SCHEMA_VERSION
-from docarag.bookrag_projection import project_to_bookrag_pdf_list
-from docarag.domain import (
+from document_services.domain.base import CONTRACT_SCHEMA_VERSION
+from document_services.evidence.projections.bookrag import project_to_bookrag_pdf_list
+from document_services.domain import (
     BlockType,
     BoundingBox,
     CanonicalBlock,

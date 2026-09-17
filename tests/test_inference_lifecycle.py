@@ -9,9 +9,9 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from Core.inference import create_rag_session, run_rag
-from Core.provider.TokenTracker import TokenTracker
-from Core.rag.session import RAGSession
+from retrieval_engine.runtime.inference import create_rag_session, run_rag
+from retrieval_engine.providers.token_tracker import TokenTracker
+from retrieval_engine.rag.session import RAGSession
 
 
 class InferenceLifecycleTests(unittest.TestCase):
@@ -187,8 +187,8 @@ class InferenceLifecycleTests(unittest.TestCase):
         rag = Mock()
 
         with (
-            patch("Core.inference.prepare_rag_dependencies", return_value={}),
-            patch("Core.inference.create_rag_agent", return_value=rag),
+            patch("retrieval_engine.runtime.inference.prepare_rag_dependencies", return_value={}),
+            patch("retrieval_engine.runtime.inference.create_rag_agent", return_value=rag),
         ):
             session = create_rag_session(cfg)
 

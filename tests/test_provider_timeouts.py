@@ -7,15 +7,15 @@ from unittest.mock import Mock, patch
 
 from pydantic import BaseModel
 
-from Core.configs.llm_config import LLMConfig
-from Core.configs.vlm_config import VLMConfig
-from Core.provider.llm import (
+from retrieval_engine.configuration.language_model import LLMConfig
+from retrieval_engine.configuration.vision_model import VLMConfig
+from retrieval_engine.providers.language_model import (
     CompletionAttemptsExhausted,
     LLM,
     OllamaController,
     OpenAIController,
 )
-from Core.provider.vlm import GPTVLMController, OllamaVLMController
+from retrieval_engine.providers.vision_model import GPTVLMController, OllamaVLMController
 
 
 class _Payload(BaseModel):
@@ -150,7 +150,7 @@ class LLMTimeoutPropagationTests(unittest.TestCase):
         llm.llm = Mock()
         llm.llm.get_completion.side_effect = TimeoutError(secret)
 
-        with self.assertLogs("Core.provider.llm", level="WARNING") as captured:
+        with self.assertLogs("retrieval_engine.providers.language_model", level="WARNING") as captured:
             with self.assertRaises(CompletionAttemptsExhausted):
                 llm.get_completion("question")
 

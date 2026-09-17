@@ -5,15 +5,15 @@ import subprocess
 import sys
 import unittest
 
-from docarag.bookrag_projection import BookRAGImageMaterialPolicy
-from docarag.composition import (
+from document_services.evidence.projections.bookrag import BookRAGImageMaterialPolicy
+from document_services.parsing.bookrag_handoff import (
     BookRAGHandoffNotReadyError,
     BookRAGHandoffReadiness,
     CompositionBindingError,
     RoutedBookRAGFacade,
     RoutedBookRAGResult,
 )
-from docarag.domain import (
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     BoundingBox,
@@ -38,15 +38,15 @@ from docarag.domain import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.parsing_orchestrator import RoutedParsingStatus
-from docarag.ports import ParserRegistry
-from docarag.presets import (
+from document_services.parsing.orchestrator import RoutedParsingStatus
+from document_services.ports import ParserRegistry
+from document_services.parsing.routing_presets import (
     DOCLING_ADAPTER,
     MINERU_ADAPTER,
     PADDLEOCR_VL_ADAPTER,
     balanced_pdf_routing_policy,
 )
-from docarag.routing import PageFeatures
+from document_services.parsing.routing import PageFeatures
 
 
 def document(page_count: int = 1) -> DocumentRef:
@@ -443,8 +443,8 @@ class RoutedBookRAGResultContractTests(unittest.TestCase):
     def test_import_does_not_load_vendor_model_or_bookrag_core_modules(self):
         script = """
 import json, sys
-import docarag.composition
-forbidden = ('Core', 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
+import document_services.parsing.bookrag_handoff
+forbidden = ("retrieval_engine", 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """
         completed = subprocess.run(

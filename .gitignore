@@ -207,3 +207,8 @@ test/
 /config/tmp/*
 /runs/
 tmp/
+
+# Local vector-index locks and historical root-level failure reports.
+/.qdrant-tree-attestation.*.lock
+/*-index_error_split_*.txt
+/*-rag_error_split_*.txt

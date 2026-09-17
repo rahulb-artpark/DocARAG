@@ -10,18 +10,18 @@ from typing import Iterator
 from urllib.parse import urlsplit
 from rich.logging import RichHandler
 
-from Core.configs.system_config import load_system_config, SourceIdentity, SystemConfig
-from Core.configs.dataset_config import load_dataset_config, DatasetConfig
-from Core.construct_index import (
+from retrieval_engine.configuration.system import load_system_config, SourceIdentity, SystemConfig
+from retrieval_engine.configuration.dataset import load_dataset_config, DatasetConfig
+from retrieval_engine.indexing.pipeline import (
     construct_GBC_index,
     construct_vdb,
     compute_mm_reranker,
     rebuild_graph_vdb,
 )
-from Core.inference import inference
-from Core.pipelines.doc_tree_builder import CanonicalIngestionProvider
-from docarag.run_logging import RunLogInfo, RunLogScope
-from docarag.sharding import document_shard_number
+from retrieval_engine.runtime.inference import inference
+from retrieval_engine.indexing.tree.builder import CanonicalIngestionProvider
+from document_services.operations.run_logging import RunLogInfo, RunLogScope
+from document_services.parsing.document_sharding import document_shard_number
 
 log = logging.getLogger(__name__)  # Get logger for main
 
@@ -270,8 +270,8 @@ def routed_parsing_provider(stage: str) -> Iterator[CanonicalIngestionProvider |
         yield None
         return
 
-    from docarag.routed_profile import load_routed_runtime_profile
-    from docarag.runtime_composition import build_balanced_routed_runtime
+    from document_services.runtime.routing_profile import load_routed_runtime_profile
+    from document_services.runtime.parser_composition import build_balanced_routed_runtime
 
     profile = load_routed_runtime_profile(profile_path)
     issues = profile.configuration_issues()
@@ -352,7 +352,7 @@ def setup_logging(
 
     scope = RunLogScope(
         save_path,
-        logger_names=("Core", "docarag", log.name),
+        logger_names=("retrieval_engine", "document_services", log.name),
         console_handler=console_handler,
     )
     with scope as run_info:
@@ -421,7 +421,7 @@ def process_document(
             )
 
     if source_sha256 is not None:
-        from docarag.domain.evidence import DocumentRef
+        from document_services.domain.evidence import DocumentRef
 
         expected_document = DocumentRef.identified(
             content_sha256=source_sha256,
@@ -598,14 +598,15 @@ def main() -> int:
                     log.error(f"  - ERROR: Failed to run inference. Reason: {e}")
                     rag_error_list.append((doc_uuid, str(e)))
 
-        # get the base directory of the script
-        import os
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # Keep generated failure reports with runtime data, outside the source tree.
+        error_log_dir = Path(__file__).resolve().parent / "runs" / "_logs"
+        if index_error_list or rag_error_list:
+            error_log_dir.mkdir(parents=True, exist_ok=True)
         dataset_name = dataset_cfg.dataset_name
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         if index_error_list:
             error_log_path = (
-                Path(base_dir)
+                error_log_dir
                 / f"{dataset_name}-index_error_split_{args.num}_{timestamp}.txt"
             )
             with open(error_log_path, "w", encoding="utf-8") as f:
@@ -617,7 +618,7 @@ def main() -> int:
 
         if rag_error_list:
             error_log_path = (
-                Path(base_dir)
+                error_log_dir
                 / f"{dataset_name}-rag_error_split_{args.num}_{timestamp}.txt"
             )
             with open(error_log_path, "w", encoding="utf-8") as f:

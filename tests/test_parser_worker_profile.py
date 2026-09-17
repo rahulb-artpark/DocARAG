@@ -10,10 +10,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag import cli
-from docarag.artifact_store import LocalContentAddressedArtifactStore
-from docarag.domain.base import canonical_json_bytes
-from docarag.parser_worker import (
+from document_services import cli
+from document_services.persistence.artifact_store import LocalContentAddressedArtifactStore
+from document_services.domain.base import canonical_json_bytes
+from document_services.runtime.parser_worker import (
     ParserWorkerCompositionError,
     ParserWorkerProfileValidationError,
     ParserWorkerVendor,
@@ -24,11 +24,11 @@ from docarag.parser_worker import (
     build_parser_worker_runtime,
     load_parser_worker_profile,
 )
-from docarag.services.mineru import MAX_MINERU_TASKS_PER_PARSE_RESULT
+from document_services.parser_clients.mineru import MAX_MINERU_TASKS_PER_PARSE_RESULT
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PROFILE_ROOT = REPOSITORY_ROOT / "docarag" / "profiles"
+PROFILE_ROOT = REPOSITORY_ROOT / "document_services" / "profiles"
 EXAMPLES = {
     ParserWorkerVendor.DOCLING: PROFILE_ROOT / "docling.example.toml",
     ParserWorkerVendor.MINERU: PROFILE_ROOT / "mineru.example.toml",
@@ -480,7 +480,7 @@ class ParserWorkerCLITests(unittest.TestCase):
         stdout = io.StringIO()
         with (
             patch(
-                "docarag.parser_worker.build_parser_worker_runtime",
+                "document_services.runtime.parser_worker.build_parser_worker_runtime",
                 return_value=runtime,
             ),
             contextlib.redirect_stdout(stdout),

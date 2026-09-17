@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
-from Core.configs.dataset_config import DatasetConfig
+from retrieval_engine.configuration.dataset import DatasetConfig
 from Eval.utils.extract_answer import AnswerExtractor, load_prompt
 from Eval.utils.utils import get_all_cost
 

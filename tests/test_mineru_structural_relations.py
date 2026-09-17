@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
-from docarag.domain import (
+from document_services.parser_adapters.mineru_compat import MinerUNormalizedAdapter
+from document_services.domain import (
     BlockType,
     ParserModality,
     RelationType,

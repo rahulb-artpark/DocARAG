@@ -78,11 +78,11 @@ class MainConfigSnapshotTests(unittest.TestCase):
         with (
             patch.dict(os.environ, environment, clear=False),
             patch(
-                "docarag.routed_profile.load_routed_runtime_profile",
+                "document_services.runtime.routing_profile.load_routed_runtime_profile",
                 return_value=profile,
             ) as loader,
             patch(
-                "docarag.runtime_composition.build_balanced_routed_runtime",
+                "document_services.runtime.parser_composition.build_balanced_routed_runtime",
                 return_value=runtime,
             ) as builder,
         ):
@@ -116,11 +116,11 @@ class MainConfigSnapshotTests(unittest.TestCase):
                 clear=False,
             ),
             patch(
-                "docarag.routed_profile.load_routed_runtime_profile",
+                "document_services.runtime.routing_profile.load_routed_runtime_profile",
                 return_value=profile,
             ),
             patch(
-                "docarag.runtime_composition.build_balanced_routed_runtime"
+                "document_services.runtime.parser_composition.build_balanced_routed_runtime"
             ) as builder,
             self.assertRaisesRegex(RuntimeError, "source_sha256"),
         ):

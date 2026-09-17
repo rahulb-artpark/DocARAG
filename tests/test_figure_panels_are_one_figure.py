@@ -20,7 +20,7 @@ import unittest
 
 from PIL import Image
 
-from Core.pipelines.pdf_refiner import figure_merger
+from retrieval_engine.parsing.pdf_refinement import figure_merger
 
 
 PANEL_PX = 28  # 14 units at 2 px/unit

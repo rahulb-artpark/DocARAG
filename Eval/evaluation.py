@@ -1,4 +1,5 @@
-from Core.configs.dataset_config import DatasetConfig, load_dataset_config
+from retrieval_engine.configuration.dataset import DatasetConfig
+from retrieval_engine.configuration.dataset import load_dataset_config
 from Eval.utils.m3doc_eval import eval_m3doc
 from Eval.utils.mmlong_eval import eval_mmlong
 from Eval.utils.qasper_eval import eval_qasper

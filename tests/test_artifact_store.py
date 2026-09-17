@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from docarag.artifact_store import (
+from document_services.persistence.artifact_store import (
     ArtifactStoreError,
     ArtifactStoreErrorCode,
     LocalContentAddressedArtifactStore,
@@ -19,9 +19,9 @@ from docarag.artifact_store import (
     make_mineru_archive_publisher,
     make_paddleocr_vl_artifact_sink,
 )
-from docarag.domain import AssetKind
-from docarag.services.mineru import MinerUArchive
-from docarag.services.paddleocr_vl import (
+from document_services.domain import AssetKind
+from document_services.parser_clients.mineru import MinerUArchive
+from document_services.parser_clients.paddleocr_vl import (
     PaddleOCRVLArtifact,
     PaddleOCRVLArtifactRole,
 )
@@ -191,7 +191,7 @@ class LocalContentAddressedArtifactStoreTests(unittest.TestCase):
                     os.chmod(stored.path, 0o400)
                 return chunk
 
-            with patch("docarag.artifact_store.os.read", side_effect=mutate_after_read):
+            with patch("document_services.persistence.artifact_store.os.read", side_effect=mutate_after_read):
                 with self.assertRaises(ArtifactStoreError) as conflict:
                     store.publish(payload)
 

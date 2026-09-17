@@ -11,7 +11,7 @@ from __future__ import annotations
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-from Core.utils.phase_timing import PhaseTimings, PhaseTotal
+from retrieval_engine.utils.timing import PhaseTimings, PhaseTotal
 
 
 class ConstructionTests(unittest.TestCase):
@@ -116,7 +116,7 @@ class SummaryTests(unittest.TestCase):
         timings.add("rerank", 4.0)
         timings.add("vector_search", 1.0)
 
-        with self.assertLogs("Core.utils.phase_timing", level="INFO") as captured:
+        with self.assertLogs("retrieval_engine.utils.timing", level="INFO") as captured:
             timings.log_summary()
 
         line = captured.output[0]

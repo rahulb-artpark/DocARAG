@@ -20,6 +20,9 @@
 
 ## Current DocARAG quick start
 
+For package responsibilities, the source tree, and migrated internal imports,
+see the [code structure guide](docs/code_structure.md).
+
 The runnable path today is the **BookRAG compatibility runtime**, not yet the
 promised standalone `lite` product. If the existing `gbc-rag` environment and
 its configured model services are already installed, the shortest supported
@@ -277,7 +280,7 @@ The current/target boundary is intentionally explicit:
 | Ingestion | One PDF through the supported MinerU compatibility runtime; common Docling/MinerU/Paddle contracts; source-bound lazy PyMuPDF probe; deterministic routing/fusion; versioned generic parser-worker HTTP client/server; strict official-protocol service clients; verified source-byte handoff; immutable local-CAS assets; result-scoped MinerU/Paddle raw-artifact receipts; one-vendor foreground worker composition with strict TOML profiles; fail-closed routed provider with staged, rollback-protected ready-pair replacement/reuse; injected Core provider plumbing; an opt-in Python composition root; a bounded application-level routed extraction receipt that binds both canonical and replay-audit bytes; and explicit structural plus table/formula/diagram subgraphs preserved through canonical reconciliation into BookRAG tree metadata | Transactional parser-artifact publication/orphan GC; streaming large parser/audit envelopes; pinned service images and owned supervision; supported routed `docarag index` composition through the application use case; live qualification of MinerU/Paddle rich semantic fields; real-model version pins; multi-host object/artifact transport; durable database-backed canonical repository; non-PDF ingestion |
 | Reproducibility | Content-addressed PDF snapshot, immutable input identity, attempt history, runtime fingerprint, checksummed manifest, canonical/derived lineage, source-bound summary/KG checkpoints, deep verification of run-local artifacts, a fixture-only runtime compatibility manifest checked by `doctor`, and an atomic source/tree/config/embedding-bound readiness attestation for the scoped Qdrant points | Certified package/model/container pins, served-weight fingerprints in revision identity, durable page/block/entity/relation/GT-Link repositories, remote Qdrant content reconciliation, and leased resumable work items |
 | Retrieval evidence | A bounded canonical catalog/tree hydrator validates document version, source hash, tree lineage, canonical block/revision, all available and actually selected representation/asset IDs, page/geometry/structure, and emits citation IDs. A standalone local/CAS byte resolver verifies assets without following symlinks. Structural citation markers are validated against exact supplied bindings, including collision-free complex-query scopes. Immutable DTOs define exact representation/asset/span/cell/bbox/diagram anchors, directed parallel relation assertions, candidate GT-Links, and revision-bound evidence-graph releases. The bounded builder consumes encoded checkpoints only after byte limits; requires canonical-input and tree-evidence-descriptor references to exact deterministic length-framed snapshots; verifies their bytes/size and selected CAS assets through exact materialization receipts; and incrementally guards release size. The descriptor snapshot includes `tree_revision_id` but is not a full `T` manifest. Original PDF/parser-native artifacts, full tree, and legacy pickle remain separately traceable. Current legacy checkpoint evidence is coarse whole-node selection, so its releases are publishable audit artifacts, not authority-eligible graph evidence. The legacy `G/M` projection is a checked compatibility view. Verified/CAS-leased image material is the default; the explicitly named unverified mutable-local-path enum marks the complete output `legacy_inspection_only`. | An adopted full-tree manifest binding root, topology, sibling order, node content, source/canonical revision and descriptor digest; exact-receipt live KG construction plus a fenced durable adoption ledger; preservation of pre-`res_repair` extractor assertions (the current checkpoint has already aggregated/collapsed some rows); exact per-model material-use receipts and assertion-specific evidence/support receipts; immutable verified asset snapshot-to-answer-model integration; structured table/formula verification; a typed public answer result; immutable Map claims with direct source receipts, Reduce claims bound to exact child-claim digests, and semantic support validation over the complete source-reaching claim DAG |
-| Operations | Repository/editable-install CLI, read-only `setup-plan`, diagnostics, implemented PostgreSQL/Qdrant `storage up/down/migrate/status`, detached indexing, status, verification, ask, loopback Web UI, secret-safe routed-profile inspection, and read-only parser-worker profile validation plus foreground `serve`; one shared, dependency-inverted routed document-extraction application use case now returns compact content-bound canonical and replay-audit receipts, but the legacy CLI does not call it yet; explicit owned/borrowed `RAGSession`; context-scoped token ledgers and named-logger files propagated through bounded worker threads; strict backend-specific provider validation, finite per-attempt remote request timeouts and bounded retries; stable SHA document sharding; identity-bound atomic query cache and streaming JSONL/generator/DataFrame result publication. The installed wheel's entry point plus help, settings, and storage command family are tested without checkout-owned `Core` or PyYAML imports. Commands that operate the BookRAG compatibility run (`status` execution, named-run selection/verification, `index`, `ask`, and `web`) still require configured checkout resources; `index`/`ask`/`web` additionally require the heavyweight BookRAG runtime. There is no supported CPU-lite golden path yet. | Complete shared `index/search/query/status/evidence` application services, a standalone complete `lite` distribution and packaged compatibility-run services, locked dependency groups, whole-product parser/model-service `up`/`down`, explicit model pulls, `lite`/`workstation`/`production` deployment profiles, separate immutable `native`/`routed`/`routed-adjudicated` build policies and request-scoped `fast`/`balanced`/`deep` query budgets, capacity-aware cross-process GPU/model leases, CAS quota/garbage collection, fully streaming main dataset ingestion, clean-host runtime qualification, authenticated public API |
+| Operations | Repository/editable-install CLI, read-only `setup-plan`, diagnostics, implemented PostgreSQL/Qdrant `storage up/down/migrate/status`, detached indexing, status, verification, ask, loopback Web UI, secret-safe routed-profile inspection, and read-only parser-worker profile validation plus foreground `serve`; one shared, dependency-inverted routed document-extraction application use case now returns compact content-bound canonical and replay-audit receipts, but the legacy CLI does not call it yet; explicit owned/borrowed `RAGSession`; context-scoped token ledgers and named-logger files propagated through bounded worker threads; strict backend-specific provider validation, finite per-attempt remote request timeouts and bounded retries; stable SHA document sharding; identity-bound atomic query cache and streaming JSONL/generator/DataFrame result publication. The installed wheel's entry point plus help, settings, and storage command family are tested without checkout-owned `retrieval_engine` or PyYAML imports. Commands that operate the BookRAG compatibility run (`status` execution, named-run selection/verification, `index`, `ask`, and `web`) still require configured checkout resources; `index`/`ask`/`web` additionally require the heavyweight BookRAG runtime. There is no supported CPU-lite golden path yet. | Complete shared `index/search/query/status/evidence` application services, a standalone complete `lite` distribution and packaged compatibility-run services, locked dependency groups, whole-product parser/model-service `up`/`down`, explicit model pulls, `lite`/`workstation`/`production` deployment profiles, separate immutable `native`/`routed`/`routed-adjudicated` build policies and request-scoped `fast`/`balanced`/`deep` query budgets, capacity-aware cross-process GPU/model leases, CAS quota/garbage collection, fully streaming main dataset ingestion, clean-host runtime qualification, authenticated public API |
 
 The maintainability decision is a **modular monolith controller with isolated
 resource-conflicting workers**. BookRAG and the routing, provenance, and policy
@@ -321,7 +324,7 @@ reference instead.
 The profile is intentionally opt-in and is not selected by `docarag index`:
 
 ```python
-from docarag.routed_profile import load_routed_runtime_profile
+from document_services.runtime.routing_profile import load_routed_runtime_profile
 
 profile = load_routed_runtime_profile("config/routed-balanced.example.toml")
 runtime_config = profile.config
@@ -373,7 +376,7 @@ docarag doctor --strict
 ```
 
 The controller wheel itself has a tested checkout-independent entry point:
-help, settings, and storage command parsing do not import `Core` or PyYAML.
+help, settings, and storage command parsing do not import `retrieval_engine` or PyYAML.
 This is not yet the promised standalone **complete** `lite` distribution,
 because `status` execution, named-run verification, `index`, `ask`, and `web`
 still resolve compatibility resources from a configured BookRAG checkout. The
@@ -392,12 +395,12 @@ records the installed package, model, and service-image identities.
 # This is read-only: it does not resolve secrets, create roots, import PyMuPDF,
 # contact a service, or allocate a model/GPU.
 docarag parser-worker validate \
-  docarag/profiles/docling.example.toml --json
+  document_services/profiles/docling.example.toml --json
 
 # Run one worker in its isolated environment. Ctrl-C stops it and closes owned
 # local resources. Use the corresponding MinerU or Paddle profile/environment
 # for the other workers.
-./.venv-docling/bin/python -m docarag.cli parser-worker serve \
+./.venv-docling/bin/python -m document_services.cli parser-worker serve \
   /absolute/path/to/docling.toml
 ```
 
@@ -572,8 +575,8 @@ remote model name/URL likewise cannot detect weights silently replaced behind
 that identity.
 
 Parser extensions follow one rule: vendor SDK execution stays behind injected
-loaders or isolated workers; the dependency-light DTOs in `docarag/domain`,
-interfaces in `docarag/ports`, and routing/orchestration code never import
+loaders or isolated workers; the dependency-light DTOs in `document_services/domain`,
+interfaces in `document_services/ports`, and routing/orchestration code never import
 model/parser/storage frameworks. A new adapter declares a capability manifest,
 translates into the same validated observation result, and passes the shared
 contract suite. The deterministic page router selects registered adapters
@@ -589,8 +592,8 @@ The supported application composition boundary is `RoutedBookRAGFacade`:
 ```python
 from pathlib import Path
 
-from docarag.composition import RoutedBookRAGFacade
-from docarag.ports import ParserRegistry
+from document_services.parsing.bookrag_handoff import RoutedBookRAGFacade
+from document_services.ports import ParserRegistry
 
 # Each adapter is constructed with an injected file/RPC loader. The loader owns
 # the vendor environment; the controller receives JSON-compatible output only.
@@ -903,8 +906,9 @@ Example preprocessing notebooks and scripts are available in [`Scripts/preproces
 
 ```text
 DocARAG/
-+-- Core/                 # current BookRAG indexing, retrieval, generation, and providers
-+-- docarag/               # controller, canonical domain/ports, provenance, and adapters
++-- retrieval_engine/     # model-backed indexing, retrieval, generation, and providers
++-- document_services/    # controller, application services, persistence, parser integrations
++-- Core/                 # compatibility exports for historical saved indexes only
 +-- Eval/                  # evaluation scripts and answer extraction utilities
 +-- Scripts/               # compatibility drivers, Web UI, examples, and preprocessing
 +-- tests/                 # contracts, lineage, checkpoints, lifecycle, retrieval, and driver tests

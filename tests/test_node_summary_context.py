@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import unittest
 
-from Core.Index.Tree import NodeType, TreeNode
-from Core.pipelines.tree_node_summary import get_node_summary_prompt
+from retrieval_engine.indexes.tree import NodeType, TreeNode
+from retrieval_engine.indexing.tree.summary import get_node_summary_prompt
 
 MAX_TOKEN = 5000
 

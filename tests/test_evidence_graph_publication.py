@@ -9,16 +9,16 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.artifact_store import LocalContentAddressedArtifactStore
-from docarag.domain.base import ContractValidationError, canonical_json_bytes
-from docarag.domain.knowledge import (
+from document_services.persistence.artifact_store import LocalContentAddressedArtifactStore
+from document_services.domain.base import ContractValidationError, canonical_json_bytes
+from document_services.domain.knowledge import (
     EntityMention,
     EvidenceAnchor,
     EvidenceGraphRelease,
     GTLink,
     RelationAssertion,
 )
-from docarag.evidence_graph_checkpoint import (
+from document_services.evidence.graph_checkpoint import (
     CHECKPOINT_MEDIA_TYPE,
     EvidenceGraphAdoptionAuthorization,
     EvidenceGraphCheckpointError,
@@ -26,7 +26,7 @@ from docarag.evidence_graph_checkpoint import (
     EvidenceGraphCheckpointRef,
     EvidenceGraphCheckpointStore,
 )
-from docarag.legacy_graph_projection import (
+from document_services.evidence.projections.legacy_graph import (
     LegacyGraphProjectionCompatibilityError,
     LegacyGraphProjectionLimitError,
     LegacyProjectionLimits,
@@ -505,7 +505,7 @@ class LegacyEvidenceGraphProjectionTests(unittest.TestCase):
         # resulting graph is read-only: assertions remain source DTOs on the
         # bundled legacy edge, while the evidence release stays authoritative.
         try:
-            from Core.Index.Graph import Graph
+            from retrieval_engine.indexes.graph import Graph
         except ModuleNotFoundError as exc:
             if exc.name == "networkx":
                 self.skipTest("BookRAG runtime dependencies are not installed")

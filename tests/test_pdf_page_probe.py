@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from docarag.adapters.pymupdf_probe import PyMuPdfProbeBackend
-from docarag.domain import ContractValidationError, DocumentRef
-from docarag.page_probe import (
+from document_services.parser_adapters.pymupdf_probe import PyMuPdfProbeBackend
+from document_services.domain import ContractValidationError, DocumentRef
+from document_services.parsing.page_probe import (
     PageProbeBackendError,
     PageProbeDependencyError,
     PageSelectionError,
@@ -18,7 +18,7 @@ from docarag.page_probe import (
     SourceBoundPdfPageProbe,
     UnsupportedProbeSourceError,
 )
-from docarag.ports import PageProbe, PageRange
+from document_services.ports import PageProbe, PageRange
 
 
 class _FakeSession:

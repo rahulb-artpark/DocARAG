@@ -9,21 +9,21 @@ projection set at all, so the first one to arrive raised UNREPRESENTABLE_TEXT.
 
 import unittest
 
-from Core.Index.Tree import FURNITURE_NODE_TYPES, NodeType
-from Core.pipelines.doc_tree_builder import _TITLE_CAPABLE_TYPES
-from Core.pipelines.kg_extractor import _TEXTUAL_KG_NODE_TYPES
-from Core.pipelines.tree_node_builder import (
+from retrieval_engine.indexes.tree import FURNITURE_NODE_TYPES, NodeType
+from retrieval_engine.indexing.tree.builder import _TITLE_CAPABLE_TYPES
+from retrieval_engine.indexing.graph.extractor import _TEXTUAL_KG_NODE_TYPES
+from retrieval_engine.indexing.tree.nodes import (
     _TEXT_CONTENT_TYPES,
     create_node_by_type,
 )
-from Core.pipelines.tree_node_summary import _SUMMARISABLE_NODE_TYPES
-from Core.pipelines.vdb_index import _TEXT_NODE_TYPES, _VISUAL_NODE_TYPES
-from docarag.adapters.mineru_compat import DECLARED_BLOCK_TYPES
-from docarag.bookrag_projection import (
+from retrieval_engine.indexing.tree.summary import _SUMMARISABLE_NODE_TYPES
+from retrieval_engine.indexing.vector.builder import _TEXT_NODE_TYPES, _VISUAL_NODE_TYPES
+from document_services.parser_adapters.mineru_compat import DECLARED_BLOCK_TYPES
+from document_services.evidence.projections.bookrag import (
     _NODE_TYPE_BY_BLOCK,
     _TEXT_BLOCKS,
 )
-from docarag.domain.evidence import BlockType
+from document_services.domain.evidence import BlockType
 
 _FURNITURE_BLOCKS = (
     BlockType.HEADER,
@@ -117,7 +117,7 @@ class EveryProjectedNodeTypeCanBeHydrated(unittest.TestCase):
     """
 
     def _projected_types(self):
-        from docarag.bookrag_projection import _VISUAL_NODE_TYPE_BY_BLOCK
+        from document_services.evidence.projections.bookrag import _VISUAL_NODE_TYPE_BY_BLOCK
 
         return (
             set(_NODE_TYPE_BY_BLOCK.values())
@@ -126,7 +126,7 @@ class EveryProjectedNodeTypeCanBeHydrated(unittest.TestCase):
         )
 
     def _hydratable_types(self):
-        from docarag.evidence_hydration import (
+        from document_services.evidence.hydration import (
             _TEXT_NODE_TYPES as HYDRATABLE_TEXT,
             _VISUAL_NODE_TYPES as HYDRATABLE_VISUAL,
         )
@@ -144,7 +144,7 @@ class EveryProjectedNodeTypeCanBeHydrated(unittest.TestCase):
         )
 
     def test_furniture_is_hydratable_even_though_it_is_not_indexed(self):
-        from docarag.evidence_hydration import _TEXT_NODE_TYPES as HYDRATABLE_TEXT
+        from document_services.evidence.hydration import _TEXT_NODE_TYPES as HYDRATABLE_TEXT
 
         for node_type in FURNITURE_NODE_TYPES:
             with self.subTest(node_type=node_type):
@@ -162,7 +162,7 @@ def _reachable_node_types():
     and ROOT is the synthetic document root, not a projected block.
     """
 
-    from docarag.bookrag_projection import (
+    from document_services.evidence.projections.bookrag import (
         _NODE_TYPE_BY_BLOCK,
         _NODE_TYPE_BY_SUBTYPE,
         _VISUAL_NODE_TYPE_BY_BLOCK,
@@ -196,13 +196,13 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
     """
 
     def test_the_index_handles_or_declares_every_reachable_type(self):
-        from Core.pipelines.vdb_index import (
+        from retrieval_engine.indexing.vector.builder import (
             _CROP_BEARING_NODE_TYPES,
             _NOT_INDEXED_NODE_TYPES,
             _TEXT_NODE_TYPES as INDEXED_TEXT,
             _VISUAL_NODE_TYPES as INDEXED_VISUAL,
         )
-        from Core.Index.Tree import NodeType
+        from retrieval_engine.indexes.tree import NodeType
 
         # Mirrors the dispatch: visual, then table/list, then equation, then text.
         indexed = _values(
@@ -219,13 +219,13 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
         )
 
     def test_extraction_handles_or_declares_every_reachable_type(self):
-        from Core.pipelines.kg_extractor import (
+        from retrieval_engine.indexing.graph.extractor import (
             _NOT_EXTRACTED_NODE_TYPES,
             _TEXTUAL_KG_NODE_TYPES,
             _VISUAL_KG_NODE_TYPES,
         )
 
-        from Core.Index.Tree import NodeType
+        from retrieval_engine.indexes.tree import NodeType
 
         # Mirrors the dispatch in _Extractor.extract: textual, then visual, then
         # table, then equation -- plus title, which kg_builder routes to
@@ -243,7 +243,7 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
         self.assertEqual(sorted(undecided), [])
 
     def test_a_type_is_not_both_indexed_and_declared_skipped(self):
-        from Core.pipelines.vdb_index import (
+        from retrieval_engine.indexing.vector.builder import (
             _NOT_INDEXED_NODE_TYPES,
             _TEXT_NODE_TYPES as INDEXED_TEXT,
             _VISUAL_NODE_TYPES as INDEXED_VISUAL,
@@ -255,13 +255,13 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
         self.assertEqual(sorted(both), [])
 
     def test_a_type_is_not_both_extracted_and_declared_skipped(self):
-        from Core.pipelines.kg_extractor import (
+        from retrieval_engine.indexing.graph.extractor import (
             _NOT_EXTRACTED_NODE_TYPES,
             _TEXTUAL_KG_NODE_TYPES,
             _VISUAL_KG_NODE_TYPES,
         )
 
-        from Core.Index.Tree import NodeType
+        from retrieval_engine.indexes.tree import NodeType
 
         both = _values(
             set(_TEXTUAL_KG_NODE_TYPES)
@@ -271,8 +271,8 @@ class EveryReachableNodeTypeIsHandledOrDeclaredSkipped(unittest.TestCase):
         self.assertEqual(sorted(both), [])
 
     def test_furniture_is_declared_skipped_by_both_seams(self):
-        from Core.pipelines.kg_extractor import _NOT_EXTRACTED_NODE_TYPES
-        from Core.pipelines.vdb_index import _NOT_INDEXED_NODE_TYPES
+        from retrieval_engine.indexing.graph.extractor import _NOT_EXTRACTED_NODE_TYPES
+        from retrieval_engine.indexing.vector.builder import _NOT_INDEXED_NODE_TYPES
 
         for node_type in FURNITURE_NODE_TYPES:
             with self.subTest(node_type=node_type):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from Core.Index.Graph import Entity, Graph, Relationship
+from retrieval_engine.indexes.graph import Entity, Graph, Relationship
 
 
 class GraphEvidenceTests(unittest.TestCase):

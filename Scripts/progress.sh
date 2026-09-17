@@ -170,7 +170,7 @@ retrieval_is_ready() {
   local readiness_python="${DOCARAG_PYTHON:-python3}"
   [[ -n "$path" && -s "$path" ]] || return 1
   [[ "$(basename "$path")" == "bm25_index.pkl" ]] && return 0
-  "$readiness_python" -m docarag.qdrant_readiness \
+  "$readiness_python" -m document_services.persistence.qdrant_readiness \
     --config "$run/run_config.yaml" \
     --attestation "$path" \
     --revision-id "$(basename "$run")" >/dev/null 2>&1

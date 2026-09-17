@@ -51,9 +51,9 @@ logging.basicConfig(
     level=logging.INFO if VERBOSE else logging.WARNING,
     format="%(message)s",
 )
-from Core.configs.system_config import load_system_config
-from Core.rag import create_rag_agent
-from Core.utils.resource_loader import prepare_rag_dependencies
+from retrieval_engine.configuration.system import load_system_config
+from retrieval_engine.rag import create_rag_agent
+from retrieval_engine.runtime.resource_loader import prepare_rag_dependencies
 
 EXIT_WORDS = {"exit", "quit", "q", ":q", "bye"}
 

@@ -1,0 +1,164 @@
+import os
+
+from zmq import ContextTerminated
+
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from retrieval_engine.indexes.vector_store import VectorStore
+from retrieval_engine.providers.vision_model import VLM
+from retrieval_engine.providers.language_model import LLM
+from retrieval_engine.rag.base_strategy import BaseRAG
+from retrieval_engine.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
+from retrieval_engine.configuration.strategies.vanilla import VanillaConfig
+from retrieval_engine.indexes.bm25 import BM25
+from retrieval_engine.utils.text import TextProcessor
+
+from typing import Dict, Any, List
+import json
+import logging
+
+log = logging.getLogger(__name__)
+
+
+class VanillaRAG(BaseRAG):
+    """
+    Text-only Vanilla Retrieval Augmented Generation,
+    supports vanilla, BM25, RAPTOR, PDF+Vanilla
+    """
+
+    def __init__(
+        self,
+        config: VanillaConfig,
+        vector_store: VectorStore,
+        llm: LLM,
+        bm25: BM25 = None,
+    ):
+        super().__init__(
+            llm=llm,
+            name="MM RAG",
+            description="Text-only Vanilla Retrieval Augmented Generation",
+        )
+        self.cfg = config
+        self.max_tokens = self.llm.config.max_tokens - 200
+        log.info("Vanilla RAG initialized.")
+        self.topk = self.cfg.topk
+
+        if self.cfg.retrieval_method == "bm25":
+            self.bm25: BM25 = bm25
+        else:
+            self.vdb = vector_store
+
+    def _retrieve(self, query: str, top_k: int = 3):
+        if self.cfg.retrieval_method == "bm25":
+            return self.bm25.search(query_text=query, top_k=top_k)
+        else:
+            return self.vdb.search(query_text=query, top_k=top_k)
+
+    def _create_augmented_prompt(self, query: str, retrieved_docs=None) -> str:
+        # context_text = "Please refer to the following background information to answer the question.\n\n--- Background Information ---\n"
+        context_text = "Please refer to the following background information to answer the question. You should base your answer strictly on the provided information and not supplement it with outside knowledge. If the background information is insufficient to answer the question, please state that the provided information is not enough.\n\n--- Background Information ---\n"
+        question_text = f"--- User Question ---\n{query}\n\n"
+        context_text += question_text
+        if retrieved_docs is None:
+            context_text += "No relevant documents found.\n"
+            return context_text
+
+        context_text += "\n--- Retrieved Documents ---\n"
+        for i, doc in enumerate(retrieved_docs):
+            context_text += f"Text {i+1}: {doc['content']}\n"
+
+        context_text = TextProcessor.split_text_into_chunks(
+            text=context_text, max_length=self.max_tokens-400
+        )
+        context_text = context_text[0]  # take the first chunk only
+        return context_text
+
+    @staticmethod
+    def _select_usable_evidence(retrieved_docs) -> List[Dict[str, Any]]:
+        """Keep only retrieval records containing non-blank textual evidence."""
+
+        usable: List[Dict[str, Any]] = []
+        for doc in retrieved_docs or ():
+            if not isinstance(doc, dict):
+                log.warning("Skipping malformed text retrieval record")
+                continue
+            content = doc.get("content")
+            if not isinstance(content, str) or not content.strip():
+                log.warning("Skipping blank text retrieval record %s", doc.get("id"))
+                continue
+            usable.append(doc)
+        return usable
+
+    def _save_retrieval_res(self, context_nodes, query_output_dir) -> List[Dict]:
+        retrieval_ids = []
+        for doc in context_nodes:
+            if "metadata" in doc:
+                meta = doc.get("metadata", {})
+                if "node_id" in meta:
+                    node_id = meta["node_id"]
+                elif "chunk_id" in meta:
+                    node_id = meta["chunk_id"]
+                else:
+                    node_id = meta.get("node_id", meta.get("id", None))
+            elif "node_id" in doc:
+                node_id = doc["node_id"]
+            else:
+                node_id = doc["id"]
+            meta_info_dict = {
+                "id": node_id,
+                "content": doc["content"],
+            }
+            retrieval_ids.append(node_id)
+            node_file_path = query_output_dir / f"{node_id}.json"
+            with open(node_file_path, "w", encoding="utf-8") as f:
+                json.dump(meta_info_dict, f, indent=2, ensure_ascii=False)
+
+        log.info("Saved retrieval results to output directory.")
+
+        return retrieval_ids
+
+    def generation(self, query: str, query_output_dir: str) -> tuple:
+        """
+        Generates an answer for a given query and returns the answer along with the context used.
+        Returns:
+            Tuple[str, List[Any]]: A tuple containing the final answer string and a list of the context nodes.
+        """
+        retrieved_docs = self._retrieve(query, top_k=self.topk)
+        if not retrieved_docs:
+            log.warning("No retrieval evidence found; refusing an ungrounded answer")
+            return NO_RETRIEVED_EVIDENCE_ANSWER, []
+
+        usable_docs = self._select_usable_evidence(retrieved_docs)
+        if not usable_docs:
+            log.warning(
+                "Retrieved text records contained no usable evidence; refusing "
+                "an ungrounded answer"
+            )
+            return NO_RETRIEVED_EVIDENCE_ANSWER, []
+
+        context_text = self._create_augmented_prompt(query, usable_docs)
+
+        final_answer = self.llm.get_completion(context_text, json_response=False)
+
+        retrieval_ids = self._save_retrieval_res(
+            usable_docs, query_output_dir=query_output_dir
+        )
+        return final_answer, retrieval_ids
+
+    def close(self):
+        try:
+            if self.cfg.retrieval_method == "bm25":
+                bm25 = getattr(self, "bm25", None)
+                self.bm25 = None
+                if bm25 is not None:
+                    log.info("Closing BM25 resources...")
+                self._close_owned_resources(("BM25", bm25))
+            else:
+                store = getattr(self, "vdb", None)
+                self.vdb = None
+                embedder = getattr(store, "embedding_model", None)
+                self._close_owned_resources(
+                    ("vector embedder", embedder),
+                    ("vector store", store),
+                )
+        finally:
+            super().close()

@@ -5,8 +5,8 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
-from Core.configs.vdb_config import VDBConfig
-from Core.provider.vdb import VectorStore, qdrant_point_id
+from retrieval_engine.configuration.vector_store import VDBConfig
+from retrieval_engine.indexes.vector_store import VectorStore, qdrant_point_id
 from tests.qdrant_fakes import FakeModels, FakeQdrantClient
 
 
@@ -113,7 +113,7 @@ class QdrantVectorStoreTests(unittest.TestCase):
 
         with (
             patch(
-                "Core.provider.vdb._load_qdrant_components",
+                "retrieval_engine.indexes.vector_store._load_qdrant_components",
                 return_value=(CapturingClient, FakeModels),
             ),
             patch.dict(
@@ -144,7 +144,7 @@ class QdrantVectorStoreTests(unittest.TestCase):
 
         with (
             patch(
-                "Core.provider.vdb._load_qdrant_components",
+                "retrieval_engine.indexes.vector_store._load_qdrant_components",
                 return_value=(CapturingClient, FakeModels),
             ),
             patch.dict(os.environ, {"TEST_QDRANT_KEY": "secret-value"}, clear=False),

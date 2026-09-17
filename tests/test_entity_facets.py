@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from Core.pipelines.entity_facets import (
+from retrieval_engine.indexing.graph.entity_facets import (
     CANONICAL_FIELD,
     _CONTEXT_DESCRIPTION_WORDS,
     collapse_entity_hits,

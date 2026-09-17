@@ -18,8 +18,8 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from Core.rag.gbc_retrieval import HybridRetrievalBinding, Retriever
-from Core.Index.Tree import NodeType
+from retrieval_engine.rag.gbc.retrieval import HybridRetrievalBinding, Retriever
+from retrieval_engine.indexes.tree import NodeType
 
 
 def _node(index_id, content, *, node_type=NodeType.TEXT):

@@ -5,7 +5,7 @@ import unittest
 import networkx as nx
 import numpy as np
 
-from Core.rag.gbc_utils import enhance_graph_with_semantic_links
+from retrieval_engine.rag.gbc.context import enhance_graph_with_semantic_links
 
 
 class _FailIfCalledEmbedder:

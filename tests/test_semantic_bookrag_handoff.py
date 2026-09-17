@@ -9,16 +9,16 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from Core.Index.Tree import DocumentTree, NodeType
-from Core.pipelines import vdb_index
-from Core.pipelines.pdf_refiner import merge_tables_and_mark_invalid
-from Core.pipelines.tree_node_builder import create_node_by_type
-from docarag.bookrag_projection import project_canonical_blocks
-from docarag.canonical_artifacts import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType
+from retrieval_engine.indexing.vector import builder as vdb_index
+from retrieval_engine.parsing.pdf_refinement import merge_tables_and_mark_invalid
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
+from document_services.evidence.projections.bookrag import project_canonical_blocks
+from document_services.evidence.artifacts import (
     CANONICAL_CONTRACT_SCHEMA_VERSION,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
 )
-from docarag.domain import (
+from document_services.domain import (
     BlockType,
     BoundingBox,
     CoordinateOrigin,
@@ -37,8 +37,8 @@ from docarag.domain import (
     SourceGeometry,
     content_sha256,
 )
-from docarag.reconciliation import reconcile_observations
-from docarag.evidence_hydration import (
+from document_services.parsing.reconciliation import reconcile_observations
+from document_services.evidence.hydration import (
     CanonicalEvidenceHydrator,
     EvidenceHydrationError,
 )

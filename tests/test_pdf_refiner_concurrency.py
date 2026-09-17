@@ -13,8 +13,8 @@ import threading
 import time
 import unittest
 
-from Core.pipelines.pdf_refiner import _judge_batches
-from Core.prompts.refiner_prompt import StitchingJudgment, StitchingJudgmentsResponse
+from retrieval_engine.parsing.pdf_refinement import _judge_batches
+from retrieval_engine.prompts.refinement import StitchingJudgment, StitchingJudgmentsResponse
 
 
 class _ScriptedLLM:

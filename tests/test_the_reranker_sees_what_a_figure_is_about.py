@@ -31,8 +31,8 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from Core.Index.Tree import NodeType
-from Core.rag.gbc_retrieval import (
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.rag.gbc.retrieval import (
     _SECTION_RERANK_NODE_TYPES,
     _SUMMARY_RERANK_NODE_TYPES,
     Retriever,

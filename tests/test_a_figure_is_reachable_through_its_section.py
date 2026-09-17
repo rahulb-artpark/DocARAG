@@ -33,8 +33,8 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.pipelines import vdb_index
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.indexing.vector import builder as vdb_index
 
 HEADING = "2.3.2.2.93. Wolter Surface"
 SECTION_SUMMARY = (

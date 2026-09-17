@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.evaluation.golden import (
+from document_services.evaluation.golden import (
     GOLDEN_MANIFEST_SCHEMA_VERSION,
     GOLDEN_PREDICTION_SCHEMA_VERSION,
     evaluate_golden_run,

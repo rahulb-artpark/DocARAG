@@ -5,8 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.evidence_projection import build_document_evidence
-from docarag.persistence.contracts import (
+from document_services.evidence.projections.store import build_document_evidence
+from document_services.persistence.contracts import (
     AssetRecord,
     BlockRecord,
     DocumentEvidence,

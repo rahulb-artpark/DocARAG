@@ -7,7 +7,7 @@ sub_type "algorithm" and sub_type "code".
 
 import unittest
 
-from docarag.adapters.mineru_compat import (
+from document_services.parser_adapters.mineru_compat import (
     content_block_text_parts,
     fence_language,
     unwrap_presentation,
@@ -86,9 +86,9 @@ class TheCanonicalRepresentationIsUnwrapped(unittest.TestCase):
     """
 
     def _text_representation(self, block):
-        from docarag.adapters.mineru_compat import _representations
+        from document_services.parser_adapters.mineru_compat import _representations
 
-        from docarag.domain.evidence import BlockType
+        from document_services.domain.evidence import BlockType
 
         return [
             r
@@ -155,8 +155,8 @@ class TheLanguageReachesTheProjection(unittest.TestCase):
     """
 
     def _representations(self, block):
-        from docarag.adapters.mineru_compat import _representations
-        from docarag.domain.evidence import BlockType
+        from document_services.parser_adapters.mineru_compat import _representations
+        from document_services.domain.evidence import BlockType
 
         return _representations(block, BlockType.CODE, confidence=None, language="en")
 
@@ -203,8 +203,8 @@ class AOneLineListingClaimsNoLanguage(unittest.TestCase):
     """
 
     def _language(self, code_body):
-        from docarag.adapters.mineru_compat import _representations
-        from docarag.domain.evidence import BlockType
+        from document_services.parser_adapters.mineru_compat import _representations
+        from document_services.domain.evidence import BlockType
 
         for representation in _representations(
             {"type": "code", "code_body": code_body},

@@ -5,9 +5,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from Core.Index.Graph import Entity, Graph
-from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
-from Core.pipelines.kg_refinement_state import (
+from retrieval_engine.indexes.graph import Entity, Graph
+from retrieval_engine.indexing.graph.refiner import EntityResolutionStats, KGRefiner
+from retrieval_engine.indexing.graph.refinement_state import (
     SCHEMA_VERSION,
     clear_state,
     load_state,

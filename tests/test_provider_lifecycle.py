@@ -7,16 +7,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from Core.Index.GBCIndex import GBC
-from Core.Index.Graph import Entity
-from Core.Index.Tree import NodeType
-from Core.configs.graph_config import GraphConfig
-from Core.configs.vdb_config import VDBConfig
-from Core.pipelines import kg_builder
-from Core.pipelines.kg_extractor import KGExtractionError
-from Core.pipelines.kg_refiner import KGRefiner
-from Core.provider.embedding import TextEmbeddingProvider
-from Core.provider.vdb import VectorStore
+from retrieval_engine.indexes.gbc import GBC
+from retrieval_engine.indexes.graph import Entity
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.configuration.knowledge_graph import GraphConfig
+from retrieval_engine.configuration.vector_store import VDBConfig
+from retrieval_engine.indexing.graph import builder as kg_builder
+from retrieval_engine.indexing.graph.extractor import KGExtractionError
+from retrieval_engine.indexing.graph.refiner import KGRefiner
+from retrieval_engine.providers.embeddings import TextEmbeddingProvider
+from retrieval_engine.indexes.vector_store import VectorStore
 from tests.qdrant_fakes import qdrant_store
 
 
@@ -114,11 +114,11 @@ class KGResourceLifecycleTests(unittest.TestCase):
 
         with (
             patch(
-                "Core.pipelines.kg_refiner.TextEmbeddingProvider",
+                "retrieval_engine.indexing.graph.refiner.TextEmbeddingProvider",
                 return_value=embedder,
             ),
             patch(
-                "Core.pipelines.kg_refiner.TextRerankerProvider",
+                "retrieval_engine.indexing.graph.refiner.TextRerankerProvider",
                 side_effect=RuntimeError("reranker failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "reranker failed"),
@@ -248,7 +248,7 @@ class GBCResourceLifecycleTests(unittest.TestCase):
                 ),
                 patch.object(GBC, "_entity_records", return_value=iter(records)),
                 patch(
-                    "Core.Index.GBCIndex.vector_index_lock",
+                    "retrieval_engine.indexes.gbc.vector_index_lock",
                     return_value=nullcontext(),
                 ),
             ):

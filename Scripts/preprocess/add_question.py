@@ -1,11 +1,11 @@
-from Core.configs.system_config import load_system_config
+from retrieval_engine.configuration.system import load_system_config
 import pandas as pd
 import os
 import logging
 import sys
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.provider.vlm import VLM
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.providers.vision_model import VLM
 from typing import List, Dict, Any, Optional
 import json
 from pydantic import BaseModel, Field

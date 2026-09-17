@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from Core.utils.artifact_paths import resolve_run_artifact_path
+from retrieval_engine.utils.artifact_paths import resolve_run_artifact_path
 
 
 class ArtifactPathTests(unittest.TestCase):

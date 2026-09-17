@@ -4,16 +4,16 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from Core.Index.Tree import NodeType
-from Core.rag.gbc_answer import (
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.rag.gbc.answer import (
     CITATION_INSTRUCTION,
     CITATION_VALIDATION_FAILURE_ANSWER,
     AnswerAgent,
 )
-from Core.rag.gbc_plan import PlanResult, SubQuestion
-from Core.rag.gbc_rag import GBCRAG
-from Core.rag.gbc_utils import GBCRAGContext
-from docarag.answer_validation import validate_answer_citations
+from retrieval_engine.rag.gbc.planner import PlanResult, SubQuestion
+from retrieval_engine.rag.gbc.agent import GBCRAG
+from retrieval_engine.rag.gbc.context import GBCRAGContext
+from document_services.retrieval.answer_validation import validate_answer_citations
 
 
 def _node():

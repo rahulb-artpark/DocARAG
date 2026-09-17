@@ -7,15 +7,15 @@ import subprocess
 import sys
 import unittest
 
-from docarag.adapters.docling import DoclingExportAdapter
-from docarag.domain import (
+from document_services.parser_adapters.docling import DoclingExportAdapter
+from document_services.domain import (
     DocumentRef,
     ErrorClassification,
     PageRef,
     ParseRequest,
     ParseStatus,
 )
-from docarag.services.docling import (
+from document_services.parser_clients.docling import (
     DoclingHTTPResponse,
     DoclingServiceConfig,
     DoclingServiceConfigurationError,
@@ -25,7 +25,7 @@ from docarag.services.docling import (
     DoclingServiceSourceError,
     DoclingServiceTimeoutError,
 )
-from docarag.source_material import VerifiedSourceMaterial
+from document_services.evidence.sources import VerifiedSourceMaterial
 
 
 SOURCE = b"%PDF-1.7\nverified docling service fixture\n%%EOF\n"
@@ -437,7 +437,7 @@ class DoclingServiceConfigurationTests(unittest.TestCase):
 
     def test_controller_import_does_not_load_docling_vendor_packages(self):
         script = (
-            "import sys; import docarag.services.docling; "
+            "import sys; import document_services.parser_clients.docling; "
             "bad=[n for n in sys.modules if n == 'docling' or "
             "n.startswith(('docling.', 'torch', 'transformers', 'paddle'))]; "
             "assert not bad, bad"

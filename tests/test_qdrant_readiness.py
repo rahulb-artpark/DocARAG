@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 import yaml
 
-from Core.utils.artifact_paths import qdrant_endpoint_sha256
-from docarag.qdrant_readiness import (
+from retrieval_engine.utils.artifact_paths import qdrant_endpoint_sha256
+from document_services.persistence.qdrant_readiness import (
     QdrantAttestationMismatch,
     validate_qdrant_attestation,
 )
@@ -105,7 +105,7 @@ class QdrantReadinessTests(unittest.TestCase):
                     clear=False,
                 ),
                 patch(
-                    "docarag.qdrant_readiness.qdrant_collection_state",
+                    "document_services.persistence.qdrant_readiness.qdrant_collection_state",
                     return_value=SimpleNamespace(exists=True, point_count=3),
                 ) as state,
             ):
@@ -132,7 +132,7 @@ class QdrantReadinessTests(unittest.TestCase):
             attestation.write_text(json.dumps(payload), encoding="utf-8")
             with (
                 patch(
-                    "docarag.qdrant_readiness.qdrant_collection_state"
+                    "document_services.persistence.qdrant_readiness.qdrant_collection_state"
                 ) as state,
                 self.assertRaisesRegex(
                     QdrantAttestationMismatch, "self-digest mismatches"
@@ -159,7 +159,7 @@ class QdrantReadinessTests(unittest.TestCase):
                     clear=False,
                 ),
                 patch(
-                    "docarag.qdrant_readiness.qdrant_collection_state"
+                    "document_services.persistence.qdrant_readiness.qdrant_collection_state"
                 ) as state,
                 self.assertRaisesRegex(
                     QdrantAttestationMismatch, "endpoint binding mismatches"

@@ -25,7 +25,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from Core.Index.GBCIndex import GBC
+from retrieval_engine.indexes.gbc import GBC
 
 
 def _records():
@@ -61,9 +61,9 @@ class OnlyTheNamedEntityIsReEmbedded(unittest.TestCase):
                 return_value={"point_count": 4},
             ),
             patch.object(GBC, "_entity_records", return_value=iter(_records())),
-            patch("Core.Index.GBCIndex.vector_index_lock"),
-            patch("Core.Index.GBCIndex.invalidate_vector_index_attestation"),
-            patch("Core.Index.GBCIndex.publish_vector_index_attestation") as publish,
+            patch("retrieval_engine.indexes.gbc.vector_index_lock"),
+            patch("retrieval_engine.indexes.gbc.invalidate_vector_index_attestation"),
+            patch("retrieval_engine.indexes.gbc.publish_vector_index_attestation") as publish,
         ):
             written = index.reindex_entities(names)
         return index, written, publish
@@ -95,7 +95,7 @@ class OnlyTheNamedEntityIsReEmbedded(unittest.TestCase):
             patch.object(
                 GBC, "_expected_entity_attestation", return_value={"point_count": 4}
             ),
-            patch("Core.Index.GBCIndex.invalidate_vector_index_attestation") as clear,
+            patch("retrieval_engine.indexes.gbc.invalidate_vector_index_attestation") as clear,
             self.assertRaisesRegex(RuntimeError, "unnamed vector"),
         ):
             index.reindex_entities(["Name: entity-0\nType: TECHNOLOGY"])
@@ -132,7 +132,7 @@ class TheEditIsScopedToOneRevision(unittest.TestCase):
     def _source():
         from pathlib import Path
 
-        from docarag import edit
+        from document_services.indexing import editing as edit
 
         return Path(edit.__file__).read_text(encoding="utf-8")
 

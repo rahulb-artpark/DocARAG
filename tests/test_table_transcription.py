@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.domain.evidence import (
+from document_services.domain.evidence import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -26,7 +26,7 @@ from docarag.domain.evidence import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.table_transcription import (
+from document_services.enrichment.table_transcription import (
     TableTranscriptionStats,
     clean_table_html,
     table_shape,

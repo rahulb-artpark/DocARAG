@@ -1,7 +1,7 @@
 import os
 import json
 import pandas as pd
-from Core.configs.dataset_config import DatasetConfig
+from retrieval_engine.configuration.dataset import DatasetConfig
 
 
 def load_cost(res_dir: str):

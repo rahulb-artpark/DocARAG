@@ -13,8 +13,8 @@ from dataclasses import replace
 from unittest import mock
 import unittest
 
-import docarag.reconciliation as reconciliation_module
-from docarag.domain import (
+import document_services.parsing.reconciliation as reconciliation_module
+from document_services.domain import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -32,7 +32,7 @@ from docarag.domain import (
     content_sha256,
     stable_id,
 )
-from docarag.reconciliation import (
+from document_services.parsing.reconciliation import (
     ReconciliationIssueCode,
     ReconciliationPolicy,
     ReconciliationResult,
@@ -384,7 +384,7 @@ class IncrementalIdentityMergeGates(unittest.TestCase):
         initial = reconcile_observations(initial_observations)
 
         with mock.patch(
-            "docarag.reconciliation._prior_match_score",
+            "document_services.parsing.reconciliation._prior_match_score",
             wraps=reconciliation_module._prior_match_score,
         ) as scorer:
             replay = reconcile_observations(
@@ -556,7 +556,7 @@ class CandidateBoundMergeGates(unittest.TestCase):
         self.assertEqual(1, len(cells))
 
         with mock.patch(
-            "docarag.reconciliation._iou",
+            "document_services.parsing.reconciliation._iou",
             wraps=reconciliation_module._iou,
         ) as iou:
             selection = reconciliation_module._bounded_candidates(

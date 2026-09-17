@@ -3,13 +3,13 @@ from __future__ import annotations
 import copy
 import unittest
 
-from docarag.adapters.paddleocr_vl import (
+from document_services.parser_adapters.paddleocr_vl import (
     ADAPTER_VERSION,
     TRANSLATION_NAME,
     PaddleOCRVLPageAdapter,
 )
-from docarag.domain import BlockType, ParseStatus, RelationType, RepresentationKind
-from docarag.reconciliation import reconcile_observations
+from document_services.domain import BlockType, ParseStatus, RelationType, RepresentationKind
+from document_services.parsing.reconciliation import reconcile_observations
 from tests.test_paddleocr_vl_adapter import (
     block,
     page_results_fixture,

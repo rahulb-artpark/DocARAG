@@ -9,11 +9,11 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from docarag.adapters.docling import (
+from document_services.parser_adapters.docling import (
     DEFAULT_MAX_EMBEDDED_ASSET_BYTES,
     DoclingExportAdapter,
 )
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     BlockType,
     CoordinateOrigin,
@@ -31,7 +31,7 @@ from docarag.domain import (
     ParserExecutionError,
     RepresentationKind,
 )
-from docarag.ports import ParserRegistry
+from document_services.ports import ParserRegistry
 
 
 SOURCE_BYTES = b"docling adapter source fixture"
@@ -457,7 +457,7 @@ class DoclingExportAdapterTests(unittest.TestCase):
 
         script = """
 import json, sys
-import docarag.adapters.docling
+import document_services.parser_adapters.docling
 forbidden = ('torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """
@@ -574,7 +574,7 @@ print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in fo
             "mimetype": "image/png",
         }
         with patch(
-            "docarag.adapters.docling.base64.b64decode",
+            "document_services.parser_adapters.docling.base64.b64decode",
             side_effect=AssertionError("oversized payload must not be decoded"),
         ) as decoder:
             result = adapter(export, max_embedded_asset_bytes=4).parse(

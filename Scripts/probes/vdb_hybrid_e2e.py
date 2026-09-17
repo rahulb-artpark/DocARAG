@@ -12,14 +12,14 @@ import sys
 
 sys.path.insert(0, "/home/rahul/DocARAG")
 
-from Core.pipelines.entity_facets import (
+from retrieval_engine.indexing.graph.entity_facets import (
     CANONICAL_FIELD,
     context_text,
     lexical_terms,
     lexical_text,
 )
-from Core.provider.embedding import TextEmbeddingProvider
-from Core.provider.vdb import VectorStore
+from retrieval_engine.providers.embeddings import TextEmbeddingProvider
+from retrieval_engine.indexes.vector_store import VectorStore
 
 SCOPE = {
     "tenant_id": "probe-tenant",

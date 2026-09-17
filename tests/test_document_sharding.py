@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
-from docarag.sharding import document_shard_number
+from document_services.parsing.document_sharding import document_shard_number
 
 
 class DocumentShardingTests(unittest.TestCase):

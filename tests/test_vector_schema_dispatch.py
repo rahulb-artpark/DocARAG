@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import unittest
 
-from Core.provider.vdb import (
+from retrieval_engine.indexes.vector_store import (
     VectorSchema,
     _TREE_DENSE_VECTORS,
     _TREE_SPARSE_VECTOR,
@@ -34,7 +34,7 @@ class _Embedder:
 
 
 def _store(schema=None, **kwargs):
-    from Core.provider.vdb import VectorStore
+    from retrieval_engine.indexes.vector_store import VectorStore
 
     client = FakeQdrantClient()
     store = VectorStore(

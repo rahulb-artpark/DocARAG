@@ -12,8 +12,8 @@ from unittest.mock import Mock, patch
 
 from pydantic import BaseModel
 
-from Core.configs.llm_config import LLMConfig
-from Core.provider.llm import OllamaController
+from retrieval_engine.configuration.language_model import LLMConfig
+from retrieval_engine.providers.language_model import OllamaController
 
 
 class Payload(BaseModel):
@@ -46,8 +46,8 @@ class SlowCallLoggingTests(unittest.TestCase):
         client.chat.return_value = response
         controller = OllamaController(llm_config=_config(), client=client)
         ticks = iter([0.0, wall_seconds])
-        with patch("Core.provider.llm.time.monotonic", lambda: next(ticks)):
-            with self.assertLogs("Core.provider.llm", level="WARNING") as logs:
+        with patch("retrieval_engine.providers.language_model.time.monotonic", lambda: next(ticks)):
+            with self.assertLogs("retrieval_engine.providers.language_model", level="WARNING") as logs:
                 controller.get_json_completion("prompt", Payload)
         return "\n".join(logs.output)
 
@@ -56,7 +56,7 @@ class SlowCallLoggingTests(unittest.TestCase):
         client.chat.return_value = response
         controller = OllamaController(llm_config=_config(), client=client)
         ticks = iter([0.0, wall_seconds])
-        with patch("Core.provider.llm.time.monotonic", lambda: next(ticks)):
+        with patch("retrieval_engine.providers.language_model.time.monotonic", lambda: next(ticks)):
             controller.get_json_completion("prompt", Payload)
 
     def test_a_model_reload_is_attributed_to_load_duration(self):

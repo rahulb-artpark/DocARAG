@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     AssetRef,
     SemanticElementKind,
@@ -10,13 +10,13 @@ from docarag.domain import (
     SemanticRelationKind,
     SemanticStructureKind,
 )
-from docarag.figure_diagram import (
+from document_services.enrichment.diagram_structure import (
     DiagramEdge,
     DiagramGraph,
     DiagramNode,
     diagram_substructure,
 )
-from docarag.figure_diagram_vlm import DiagramSchema, VLMDiagramExtractor
+from document_services.enrichment.diagram_transcription import DiagramSchema, VLMDiagramExtractor
 
 OBSERVATIONS = ("obs_" + "a" * 32,)
 

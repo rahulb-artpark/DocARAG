@@ -22,8 +22,8 @@ import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-from docarag.persistence.postgres import PostgresLedger
-from docarag.tree_store import _GRAPH_ENTITIES_SQL
+from document_services.persistence.postgres import PostgresLedger
+from document_services.persistence.tree_store import _GRAPH_ENTITIES_SQL
 
 
 class _Cursor:
@@ -119,7 +119,7 @@ class EveryEntityReachesTheIndex(unittest.TestCase):
     """An index built from a display cap cannot answer about what it dropped."""
 
     def _store(self, count):
-        from docarag.tree_store import TreeStore
+        from document_services.persistence.tree_store import TreeStore
 
         rows = [
             {
@@ -203,7 +203,7 @@ class ARebuildThatCannotWriteDestroysNothing(unittest.TestCase):
     """The order that cost six revisions their entity index."""
 
     def _store(self, *, named: bool):
-        from Core.provider.vdb import VectorSchema, VectorStore
+        from retrieval_engine.indexes.vector_store import VectorSchema, VectorStore
         from tests.qdrant_fakes import FakeModels, FakeQdrantClient
 
         client = FakeQdrantClient()
@@ -248,7 +248,7 @@ class ARebuildThatCannotWriteDestroysNothing(unittest.TestCase):
         # cannot write still destroys the index it was replacing.
         from unittest.mock import Mock, patch
 
-        from Core.Index.GBCIndex import GBC
+        from retrieval_engine.indexes.gbc import GBC
 
         index = object.__new__(GBC)
         index.save_dir = "/tmp/run"
@@ -260,7 +260,7 @@ class ARebuildThatCannotWriteDestroysNothing(unittest.TestCase):
 
         with (
             patch.object(GBC, "_expected_entity_attestation", return_value={}),
-            patch("Core.Index.GBCIndex.invalidate_vector_index_attestation") as clear,
+            patch("retrieval_engine.indexes.gbc.invalidate_vector_index_attestation") as clear,
             self.assertRaisesRegex(RuntimeError, "named dense vectors"),
         ):
             index.rebuild_vdb()
@@ -270,7 +270,7 @@ class ARebuildThatCannotWriteDestroysNothing(unittest.TestCase):
 
     def test_an_absent_collection_is_writable(self):
         # Nothing to destroy, and the create will use this schema.
-        from Core.provider.vdb import VectorSchema, VectorStore
+        from retrieval_engine.indexes.vector_store import VectorSchema, VectorStore
         from tests.qdrant_fakes import FakeModels, FakeQdrantClient
 
         store = VectorStore(

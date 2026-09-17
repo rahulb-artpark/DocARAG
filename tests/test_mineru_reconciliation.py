@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from Core.provider.mineru_reconciliation import (
+from retrieval_engine.parsing.mineru_reconciliation import (
     MinerUReconciliationError,
     reconcile_middle_content,
 )

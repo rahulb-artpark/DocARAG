@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from docarag.tree_integrity import TreeIntegrityError, verify_tree_pair
+from document_services.evidence.tree_integrity import TreeIntegrityError, verify_tree_pair
 
 
 _IDENTITY = {
@@ -50,7 +50,7 @@ class _TupleBboxTree:
 class RealBookRAGTreeIntegrityTests(unittest.TestCase):
     def test_real_document_tree_pickle_json_and_source_identity(self):
         try:
-            from Core.Index.Tree import DocumentTree
+            from retrieval_engine.indexes.tree import DocumentTree
         except ImportError as exc:
             self.skipTest(f"BookRAG runtime dependencies are unavailable: {exc}")
 

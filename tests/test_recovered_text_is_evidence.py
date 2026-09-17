@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.adapters.mineru_compat import _representations
-from docarag.domain.evidence import BlockType, RepresentationKind
+from document_services.parser_adapters.mineru_compat import _representations
+from document_services.domain.evidence import BlockType, RepresentationKind
 
 
 def _reps(block, block_type):

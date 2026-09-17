@@ -8,26 +8,26 @@ from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.configs.llm_config import LLMConfig
-from Core.configs.vlm_config import VLMConfig
-from Core.pipelines.tree_node_summary import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.configuration.language_model import LLMConfig
+from retrieval_engine.configuration.vision_model import VLMConfig
+from retrieval_engine.indexing.tree.summary import (
     TreeSummaryGenerationError,
     generate_tree_node_summary,
 )
-from Core.provider.llm import (
+from retrieval_engine.providers.language_model import (
     BatchCompletionError,
     CompletionAttemptsExhausted,
     CompletionRequest,
     LLM,
 )
-from Core.provider.vlm import (
+from retrieval_engine.providers.vision_model import (
     BatchGenerationError,
     GenerationAttemptsExhausted,
     GenerationRequest,
     VLM,
 )
-from Core.utils.bounded_executor import iter_bounded_ordered
+from retrieval_engine.utils.bounded_executor import iter_bounded_ordered
 
 
 def make_llm(controller, **overrides) -> LLM:

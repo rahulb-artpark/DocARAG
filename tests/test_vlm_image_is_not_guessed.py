@@ -22,7 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 
-from Core.provider.vlm import _as_image_payloads, _root_cause
+from retrieval_engine.providers.vision_model import _as_image_payloads, _root_cause
 
 
 class AnImageFileBecomesAPath(unittest.TestCase):

@@ -7,8 +7,8 @@ import subprocess
 import sys
 import unittest
 
-from docarag.adapters.paddleocr_vl import PaddleOCRVLPageAdapter
-from docarag.domain import (
+from document_services.parser_adapters.paddleocr_vl import PaddleOCRVLPageAdapter
+from document_services.domain import (
     AssetKind,
     BlockType,
     CoordinateSpace,
@@ -27,7 +27,7 @@ from docarag.domain import (
     ParserModality,
     RepresentationKind,
 )
-from docarag.ports import ParserRegistry
+from document_services.ports import ParserRegistry
 
 
 def request_fixture() -> ParseRequest:
@@ -428,7 +428,7 @@ class PaddleOCRVLPageAdapterTests(unittest.TestCase):
     def test_import_does_not_load_paddle_or_model_runtimes(self):
         script = """
 import json, sys
-import docarag.adapters.paddleocr_vl
+import document_services.parser_adapters.paddleocr_vl
 forbidden = ('paddle', 'paddleocr', 'torch', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """

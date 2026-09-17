@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from docarag.application import (
+from document_services.application import (
     CanonicalExtractionPayload,
     DocumentExtractionArtifactError,
     DocumentExtractionBindingError,
@@ -23,13 +23,13 @@ from docarag.application import (
     ExtractDocumentUseCase,
     RoutedDocumentExtractionBackend,
 )
-from docarag.canonical_artifacts import (
+from document_services.evidence.artifacts import (
     CANONICAL_CONTRACT_SCHEMA_VERSION,
     CANONICAL_EVIDENCE_ARTIFACT_ROLE,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
 )
-from docarag.composition import RoutedBookRAGFacade
-from docarag.domain import (
+from document_services.parsing.bookrag_handoff import RoutedBookRAGFacade
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     BoundingBox,
@@ -49,14 +49,18 @@ from docarag.domain import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.domain.base import (
+from document_services.domain.base import (
     ContractValidationError,
     canonical_json_bytes,
     content_sha256,
 )
-from docarag.presets import DOCLING_ADAPTER, MINERU_ADAPTER, PADDLEOCR_VL_ADAPTER
-from docarag.routed_ingestion import RoutedBookRAGAuditValidator
-from docarag.routing import PageFeatures
+from document_services.parsing.routing_presets import (
+    DOCLING_ADAPTER,
+    MINERU_ADAPTER,
+    PADDLEOCR_VL_ADAPTER,
+)
+from document_services.parsing.routed_ingestion import RoutedBookRAGAuditValidator
+from document_services.parsing.routing import PageFeatures
 
 
 SOURCE_BYTES = b"%PDF-1.7 application extraction fixture\n"
@@ -294,8 +298,8 @@ class DocumentExtractionContractTests(unittest.TestCase):
     def test_dependency_light_application_import_does_not_load_composition(self):
         script = """
 import json, sys
-import docarag.application.extract_document
-print(json.dumps('docarag.composition' in sys.modules))
+import document_services.application.extract_document
+print(json.dumps('document_services.parsing.bookrag_handoff' in sys.modules))
 """
         completed = subprocess.run(
             [sys.executable, "-c", script],

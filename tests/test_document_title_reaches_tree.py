@@ -12,10 +12,10 @@ from a canonical block through to a node type. This one does.
 
 import unittest
 
-from Core.Index.Tree import NodeType
-from Core.pipelines.tree_node_builder import create_node_by_type
-from docarag.bookrag_projection import project_canonical_blocks
-from docarag.domain.evidence import BlockType, RepresentationKind
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
+from document_services.evidence.projections.bookrag import project_canonical_blocks
+from document_services.domain.evidence import BlockType, RepresentationKind
 
 from tests.test_bookrag_projection import (
     canonical_block,

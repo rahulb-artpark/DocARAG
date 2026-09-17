@@ -6,8 +6,8 @@ import subprocess
 import sys
 import unittest
 
-from docarag.application import ExtractDocumentUseCase
-from docarag.domain import (
+from document_services.application import ExtractDocumentUseCase
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     ParseRequest,
@@ -15,13 +15,13 @@ from docarag.domain import (
     ParserCapabilityManifest,
     ParserModality,
 )
-from docarag.presets import (
+from document_services.parsing.routing_presets import (
     DOCLING_ADAPTER,
     MINERU_ADAPTER,
     PADDLEOCR_VL_ADAPTER,
 )
-from docarag.routed_ingestion import RoutedCanonicalIngestionProvider
-from docarag.runtime_composition import (
+from document_services.parsing.routed_ingestion import RoutedCanonicalIngestionProvider
+from document_services.runtime.parser_composition import (
     BalancedRoutedRuntimeConfig,
     ParserWorkerEndpointConfig,
     RuntimeCompositionClosedError,
@@ -29,7 +29,7 @@ from docarag.runtime_composition import (
     RuntimeCompositionIdentityError,
     build_balanced_routed_runtime,
 )
-from docarag.transport import WorkerHealth, WorkerNotReadyError, WorkerState
+from document_services.worker_transport import WorkerHealth, WorkerNotReadyError, WorkerState
 
 
 def _manifest(adapter_name: str, adapter_version: str) -> ParserCapabilityManifest:
@@ -377,8 +377,8 @@ class BalancedRuntimeFactoryTests(unittest.TestCase):
     def test_module_import_does_not_load_vendor_or_bookrag_runtime(self):
         script = """
 import sys
-import docarag.runtime_composition
-for name in ('pymupdf', 'fitz', 'torch', 'paddle', 'transformers', 'Core'):
+import document_services.runtime.parser_composition
+for name in ('pymupdf', 'fitz', 'torch', 'paddle', 'transformers', "retrieval_engine"):
     assert name not in sys.modules, name
 """
         completed = subprocess.run(

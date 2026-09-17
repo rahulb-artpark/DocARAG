@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import unittest
 
-from Core.rag.gbc_answer import _visual_evidence_content
+from retrieval_engine.rag.gbc.answer import _visual_evidence_content
 
 SUMMARY = "Zernike Surface. A 3D rendering of the Zernike surface."
 CONTENT = (
@@ -81,7 +81,7 @@ class BothVisualPromptsUseIt(unittest.TestCase):
     def _source():
         from pathlib import Path
 
-        from Core.rag import gbc_answer
+        from retrieval_engine.rag.gbc import answer as gbc_answer
 
         return Path(gbc_answer.__file__).read_text(encoding="utf-8")
 

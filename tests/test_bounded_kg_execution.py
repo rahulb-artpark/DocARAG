@@ -5,11 +5,11 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from Core.Index.Graph import Entity
-from Core.Index.Tree import NodeType
-from Core.configs.graph_config import GraphConfig
-from Core.pipelines.kg_extractor import KGExtractionError, KGExtractor
-from Core.pipelines.kg_refiner import KGRefinementError, KGRefiner
+from retrieval_engine.indexes.graph import Entity
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.configuration.knowledge_graph import GraphConfig
+from retrieval_engine.indexing.graph.extractor import KGExtractionError, KGExtractor
+from retrieval_engine.indexing.graph.refiner import KGRefinementError, KGRefiner
 
 
 def _node(index: int):

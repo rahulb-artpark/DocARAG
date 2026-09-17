@@ -16,8 +16,8 @@ nests under the nearest shallower heading rather than falling to the root.
 import unittest
 from types import SimpleNamespace
 
-from Core.Index.Tree import DocumentTree, NodeType
-from Core.pipelines.doc_tree_builder import construct_tree_index
+from retrieval_engine.indexes.tree import DocumentTree, NodeType
+from retrieval_engine.indexing.tree.builder import construct_tree_index
 
 
 def _new_tree():

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from Core.provider.embedding import (
+from retrieval_engine.providers.embeddings import (
     MultimodalEmbeddingProvider,
     MMRerankerProvider,
     _MultimodalSharedRuntime,

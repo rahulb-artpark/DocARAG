@@ -7,8 +7,8 @@ import unittest
 
 import yaml
 
-from docarag.artifact_roles import resolve_artifact_roles
-from docarag.domain.evidence import DocumentRef
+from document_services.evidence.artifact_roles import resolve_artifact_roles
+from document_services.domain.evidence import DocumentRef
 
 
 REPO = Path(__file__).resolve().parents[1]

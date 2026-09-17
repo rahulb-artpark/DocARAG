@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from Core.rag.stored_index import (
+from retrieval_engine.rag.stored_indexes import (
     StoredTreeMeta,
     StoredGraphIndex,
     StoredIndex,
@@ -15,7 +15,7 @@ from Core.rag.stored_index import (
     entity_node_name,
     split_node_name,
 )
-from docarag.tree_store import GraphEdge, NodeMeta, TreeNodeView
+from document_services.persistence.tree_store import GraphEdge, NodeMeta, TreeNodeView
 
 
 def node(index_id: int, parent_id: int | None = 0, **meta) -> TreeNodeView:
@@ -330,8 +330,8 @@ class StoredEntitySearchTests(unittest.TestCase):
             opened.update(kwargs)
             return Mock()
 
-        with patch("Core.provider.embedding.TextEmbeddingProvider", Mock()), patch(
-            "Core.provider.vdb.VectorStore", vector_store
+        with patch("retrieval_engine.providers.embeddings.TextEmbeddingProvider", Mock()), patch(
+            "retrieval_engine.indexes.vector_store.VectorStore", vector_store
         ):
             index = StoredIndex(store, config=self._config())
         return index, opened

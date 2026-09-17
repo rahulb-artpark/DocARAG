@@ -5,9 +5,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.asset_material import AssetMaterialErrorCode
-from docarag.domain import DocumentRef
-from docarag.source_material import (
+from document_services.evidence.assets import AssetMaterialErrorCode
+from document_services.domain import DocumentRef
+from document_services.evidence.sources import (
     SOURCE_MATERIAL_BINDING_KEY,
     SourceMaterialError,
     SourceMaterialResolver,

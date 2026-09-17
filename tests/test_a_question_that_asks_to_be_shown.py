@@ -28,22 +28,22 @@ import unittest
 
 from qdrant_client import models as real_models
 
-from Core.Index.Tree import NodeType
-from Core.provider.vdb import (
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.indexes.vector_store import (
     TREE_NODE_PAYLOAD_SCHEMA,
     TREE_SCOPED_VECTOR_SUFFIX,
     VectorSchema,
     VectorStore,
     tree_vector_base_name,
 )
-from Core.rag.gbc_plan import (
+from retrieval_engine.rag.gbc.planner import (
     REQUESTED_NODE_TYPE_FAMILIES,
     PlanResult,
     SubQuestion,
     TaskPlanner,
     requested_node_type_filter,
 )
-from Core.rag.gbc_retrieval import Retriever
+from retrieval_engine.rag.gbc.retrieval import Retriever
 from tests.qdrant_fakes import FakeModels, FakeQdrantClient
 
 

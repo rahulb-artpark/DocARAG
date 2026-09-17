@@ -5,11 +5,11 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from Core.Index.Graph import Entity, Relationship
-from Core.Index.Tree import NodeType
-from Core.configs.graph_config import GraphConfig
-from Core.pipelines.kg_extractor import KGExtractor, LLMExtractor, LocalExtractor
-from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
+from retrieval_engine.indexes.graph import Entity, Relationship
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.configuration.knowledge_graph import GraphConfig
+from retrieval_engine.indexing.graph.extractor import KGExtractor, LLMExtractor, LocalExtractor
+from retrieval_engine.indexing.graph.refiner import EntityResolutionStats, KGRefiner
 
 
 class GraphConfigValidationTests(unittest.TestCase):

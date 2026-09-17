@@ -9,13 +9,13 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from Core.provider.vdb import (
+from retrieval_engine.indexes.vector_store import (
     MissingVectorSourceIdentityError,
     VectorStore,
     stable_vector_record_id,
 )
-from Core.provider.embedding import MultimodalEmbeddingProvider
-from Core.rag.mm_rag import MMRAG, NO_USABLE_EVIDENCE_ANSWER
+from retrieval_engine.providers.embeddings import MultimodalEmbeddingProvider
+from retrieval_engine.rag.strategies.multimodal import MMRAG, NO_USABLE_EVIDENCE_ANSWER
 from tests.qdrant_fakes import FakeModels, FakeQdrantClient, qdrant_store
 
 

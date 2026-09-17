@@ -5,8 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.persistence.contracts import DocumentScope
-from docarag.document_store import (
+from document_services.persistence.contracts import DocumentScope
+from document_services.persistence.document_store import (
     DocumentStore,
     DocumentStoreError,
     scope_for_run,

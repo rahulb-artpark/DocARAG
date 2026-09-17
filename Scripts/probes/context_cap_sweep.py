@@ -20,9 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/rahul/DocARAG")
 
-from Core.pipelines.entity_facets import CANONICAL_FIELD, lexical_terms, lexical_text
-from Core.provider.embedding import TextEmbeddingProvider
-from Core.provider.vdb import VectorStore
+from retrieval_engine.indexing.graph.entity_facets import (
+    CANONICAL_FIELD,
+    lexical_terms,
+    lexical_text,
+)
+from retrieval_engine.providers.embeddings import TextEmbeddingProvider
+from retrieval_engine.indexes.vector_store import VectorStore
 
 GRAPH = Path(
     "/home/rahul/DocARAG/runs/doc_df198aeb160bb6240f5843b978d6fbcc/"

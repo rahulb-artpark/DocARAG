@@ -5,8 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from Core.pipelines.doc_tree_builder import _stable_local_artifact_receipt
-from docarag.persistence import (
+from retrieval_engine.indexing.tree.builder import _stable_local_artifact_receipt
+from document_services.persistence import (
     ArtifactAvailability,
     DocumentScope,
     StageEventStatus,
@@ -16,7 +16,7 @@ from docarag.persistence import (
     WorkState,
     durable_stage,
 )
-from docarag.persistence.contracts import IndexRevisionState
+from document_services.persistence.contracts import IndexRevisionState
 
 
 def _environment() -> dict[str, str]:
@@ -222,7 +222,7 @@ class DurableStageRuntimeTests(unittest.TestCase):
         self.assertNotIn("shell_index_revision_id", spec.metadata)
 
     def test_publish_index_revision_spec_metadata_is_always_empty(self):
-        # docarag/evidence_persist.py's _admit_revision always admits this
+        # document_services/persistence/evidence_writer.py's _admit_revision always admits this
         # same revision_id first (before any stage runs), with metadata={}
         # (IndexRevisionSpec's default -- it passes none). create_index_revision
         # rejects a later call for the same identity whose metadata differs

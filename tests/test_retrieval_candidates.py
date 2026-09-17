@@ -6,8 +6,8 @@ import math
 import unittest
 from unittest.mock import patch
 
-from docarag.domain.base import ContractValidationError
-from docarag.retrieval_candidates import (
+from document_services.domain.base import ContractValidationError
+from document_services.retrieval.candidates import (
     ABSOLUTE_MAX_LEGS,
     ABSOLUTE_MAX_RRF_K,
     MAX_CANONICAL_REVISIONS_PER_HIT,
@@ -959,7 +959,7 @@ class RetrievalCandidateContractTests(unittest.TestCase):
             with self.subTest(dto=dto.__name__), patch.object(
                 dto, "MAX_JSON_BYTES", encoded_size - 1
             ), patch(
-                "docarag.retrieval_candidates.parse_json_object",
+                "document_services.retrieval.candidates.parse_json_object",
                 side_effect=AssertionError("JSON decoding must not run"),
             ):
                 with self.assertRaisesRegex(
@@ -969,7 +969,7 @@ class RetrievalCandidateContractTests(unittest.TestCase):
 
         # Character length alone is insufficient for a multibyte text payload.
         with patch.object(FusionBounds, "MAX_JSON_BYTES", 4), patch(
-            "docarag.retrieval_candidates.parse_json_object",
+            "document_services.retrieval.candidates.parse_json_object",
             side_effect=AssertionError("JSON decoding must not run"),
         ):
             with self.assertRaisesRegex(
@@ -978,7 +978,7 @@ class RetrievalCandidateContractTests(unittest.TestCase):
                 FusionBounds.from_json('"\u00e9\u00e9"')
 
         with patch(
-            "docarag.retrieval_candidates.parse_json_object",
+            "document_services.retrieval.candidates.parse_json_object",
             side_effect=AssertionError("JSON decoding must not run"),
         ):
             with self.assertRaisesRegex(ContractValidationError, "valid UTF-8"):
@@ -1025,7 +1025,7 @@ class RetrievalCandidateContractTests(unittest.TestCase):
         leg = self._leg("dense-text", repeated)
 
         with patch(
-            "docarag.retrieval_candidates.MAX_BINDINGS_PER_FUSED_CANDIDATE", 2
+            "document_services.retrieval.candidates.MAX_BINDINGS_PER_FUSED_CANDIDATE", 2
         ):
             result = self._fuse((leg,), bounds=bounds)
 
@@ -1045,14 +1045,14 @@ class RetrievalCandidateContractTests(unittest.TestCase):
         )
         distinct_leg = self._leg("dense-text", distinct_nodes)
         with patch(
-            "docarag.retrieval_candidates.MAX_BINDINGS_PER_FUSED_CANDIDATE", 2
+            "document_services.retrieval.candidates.MAX_BINDINGS_PER_FUSED_CANDIDATE", 2
         ), self.assertRaisesRegex(ContractValidationError, "tree_node_ids"):
             self._fuse((distinct_leg,), bounds=bounds)
 
     def test_aggregate_byte_preflight_runs_before_nested_dtos(self) -> None:
         scope_payload = self.scope.to_dict()
         with patch(
-            "docarag.retrieval_candidates.MAX_SCOPE_IDENTITY_UTF8_BYTES", 1
+            "document_services.retrieval.candidates.MAX_SCOPE_IDENTITY_UTF8_BYTES", 1
         ), patch.object(
             DocumentEvidenceBinding,
             "from_dict",
@@ -1067,7 +1067,7 @@ class RetrievalCandidateContractTests(unittest.TestCase):
             (self._leg("dense-text", (self._hit("a", "block-a", 1),)),)
         )
         with patch(
-            "docarag.retrieval_candidates.MAX_TRACE_IDENTITY_UTF8_BYTES", 1
+            "document_services.retrieval.candidates.MAX_TRACE_IDENTITY_UTF8_BYTES", 1
         ), patch.object(
             CandidateHit,
             "from_dict",
@@ -1113,12 +1113,12 @@ class RetrievalCandidateContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractValidationError, "UTF-8 bytes"):
             self._binding("d" * 513, "version")
         with patch(
-            "docarag.retrieval_candidates.MAX_SCOPE_IDENTITY_UTF8_BYTES", 1
+            "document_services.retrieval.candidates.MAX_SCOPE_IDENTITY_UTF8_BYTES", 1
         ):
             with self.assertRaisesRegex(ContractValidationError, "scope identity"):
                 self._scope(self.scope.planned_legs)
         with patch(
-            "docarag.retrieval_candidates.MAX_TRACE_IDENTITY_UTF8_BYTES", 1
+            "document_services.retrieval.candidates.MAX_TRACE_IDENTITY_UTF8_BYTES", 1
         ):
             with self.assertRaisesRegex(ContractValidationError, "identity payload"):
                 self._fuse(

@@ -5,12 +5,12 @@ import subprocess
 import sys
 import unittest
 
-from docarag.adapters.docling import DoclingExportAdapter
-from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
-from docarag.adapters.paddleocr_vl import PaddleOCRVLPageAdapter
-from docarag.domain import ContractValidationError, PageRef
-from docarag.ports import ParserRegistry
-from docarag.presets import (
+from document_services.parser_adapters.docling import DoclingExportAdapter
+from document_services.parser_adapters.mineru_compat import MinerUNormalizedAdapter
+from document_services.parser_adapters.paddleocr_vl import PaddleOCRVLPageAdapter
+from document_services.domain import ContractValidationError, PageRef
+from document_services.ports import ParserRegistry
+from document_services.parsing.routing_presets import (
     BALANCED_PDF_PRESET,
     DOCLING_ADAPTER,
     MINERU_ADAPTER,
@@ -18,7 +18,7 @@ from docarag.presets import (
     balanced_pdf_routing_policy,
     routing_policy_preset,
 )
-from docarag.routing import DeterministicPageRouter, PageFeatures
+from document_services.parsing.routing import DeterministicPageRouter, PageFeatures
 
 
 def stats(**overrides: object) -> dict[str, object]:
@@ -129,8 +129,8 @@ class RoutingPresetTests(unittest.TestCase):
     def test_importing_preset_does_not_load_model_runtimes(self):
         script = """
 import json, sys
-import docarag.presets
-forbidden = ('Core', 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
+import document_services.parsing.routing_presets
+forbidden = ("retrieval_engine", 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """
         completed = subprocess.run(

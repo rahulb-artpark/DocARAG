@@ -6,13 +6,13 @@ import json
 from unittest.mock import patch
 import unittest
 
-from docarag.domain.base import (
+from document_services.domain.base import (
     canonical_json_bytes,
     content_sha256,
     json_ready,
     stable_id,
 )
-from docarag.domain.evidence import (
+from document_services.domain.evidence import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -22,9 +22,11 @@ from docarag.domain.evidence import (
     Representation,
     RepresentationKind,
 )
-from docarag.domain.knowledge import EvidenceAnchor as DomainEvidenceAnchor
-from docarag.domain.knowledge import EvidenceGraphRelease
-from docarag.evidence_graph_builder import (
+from document_services.domain.knowledge import (
+    EvidenceAnchor as DomainEvidenceAnchor,
+    EvidenceGraphRelease,
+)
+from document_services.evidence.graph_builder import (
     BUILDER_SCHEMA_VERSION,
     DEFAULT_MAX_RELEASE_BYTES,
     LEGACY_CHECKPOINT_SCHEMA_VERSION,
@@ -44,7 +46,7 @@ from docarag.evidence_graph_builder import (
     iter_canonical_input_artifact_bytes,
     iter_tree_descriptor_artifact_bytes,
 )
-from docarag.legacy_graph_projection import (
+from document_services.evidence.projections.legacy_graph import (
     LegacyProjectionPolicy,
     project_bookrag_legacy_graph,
 )
@@ -238,7 +240,7 @@ def _checkpoint_identity(
         },
         "models": {
             "llm": {
-                "controller": "Core.provider.llm.LLM",
+                "controller": "retrieval_engine.providers.language_model.LLM",
                 "config": {
                     "backend": "fixture",
                     "model_name": model_revision,
@@ -246,7 +248,7 @@ def _checkpoint_identity(
                 },
             },
             "vlm": {
-                "controller": "Core.provider.vlm.VLM",
+                "controller": "retrieval_engine.providers.vision_model.VLM",
                 "config": {
                     "backend": "fixture",
                     "model_name": model_revision,
@@ -1141,7 +1143,7 @@ class EvidenceGraphReleaseBuilderTests(unittest.TestCase):
             return anchor
 
         with patch(
-            "docarag.evidence_graph_builder.EvidenceAnchor",
+            "document_services.evidence.graph_builder.EvidenceAnchor",
             side_effect=colliding_anchor,
         ):
             with self.assertRaises(EvidenceGraphBuildError) as raised:

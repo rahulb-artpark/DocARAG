@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 import unittest
 
-from Core.pipelines.tree_node_builder import create_node_by_type
-from docarag.bookrag_projection import ProjectionBindingError, project_canonical_blocks
-from docarag.domain import (
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
+from document_services.evidence.projections.bookrag import (
+    ProjectionBindingError,
+    project_canonical_blocks,
+)
+from document_services.domain import (
     BoundingBox,
     CanonicalBlock,
     ContractValidationError,
@@ -14,14 +17,16 @@ from docarag.domain import (
     RelationType,
     stable_id,
 )
-from docarag.reconciliation import (
+from document_services.parsing.reconciliation import (
     ReconciliationIssueCode,
     ReconciliationResult,
     reconcile_observations,
 )
-from tests.test_docling_adapter import adapter as docling_adapter
-from tests.test_docling_adapter import export_fixture as docling_export
-from tests.test_docling_adapter import request_fixture as docling_request
+from tests.test_docling_adapter import (
+    adapter as docling_adapter,
+    export_fixture as docling_export,
+    request_fixture as docling_request,
+)
 from tests.test_parser_contracts import fake_observation, request_fixture
 
 

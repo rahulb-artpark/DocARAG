@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.evidence_projection import _strip_nul_bytes, build_document_evidence
+from document_services.evidence.projections.store import _strip_nul_bytes, build_document_evidence
 
 NUL = chr(0)
 

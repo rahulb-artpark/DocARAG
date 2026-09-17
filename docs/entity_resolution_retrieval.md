@@ -89,7 +89,7 @@ used by entity resolution and the query path both.
 
 ## What this costs in the provider
 
-`Core/provider/vdb.py` today configures a single unnamed dense vector and
+`retrieval_engine/indexes/vector_store.py` today configures a single unnamed dense vector and
 actively rejects named ones:
 
 ```python

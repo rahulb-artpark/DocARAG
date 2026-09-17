@@ -105,7 +105,7 @@ Cheap distance-gate skips **collapse from 927 → ~190** while the expensive pat
 nearly **doubles (23% → 41%)** — and this happened within the first **4%** of the
 document. Mechanism: as the entity VDB fills, almost every new entity finds a
 near-neighbour inside the 0.2 gate
-([kg_refiner.py:480](../Core/pipelines/kg_refiner.py#L480)), so it proceeds to
+([kg_refiner.py:480](../retrieval_engine/indexing/graph/refiner.py#L480)), so it proceeds to
 rerank + LLM instead of being admitted cheaply. The slow-path share keeps rising
 with document size.
 
@@ -119,16 +119,16 @@ priority from v1 of this plan.
 
 **Refinement has zero durability.** `build_knowledge_graph` does not persist the
 graph (the call is commented out,
-[kg_builder.py:172](../Core/pipelines/kg_builder.py#L172)); the only
+[kg_builder.py:172](../retrieval_engine/indexing/graph/builder.py#L172)); the only
 `graph_index.save_graph()` on the real pipeline path runs in
-[construct_index.py](../Core/construct_index.py) **after `build_knowledge_graph`
+[construct_index.py](../retrieval_engine/indexing/pipeline.py) **after `build_knowledge_graph`
 fully returns** — i.e. after all extraction *and* `refine_entities()` *and*
 `refine_relation()` complete.
 
 So: extraction is checkpointed per node (702 files survived), but **every hour of
 refinement is lost on any crash.** Three crashes ⇒ three total losses of
 refinement. Combined with ~63K serial LLM calls and a fail-fast
-`entity_merge` ([kg_refiner.py:242](../Core/pipelines/kg_refiner.py#L242)), the
+`entity_merge` ([kg_refiner.py:242](../retrieval_engine/indexing/graph/refiner.py#L242)), the
 probability of ever reaching the end is effectively zero.
 
 **Even a 10× speedup leaves a ~21h unresumable run, which will still fail.
@@ -191,7 +191,7 @@ outranks F3 (concurrent calls)** — a point v1 of this plan had backwards.
 
 - Per-phase wall + LLM-call + token counters (extend `TokenTracker.record_stage`).
 - **ER counters** in `search_similar_entities`
-  ([kg_refiner.py:454](../Core/pipelines/kg_refiner.py#L454)): gate-skips, rerank
+  ([kg_refiner.py:454](../retrieval_engine/indexing/graph/refiner.py#L454)): gate-skips, rerank
   calls, gradient outcomes, LLM-select calls, LLM-merge calls — **bucketed by
   graph size** so the super-linear curve in §1.1 is tracked continuously, not
   reconstructed from logs afterwards.
@@ -207,7 +207,7 @@ growth curve.
 ### G1. Durable, resumable refinement  ← **the new #1 item**
 - **Problem:** all refinement state (graph, entity VDB, alias map) is in-memory
   until the single end-of-stage `save_graph()`
-  ([construct_index.py](../Core/construct_index.py), after
+  ([construct_index.py](../retrieval_engine/indexing/pipeline.py), after
   `build_knowledge_graph` returns). Any crash ⇒ total loss.
 - **Change:** periodically and atomically snapshot the refinement triple
   *(graph, entity-VDB state, `entity_alias_map`)* at a batch boundary, keyed by
@@ -220,10 +220,10 @@ growth curve.
 
 ### G2. `entity_merge` atomicity + resilience
 - **Problem:** one LLM budget-exhaustion in `entity_merge`
-  ([kg_refiner.py:242](../Core/pipelines/kg_refiner.py#L242)) kills the whole
+  ([kg_refiner.py:242](../retrieval_engine/indexing/graph/refiner.py#L242)) kills the whole
   stage (fail-fast, unlike the pdf_refiner mergers).
 - **Care:** `delete_entity_from_vdb(old_entity)`
-  ([kg_refiner.py:200](../Core/pipelines/kg_refiner.py#L200)) runs **before** the
+  ([kg_refiner.py:200](../retrieval_engine/indexing/graph/refiner.py#L200)) runs **before** the
   risky LLM call. A naive try/except-skip leaves the graph half-mutated. Stage the
   delete and apply it only on LLM success (or make the pair transactional).
 - Also set `think_mode=False` on merge/select calls — same budget-exhaustion root
@@ -247,8 +247,8 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
   fixtures; any blocked pair that the baseline would have merged is a bug.
 
 ### G4. Batch multiple ER decisions per LLM call
-- Today: one LLM call per candidate entity ([:584](../Core/pipelines/kg_refiner.py#L584))
-  and one per merge ([:242](../Core/pipelines/kg_refiner.py#L242)) — up to 2
+- Today: one LLM call per candidate entity ([:584](../retrieval_engine/indexing/graph/refiner.py#L584))
+  and one per merge ([:242](../retrieval_engine/indexing/graph/refiner.py#L242)) — up to 2
   round-trips per entity. Batch several independent ER adjudications into a single
   structured call (as the tree mergers already do with pairs).
 - Only entities whose candidate sets are disjoint may share a call — otherwise
@@ -258,7 +258,7 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
 
 ### G5. Widen the deterministic fast paths
 - 1,536 of 4,959 entities already merge cheaply by exact name/type
-  ([:198-215](../Core/pipelines/kg_refiner.py#L198)). Extend deterministic
+  ([:198-215](../retrieval_engine/indexing/graph/refiner.py#L198)). Extend deterministic
   handling to unambiguous normalizations (case/whitespace/punctuation, known
   abbreviation pairs) that today pay a full LLM adjudication.
 - **Quality gate:** each new deterministic rule must show ~100% agreement with
@@ -271,7 +271,7 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
   rerank cost.** To cut *reranking*, tune `distance_threshold` / `topk`; to cut
   *LLM calls*, tune `g`.
 - **Reciprocal caveat:** code is `score ≥ prev·g`
-  ([kg_refiner.py:533](../Core/pipelines/kg_refiner.py#L533)); paper Alg. 1 line 6
+  ([kg_refiner.py:533](../retrieval_engine/indexing/graph/refiner.py#L533)); paper Alg. 1 line 6
   is `S[v_c] > score/g`. In code, **lowering `g` is *more* permissive** — opposite
   to the paper's notation. Confirm intent before touching `g=0.6`.
 - Tune only against Fig. 6 metrics + recall. This is the one ER change that
@@ -282,7 +282,7 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
 ## PHASE 3 — GRAPH: parallelism (F3)
 
 ### G7. Decouple extraction from refinement
-- Driver interleaves them ([kg_builder.py:189-205](../Core/pipelines/kg_builder.py#L189)):
+- Driver interleaves them ([kg_builder.py:189-205](../retrieval_engine/indexing/graph/builder.py#L189)):
   32 nodes extract concurrently, then refine **serially** before the next batch
   extracts — so extraction is throttled by ER.
 - Let extraction stream to completion as its own resumable pass (already
@@ -292,21 +292,21 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
 
 ### G8. Parallelize the read-only half of ER (preserve Algorithm 1 exactly)
 - Algorithm 1 is sequential **only in the commit**. The prep — embed + VDB search
-  + rerank ([:475-520](../Core/pipelines/kg_refiner.py#L475)) — is read-only.
+  + rerank ([:475-520](../retrieval_engine/indexing/graph/refiner.py#L475)) — is read-only.
 - Compute prep for a window of K pending entities concurrently; **commit
   serially**; recompute an entity's candidate set only if an earlier commit in the
   window touched its neighbourhood.
 - Safe because `advanced_kg_refiner` defers VDB adds until after the per-node loop
-  ([:763](../Core/pipelines/kg_refiner.py#L763)) — **this "no ER within the same
+  ([:763](../retrieval_engine/indexing/graph/refiner.py#L763)) — **this "no ER within the same
   node" invariant (BookRAG §4.3.2) must be preserved explicitly.**
 - **Quality gate:** ER-decision diff identical to serial baseline.
 
 ### G9. Reranker: batch, and stop flushing per entity
 - `self.reranker.clean_cache()` runs **once per entity**
-  ([:516](../Core/pipelines/kg_refiner.py#L516)) — a GPU cache flush ~119K times.
+  ([:516](../retrieval_engine/indexing/graph/refiner.py#L516)) — a GPU cache flush ~119K times.
   Move to per-window/threshold.
 - The provider already batches documents per query
-  ([rerank.py:351](../Core/provider/rerank.py#L351)); with G8's window, batch
+  ([rerank.py:351](../retrieval_engine/providers/reranking.py#L351)); with G8's window, batch
   across entities too.
 - **Quality:** none affected (non-semantic).
 
@@ -321,16 +321,16 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
   *Tree-Traverse baseline*, **not BookRAG's hierarchical BookIndex**.
 - **Cause:** `qwen3.6:35b` spends its whole `max_tokens=5000` on internal
   thinking and emits no JSON. `get_json_completion` accepts `think_mode`
-  ([llm.py:665](../Core/provider/llm.py#L665)); it is never set on this path.
+  ([llm.py:665](../retrieval_engine/providers/language_model.py#L665)); it is never set on this path.
 - **Fix:** set `think_mode=False` (or raise the completion budget) at
-  [outline_extractor.py:320](../Core/pipelines/outline_extractor.py#L320);
+  [outline_extractor.py:320](../retrieval_engine/indexing/tree/outline.py#L320);
   reproduce the empty response in isolation first.
 - **Effect:** real hierarchy (**quality ↑**) **and** reclaims ~2h54m.
 
 > ⚠️ **New risk this revision surfaces — T1 will make summarization slower.**
 > `generate_tree_node_summary` is **level-sequential** (a section prompt consumes
 > its children's summaries); only nodes *within* a level run concurrently
-> ([tree_node_summary.py:218-224](../Core/pipelines/tree_node_summary.py#L218)).
+> ([tree_node_summary.py:218-224](../retrieval_engine/indexing/tree/summary.py#L218)).
 > Today's flat tree (max level 1) is therefore the *maximally parallel* case — one
 > huge level. A correct deep hierarchy introduces more sequential level passes.
 > Leaves still dominate the node count, so the effect should be modest, but it
@@ -342,22 +342,22 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
 
 ### T2. Raise merger batch packing (call-count reduction — do before T3)
 - `get_json_str_text` hard-caps **3 pairs per call**
-  (`number_of_pairs < 3`, [pdf_refiner.py:797](../Core/pipelines/pdf_refiner.py#L797))
+  (`number_of_pairs < 3`, [pdf_refiner.py:797](../retrieval_engine/parsing/pdf_refinement.py#L797))
   independently of the token budget. 2,022 text candidates ⇒ ~674 calls.
 - Packing to the actual token budget (~10/call) is a **~3× call-count reduction**
   that *composes* with T3's parallelism — and on one GPU, fewer calls beats
   concurrent calls.
 - **Quality gate:** the existing response-length-mismatch check
-  ([:868](../Core/pipelines/pdf_refiner.py#L868)) already guards the failure mode;
+  ([:868](../retrieval_engine/parsing/pdf_refinement.py#L868)) already guards the failure mode;
   measure mismatch/retry rate as packing rises and stop before it degrades.
   Merged `pdf_list` must match baseline.
 
 ### T3. Parallelize the mergers (byte-identical)
 - text/label/table judging is a **pure map** — batches independent, merging is a
-  separate reverse pass ([:893](../Core/pipelines/pdf_refiner.py#L893)).
+  separate reverse pass ([:893](../retrieval_engine/parsing/pdf_refinement.py#L893)).
 - Replace the serial loop in `_llm_stitching_judge`
-  ([:843-870](../Core/pipelines/pdf_refiner.py#L843)) and the table-pair loop
-  ([:1257-1270](../Core/pipelines/pdf_refiner.py#L1257)) with the in-tree
+  ([:843-870](../retrieval_engine/parsing/pdf_refinement.py#L843)) and the table-pair loop
+  ([:1257-1270](../retrieval_engine/parsing/pdf_refinement.py#L1257)) with the in-tree
   `llm.iter_completion_results` (already used by `tree_node_summary`).
 - **Subtlety:** `found_remove_text`'s failure-path list mutation must move to
   after collection.
@@ -374,7 +374,7 @@ decisions**. Each item is gated on harness item 4 (ER-decision diff).
 ### T5. Parallelize outline batches
 - ⚠️ Outline batching is a **sequential fold, not a map**: each chunk reads
   `final_outline` accumulated so far
-  ([outline_extractor.py:253-280](../Core/pipelines/outline_extractor.py#L253)),
+  ([outline_extractor.py:253-280](../retrieval_engine/indexing/tree/outline.py#L253)),
   so T3's trick does not apply directly.
 - **Change:** precompute a cheap global skeleton (level-0 + level-1 candidates via
   numbering/height), feed every batch that *fixed* skeleton instead of the running
@@ -459,22 +459,22 @@ parallelism, is the deciding factor.**
 
 | # | Deviation | Location | Call needed |
 |---|---|---|---|
-| A1 | **Hierarchy absent — §4.2.2 effectively not realised.** All outline chunks fail ⇒ `Max level: 1`. Current index ≈ paper's Tree-Traverse baseline, not BookRAG. | [outline_extractor.py:320](../Core/pipelines/outline_extractor.py#L320) | fixed by **T1** |
-| A2 | **`g` reciprocal to the paper.** Code `score ≥ prev·g`; paper Alg. 1 `S > score/g`. Lowering `g` is *more* permissive in code. | [kg_refiner.py:533](../Core/pipelines/kg_refiner.py#L533) | confirm intent before **G6** |
-| A3 | **`mink` seed not in the paper.** Code seeds selection with `ranked_results[:mink]` (mink=1); paper seeds `Ec[0]` only. Equivalent at 1; flagged for clarity. | [kg_refiner.py:528](../Core/pipelines/kg_refiner.py#L528) | note only |
-| A4 | **`max_gleaning=0`.** Paper's extraction permits multi-round gleaning; disabled here. Fine for speed — noted so a future quality tweak does not silently add serial calls. | [kg_extractor.py:386](../Core/pipelines/kg_extractor.py#L386) | note only |
+| A1 | **Hierarchy absent — §4.2.2 effectively not realised.** All outline chunks fail ⇒ `Max level: 1`. Current index ≈ paper's Tree-Traverse baseline, not BookRAG. | [outline_extractor.py:320](../retrieval_engine/indexing/tree/outline.py#L320) | fixed by **T1** |
+| A2 | **`g` reciprocal to the paper.** Code `score ≥ prev·g`; paper Alg. 1 `S > score/g`. Lowering `g` is *more* permissive in code. | [kg_refiner.py:533](../retrieval_engine/indexing/graph/refiner.py#L533) | confirm intent before **G6** |
+| A3 | **`mink` seed not in the paper.** Code seeds selection with `ranked_results[:mink]` (mink=1); paper seeds `Ec[0]` only. Equivalent at 1; flagged for clarity. | [kg_refiner.py:528](../retrieval_engine/indexing/graph/refiner.py#L528) | note only |
+| A4 | **`max_gleaning=0`.** Paper's extraction permits multi-round gleaning; disabled here. Fine for speed — noted so a future quality tweak does not silently add serial calls. | [kg_extractor.py:386](../retrieval_engine/indexing/graph/extractor.py#L386) | note only |
 | A5 | **Scale gap.** Paper validated ≤42 avg pages / ~1.3K entities; we run 1,870 pages / ~119K entities. Incremental "clean ER" was chosen for the small-graph regime. | §0 | drives **Phase 2** |
 
 ## Appendix B — BookRAG invariants the scaling must not break
 
 | Paper concern | Where | Protected by |
 |---|---|---|
-| §4.3.2 Alg. 1 **sequential commit** (each insert changes the next lookup) | [kg_refiner.py:526-541](../Core/pipelines/kg_refiner.py#L526) | G8 parallelizes read-only prep only; commit stays serial; ER-decision diff |
-| §4.3.2 **no ER within the same node** (a node's own entities aren't resolved against each other) | VDB add deferred to after the loop, [:763](../Core/pipelines/kg_refiner.py#L763) | explicit invariant in G7/G8 |
+| §4.3.2 Alg. 1 **sequential commit** (each insert changes the next lookup) | [kg_refiner.py:526-541](../retrieval_engine/indexing/graph/refiner.py#L526) | G8 parallelizes read-only prep only; commit stays serial; ER-decision diff |
+| §4.3.2 **no ER within the same node** (a node's own entities aren't resolved against each other) | VDB add deferred to after the loop, [:763](../retrieval_engine/indexing/graph/refiner.py#L763) | explicit invariant in G7/G8 |
 | §4.3.2 **GT-Link** (origin node per entity, aggregated on merge) | `add_and_link(tree_node_id=…)` | link-integrity check in harness |
-| §4.3.1 **modality-dependent extraction** (LLM text / VLM image / typed table entity) | [kg_extractor.py:472](../Core/pipelines/kg_extractor.py#L472), [:767](../Core/pipelines/kg_extractor.py#L767) | G7 moves scheduling only |
-| §4.2.2 **batched filtering with l=1 context window** | [outline_extractor.py:253-280](../Core/pipelines/outline_extractor.py#L253) | T5 keeps the level-0/1 signal from a stable skeleton |
-| §4.2.2 **type recheck τ′ (Title→Text)** | [doc_tree_builder.py:1346-1353](../Core/pipelines/doc_tree_builder.py#L1346) → [tree_node_builder.py:75](../Core/pipelines/tree_node_builder.py#L75) | T4's agreement gate |
+| §4.3.1 **modality-dependent extraction** (LLM text / VLM image / typed table entity) | [kg_extractor.py:472](../retrieval_engine/indexing/graph/extractor.py#L472), [:767](../retrieval_engine/indexing/graph/extractor.py#L767) | G7 moves scheduling only |
+| §4.2.2 **batched filtering with l=1 context window** | [outline_extractor.py:253-280](../retrieval_engine/indexing/tree/outline.py#L253) | T5 keeps the level-0/1 signal from a stable skeleton |
+| §4.2.2 **type recheck τ′ (Title→Text)** | [doc_tree_builder.py:1346-1353](../retrieval_engine/indexing/tree/builder.py#L1346) → [tree_node_builder.py:75](../retrieval_engine/indexing/tree/nodes.py#L75) | T4's agreement gate |
 | Fig. 6 **ER quality metrics** (#entities, density, diameter, #CC) | — | harness item 3, gate for every ER change |
 
 ---

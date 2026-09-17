@@ -5,7 +5,7 @@ import subprocess
 import sys
 import unittest
 
-from docarag.domain import (
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     BoundingBox,
@@ -27,7 +27,7 @@ from docarag.domain import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.parsing_orchestrator import (
+from document_services.parsing.orchestrator import (
     InvocationRole,
     InvocationTrigger,
     OrchestrationContractError,
@@ -41,8 +41,8 @@ from docarag.parsing_orchestrator import (
     RoutedParsingResult,
     RoutedParsingStatus,
 )
-from docarag.ports import ParserRegistry
-from docarag.routing import (
+from document_services.ports import ParserRegistry
+from document_services.parsing.routing import (
     AdapterRoutingProfile,
     DeterministicPageRouter,
     PageClass,
@@ -562,8 +562,8 @@ class ParsingOrchestrationAuditContractTests(unittest.TestCase):
     def test_import_does_not_load_vendor_model_or_bookrag_core_modules(self):
         script = """
 import json, sys
-import docarag.parsing_orchestrator
-forbidden = ('Core', 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
+import document_services.parsing.orchestrator
+forbidden = ("retrieval_engine", 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """
         completed = subprocess.run(

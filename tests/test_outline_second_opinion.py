@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from Core.Index.Tree import DocumentTree, NodeType
-from Core.pipelines.doc_tree_builder import construct_tree_index
-from Core.pipelines.outline_extractor import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType
+from retrieval_engine.indexing.tree.builder import construct_tree_index
+from retrieval_engine.indexing.tree.outline import (
     extract_pdf_outline_in_chunks,
     heading_shaped,
 )

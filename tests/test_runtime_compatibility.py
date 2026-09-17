@@ -9,7 +9,7 @@ import tomllib
 from types import SimpleNamespace
 import unittest
 
-from docarag.diagnostics import (
+from document_services.operations.diagnostics import (
     CommandOutput,
     DiagnosticProbes,
     HttpResponse,
@@ -19,14 +19,14 @@ from docarag.diagnostics import (
     doctor_for_routed_profile,
     doctor_for_settings,
 )
-from docarag.domain.evidence import BlockType
-from docarag.domain.parsing import (
+from document_services.domain.evidence import BlockType
+from document_services.domain.parsing import (
     AcceleratorKind,
     ParserCapabilityManifest,
     ParserModality,
 )
-from docarag.routed_profile import load_routed_runtime_profile
-from docarag.runtime_compatibility import (
+from document_services.runtime.routing_profile import load_routed_runtime_profile
+from document_services.runtime.compatibility_manifest import (
     CompatibilityManifestError,
     DEFAULT_MANIFEST_PATH,
     MANIFEST_SCHEMA_VERSION,
@@ -242,7 +242,7 @@ class RuntimeCompatibilityManifestTests(unittest.TestCase):
                 )
 
         code = (
-            "import json,sys; import docarag.runtime_compatibility; "
+            "import json,sys; import document_services.runtime.compatibility_manifest; "
             "roots=('torch','paddle','paddleocr','docling','mineru','transformers','vllm'); "
             "print(json.dumps(sorted(n for n in sys.modules if n.split('.')[0] in roots)))"
         )

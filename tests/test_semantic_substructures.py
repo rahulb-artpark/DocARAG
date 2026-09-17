@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.bookrag_projection import project_canonical_blocks
-from docarag.domain import (
+from document_services.evidence.projections.bookrag import project_canonical_blocks
+from document_services.domain import (
     BlockType,
     BoundingBox,
     CanonicalBlock,
@@ -32,7 +32,7 @@ from docarag.domain import (
     SourceGeometry,
     content_sha256,
 )
-from docarag.reconciliation import reconcile_observations
+from document_services.parsing.reconciliation import reconcile_observations
 
 
 DOCUMENT_VERSION = "semantic-document-version"

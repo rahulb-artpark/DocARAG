@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from Core.utils.summary_checkpoint import (
+from retrieval_engine.indexing.tree.checkpoint import (
     SummaryCheckpointStore,
     summary_cache_identity,
 )

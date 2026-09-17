@@ -27,11 +27,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from Core.Index.Tree import NodeType
-from Core.configs.graph_config import GraphConfig
-from Core.configs.vdb_config import VDBConfig
-from Core.pipelines import kg_builder
-from Core.pipelines.kg_refinement_state import state_path
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.configuration.knowledge_graph import GraphConfig
+from retrieval_engine.configuration.vector_store import VDBConfig
+from retrieval_engine.indexing.graph import builder as kg_builder
+from retrieval_engine.indexing.graph.refinement_state import state_path
 
 
 _PROBE: contextvars.ContextVar[str] = contextvars.ContextVar("probe", default="unset")

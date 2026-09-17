@@ -3,7 +3,7 @@ from utils.extract_answer import AnswerExtractor, load_prompt
 from utils.utils import get_all_cost
 
 from utils.m3doc_eval import list_f1
-from Core.configs.dataset_config import DatasetConfig
+from retrieval_engine.configuration.dataset import DatasetConfig
 
 
 import pandas as pd

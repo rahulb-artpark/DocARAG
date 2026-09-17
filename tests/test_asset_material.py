@@ -9,13 +9,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag.asset_material import (
+from document_services.evidence.assets import (
     ASSET_MATERIAL_SCHEMA_VERSION,
     AssetMaterialErrorCode,
     AssetMaterialResolver,
     AssetMaterializationError,
 )
-from docarag.domain import AssetKind, AssetRef
+from document_services.domain import AssetKind, AssetRef
 
 
 def digest(data: bytes) -> str:
@@ -138,7 +138,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
             requested_counts.append(count)
             return real_read(file_descriptor, count)
 
-        with patch("docarag.asset_material.os.read", side_effect=recording_read):
+        with patch("document_services.evidence.assets.os.read", side_effect=recording_read):
             material = self.resolver(max_asset_bytes=len(payload)).resolve(
                 asset(os.fspath(path), payload), include_bytes=True
             )
@@ -159,7 +159,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
             requested_counts.append(count)
             return real_read(file_descriptor, min(count, 17))
 
-        with patch("docarag.asset_material.os.read", side_effect=short_read):
+        with patch("document_services.evidence.assets.os.read", side_effect=short_read):
             material = self.resolver(chunk_size=31).resolve(
                 asset(os.fspath(path), payload), include_bytes=True
             )
@@ -190,7 +190,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
             return chunk
 
         with patch(
-            "docarag.asset_material.os.read", side_effect=grow_after_initial_read
+            "document_services.evidence.assets.os.read", side_effect=grow_after_initial_read
         ):
             with self.assertRaises(AssetMaterializationError) as raised:
                 self.resolver(max_asset_bytes=512).resolve(
@@ -238,9 +238,9 @@ class AssetMaterialResolverTests(unittest.TestCase):
             real_close(descriptor)
 
         with (
-            patch("docarag.asset_material.os.open", side_effect=tracking_open),
-            patch("docarag.asset_material.os.fstat", side_effect=failing_fstat),
-            patch("docarag.asset_material.os.close", side_effect=tracking_close),
+            patch("document_services.evidence.assets.os.open", side_effect=tracking_open),
+            patch("document_services.evidence.assets.os.fstat", side_effect=failing_fstat),
+            patch("document_services.evidence.assets.os.close", side_effect=tracking_close),
         ):
             with self.assertRaises(AssetMaterializationError) as raised:
                 resolver.resolve(asset(os.fspath(path), payload))
@@ -374,7 +374,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
         payload = b"x" * 33
         oversized = self.root / "oversized.png"
         oversized.write_bytes(payload)
-        with patch("docarag.asset_material.os.read", wraps=os.read) as read:
+        with patch("document_services.evidence.assets.os.read", wraps=os.read) as read:
             with self.assertRaises(AssetMaterializationError) as raised:
                 self.resolver(max_asset_bytes=32).resolve(
                     asset(os.fspath(oversized), payload)
@@ -416,7 +416,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
                     os.fsync(stream.fileno())
             return chunk
 
-        with patch("docarag.asset_material.os.read", side_effect=changing_read):
+        with patch("document_services.evidence.assets.os.read", side_effect=changing_read):
             with self.assertRaises(AssetMaterializationError) as raised:
                 self.resolver().resolve(reference)
         self.assertEqual(
@@ -441,7 +441,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
                 path.write_bytes(original)
             return chunk
 
-        with patch("docarag.asset_material.os.read", side_effect=replacing_read):
+        with patch("document_services.evidence.assets.os.read", side_effect=replacing_read):
             with self.assertRaises(AssetMaterializationError) as raised:
                 self.resolver().resolve(reference)
         self.assertEqual(
@@ -470,7 +470,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
             return result
 
         with patch(
-            "docarag.asset_material.os.fstat", side_effect=mutate_after_final_fstat
+            "document_services.evidence.assets.os.fstat", side_effect=mutate_after_final_fstat
         ):
             with self.assertRaises(AssetMaterializationError) as raised:
                 self.resolver().resolve(reference)
@@ -503,7 +503,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
             sha256="f" * 64,
         )
         resolver = self.resolver()
-        with patch("docarag.asset_material.os.open", wraps=os.open) as opened:
+        with patch("document_services.evidence.assets.os.open", wraps=os.open) as opened:
             with self.assertRaises(AssetMaterializationError) as raised:
                 resolver.resolve_many((reference, conflict))
         self.assertEqual(AssetMaterialErrorCode.TARGET_CONFLICT, raised.exception.code)
@@ -528,7 +528,7 @@ class AssetMaterialResolverTests(unittest.TestCase):
             read_calls += 1
             return real_read(file_descriptor, count)
 
-        with patch("docarag.asset_material.os.read", side_effect=counting_read):
+        with patch("document_services.evidence.assets.os.read", side_effect=counting_read):
             materials = self.resolver().resolve_many((first, second))
 
         self.assertEqual((first.asset_id, second.asset_id), tuple(x.asset_id for x in materials))

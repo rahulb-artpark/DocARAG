@@ -1,6 +1,6 @@
 import unittest
 
-from docarag.domain.evidence import (
+from document_services.domain.evidence import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -14,7 +14,7 @@ from docarag.domain.evidence import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.formula_transcription import (
+from document_services.enrichment.formula_transcription import (
     VLMFormulaTranscriber,
     _find_unambiguous_equation_span,
     clean_latex,

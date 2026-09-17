@@ -8,16 +8,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag.artifact_store import LocalContentAddressedArtifactStore
-from docarag.bookrag_projection import (
+from document_services.persistence.artifact_store import LocalContentAddressedArtifactStore
+from document_services.evidence.projections.bookrag import (
     BookRAGAssetMaterializationLease,
     project_canonical_blocks,
 )
-from docarag.canonical_artifacts import (
+from document_services.evidence.artifacts import (
     CANONICAL_CONTRACT_SCHEMA_VERSION,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
 )
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -31,12 +31,12 @@ from docarag.domain import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.evidence_hydration import (
+from document_services.evidence.hydration import (
     CITATION_SCHEMA_VERSION,
     CanonicalEvidenceHydrator,
     EvidenceHydrationError,
 )
-from docarag.derived_identity import (
+from document_services.evidence.identity import (
     caption_footnote_text,
     channel_text,
     derived_evidence_id,
@@ -559,7 +559,7 @@ class EvidenceHydrationTests(unittest.TestCase):
         after = SimpleNamespace(**vars(before))
         after.st_mtime_ns += 1
         with patch(
-            "docarag.evidence_hydration.os.fstat",
+            "document_services.evidence.hydration.os.fstat",
             side_effect=(before, after),
         ):
             with self.assertRaisesRegex(EvidenceHydrationError, "changed while"):

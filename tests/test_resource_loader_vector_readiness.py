@@ -7,12 +7,12 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.pipelines import vdb_index
-from Core.provider.vdb import VectorSchema
-from Core.utils import resource_loader
-from Core.utils.vector_index_manifest import vector_index_lock
-from Core.utils.artifact_paths import QdrantCollectionState
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.indexing.vector import builder as vdb_index
+from retrieval_engine.indexes.vector_store import VectorSchema
+from retrieval_engine.runtime import resource_loader
+from retrieval_engine.indexes.vector_manifest import vector_index_lock
+from retrieval_engine.utils.artifact_paths import QdrantCollectionState
 
 
 class FakeGmeEmbedder:
@@ -167,7 +167,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.MultimodalEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider",
                     side_effect=AssertionError("model loaded before readiness"),
                 ) as model,
                 self.assertRaisesRegex(
@@ -203,10 +203,10 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.MultimodalEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider",
                     return_value=model,
                 ) as model_factory,
-                patch("Core.provider.vdb.VectorStore", return_value=store) as store_factory,
+                patch("retrieval_engine.indexes.vector_store.VectorStore", return_value=store) as store_factory,
                 patch.object(
                     vdb_index,
                     "expected_tree_vector_index_attestation",
@@ -266,7 +266,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             config.source.sha256 = "b" * 64
             with (
-                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
+                patch("retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -281,7 +281,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                 "another-collection"
             )
             with (
-                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
+                patch("retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -293,7 +293,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             changed_model = _config(directory, model_name="gme-v2")
             with (
-                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
+                patch("retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -328,14 +328,14 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             store = LeaseAwareStore()
             with (
                 patch(
-                    "Core.provider.embedding.MultimodalEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider",
                     return_value=model,
                 ) as gme_factory,
                 patch(
-                    "Core.provider.embedding.TextEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.TextEmbeddingProvider",
                     side_effect=AssertionError("query selected incompatible provider"),
                 ) as text_factory,
-                patch("Core.provider.vdb.VectorStore", return_value=store),
+                patch("retrieval_engine.indexes.vector_store.VectorStore", return_value=store),
             ):
                 dependencies = resource_loader.prepare_rag_dependencies(config)
 
@@ -352,7 +352,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.MultimodalEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider",
                     side_effect=RuntimeError("model unavailable"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "model unavailable"),
@@ -375,7 +375,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             self.seal_patch.start()
 
             with (
-                patch("Core.provider.embedding.MultimodalEmbeddingProvider") as model,
+                patch("retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider") as model,
                 self.assertRaisesRegex(
                     vdb_index.VectorIndexBindingError,
                     "sealed store revision",
@@ -397,10 +397,10 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
 
             with (
                 patch(
-                    "Core.provider.embedding.MultimodalEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.MultimodalEmbeddingProvider",
                     return_value=model,
                 ),
-                patch("Core.provider.vdb.VectorStore", return_value=store),
+                patch("retrieval_engine.indexes.vector_store.VectorStore", return_value=store),
                 self.assertRaisesRegex(RuntimeError, "attach failed"),
             ):
                 resource_loader.prepare_rag_dependencies(config)
@@ -454,11 +454,11 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                     side_effect=[Mock(), Mock()],
                 ),
                 patch(
-                    "Core.provider.embedding.TextEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.TextEmbeddingProvider",
                     return_value=model,
                 ),
                 patch(
-                    "Core.provider.vdb.VectorStore",
+                    "retrieval_engine.indexes.vector_store.VectorStore",
                     side_effect=[tree_store, RuntimeError("graph open failed")],
                 ),
                 self.assertRaisesRegex(RuntimeError, "graph open failed"),
@@ -482,7 +482,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "Core.provider.embedding.TextEmbeddingProvider",
+                    "retrieval_engine.providers.embeddings.TextEmbeddingProvider",
                     return_value=vanilla_model,
                 ),
                 patch.object(
@@ -491,7 +491,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
                     return_value=Mock(),
                 ),
                 patch(
-                    "Core.provider.vdb.VectorStore",
+                    "retrieval_engine.indexes.vector_store.VectorStore",
                     side_effect=RuntimeError("vanilla open failed"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "vanilla open failed"),
@@ -511,7 +511,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         )
         with (
             patch(
-                "Core.rag.stored_index.StoredIndex.open",
+                "retrieval_engine.rag.stored_indexes.StoredIndex.open",
                 return_value=gbc,
             ) as load_gbc,
             patch.object(
@@ -539,7 +539,7 @@ class ResourceLoaderVectorReadinessTests(unittest.TestCase):
         )
         with (
             patch(
-                "Core.rag.stored_index.StoredIndex.open",
+                "retrieval_engine.rag.stored_indexes.StoredIndex.open",
                 return_value=gbc,
             ),
             patch.object(

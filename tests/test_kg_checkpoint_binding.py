@@ -9,9 +9,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from Core.Index.Graph import Entity
-from Core.Index.Tree import NodeType, TreeNode
-from Core.pipelines.kg_extractor import (
+from retrieval_engine.indexes.graph import Entity
+from retrieval_engine.indexes.tree import NodeType, TreeNode
+from retrieval_engine.indexing.graph.extractor import (
     KG_CHECKPOINT_SCHEMA_VERSION,
     KGExtractor,
 )
@@ -213,7 +213,7 @@ class KGCheckpointBindingTests(unittest.TestCase):
             self.assertEqual(worker.calls, 2)
 
             with patch(
-                "Core.pipelines.kg_extractor.ENTITY_EXTRACTION",
+                "retrieval_engine.indexing.graph.extractor.ENTITY_EXTRACTION",
                 "changed entity extraction prompt {input_text}",
             ):
                 extractor.extract_kg(node)
@@ -369,7 +369,7 @@ class KGCheckpointBindingTests(unittest.TestCase):
 
             identity = extractor._checkpoint_identity(node, kind="node")
             with patch(
-                "Core.pipelines.kg_extractor.json.dump",
+                "retrieval_engine.indexing.graph.extractor.json.dump",
                 side_effect=RuntimeError("interrupted serialization"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "interrupted"):

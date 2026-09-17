@@ -42,12 +42,15 @@ os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
-from docarag.cli import _load_project_environment
-from docarag.compat import RunReadiness, inspect_run_readiness, run_provenance
-from docarag.provenance import query_readiness_stat_key
-from docarag.provenance import sha256_file
-from docarag.run_logging import RunLogInfo, RunLogScope
-from Core.provider.TokenTracker import TokenTracker
+from document_services.cli import _load_project_environment
+from document_services.runtime.bookrag_bridge import (
+    RunReadiness,
+    inspect_run_readiness,
+    run_provenance,
+)
+from document_services.evidence.provenance import query_readiness_stat_key, sha256_file
+from document_services.operations.run_logging import RunLogInfo, RunLogScope
+from retrieval_engine.providers.token_tracker import TokenTracker
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
@@ -550,7 +553,7 @@ CROSS_LINK_PLAN_FILE = "library-cross-link-plan.json"
 
 
 def write_cross_link_plan(run_dir, mode, target_run_dirs):
-    """Persist the ingest-time cross-link decision; docarag/pipeline.py reads
+    """Persist the ingest-time cross-link decision; document_services/indexing/pipeline.py reads
     this once the new document's graph stage completes."""
 
     path = Path(run_dir) / CROSS_LINK_PLAN_FILE
@@ -627,7 +630,7 @@ def _qdrant_delete_scope(qdrant_url, timeout_seconds, collection, scope):
 
 
 def _revision_key_for_run(ledger, run_dir):
-    from docarag.persistence import DocumentScope
+    from document_services.persistence import DocumentScope
 
     manifest = _read_json_if_present(Path(run_dir) / "run-manifest.json")
     return ledger.revision_key(
@@ -650,9 +653,9 @@ def _cross_link_summaries(runs):
     """
 
     try:
-        from docarag.corpus_store import CorpusStore
-        from docarag.persistence import PostgresLedger
-        from docarag.settings import load_settings
+        from document_services.persistence.corpus_store import CorpusStore
+        from document_services.persistence import PostgresLedger
+        from document_services.runtime.settings import load_settings
 
         ledger = PostgresLedger(load_settings().resolve_database_url())
     except Exception:
@@ -777,8 +780,8 @@ def delete_run_everywhere(run_dir):
                     removed["vectors"][collection] = f"failed: {type(exc).__name__}"
 
         try:
-            from docarag.persistence import DocumentScope, PostgresLedger
-            from docarag.settings import load_settings
+            from document_services.persistence import DocumentScope, PostgresLedger
+            from document_services.runtime.settings import load_settings
 
             ledger = PostgresLedger(load_settings().resolve_database_url())
             scope = DocumentScope(tenant, corpus, document_id, document_version_id)
@@ -857,10 +860,10 @@ def delete_run_everywhere(run_dir):
                         )
 
                 if affected_grouping_keys:
-                    from Core.configs.system_config import SystemConfig
-                    from Core.provider.embedding import TextEmbeddingProvider
-                    from docarag.grouping_maintenance import recalculate_affected_groupings
-                    from docarag.persistence.contracts import CorpusScope
+                    from retrieval_engine.configuration.system import SystemConfig
+                    from retrieval_engine.providers.embeddings import TextEmbeddingProvider
+                    from document_services.indexing.grouping_maintenance import recalculate_affected_groupings
+                    from document_services.persistence.contracts import CorpusScope
 
                     embed_cfg = SystemConfig(**config).graph.embedding_config
                     embedder = TextEmbeddingProvider(
@@ -894,7 +897,7 @@ def start_index(pdf_path):
     """Launch the CLI indexer, which owns admission and the stage ledger."""
 
     completed = subprocess.run(
-        [sys.executable, "-m", "docarag.cli", "index", str(pdf_path)],
+        [sys.executable, "-m", "document_services.cli", "index", str(pdf_path)],
         cwd=str(REPO),
         capture_output=True,
         text=True,
@@ -967,7 +970,7 @@ _ANSWER_TIME_BUDGET_FIELDS = (
 def refresh_answer_time_budgets(cfg):
     """Take answer-time budgets from the current config, not the run's copy."""
 
-    from Core.configs.system_config import load_system_config
+    from retrieval_engine.configuration.system import load_system_config
 
     strategy = getattr(getattr(cfg, "rag", None), "strategy_config", None)
     if strategy is None:
@@ -1138,7 +1141,7 @@ def run_code_fingerprint_matches(run_dir):
     if not isinstance(recorded, str) or not recorded:
         return None
     try:
-        from docarag.admission import compute_code_fingerprint
+        from document_services.indexing.admission import compute_code_fingerprint
 
         current, _count = compute_code_fingerprint(REPO, REPO / "Scripts" / "index_pdf.sh")
     except Exception:
@@ -1479,7 +1482,7 @@ class AppState:
 
         self.require_document_scope()
         if self._store is None:
-            from docarag.document_store import DocumentStore
+            from document_services.persistence.document_store import DocumentStore
 
             self._store = DocumentStore.open(self.scope_run_dir)
         return self._store
@@ -1838,9 +1841,9 @@ class AppState:
     def _build_scoped_rag_agent(self, run_dirs):
         """Build a fresh multi-document RAG agent over exactly these run dirs."""
 
-        from Core.configs.system_config import load_system_config
-        from Core.rag import create_rag_agent
-        from Core.utils.resource_loader import prepare_corpus_rag_dependencies
+        from retrieval_engine.configuration.system import load_system_config
+        from retrieval_engine.rag import create_rag_agent
+        from retrieval_engine.runtime.resource_loader import prepare_corpus_rag_dependencies
 
         document_configs = []
         for run_dir in run_dirs:
@@ -2007,7 +2010,7 @@ class AppState:
         if self._graph_cache is not None and self._graph_cache_key == key:
             return self._graph_cache
 
-        from Core.rag.stored_index import entity_node_name
+        from retrieval_engine.rag.stored_indexes import entity_node_name
 
         store = self.store()
         entities = store.tree.graph_entities()
@@ -2082,9 +2085,9 @@ class AppState:
         full tree payload) -- Document scope stays the place to read text.
         """
 
-        from docarag.corpus_store import CorpusStore
-        from docarag.document_store import DocumentStore
-        from Core.rag.stored_index import entity_node_name
+        from document_services.persistence.corpus_store import CorpusStore
+        from document_services.persistence.document_store import DocumentStore
+        from retrieval_engine.rag.stored_indexes import entity_node_name
 
         nodes = {}
         links = []
@@ -2240,9 +2243,9 @@ class AppState:
                 close()
             self.rag_agent = None
 
-        from Core.configs.system_config import load_system_config
-        from Core.rag import create_rag_agent
-        from Core.utils.resource_loader import prepare_rag_dependencies
+        from retrieval_engine.configuration.system import load_system_config
+        from retrieval_engine.rag import create_rag_agent
+        from retrieval_engine.runtime.resource_loader import prepare_rag_dependencies
 
         run_config = self.scope_run_dir / "run_config.yaml"
         cfg = load_system_config(str(run_config if run_config.is_file() else DEFAULT_CONFIG))
@@ -2250,7 +2253,7 @@ class AppState:
         refresh_answer_time_budgets(cfg)
         # cfg.graph.refine_type, loaded above from this run's own frozen
         # run_config.yaml, is already exactly what was used to build this
-        # run -- graph_artifact_variant(cfg.graph) (Core/configs/graph_config.py)
+        # run -- graph_artifact_variant(cfg.graph) (retrieval_engine/configuration/knowledge_graph.py)
         # is a pure function of cfg.graph alone, so recomputing it here would
         # always reproduce the same variant the build already used. There is
         # no build-time fallback/downgrade path that could make the actual
@@ -2356,7 +2359,7 @@ class AppState:
             try:
                 with RunLogScope(
                     q_dir,
-                    logger_names=("Core", "docarag", __name__),
+                    logger_names=("retrieval_engine", "document_services", __name__),
                     run_id=query_id,
                 ) as run_log_info:
                     readiness = self.chat_readiness()
@@ -3011,7 +3014,7 @@ class Handler(SimpleHTTPRequestHandler):
         Returns None after sending an error response on a bad request. A
         "group" choice is resolved to concrete run dirs here so the stored
         plan's shape is always ``{"mode": "auto"|"skip"|"documents", ...}`` --
-        docarag/pipeline.py never needs to know about groups.
+        document_services/indexing/pipeline.py never needs to know about groups.
         """
 
         raw_header = self.headers.get("X-Cross-Link-Plan")
@@ -3219,7 +3222,7 @@ class Handler(SimpleHTTPRequestHandler):
             attempt_dir.mkdir(parents=True, exist_ok=True)
             completed = subprocess.run(
                 [
-                    sys.executable, "-m", "docarag.recovery",
+                    sys.executable, "-m", "document_services.indexing.recovery",
                     "--run", str(run_dir),
                     "--attempt-dir", str(attempt_dir),
                     "--from-stage", from_stage,
@@ -3483,7 +3486,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error_json(HTTPStatus.BAD_REQUEST, "No other documents to link against")
             return
 
-        command = [sys.executable, "-m", "docarag.cross_doc_link", "--run", str(run_dir)]
+        command = [sys.executable, "-m", "document_services.indexing.linking_cli", "--run", str(run_dir)]
         if mode == "mesh":
             command += ["--mode", "mesh"]
         else:
@@ -3515,8 +3518,8 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
         try:
-            from docarag.persistence import PostgresLedger
-            from docarag.settings import load_settings
+            from document_services.persistence import PostgresLedger
+            from document_services.runtime.settings import load_settings
 
             ledger = PostgresLedger(load_settings().resolve_database_url())
             revision_key = _revision_key_for_run(ledger, run_dir)
@@ -3549,7 +3552,7 @@ class Handler(SimpleHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, "nodeId and non-empty text are required"
                 )
                 return
-            from docarag.edit import edit_node_summary
+            from document_services.indexing.editing import edit_node_summary
 
             # The vectors are re-derived in place, which needs the attestation
             # build lock this server's own agent holds a shared lease on.
@@ -3580,7 +3583,7 @@ class Handler(SimpleHTTPRequestHandler):
                     HTTPStatus.BAD_REQUEST, "nodeId and non-empty text are required"
                 )
                 return
-            from docarag.edit import edit_node_content
+            from document_services.indexing.editing import edit_node_content
 
             self.state.release_index_locks()
             edit_node_content(self.state.scope_run_dir, node_id, text.strip())
@@ -3626,7 +3629,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "canonical, kind and non-empty text are required",
                 )
                 return
-            from docarag.edit import edit_entity_description
+            from document_services.indexing.editing import edit_entity_description
 
             self.state.release_index_locks()
             edit_entity_description(

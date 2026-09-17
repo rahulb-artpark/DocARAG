@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from docarag.vdb_tree_source import asset_cas_root, openable_image
+from document_services.persistence.vector_tree_source import asset_cas_root, openable_image
 
 
 class IdentityNeverDisplacesAPath(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Sharded parsing preserves page continuity across shard boundaries.
 
 Every risk here was found by reading the real merge/search code, not
-assumed -- see Core/pipelines/sharded_parsing.py's module docstring for the
+assumed -- see retrieval_engine/parsing/page_sharding.py's module docstring for the
 exact evidence each test below is checking.
 """
 
@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from Core.pipelines.sharded_parsing import (
+from retrieval_engine.parsing.page_sharding import (
     CARRY_PAGES,
     ParsedShard,
     offset_page_indices,

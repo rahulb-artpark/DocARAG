@@ -6,13 +6,13 @@ from unittest.mock import Mock
 
 from pydantic import ValidationError
 
-from Core.configs.rag.gbc_config import GBCRAGConfig
-from Core.prompts.gbc_prompt import (
+from retrieval_engine.configuration.strategies.gbc import GBCRAGConfig
+from retrieval_engine.prompts.gbc import (
     QuestionEntity,
     QuestionEntityExtraction,
     SecEXPSelection,
 )
-from Core.rag.gbc_plan import (
+from retrieval_engine.rag.gbc.planner import (
     ComplexResult,
     Filter,
     GlobalResult,
@@ -22,8 +22,8 @@ from Core.rag.gbc_plan import (
     SubQuestion,
     TaskPlanner,
 )
-from Core.rag.gbc_rag import GBCRAG, SectionSelectionBudgetExceeded
-from Core.rag.gbc_utils import GBCRAGContext, SubStep
+from retrieval_engine.rag.gbc.agent import GBCRAG, SectionSelectionBudgetExceeded
+from retrieval_engine.rag.gbc.context import GBCRAGContext, SubStep
 
 
 class _SequencedLLM:

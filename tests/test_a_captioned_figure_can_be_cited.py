@@ -36,24 +36,24 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.derived_identity import (
+from document_services.evidence.identity import (
     caption_footnote_text,
     channel_text,
     derived_evidence_id,
     derived_identity_payload,
     derived_output_identity,
 )
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     AssetRef,
     BlockType,
     Representation,
     RepresentationKind,
 )
-from docarag.evidence_hydration import EvidenceHydrationError
+from document_services.evidence.hydration import EvidenceHydrationError
 
-from Core.pipelines.pdf_refiner import _derived_output_content
-from Core.pipelines.tree_node_builder import create_node_by_type
+from retrieval_engine.parsing.pdf_refinement import _derived_output_content
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
 
 from tests.test_evidence_hydration import (
     CANONICAL_CONTRACT_SCHEMA_VERSION,

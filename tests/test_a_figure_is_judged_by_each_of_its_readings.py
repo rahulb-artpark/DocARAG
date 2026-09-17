@@ -24,8 +24,8 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from Core.Index.Tree import NodeType
-from Core.rag.gbc_retrieval import Retriever
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.rag.gbc.retrieval import Retriever
 
 HEADING = "2.3.2.2.94. Zernike Surface"
 SUMMARY = "A 3D rendering of the Zernike surface, whose polynomials describe aberrations."

@@ -11,7 +11,7 @@ import threading
 import time
 import unittest
 
-from docarag.domain import (
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     DocumentRef,
@@ -22,8 +22,8 @@ from docarag.domain import (
     ParserCapabilityManifest,
     ParserModality,
 )
-from docarag.ports import ParserRegistry
-from docarag.transport import (
+from document_services.ports import ParserRegistry
+from document_services.worker_transport import (
     HTTPParserAdapter,
     HTTPParserClientConfig,
     PARSER_WORKER_PROTOCOL_VERSION,
@@ -42,7 +42,7 @@ from docarag.transport import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-TRANSPORT_ROOT = REPOSITORY_ROOT / "docarag" / "transport"
+TRANSPORT_ROOT = REPOSITORY_ROOT / "document_services" / "worker_transport"
 
 
 def manifest_fixture() -> ParserCapabilityManifest:
@@ -382,10 +382,10 @@ class ParserWorkerImportBoundaryTests(unittest.TestCase):
         script = """
 import json
 import sys
-import docarag.transport
+import document_services.worker_transport
 
 forbidden = (
-    "Core", "docling", "mineru", "paddle", "paddleocr", "psycopg",
+    "retrieval_engine", "docling", "mineru", "paddle", "paddleocr", "psycopg",
     "qdrant_client", "spacy", "torch", "transformers", "vllm"
 )
 loaded = sorted(
@@ -430,7 +430,7 @@ print(json.dumps(loaded))
                 self.assertFalse(
                     imports
                     & {
-                        "Core",
+                        "retrieval_engine",
                         "docling",
                         "mineru",
                         "paddle",

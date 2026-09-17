@@ -31,15 +31,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from Core.Index.Tree import NodeType
-from Core.pipelines.vdb_index import (
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.indexing.vector.builder import (
     DEFAULT_MAX_AVERAGE_LENGTH_DRIFT,
     TreeVectorReconciliation,
     VectorIndexBindingError,
     _projected_tree_points,
     reconcile_tree_vector_index,
 )
-from Core.provider.vdb import VectorSchema, VectorStore
+from retrieval_engine.indexes.vector_store import VectorSchema, VectorStore
 from tests.qdrant_fakes import FakeModels, FakeQdrantClient
 
 SOURCE = "a" * 64
@@ -248,10 +248,10 @@ class OnlyTheDifferenceIsEmbedded(unittest.TestCase):
                 scope_filter=SCOPE,
             )
 
-        with patch("Core.pipelines.vdb_index.VectorStore", _open), patch(
-            "Core.pipelines.vdb_index.TextEmbeddingProvider", lambda **_k: embedder
+        with patch("retrieval_engine.indexing.vector.builder.VectorStore", _open), patch(
+            "retrieval_engine.indexing.vector.builder.TextEmbeddingProvider", lambda **_k: embedder
         ), patch(
-            "Core.pipelines.vdb_index.tree_vector_scope",
+            "retrieval_engine.indexing.vector.builder.tree_vector_scope",
             lambda *_a, **_k: SCOPE,
         ):
             first = reconcile_tree_vector_index(

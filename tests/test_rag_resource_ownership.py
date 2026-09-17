@@ -4,18 +4,18 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, Mock, patch
 
-from Core.provider.llm import LLM
-from Core.provider.vlm import VLM
-from Core.rag import create_rag_agent
-from Core.rag.base_rag import BaseRAG
-from Core.rag.gbc_vanilla_rag import GBCVanillaRAG
-from Core.rag.gbc_rag import GBCRAG
-from Core.rag.graph_rag import GraphRAG
-from Core.rag.mm_rag import MMRAG
-from Core.rag.vanilla_rag import VanillaRAG
-from Core.configs.rag.mm_config import MMConfig
-from Core.configs.rag.gbc_config import GBCRAGConfig
-from Core.configs.rag.vanilla_config import VanillaConfig
+from retrieval_engine.providers.language_model import LLM
+from retrieval_engine.providers.vision_model import VLM
+from retrieval_engine.rag import create_rag_agent
+from retrieval_engine.rag.base_strategy import BaseRAG
+from retrieval_engine.rag.strategies.gbc_vanilla import GBCVanillaRAG
+from retrieval_engine.rag.gbc.agent import GBCRAG
+from retrieval_engine.rag.strategies.graph import GraphRAG
+from retrieval_engine.rag.strategies.multimodal import MMRAG
+from retrieval_engine.rag.strategies.vanilla import VanillaRAG
+from retrieval_engine.configuration.strategies.multimodal import MMConfig
+from retrieval_engine.configuration.strategies.gbc import GBCRAGConfig
+from retrieval_engine.configuration.strategies.vanilla import VanillaConfig
 
 
 class _MinimalRAG(BaseRAG):
@@ -75,8 +75,8 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
         store = Mock()
         store.embedding_model = embedder
         with (
-            patch("Core.rag.LLM", return_value=llm),
-            patch("Core.rag.VLM", side_effect=RuntimeError("VLM startup failed")),
+            patch("retrieval_engine.rag.factory.LLM", return_value=llm),
+            patch("retrieval_engine.rag.factory.VLM", side_effect=RuntimeError("VLM startup failed")),
             self.assertRaisesRegex(RuntimeError, "VLM startup failed"),
         ):
             create_rag_agent(
@@ -97,10 +97,10 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
         store = Mock()
         store.embedding_model = embedder
         with (
-            patch("Core.rag.LLM", return_value=llm),
-            patch("Core.rag.VLM", return_value=vlm),
+            patch("retrieval_engine.rag.factory.LLM", return_value=llm),
+            patch("retrieval_engine.rag.factory.VLM", return_value=vlm),
             patch(
-                "Core.rag._create_rag_agent_from_clients",
+                "retrieval_engine.rag.factory._create_rag_agent_from_clients",
                 side_effect=RuntimeError("strategy startup failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "strategy startup failed"),
@@ -119,8 +119,8 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
 
     def test_unsupported_strategy_fails_before_allocating_models(self):
         with (
-            patch("Core.rag.LLM") as llm_factory,
-            patch("Core.rag.VLM") as vlm_factory,
+            patch("retrieval_engine.rag.factory.LLM") as llm_factory,
+            patch("retrieval_engine.rag.factory.VLM") as vlm_factory,
             self.assertRaisesRegex(NotImplementedError, "unsupported"),
         ):
             create_rag_agent(
@@ -135,10 +135,10 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
     def test_text_only_vanilla_does_not_allocate_a_vlm(self):
         llm = Mock()
         with (
-            patch("Core.rag.LLM", return_value=llm),
-            patch("Core.rag.VLM") as vlm_factory,
+            patch("retrieval_engine.rag.factory.LLM", return_value=llm),
+            patch("retrieval_engine.rag.factory.VLM") as vlm_factory,
             patch(
-                "Core.rag._create_rag_agent_from_clients",
+                "retrieval_engine.rag.factory._create_rag_agent_from_clients",
                 return_value="agent",
             ) as dispatch,
         ):
@@ -155,8 +155,8 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
 
     def test_missing_dependency_fails_before_allocating_models(self):
         with (
-            patch("Core.rag.LLM") as llm_factory,
-            patch("Core.rag.VLM") as vlm_factory,
+            patch("retrieval_engine.rag.factory.LLM") as llm_factory,
+            patch("retrieval_engine.rag.factory.VLM") as vlm_factory,
             self.assertRaisesRegex(ValueError, "vector_store"),
         ):
             create_rag_agent(
@@ -170,8 +170,8 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
 
     def test_gbc_requires_attested_tree_vdb_before_allocating_models(self):
         with (
-            patch("Core.rag.LLM") as llm_factory,
-            patch("Core.rag.VLM") as vlm_factory,
+            patch("retrieval_engine.rag.factory.LLM") as llm_factory,
+            patch("retrieval_engine.rag.factory.VLM") as vlm_factory,
             self.assertRaisesRegex(ValueError, "tree_vdb"),
         ):
             create_rag_agent(
@@ -191,9 +191,9 @@ class ProviderControllerLifecycleTests(unittest.TestCase):
         tree_vdb = Mock()
         agent = Mock()
         with (
-            patch("Core.rag.LLM", return_value=llm),
-            patch("Core.rag.VLM", return_value=vlm),
-            patch("Core.rag.GBCRAG", return_value=agent) as factory,
+            patch("retrieval_engine.rag.factory.LLM", return_value=llm),
+            patch("retrieval_engine.rag.factory.VLM", return_value=vlm),
+            patch("retrieval_engine.rag.factory.GBCRAG", return_value=agent) as factory,
         ):
             result = create_rag_agent(
                 strategy_config=GBCRAGConfig(),

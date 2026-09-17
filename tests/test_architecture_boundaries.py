@@ -11,24 +11,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # BookRAG. Vendor SDKs and infrastructure clients belong behind adapters and
 # must never become transitive requirements of this layer.
 BOUNDARY_PATHS = (
-    *sorted((PROJECT_ROOT / "docarag" / "domain").glob("*.py")),
-    *sorted((PROJECT_ROOT / "docarag" / "application").glob("*.py")),
-    PROJECT_ROOT / "docarag" / "ports" / "parser.py",
-    PROJECT_ROOT / "docarag" / "routing.py",
-    PROJECT_ROOT / "docarag" / "reconciliation.py",
-    PROJECT_ROOT / "docarag" / "retrieval_candidates.py",
-    PROJECT_ROOT / "docarag" / "bookrag_projection.py",
-    PROJECT_ROOT / "docarag" / "evidence_graph_builder.py",
-    PROJECT_ROOT / "docarag" / "evidence_graph_checkpoint.py",
-    PROJECT_ROOT / "docarag" / "legacy_graph_projection.py",
-    PROJECT_ROOT / "docarag" / "parsing_orchestrator.py",
-    PROJECT_ROOT / "docarag" / "composition.py",
-    PROJECT_ROOT / "docarag" / "presets.py",
+    *sorted((PROJECT_ROOT / "document_services" / "domain").glob("*.py")),
+    *sorted((PROJECT_ROOT / "document_services" / "application").glob("*.py")),
+    PROJECT_ROOT / "document_services" / "ports" / "parser.py",
+    PROJECT_ROOT / "document_services" / "parsing" / "routing.py",
+    PROJECT_ROOT / "document_services" / "parsing" / "reconciliation.py",
+    PROJECT_ROOT / "document_services" / "retrieval" / "candidates.py",
+    PROJECT_ROOT / "document_services" / "evidence" / "projections" / "bookrag.py",
+    PROJECT_ROOT / "document_services" / "evidence" / "graph_builder.py",
+    PROJECT_ROOT / "document_services" / "evidence" / "graph_checkpoint.py",
+    PROJECT_ROOT / "document_services" / "evidence" / "projections" / "legacy_graph.py",
+    PROJECT_ROOT / "document_services" / "parsing" / "orchestrator.py",
+    PROJECT_ROOT / "document_services" / "parsing" / "bookrag_handoff.py",
+    PROJECT_ROOT / "document_services" / "parsing" / "routing_presets.py",
 )
 
 FORBIDDEN_IMPORT_ROOTS = frozenset(
     {
         "Core",
+        "retrieval_engine",
         "docling",
         "fastapi",
         "fitz",

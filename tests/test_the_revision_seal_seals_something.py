@@ -23,7 +23,7 @@ from __future__ import annotations
 import unittest
 from contextlib import contextmanager
 
-from docarag.persistence.postgres import PostgresLedger
+from document_services.persistence.postgres import PostgresLedger
 
 
 class _Cursor:

@@ -7,7 +7,7 @@ import unittest
 from pydantic import ValidationError
 import yaml
 
-from Core.configs.system_config import SystemConfig, load_system_config
+from retrieval_engine.configuration.system import SystemConfig, load_system_config
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]

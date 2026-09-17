@@ -13,8 +13,8 @@ from the two parser views through to a single output block.
 import tempfile
 import unittest
 
-from Core.provider.mineru_reconciliation import reconcile_middle_content
-from docarag.adapters.mineru_compat import content_block_text_parts
+from retrieval_engine.parsing.mineru_reconciliation import reconcile_middle_content
+from document_services.parser_adapters.mineru_compat import content_block_text_parts
 
 _ITEMS = (
     "• Cannot su nearby olyects distinctly",

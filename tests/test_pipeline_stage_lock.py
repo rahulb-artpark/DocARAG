@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.pipeline import StageLockedError, _lock_key, _stage_lock
+from document_services.indexing.pipeline import StageLockedError, _lock_key, _stage_lock
 
 
 class _FakeConnection:

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 import uuid
 
-from Core.provider.vdb import VectorStore
+from retrieval_engine.indexes.vector_store import VectorStore
 
 
 QDRANT_URL = os.environ.get("DOCARAG_TEST_QDRANT_URL")

@@ -4,8 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 import unittest
 
-from Core.provider.TokenTracker import TokenTracker, TokenUsageScope
-from Core.utils.bounded_executor import iter_bounded_ordered
+from retrieval_engine.providers.token_tracker import TokenTracker, TokenUsageScope
+from retrieval_engine.utils.bounded_executor import iter_bounded_ordered
 
 
 class TokenTrackerScopeTests(unittest.TestCase):

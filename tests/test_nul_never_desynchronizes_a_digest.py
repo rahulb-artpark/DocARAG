@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.adapters.mineru_compat import _joined_text
-from docarag.domain.base import content_sha256, freeze_json
-from docarag.domain.evidence import Representation, RepresentationKind
+from document_services.parser_adapters.mineru_compat import _joined_text
+from document_services.domain.base import content_sha256, freeze_json
+from document_services.domain.evidence import Representation, RepresentationKind
 
 NUL = "\x00"
 ZERNIKE = f"in lens units, {NUL} is the normalized radial ray coordinate."
@@ -85,7 +85,7 @@ class NulIsGoneBeforeAnythingHashes(unittest.TestCase):
                 self.assertEqual(value, freeze_json(value))
 
     def test_freezing_still_rejects_what_it_always_rejected(self):
-        from docarag.domain.base import ContractValidationError
+        from document_services.domain.base import ContractValidationError
 
         with self.assertRaises(ContractValidationError):
             freeze_json({1: "non-string key"})

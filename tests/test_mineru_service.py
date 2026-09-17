@@ -10,8 +10,8 @@ import unittest
 from urllib.parse import quote
 import zipfile
 
-from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
-from docarag.domain import (
+from document_services.parser_adapters.mineru_compat import MinerUNormalizedAdapter
+from document_services.domain import (
     BlockType,
     DocumentRef,
     ErrorClassification,
@@ -24,8 +24,8 @@ from docarag.domain import (
     ParseStatus,
     ParserArtifactAvailability,
 )
-from docarag.ports import ParserRegistry
-from docarag.services.mineru import (
+from document_services.ports import ParserRegistry
+from document_services.parser_clients.mineru import (
     MAX_MINERU_TASKS_PER_PARSE_RESULT,
     MINERU_RESULT_ARCHIVE_ARTIFACT_SCHEMA,
     MinerUAPIClient,
@@ -36,7 +36,7 @@ from docarag.services.mineru import (
     MinerUServiceLoader,
     PublishedMinerUArchive,
 )
-from docarag.source_material import VerifiedSourceMaterial
+from document_services.evidence.sources import VerifiedSourceMaterial
 
 
 PDF_BYTES = b"%PDF-1.7\nverified mineru fixture\n%%EOF"
@@ -765,7 +765,7 @@ class MinerUServiceFailureTests(unittest.TestCase):
     def test_module_imports_no_vendor_or_ml_runtime(self):
         script = """
 import json, sys
-import docarag.services.mineru
+import document_services.parser_clients.mineru
 forbidden = ('mineru', 'torch', 'transformers', 'vllm', 'httpx')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """

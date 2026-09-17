@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from Core.inference import run_rag
-from Core.utils.query_cache import QueryCacheContext, query_prompt_code_sha256
+from retrieval_engine.runtime.inference import run_rag
+from retrieval_engine.rag.query_cache import QueryCacheContext, query_prompt_code_sha256
 
 
 def cache_context(
@@ -112,11 +112,11 @@ class QueryCacheStreamingTests(unittest.TestCase):
     def test_query_code_identity_changes_with_prompt_source_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "Core" / "prompts").mkdir(parents=True)
-            (root / "docarag").mkdir()
-            prompt = root / "Core" / "prompts" / "answer.py"
+            (root / "retrieval_engine" / "prompts").mkdir(parents=True)
+            (root / "document_services").mkdir()
+            prompt = root / "retrieval_engine" / "prompts" / "answer.py"
             prompt.write_text('PROMPT = "first"\n', encoding="utf-8")
-            (root / "docarag" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "document_services" / "__init__.py").write_text("", encoding="utf-8")
             first = query_prompt_code_sha256(root)
             prompt.write_text('PROMPT = "second"\n', encoding="utf-8")
             second = query_prompt_code_sha256(root)

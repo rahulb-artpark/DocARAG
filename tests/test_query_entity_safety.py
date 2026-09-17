@@ -3,8 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from Core.prompts.gbc_prompt import QuestionEntity
-from Core.rag.gbc_rag import GBCRAG
+from retrieval_engine.prompts.gbc import QuestionEntity
+from retrieval_engine.rag.gbc.agent import GBCRAG
 
 
 class _EntityStore:

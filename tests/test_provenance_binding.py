@@ -9,8 +9,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from docarag import provenance, recovery, runtime_probe
-from docarag.compat import inspect_run_readiness
+from document_services.evidence import provenance
+from document_services.indexing import recovery
+from document_services.operations import environment_probe as runtime_probe
+from document_services.runtime.bookrag_bridge import inspect_run_readiness
 
 
 def write_json(path: Path, payload: object) -> None:
@@ -258,7 +260,7 @@ class ProvenanceBindingTests(unittest.TestCase):
         provenance._sha256_for_stat.cache_clear()
         provenance._json_for_stat.cache_clear()
         qdrant = patch(
-            "Core.utils.artifact_paths.qdrant_collection_state",
+            "retrieval_engine.utils.artifact_paths.qdrant_collection_state",
             return_value=SimpleNamespace(exists=True, point_count=1),
         )
         qdrant.start()
@@ -332,10 +334,10 @@ class ProvenanceBindingTests(unittest.TestCase):
         ]
         with (
             patch(
-                "docarag.runtime_probe.metadata.distributions",
+                "document_services.operations.environment_probe.metadata.distributions",
                 return_value=installed,
             ),
-            patch("docarag.runtime_probe.gpu_identity", return_value=[]),
+            patch("document_services.operations.environment_probe.gpu_identity", return_value=[]),
             patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,3"}),
         ):
             payload = runtime_probe.build_payload(
@@ -581,7 +583,7 @@ class ProvenanceBindingTests(unittest.TestCase):
                 hashed.append(Path(path))
                 return original(Path(path))
 
-            with patch("docarag.provenance.sha256_file", side_effect=recording_hash):
+            with patch("document_services.evidence.provenance.sha256_file", side_effect=recording_hash):
                 first = provenance.verify_query_artifacts(run)
                 first_count = len(hashed)
                 second = provenance.verify_query_artifacts(run)

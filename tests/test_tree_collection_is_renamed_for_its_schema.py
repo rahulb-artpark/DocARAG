@@ -92,7 +92,7 @@ class TheOtherCollectionsAreLeftAlone(unittest.TestCase):
     def test_the_entity_collection_is_untouched(self):
         # It made this same migration already, under its own name, and the
         # graph stage that writes it is out of scope here.
-        from Core.configs.graph_config import GraphConfig
+        from retrieval_engine.configuration.knowledge_graph import GraphConfig
 
         self.assertEqual(
             "bookrag-entities-hybrid-v1", GraphConfig().entity_collection_name

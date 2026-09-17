@@ -16,10 +16,10 @@ import types
 import unittest
 from unittest.mock import patch
 
-from Core.provider.TokenTracker import TokenTracker
-from docarag import cli
-from docarag import compat
-from docarag.settings import (
+from retrieval_engine.providers.token_tracker import TokenTracker
+from document_services import cli
+from document_services.runtime import bookrag_bridge as compat
+from document_services.runtime.settings import (
     RuntimeSettings,
     discover_settings_path,
     initialize_settings,
@@ -69,18 +69,18 @@ def make_run(root: Path, name: str = "run-1", *, snapshot: bool = True) -> Path:
 
 
 def fake_runtime_modules(agent, events: list[str]) -> dict[str, types.ModuleType]:
-    core = types.ModuleType("Core")
+    core = types.ModuleType("retrieval_engine")
     core.__path__ = []
-    configs = types.ModuleType("Core.configs")
+    configs = types.ModuleType("retrieval_engine.configuration")
     configs.__path__ = []
-    system_config = types.ModuleType("Core.configs.system_config")
-    rag = types.ModuleType("Core.rag")
-    provider = types.ModuleType("Core.provider")
+    system_config = types.ModuleType("retrieval_engine.configuration.system")
+    rag = types.ModuleType("retrieval_engine.rag")
+    provider = types.ModuleType("retrieval_engine.providers")
     provider.__path__ = []
-    token_tracker = types.ModuleType("Core.provider.TokenTracker")
-    utils = types.ModuleType("Core.utils")
+    token_tracker = types.ModuleType("retrieval_engine.providers.token_tracker")
+    utils = types.ModuleType("retrieval_engine.utils")
     utils.__path__ = []
-    resource_loader = types.ModuleType("Core.utils.resource_loader")
+    resource_loader = types.ModuleType("retrieval_engine.runtime.resource_loader")
 
     def load_config(path):
         events.append("load_config")
@@ -104,14 +104,14 @@ def fake_runtime_modules(agent, events: list[str]) -> dict[str, types.ModuleType
     rag.create_rag_agent = create
     token_tracker.TokenTracker = TokenTracker
     return {
-        "Core": core,
-        "Core.configs": configs,
-        "Core.configs.system_config": system_config,
-        "Core.rag": rag,
-        "Core.provider": provider,
-        "Core.provider.TokenTracker": token_tracker,
-        "Core.utils": utils,
-        "Core.utils.resource_loader": resource_loader,
+        "retrieval_engine": core,
+        "retrieval_engine.configuration": configs,
+        "retrieval_engine.configuration.system": system_config,
+        "retrieval_engine.rag": rag,
+        "retrieval_engine.providers": provider,
+        "retrieval_engine.providers.token_tracker": token_tracker,
+        "retrieval_engine.utils": utils,
+        "retrieval_engine.runtime.resource_loader": resource_loader,
     }
 
 
@@ -207,14 +207,14 @@ class SettingsTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"DOCARAG_SETTINGS": str(environment)}),
-                patch("docarag.settings.repository_root", return_value=repo),
+                patch("document_services.runtime.settings.repository_root", return_value=repo),
             ):
                 self.assertEqual(explicit.resolve(), discover_settings_path(explicit, cwd=cwd))
                 self.assertEqual(environment.resolve(), discover_settings_path(cwd=cwd))
 
             with (
                 patch.dict(os.environ, {}, clear=True),
-                patch("docarag.settings.repository_root", return_value=repo),
+                patch("document_services.runtime.settings.repository_root", return_value=repo),
             ):
                 self.assertEqual(cwd_file.resolve(), discover_settings_path(cwd=cwd))
                 cwd_file.unlink()
@@ -447,7 +447,7 @@ class CompatibilityTests(unittest.TestCase):
             modules = fake_runtime_modules(Agent(), events)
             with (
                 patch.dict(sys.modules, modules),
-                patch("docarag.compat.time.monotonic", side_effect=clock),
+                patch("document_services.runtime.bookrag_bridge.time.monotonic", side_effect=clock),
             ):
                 result = compat.ask(
                     run_dir=run,
@@ -730,12 +730,12 @@ class CLITests(unittest.TestCase):
         )
         output = io.StringIO()
         with (
-            patch("docarag.cli._load", return_value=settings),
+            patch("document_services.cli._load", return_value=settings),
             patch(
-                "docarag.diagnostics.doctor_for_routed_profile",
+                "document_services.operations.diagnostics.doctor_for_routed_profile",
                 return_value=report,
             ) as routed_doctor,
-            patch("docarag.diagnostics.doctor_for_settings") as legacy_doctor,
+            patch("document_services.operations.diagnostics.doctor_for_settings") as legacy_doctor,
             contextlib.redirect_stdout(output),
         ):
             code = cli.main(
@@ -757,7 +757,7 @@ class CLITests(unittest.TestCase):
     def test_unreadable_settings_are_reported_without_a_traceback(self):
         stderr = io.StringIO()
         with (
-            patch("docarag.cli.load_settings", side_effect=PermissionError("denied")),
+            patch("document_services.cli.load_settings", side_effect=PermissionError("denied")),
             contextlib.redirect_stderr(stderr),
         ):
             code = cli.main(["settings"])
@@ -779,7 +779,7 @@ class CLITests(unittest.TestCase):
             ).resolved()
             output = io.StringIO()
             with (
-                patch("docarag.cli._load", return_value=settings),
+                patch("document_services.cli._load", return_value=settings),
                 contextlib.redirect_stdout(output),
             ):
                 code = cli.main(["verify", "--run", str(run), "--json"])
@@ -790,7 +790,7 @@ class CLITests(unittest.TestCase):
             self.assertIn("artifact-manifest", payload["errors"][0])
 
     def test_index_rejects_missing_document_without_subprocess(self):
-        with patch("docarag.cli._run") as runner:
+        with patch("document_services.cli._run") as runner:
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 code = cli.main(["index", "/definitely/missing.pdf"])
@@ -799,7 +799,7 @@ class CLITests(unittest.TestCase):
         runner.assert_not_called()
 
     def test_ask_rejects_blank_question_without_loading_settings(self):
-        with patch("docarag.cli._load") as loader, contextlib.redirect_stderr(
+        with patch("document_services.cli._load") as loader, contextlib.redirect_stderr(
             io.StringIO()
         ):
             code = cli.main(["ask", "   "])
@@ -819,8 +819,8 @@ class CLITests(unittest.TestCase):
             ).resolved()
 
             with (
-                patch("docarag.cli._load", return_value=settings),
-                patch("docarag.cli._run", return_value=0) as runner,
+                patch("document_services.cli._load", return_value=settings),
+                patch("document_services.cli._run", return_value=0) as runner,
             ):
                 code = cli.main(["ask", "question", "--run", str(run)])
 
@@ -852,8 +852,8 @@ class CLITests(unittest.TestCase):
             ).resolved()
 
             with (
-                patch("docarag.cli._load", return_value=settings),
-                patch("docarag.cli._run", return_value=0) as runner,
+                patch("document_services.cli._load", return_value=settings),
+                patch("document_services.cli._run", return_value=0) as runner,
             ):
                 delegated_without_fallback = cli.main(
                     ["ask", "question", "--run", str(run)]
@@ -892,11 +892,11 @@ class CLITests(unittest.TestCase):
             output = io.StringIO()
 
             with (
-                patch("docarag.compat.resolve_run", return_value=run) as resolver,
+                patch("document_services.runtime.bookrag_bridge.resolve_run", return_value=run) as resolver,
                 patch(
-                    "docarag.compat.resolve_run_config", return_value=snapshot
+                    "document_services.runtime.bookrag_bridge.resolve_run_config", return_value=snapshot
                 ) as config_resolver,
-                patch("docarag.compat.ask", return_value={"answer": "ok"}) as asker,
+                patch("document_services.runtime.bookrag_bridge.ask", return_value={"answer": "ok"}) as asker,
                 contextlib.redirect_stdout(output),
             ):
                 code = compat._main(
@@ -928,8 +928,8 @@ class CLITests(unittest.TestCase):
 
     def test_web_start_forwards_port_and_run_to_the_service(self):
         with (
-            patch("docarag.cli._load"),
-            patch("docarag.web_service.main", return_value=0) as service,
+            patch("document_services.cli._load"),
+            patch("document_services.operations.web_service.main", return_value=0) as service,
         ):
             code = cli.main(["web", "start", "--port", "65535", "--run", "runs/x"])
 
@@ -941,7 +941,7 @@ class CLITests(unittest.TestCase):
 
     def test_web_requires_an_action(self):
         with (
-            patch("docarag.cli._load") as loader,
+            patch("document_services.cli._load") as loader,
             contextlib.redirect_stderr(io.StringIO()),
             self.assertRaises((SystemExit, argparse.ArgumentError)),
         ):
@@ -952,8 +952,8 @@ class CLITests(unittest.TestCase):
     def test_web_stop_and_status_reach_the_service(self):
         for action in ("stop", "status"):
             with (
-                patch("docarag.cli._load"),
-                patch("docarag.web_service.main", return_value=0) as service,
+                patch("document_services.cli._load"),
+                patch("document_services.operations.web_service.main", return_value=0) as service,
             ):
                 code = cli.main(["web", action])
 
@@ -975,8 +975,8 @@ class CLITests(unittest.TestCase):
             ).resolved()
 
             with (
-                patch("docarag.cli._load", return_value=settings),
-                patch("docarag.cli._run", return_value=0) as runner,
+                patch("document_services.cli._load", return_value=settings),
+                patch("document_services.cli._run", return_value=0) as runner,
             ):
                 delegated_without_fallback = cli.main(
                     ["ask", "question", "--run", str(run)]
@@ -1015,11 +1015,11 @@ class CLITests(unittest.TestCase):
             output = io.StringIO()
 
             with (
-                patch("docarag.compat.resolve_run", return_value=run) as resolver,
+                patch("document_services.runtime.bookrag_bridge.resolve_run", return_value=run) as resolver,
                 patch(
-                    "docarag.compat.resolve_run_config", return_value=snapshot
+                    "document_services.runtime.bookrag_bridge.resolve_run_config", return_value=snapshot
                 ) as config_resolver,
-                patch("docarag.compat.ask", return_value={"answer": "ok"}) as asker,
+                patch("document_services.runtime.bookrag_bridge.ask", return_value={"answer": "ok"}) as asker,
                 contextlib.redirect_stdout(output),
             ):
                 code = compat._main(

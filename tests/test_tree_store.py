@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.tree_store import (
+from document_services.persistence.tree_store import (
     MAX_NODES_PER_READ,
     GraphEdge,
     NodeMeta,

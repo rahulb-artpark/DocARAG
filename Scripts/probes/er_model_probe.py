@@ -22,10 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/rahul/DocARAG")
 
-from Core.configs.llm_config import LLMConfig, indexing_llm_config
-from Core.prompts.kg_prompt import ENTITY_RESOLUATION_PROMPT, ERExtractSel
-from Core.provider.llm import LLM
-from Core.utils.utils import truncate_description
+from retrieval_engine.configuration.language_model import LLMConfig, indexing_llm_config
+from retrieval_engine.prompts.knowledge_graph import ENTITY_RESOLUATION_PROMPT, ERExtractSel
+from retrieval_engine.providers.language_model import LLM
+from retrieval_engine.utils.text import truncate_description
 
 GRAPH = Path(
     "/home/rahul/DocARAG/runs/doc_df198aeb160bb6240f5843b978d6fbcc/"

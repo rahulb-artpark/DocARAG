@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from Core.provider.vdb import (
+from retrieval_engine.indexes.vector_store import (
     VectorSchema,
     VectorStore,
     _PAYLOAD_CONTENTS,
@@ -293,7 +293,7 @@ class ThePointIdNamesTheNodeNotAReading(unittest.TestCase):
         self.assertTrue(self._id().startswith("record_node_"))
 
     def test_a_point_without_source_identity_is_refused(self):
-        from Core.provider.vdb import MissingVectorSourceIdentityError
+        from retrieval_engine.indexes.vector_store import MissingVectorSourceIdentityError
 
         with self.assertRaises(MissingVectorSourceIdentityError):
             tree_point_record_id(

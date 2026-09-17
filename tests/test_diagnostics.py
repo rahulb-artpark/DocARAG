@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from docarag.diagnostics import (
+from document_services.operations.diagnostics import (
     CheckType,
     CommandOutput,
     CommandSpec,
@@ -392,7 +392,7 @@ class DiagnosticsTest(unittest.TestCase):
 
     def test_import_does_not_load_model_frameworks(self):
         code = (
-            "import sys; import docarag.diagnostics; "
+            "import sys; import document_services.operations.diagnostics; "
             "print(','.join(n for n in "
             "('torch','paddle','transformers','mineru') if n in sys.modules))"
         )

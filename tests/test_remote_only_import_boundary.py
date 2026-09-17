@@ -40,27 +40,30 @@ class RemoteOnlyImportBoundaryTests(unittest.TestCase):
             builtins.__import__ = guarded_import
             sys.meta_path.insert(0, ForbiddenModuleFinder())
 
-            from Core.configs.embedding_config import EmbeddingConfig
-            import Core.configs.dataset_config
-            import Core.configs.gbc_limits
-            import Core.configs.graph_config
-            from Core.configs.llm_config import LLMConfig
-            import Core.configs.mineru_config
-            import Core.configs.rag_config
-            from Core.configs.rerank_config import RerankerConfig
-            import Core.configs.system_config
-            import Core.configs.tree_config
-            import Core.configs.vdb_config
-            from Core.configs.vlm_config import VLMConfig
-            import Core.utils.resource_loader
-            import Core.provider.TokenTracker
-            from Core.provider.embedding import TextEmbeddingProvider
-            import Core.provider.extract_pdf_info
-            from Core.provider.llm import OllamaController, OpenAIController
-            import Core.provider.mineru_reconciliation
-            from Core.provider.rerank import TextRerankerProvider
-            import Core.provider.vdb
-            from Core.provider.vlm import GPTVLMController, OllamaVLMController
+            from retrieval_engine.configuration.embeddings import EmbeddingConfig
+            import retrieval_engine.configuration.dataset
+            import retrieval_engine.configuration.gbc_limits
+            import retrieval_engine.configuration.knowledge_graph
+            from retrieval_engine.configuration.language_model import LLMConfig
+            import retrieval_engine.configuration.mineru
+            import retrieval_engine.configuration.retrieval
+            from retrieval_engine.configuration.reranking import RerankerConfig
+            import retrieval_engine.configuration.system
+            import retrieval_engine.configuration.document_tree
+            import retrieval_engine.configuration.vector_store
+            from retrieval_engine.configuration.vision_model import VLMConfig
+            import retrieval_engine.runtime.resource_loader
+            import retrieval_engine.providers.token_tracker
+            from retrieval_engine.providers.embeddings import TextEmbeddingProvider
+            import retrieval_engine.parsing.mineru_parser
+            from retrieval_engine.providers.language_model import OllamaController, OpenAIController
+            import retrieval_engine.parsing.mineru_reconciliation
+            from retrieval_engine.providers.reranking import TextRerankerProvider
+            import retrieval_engine.indexes.vector_store
+            from retrieval_engine.providers.vision_model import (
+                GPTVLMController,
+                OllamaVLMController,
+            )
 
             class OpenAIClient:
                 def __init__(self, answer):
@@ -249,7 +252,7 @@ class RemoteOnlyImportBoundaryTests(unittest.TestCase):
         self.assertEqual(result["forbidden_loaded"], [])
 
     def test_text_embedding_cuda_cleanup_uses_owned_runtime_once(self):
-        from Core.provider.embedding import TextEmbeddingProvider
+        from retrieval_engine.providers.embeddings import TextEmbeddingProvider
 
         cuda = Mock()
         cuda.is_available.return_value = True
@@ -271,7 +274,7 @@ class RemoteOnlyImportBoundaryTests(unittest.TestCase):
         self.assertIsNone(provider._torch_functional)
 
     def test_gme_cuda_cleanup_and_singleton_release_are_idempotent(self):
-        from Core.provider.embedding import MultimodalEmbeddingProvider
+        from retrieval_engine.providers.embeddings import MultimodalEmbeddingProvider
 
         cuda = Mock()
         cuda.is_available.return_value = True

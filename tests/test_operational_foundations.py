@@ -10,37 +10,37 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag.operations.gpu_admission import (
+from document_services.operations.gpu_admission import (
     GpuAdmissionController,
     GpuAdmissionError,
     GpuDevice,
 )
-from docarag.operations.metrics import MetricsRegistry
-from docarag.operations.object_storage import (
+from document_services.operations.metrics import MetricsRegistry
+from document_services.operations.object_storage import (
     LocalObjectStore,
     ObjectStoreError,
     S3CompatibleObjectStore,
 )
-from docarag.operations.quotas import (
+from document_services.operations.quotas import (
     InMemoryQuotaStore,
     QuotaDelta,
     QuotaExceededError,
     QuotaLimits,
 )
-from docarag.operations.scheduler import DurableLeaseWorker
-from docarag.operations.security import (
+from document_services.operations.scheduler import DurableLeaseWorker
+from document_services.operations.security import (
     ApiKeyAuthenticator,
     ApiPrincipal,
     AuthenticationError,
     AuthorizationError,
 )
-from docarag.operations.service_supervisor import (
+from document_services.operations.service_supervisor import (
     ManagedServiceSupervisor,
     ServiceOwnership,
     ServiceSpec,
     ServiceState,
 )
-from docarag.persistence import CorpusScope, DocumentScope, WorkLease, WorkState
+from document_services.persistence import CorpusScope, DocumentScope, WorkLease, WorkState
 
 
 class _Inventory:

@@ -5,14 +5,14 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from Core.Index.Tree import DocumentTree
-from Core.pipelines.pdf_refiner import (
+from retrieval_engine.indexes.tree import DocumentTree
+from retrieval_engine.parsing.pdf_refinement import (
     dash_line_refiner,
     merge_tables_and_mark_invalid,
     merge_text_and_mark_invalid,
     truncate_ocr_error_refiner,
 )
-from Core.pipelines.tree_node_builder import create_node_by_type
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
 
 
 def canonical_block(

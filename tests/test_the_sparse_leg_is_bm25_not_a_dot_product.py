@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import unittest
 
-from Core.pipelines.entity_facets import (
+from retrieval_engine.indexing.graph.entity_facets import (
     BM25_B,
     BM25_K1,
     bm25_query_terms,

@@ -4,12 +4,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from docarag.artifact_store import LocalContentAddressedArtifactStore
-from docarag.bookrag_projection import (
+from document_services.persistence.artifact_store import LocalContentAddressedArtifactStore
+from document_services.evidence.projections.bookrag import (
     BookRAGAssetMaterializationLease,
     project_canonical_blocks,
 )
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     BlockType,
     BoundingBox,
@@ -22,8 +22,8 @@ from docarag.domain import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.figure_describe import GroundedFigureDescriber
-from docarag.figure_enrichment import (
+from document_services.enrichment.figure_description import GroundedFigureDescriber
+from document_services.enrichment.figure_enrichment import (
     FigureOCRResult,
     OCRSpan,
     enrich_visual_blocks,
@@ -268,7 +268,7 @@ class FigureEnrichmentTest(unittest.TestCase):
         def broken(_data: bytes) -> FigureOCRResult:
             raise RuntimeError("model unavailable")
 
-        with self.assertLogs("docarag.figure_enrichment", level="WARNING"):
+        with self.assertLogs("document_services.enrichment.figure_enrichment", level="WARNING"):
             enriched, stats = self.enrich((block,), ocr_engine=broken)
 
         self.assertEqual(enriched[0], block)
@@ -280,7 +280,7 @@ class FigureEnrichmentTest(unittest.TestCase):
         def broken(_data: bytes, _text: str) -> str:
             raise RuntimeError("vision model unavailable")
 
-        with self.assertLogs("docarag.figure_enrichment", level="WARNING"):
+        with self.assertLogs("document_services.enrichment.figure_enrichment", level="WARNING"):
             enriched, stats = self.enrich((block,), describer=broken)
 
         kinds = {item.kind for item in enriched[0].representations}

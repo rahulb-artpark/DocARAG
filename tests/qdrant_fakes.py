@@ -473,7 +473,7 @@ class FakeQdrantClient:
 
 
 def qdrant_store(embedding_model, *, scope_filter=None, collection_name="test"):
-    from Core.provider.vdb import VectorStore
+    from retrieval_engine.indexes.vector_store import VectorStore
 
     client = FakeQdrantClient()
     store = VectorStore(

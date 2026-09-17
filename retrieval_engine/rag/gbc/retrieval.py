@@ -1,0 +1,1550 @@
+import heapq
+import hashlib
+import json
+import math
+import numbers
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+import networkx as nx
+import logging
+
+from retrieval_engine.indexing.graph.entity_facets import bm25_query_terms
+from retrieval_engine.providers.embeddings import TextEmbeddingProvider, MMRerankerProvider
+from retrieval_engine.providers.reranking import TextRerankerProvider
+from retrieval_engine.indexes.vector_store import _TREE_SPARSE_VECTOR
+from retrieval_engine.indexes.tree import TreeNode, NodeType
+from retrieval_engine.parsing.table_conversion import table2text
+from retrieval_engine.utils.text import num_tokens, TextProcessor
+from retrieval_engine.utils.timing import PhaseTimings
+from retrieval_engine.prompts.gbc import TEXT_RERANKER_PROMPT, MM_RERANKER_INSTRUCTION
+from retrieval_engine.rag.gbc.context import (
+    enhance_graph_with_semantic_links,
+    merge_ranker_scores,
+    calculate_skyline,
+)
+
+log = logging.getLogger(__name__)
+#: Node types projected to the reranker with the heading above them. The same
+#: set the index gives a section ``context`` vector: each of these shows
+#: something without naming it. A paragraph is excluded because it already is
+#: the section's prose, and a title because it is the heading.
+_SECTION_RERANK_NODE_TYPES = frozenset(
+    {
+        NodeType.IMAGE,
+        NodeType.CHART,
+        NodeType.DIAGRAM,
+        NodeType.TABLE,
+        NodeType.LIST,
+        NodeType.CODE,
+        NodeType.ALGORITHM,
+        NodeType.EQUATION,
+    }
+)
+#: Node types whose ``summary`` is prose about content that is not prose. The
+#: reranker read content, caption and footnote only, so a figure reached it as
+#: the vision model's account of the pixels and nothing else.
+_SUMMARY_RERANK_NODE_TYPES = _SECTION_RERANK_NODE_TYPES
+
+MAX_SEMANTIC_RERANK_CHARS = 8192
+MAX_SEMANTIC_RERANK_ELEMENTS = 256
+SEMANTIC_SELECTOR_METADATA_FIELDS = (
+    "semantic_substructure_id",
+    "semantic_structure_kind",
+    "semantic_structure_availability",
+    "semantic_structure_producer_kind",
+    "semantic_sha256",
+    "semantic_comparison_sha256",
+    "semantic_element_id",
+    "semantic_element_kind",
+    "semantic_element_local_key",
+    "semantic_element_content_sha256",
+    "semantic_element_source_selector_count",
+    "semantic_element_relation_count",
+    "semantic_element_role",
+    "semantic_element_row_index",
+    "semantic_element_column_index",
+    "semantic_element_row_span",
+    "semantic_element_column_span",
+    "semantic_element_confidence",
+    "semantic_bbox_x0",
+    "semantic_bbox_y0",
+    "semantic_bbox_x1",
+    "semantic_bbox_y1",
+    "semantic_coordinate_space",
+    "semantic_coordinate_origin",
+)
+
+
+@dataclass(frozen=True)
+class HybridRetrievalBinding:
+    """Immutable source/index identity needed by candidate-contract fusion."""
+
+    tenant_id: str
+    corpus_id: str
+    document_id: str
+    document_version_id: str
+    source_sha256: str
+    canonical_artifact_sha256: str
+    tree_revision_id: str
+    dense_index_revision_id: str
+
+
+@dataclass(frozen=True)
+class CorpusRetrievalBinding:
+    """One HybridRetrievalBinding per document, all sharing one corpus scope."""
+
+    tenant_id: str
+    corpus_id: str
+    documents: Dict[str, HybridRetrievalBinding]
+
+
+class _CandidateContractUnavailable(ValueError):
+    """A legacy tree node lacks the identity required by the v1 contract."""
+
+
+def _composite_tree_node_id(node: TreeNode) -> str:
+    """Globally unique across documents; a bare index_id is only unique within one."""
+
+    return f"{node.document_version_id}:{node.index_id}"
+
+
+class Retriever:
+    def __init__(
+        self,
+        variant: str,
+        reranker: TextRerankerProvider,
+        # mm_reranker: MMRerankerProvider,
+        embedder: TextEmbeddingProvider,
+        alpha: float = 0.85,
+        topk_ent: int = 20,
+        x_percentile: float = 0.85,
+        topk: int = 10,
+        topk_relative_floor: float = 0.5,
+        topk_min: int = 3,
+        candidate_pool_size: int = 512,
+        tree_vdb: Any | None = None,
+        retrieval_binding: HybridRetrievalBinding | CorpusRetrievalBinding | None = None,
+    ):
+        if isinstance(topk, bool) or not isinstance(topk, int) or topk < 1:
+            raise ValueError("topk must be a positive integer")
+        if (
+            isinstance(topk_relative_floor, bool)
+            or not isinstance(topk_relative_floor, (int, float))
+            or not 0.0 < topk_relative_floor <= 1.0
+        ):
+            raise ValueError("topk_relative_floor must be a number in (0, 1]")
+        if isinstance(topk_min, bool) or not isinstance(topk_min, int) or topk_min < 1:
+            raise ValueError("topk_min must be a positive integer")
+        if (
+            isinstance(candidate_pool_size, bool)
+            or not isinstance(candidate_pool_size, int)
+            or not 1 <= candidate_pool_size <= 4096
+        ):
+            raise ValueError("candidate_pool_size must be an integer in [1, 4096]")
+        if candidate_pool_size < topk:
+            raise ValueError("candidate_pool_size must be greater than or equal to topk")
+
+        self.variant = variant
+        self.reranker: TextRerankerProvider = reranker
+        # self.mm_reranker: MMRerankerProvider = mm_reranker
+        self.embedder: TextEmbeddingProvider = embedder
+        self.alpha: float = alpha
+        self.topk_ent: int = topk_ent
+        self.x_percentile: float = x_percentile
+        self.topk: int = topk
+        self.topk_relative_floor: float = float(topk_relative_floor)
+        self.topk_min: int = topk_min
+        self.candidate_pool_size: int = candidate_pool_size
+        self.tree_vdb = tree_vdb
+        self.retrieval_binding = retrieval_binding
+        self.last_fusion_result = None
+        self.last_semantic_selector_by_node: dict[int, dict[str, object]] = {}
+        # Shared with GBCRAG so one summary covers planning and retrieval
+        # rather than two that cannot be added together.
+        self.timings = PhaseTimings("query retrieval")
+
+    @staticmethod
+    def _bounded_scalar_text(value: object, *, max_chars: int = 512) -> str:
+        """Project nested semantic content without serializing a full graph."""
+
+        parts: list[str] = []
+        chars = 0
+        visited = 0
+        stack = [value]
+        while stack and visited < 128 and chars < max_chars:
+            current = stack.pop()
+            visited += 1
+            if isinstance(current, str):
+                text = current.strip()
+            elif isinstance(current, (int, float)) and not isinstance(current, bool):
+                text = str(current)
+            elif isinstance(current, Mapping):
+                values = [
+                    current[key]
+                    for key in sorted(current, key=lambda item: str(item))[:32]
+                ]
+                stack.extend(reversed(values))
+                continue
+            elif isinstance(current, Sequence) and not isinstance(
+                current, (str, bytes, bytearray)
+            ):
+                stack.extend(reversed(list(current[:32])))
+                continue
+            else:
+                continue
+            if not text:
+                continue
+            remaining = max_chars - chars
+            text = text[:remaining]
+            parts.append(text)
+            chars += len(text)
+        return " ".join(parts)[:max_chars]
+
+    @staticmethod
+    def _semantic_rerank_text(node: TreeNode) -> str:
+        raw_structures = getattr(node.meta_info, "semantic_substructures", None)
+        if not isinstance(raw_structures, list):
+            return ""
+        parts: list[str] = []
+        chars = 0
+        element_count = 0
+        for structure in raw_structures[:32]:
+            if not isinstance(structure, Mapping):
+                continue
+            structure_kind = structure.get("kind")
+            raw_elements = structure.get("elements")
+            if not isinstance(raw_elements, list):
+                continue
+            for element in raw_elements:
+                if element_count >= MAX_SEMANTIC_RERANK_ELEMENTS:
+                    break
+                element_count += 1
+                if not isinstance(element, Mapping):
+                    continue
+                context = [
+                    value
+                    for value in (
+                        structure_kind,
+                        element.get("kind"),
+                        element.get("role"),
+                        element.get("local_key"),
+                    )
+                    if isinstance(value, str) and value
+                ]
+                content = Retriever._bounded_scalar_text(element.get("content"))
+                if content:
+                    context.append(content)
+                rendered = " | ".join(context)
+                if not rendered:
+                    continue
+                remaining = MAX_SEMANTIC_RERANK_CHARS - chars
+                if remaining <= 0:
+                    break
+                rendered = rendered[:remaining]
+                parts.append(rendered)
+                chars += len(rendered)
+            if element_count >= MAX_SEMANTIC_RERANK_ELEMENTS or chars >= MAX_SEMANTIC_RERANK_CHARS:
+                break
+        return "\n".join(parts)[:MAX_SEMANTIC_RERANK_CHARS]
+
+    @staticmethod
+    def _node_rerank_text(node: TreeNode) -> str:
+        """Return a safe text projection for every BookRAG evidence modality.
+
+        A figure, table or listing is projected with the heading above it and
+        its own summary in front of its content, for the reason the index gives
+        them a section vector: they show something without naming it, and the
+        name is what a question says.
+
+        Measured on the Wolter figure against "show me the image of Wolter
+        Surface, its parameters and the equation that defines it", with the ten
+        nodes that actually won the slots for comparison:
+
+            content + caption + footnote   0.0000   the floor
+            + summary                      0.8516   below the weakest winner
+            + heading                      0.9961   above seven of the ten
+            + heading + summary            0.9922   above seven of the ten
+                          weakest winner   0.9297
+
+        Zero, not merely low: "3D rendered image of a smooth, gray cylindrical
+        object" has nothing to do with that question, so the reranker rejected
+        it outright and the answer said the document contained no image of the
+        Wolter Surface. Retrieval had already ranked it first in two legs.
+
+        The summary is kept alongside the heading even though it scores a step
+        lower here -- one step on a 0.6B reranker's quantized scale is noise,
+        and it is the only prose naming the subject where a heading is generic.
+        """
+
+        named = Retriever._rerank_named_text(node)
+        body = Retriever._rerank_body_text(node)
+        return "\n".join(part for part in (named, body) if part)
+
+    @staticmethod
+    def _rerank_named_text(node: TreeNode) -> str:
+        """What a node says it is: the heading above it and its own summary."""
+
+        values: list[str] = []
+        section = Retriever._section_heading_text(node)
+        if section:
+            values.append(section)
+        if node.type in _SUMMARY_RERANK_NODE_TYPES:
+            summary = getattr(node, "summary", None)
+            if isinstance(summary, str) and summary.strip():
+                values.append(summary.strip())
+        return "\n".join(values)
+
+    @staticmethod
+    def _rerank_body_text(node: TreeNode) -> str:
+        """What a node holds: its grid, its own text, and its parts."""
+
+        meta = node.meta_info
+        values: list[str] = []
+        if node.type == NodeType.TABLE:
+            try:
+                table_text = table2text(meta.model_dump())
+            except (AttributeError, KeyError, TypeError, ValueError):
+                table_text = ""
+            if isinstance(table_text, str) and table_text.strip():
+                values.append(table_text)
+        for field_name in ("content", "caption", "footnote"):
+            value = getattr(meta, field_name, None)
+            if isinstance(value, str) and value.strip() and value not in values:
+                values.append(value)
+        semantic_text = Retriever._semantic_rerank_text(node)
+        if semantic_text:
+            values.append(semantic_text)
+        return "\n".join(values)
+
+    @staticmethod
+    def _node_rerank_views(node: TreeNode) -> List[Tuple[str, str]]:
+        """One document per reading of a node, each scored on its own merits.
+
+        A figure that shows something without naming it carries two unrelated
+        texts: the heading and summary saying what it is, and a description of
+        what it looks like. Joined into one document the longer one decides the
+        score. Node 8297's 320-character summary naming the Zernike surface lost
+        to 610 characters of "a 3D rendered icon or graphic, not a chart, table,
+        or diagram ... typical of digital icons or interface elements", and the
+        figure ranked 31st of 512 for a question asking to be shown it.
+
+        Scored separately it ranks 5th at 1.0000 on its naming view, and the
+        pixel description keeps its own document -- so "what does the figure
+        look like" still reaches it. A node's score is the best any of its
+        readings achieves, because a question resembles one reading or the
+        other, never their concatenation.
+
+        Only a node that both shows and names gets a second document, so this
+        costs one extra per figure, table, listing and equation rather than per
+        node: 666 documents for 512 candidates, measured on that query.
+        """
+
+        named = Retriever._rerank_named_text(node)
+        body = Retriever._rerank_body_text(node)
+        if node.type in _SUMMARY_RERANK_NODE_TYPES and named and body:
+            section = Retriever._section_heading_text(node)
+            # The heading rides with both: it is the only thing placing the
+            # description in the document, and dropping it here would score the
+            # body worse than the single document it replaces.
+            return [
+                ("named", named),
+                ("body", "\n".join(part for part in (section, body) if part)),
+            ]
+        return [("whole", "\n".join(part for part in (named, body) if part))]
+
+    @staticmethod
+    def _section_heading_text(node: TreeNode) -> str:
+        """The heading directly above a node that shows without naming.
+
+        The direct parent, matching the index's ``_section_context_text`` and
+        ``GBCRAG._with_section_titles``: 2956 of 2957 figures, equations and
+        listings in this corpus sit straight under their heading.
+        """
+
+        if node.type not in _SECTION_RERANK_NODE_TYPES:
+            return ""
+        parent = getattr(node, "parent", None)
+        if parent is None or getattr(parent, "type", None) != NodeType.TITLE:
+            return ""
+        heading = getattr(getattr(parent, "meta_info", None), "content", None)
+        return heading.strip() if isinstance(heading, str) else ""
+
+    @staticmethod
+    def _query_terms(query: str) -> tuple[str, ...]:
+        """Return at most 64 stable Unicode query terms."""
+
+        terms: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"[^\W_]+", query.casefold(), flags=re.UNICODE):
+            term = match.group(0)
+            if term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+            if len(terms) == 64:
+                break
+        return tuple(terms)
+
+    def _bm25_candidates(
+        self,
+        subtree_nodes: List[TreeNode],
+        query: str,
+    ) -> List[Tuple[TreeNode, float]]:
+        """Rank the selected subtree with bounded exact query-term BM25.
+
+        Only frequencies for the at-most-64 query terms are retained.  The two
+        linear scans avoid allocating a token matrix for a large document; the
+        result heap is bounded by ``candidate_pool_size``.
+        """
+
+        query_terms = self._query_terms(query)
+        if not query_terms or not subtree_nodes:
+            return []
+        query_set = set(query_terms)
+        document_frequency = {term: 0 for term in query_terms}
+        total_document_length = 0
+
+        for node in subtree_nodes:
+            present: set[str] = set()
+            length = 0
+            text = self._node_rerank_text(node).casefold()
+            for match in re.finditer(r"[^\W_]+", text, flags=re.UNICODE):
+                term = match.group(0)
+                length += 1
+                if term in query_set:
+                    present.add(term)
+            total_document_length += length
+            for term in present:
+                document_frequency[term] += 1
+
+        document_count = len(subtree_nodes)
+        average_length = total_document_length / max(1, document_count)
+        if average_length <= 0:
+            return []
+        idf = {
+            term: math.log(
+                1.0
+                + (document_count - document_frequency[term] + 0.5)
+                / (document_frequency[term] + 0.5)
+            )
+            for term in query_terms
+        }
+        k1 = 1.2
+        b = 0.75
+        heap: list[tuple[float, int, int, TreeNode]] = []
+        limit = self.candidate_pool_size
+        for position, node in enumerate(subtree_nodes):
+            frequencies = {term: 0 for term in query_terms}
+            length = 0
+            text = self._node_rerank_text(node).casefold()
+            for match in re.finditer(r"[^\W_]+", text, flags=re.UNICODE):
+                term = match.group(0)
+                length += 1
+                if term in frequencies:
+                    frequencies[term] += 1
+            normalization = k1 * (1.0 - b + b * length / average_length)
+            score = 0.0
+            for term, frequency in frequencies.items():
+                if frequency:
+                    score += idf[term] * (
+                        frequency * (k1 + 1.0) / (frequency + normalization)
+                    )
+            if score <= 0.0:
+                continue
+            item = (score, -position, position, node)
+            if len(heap) < limit:
+                heapq.heappush(heap, item)
+            elif item[:2] > heap[0][:2]:
+                heapq.heapreplace(heap, item)
+
+        return [
+            (node, score)
+            for score, _negative_position, _position, node in sorted(
+                heap,
+                key=lambda item: (-item[0], item[2]),
+            )
+        ]
+
+    @staticmethod
+    def _node_id_from_hit(hit: Mapping[str, Any]) -> int | None:
+        metadata = hit.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return None
+        value = metadata.get("node_id")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value):
+            return int(value)
+        return None
+
+    @staticmethod
+    def _document_version_id_from_hit(hit: Mapping[str, Any]) -> str:
+        metadata = hit.get("metadata")
+        value = metadata.get("document_version_id") if isinstance(metadata, Mapping) else None
+        return value if isinstance(value, str) else ""
+
+    def _vector_candidates(
+        self,
+        subtree_nodes: List[TreeNode],
+        query: str,
+        requested_node_types: Sequence[str] = (),
+    ) -> Dict[str, List[Tuple[TreeNode, Mapping[str, Any]]]]:
+        """One bounded candidate list per named vector, from one round trip.
+
+        A node's readings share a point now, so asking for a name is what
+        separates "this figure looks like the question" from "this figure's
+        caption reads like it". Returned unfused, because which vector matched
+        is the signal the schema exists to carry -- fusing server-side would
+        hand back one opaque list and leave the RRF trace below claiming an
+        arithmetic it never performed.
+        """
+
+        if self.tree_vdb is None or not subtree_nodes:
+            return {}
+        allowed = {(node.document_version_id, node.index_id): node for node in subtree_nodes}
+        # Search a bounded oversample because the source-scoped Qdrant index is
+        # document-wide while section selection may authorize one subtree.
+        search_limit = min(
+            4096,
+            max(self.candidate_pool_size, 4 * self.candidate_pool_size),
+        )
+        search_named = getattr(self.tree_vdb, "search_tree_vectors", None)
+        if callable(search_named):
+            rows_by_name = search_named(
+                query,
+                top_k=search_limit,
+                # Every query term once. The saturation and length
+                # normalization are baked into the stored values; applying
+                # them again here would score the question, not the document.
+                lexical_terms=bm25_query_terms(query),
+                # Empty unless the plan said the question asks to be shown a
+                # kind of content, in which case each vector also gets a twin
+                # leg restricted to it.
+                scoped_node_types=tuple(requested_node_types),
+            )
+        else:
+            # A store with one unnamed vector has one list and no name to give
+            # it -- the gbcvanilla index, and every mock in the tests.
+            rows_by_name = {
+                "": self.tree_vdb.search(query_text=query, top_k=search_limit)
+            }
+        return {
+            name: self._bounded_subtree_rows(rows, allowed)
+            for name, rows in rows_by_name.items()
+        }
+
+    def _bounded_subtree_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        allowed: Mapping[tuple[str, int], TreeNode],
+    ) -> List[Tuple[TreeNode, Mapping[str, Any]]]:
+        candidates: list[tuple[TreeNode, Mapping[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise ValueError("TreeVDB search must return mapping records")
+            node_id = self._node_id_from_hit(row)
+            if node_id is None:
+                continue
+            node = allowed.get((self._document_version_id_from_hit(row), node_id))
+            if node is None:
+                continue
+            candidates.append((node, row))
+            if len(candidates) == self.candidate_pool_size:
+                break
+        return candidates
+
+    def _expected_vector_names(self) -> Tuple[str, ...]:
+        """The legs this store would have produced, for tracing a failure."""
+
+        from retrieval_engine.indexes.vector_store import _TREE_DENSE_VECTORS
+
+        if self.tree_vdb is not None and callable(
+            getattr(self.tree_vdb, "search_tree_vectors", None)
+        ):
+            return (*_TREE_DENSE_VECTORS, _TREE_SPARSE_VECTOR)
+        return ("",)
+
+    @staticmethod
+    def _leg_identity(leg_name: str) -> Tuple[str, str, str]:
+        """The leg id, kind and backend one leg name is retrieved under.
+
+        A type-scoped leg is a leg of its own in the trace, because it asked a
+        different question of the index -- the same vector over a restricted
+        population -- and a reader of the trace has to be able to tell whether a
+        node arrived because it matched or because its kind was asked for.
+        """
+
+        from retrieval_engine.indexes.vector_store import (
+            TREE_SCOPED_VECTOR_SUFFIX,
+            tree_vector_base_name,
+        )
+
+        scoped = leg_name.endswith(TREE_SCOPED_VECTOR_SUFFIX)
+        vector_name = tree_vector_base_name(leg_name)
+        prefix = "typed-" if scoped else ""
+        backend_scope = "-typed" if scoped else ""
+        if vector_name == _TREE_SPARSE_VECTOR:
+            return (
+                f"{prefix}lexical-tree",
+                "sparse",
+                f"qdrant-tree-sparse{backend_scope}",
+            )
+        if not vector_name:
+            return "dense-tree", "dense", "qdrant-tree-dense"
+        return (
+            f"{prefix}dense-tree-{vector_name}",
+            "dense",
+            f"qdrant-tree-dense{backend_scope}",
+        )
+
+    @staticmethod
+    def _sha256_json(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _node_material_ids(node: TreeNode, field_name: str) -> tuple[str, ...]:
+        values = getattr(node.meta_info, field_name, None) or ()
+        if not isinstance(values, (list, tuple)):
+            raise _CandidateContractUnavailable(
+                f"tree node {node.index_id} has invalid {field_name}"
+            )
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str) or not value or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return tuple(result)
+
+    def _binding_for_node(self, node: TreeNode) -> HybridRetrievalBinding:
+        """This node's own document binding, whether bound single- or corpus-scoped."""
+
+        binding = self.retrieval_binding
+        if binding is None:
+            raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        if isinstance(binding, CorpusRetrievalBinding):
+            resolved = binding.documents.get(node.document_version_id)
+            if resolved is None:
+                raise _CandidateContractUnavailable(
+                    f"no retrieval binding for document {node.document_version_id!r}"
+                )
+            return resolved
+        return binding
+
+    def _candidate_hit(
+        self,
+        *,
+        node: TreeNode,
+        rank: int,
+        backend_id: str,
+        leg_kind: str,
+        raw_score: float,
+        payload: object,
+        hit_id: str,
+        filter_identity: str,
+        policy_identity: str,
+    ):
+        from document_services.retrieval.candidates import CandidateHit
+
+        binding = self._binding_for_node(node)
+        index_revision_id = (
+            binding.tree_revision_id if leg_kind == "bm25" else binding.dense_index_revision_id
+        )
+        meta = node.meta_info
+        direct_block = getattr(meta, "canonical_block_id", None)
+        direct_revision = getattr(meta, "canonical_revision_id", None)
+        derived_id = getattr(meta, "derived_evidence_id", None)
+        source_revisions = self._node_material_ids(
+            node, "source_canonical_revision_ids"
+        )
+        if isinstance(direct_block, str) and direct_block and isinstance(
+            direct_revision, str
+        ) and direct_revision:
+            evidence = {"canonical_evidence_id": direct_block}
+            canonical_revisions = (direct_revision,)
+        elif isinstance(derived_id, str) and derived_id and source_revisions:
+            evidence = {"derived_evidence_id": derived_id}
+            canonical_revisions = source_revisions
+        else:
+            raise _CandidateContractUnavailable(
+                f"tree node {node.index_id} lacks canonical/derived evidence identity"
+            )
+
+        representations = self._node_material_ids(
+            node, "canonical_representation_ids"
+        )
+        assets = self._node_material_ids(node, "canonical_asset_ids")
+        selected_representations = tuple(
+            value
+            for value in self._node_material_ids(
+                node, "selected_representation_ids"
+            )
+            if value in representations
+        )
+        selected_assets = tuple(
+            value
+            for value in self._node_material_ids(node, "selected_asset_ids")
+            if value in assets
+        )
+        modality = (
+            node.type.value if isinstance(node.type, NodeType) else str(node.type)
+        )
+        if isinstance(payload, Mapping):
+            metadata = payload.get("metadata")
+            if isinstance(metadata, Mapping):
+                candidate_modality = metadata.get("modality")
+                if isinstance(candidate_modality, str) and candidate_modality:
+                    modality = candidate_modality
+
+        return CandidateHit(
+            hit_id=hit_id,
+            tenant_id=binding.tenant_id,
+            corpus_id=binding.corpus_id,
+            document_id=binding.document_id,
+            document_version_id=binding.document_version_id,
+            source_sha256=binding.source_sha256,
+            canonical_artifact_sha256=binding.canonical_artifact_sha256,
+            tree_revision_id=binding.tree_revision_id,
+            tree_node_id=_composite_tree_node_id(node),
+            modality=modality,
+            backend_id=backend_id,
+            leg_kind=leg_kind,
+            index_revision_id=index_revision_id,
+            raw_score=raw_score,
+            rank=rank,
+            payload_identity=self._sha256_json(payload),
+            filter_identity=filter_identity,
+            policy_identity=policy_identity,
+            canonical_revision_ids=canonical_revisions,
+            canonical_representation_ids=representations,
+            canonical_asset_ids=assets,
+            selected_representation_ids=selected_representations,
+            selected_asset_ids=selected_assets,
+            **evidence,
+        )
+
+    def _representative_index_revision_id(self, *, dense: bool) -> str:
+        """One leg-level identity for 'what index was queried' this call.
+
+        A single document's binding already has one value. A corpus binding
+        joins every bound document's own value deterministically, since a
+        leg describes the whole scope queried, not one hit's document.
+        """
+
+        binding = self.retrieval_binding
+        if binding is None:
+            raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        if isinstance(binding, CorpusRetrievalBinding):
+            values = sorted(
+                (b.dense_index_revision_id if dense else b.tree_revision_id)
+                for b in binding.documents.values()
+            )
+            return "corpus:" + ",".join(values)
+        return binding.dense_index_revision_id if dense else binding.tree_revision_id
+
+    def _document_bindings_for_hits(self, all_hits: list) -> tuple:
+        """One DocumentEvidenceBinding per document actually touched by these hits."""
+
+        from document_services.retrieval.candidates import DocumentEvidenceBinding
+
+        binding = self.retrieval_binding
+        by_doc: Dict[str, list] = {}
+        for hit in all_hits:
+            by_doc.setdefault(hit.document_version_id, []).append(hit)
+
+        bindings = []
+        for document_version_id in sorted(by_doc):
+            hits = by_doc[document_version_id]
+            if isinstance(binding, CorpusRetrievalBinding):
+                doc_binding = binding.documents.get(document_version_id)
+                if doc_binding is None:
+                    raise _CandidateContractUnavailable(
+                        f"no retrieval binding for document {document_version_id!r}"
+                    )
+            else:
+                doc_binding = binding
+            bindings.append(
+                DocumentEvidenceBinding(
+                    document_id=doc_binding.document_id,
+                    document_version_id=doc_binding.document_version_id,
+                    source_sha256=doc_binding.source_sha256,
+                    canonical_artifact_sha256=doc_binding.canonical_artifact_sha256,
+                    tree_revision_id=doc_binding.tree_revision_id,
+                    canonical_revision_ids=tuple(
+                        sorted({v for hit in hits for v in hit.canonical_revision_ids})
+                    ),
+                    canonical_representation_ids=tuple(
+                        sorted({v for hit in hits for v in hit.canonical_representation_ids})
+                    ),
+                    canonical_asset_ids=tuple(
+                        sorted({v for hit in hits for v in hit.canonical_asset_ids})
+                    ),
+                )
+            )
+        return tuple(bindings)
+
+    def _contract_fusion(
+        self,
+        *,
+        subtree_nodes: List[TreeNode],
+        query: str,
+        vector_candidates: Dict[str, List[Tuple[TreeNode, Mapping[str, Any]]]],
+        bm25_candidates: List[Tuple[TreeNode, float]],
+        dense_error: bool,
+    ) -> List[TreeNode]:
+        """Translate live results to the backend-neutral candidate contract."""
+
+        from document_services.retrieval.candidates import (
+            CandidateLeg,
+            CandidateQueryScope,
+            FusionBounds,
+            PlannedRetrievalLeg,
+            fuse_candidates,
+        )
+
+        binding = self.retrieval_binding
+        if binding is None:
+            raise _CandidateContractUnavailable("retrieval binding is unavailable")
+        tenant_id = binding.tenant_id
+        corpus_id = binding.corpus_id
+        dense_index_revision_id = self._representative_index_revision_id(dense=True)
+        tree_index_revision_id = self._representative_index_revision_id(dense=False)
+        filter_digest = hashlib.sha256()
+        for node in subtree_nodes:
+            filter_digest.update(_composite_tree_node_id(node).encode("utf-8"))
+            filter_digest.update(b"\0")
+        filter_identity = f"subtree-{filter_digest.hexdigest()}"
+        policy_identity = "bookrag-hybrid-qdrant-bm25-v1"
+        query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        retrieval_config_sha256 = self._sha256_json(
+            {
+                "candidate_pool_size": self.candidate_pool_size,
+                "dense_oversample": 4,
+                "rrf_k": 60,
+                "policy": policy_identity,
+                # Which vectors were asked is part of what the config is: the
+                # same query over a different set of names is a different
+                # retrieval.
+                "vector_names": sorted(vector_candidates),
+            }
+        )
+        bm25_backend = "bookrag-tree-bm25"
+        bm25_leg_config = self._sha256_json(
+            {"backend": bm25_backend, "tree": tree_index_revision_id}
+        )
+
+        vector_hits: dict[str, list] = {}
+        for vector_name, candidates in vector_candidates.items():
+            leg_id, leg_kind, backend_id = self._leg_identity(vector_name)
+            hits = []
+            for rank, (node, row) in enumerate(candidates, start=1):
+                distance = row.get("distance")
+                if isinstance(distance, bool) or not isinstance(distance, numbers.Real):
+                    raise ValueError("TreeVDB hit distance must be numeric")
+                row_id = row.get("id")
+                if not isinstance(row_id, str) or not row_id:
+                    row_id = self._sha256_json(row)
+                hits.append(
+                    self._candidate_hit(
+                        node=node,
+                        rank=rank,
+                        backend_id=backend_id,
+                        leg_kind=leg_kind,
+                        raw_score=1.0 - float(distance),
+                        payload=row,
+                        # The row id already ends in the vector name, so hits
+                        # from different legs never collide.
+                        hit_id=f"{leg_id}-{row_id}",
+                        filter_identity=filter_identity,
+                        policy_identity=policy_identity,
+                    )
+                )
+            vector_hits[vector_name] = hits
+        bm25_hits = [
+            self._candidate_hit(
+                node=node,
+                rank=rank,
+                backend_id=bm25_backend,
+                leg_kind="bm25",
+                raw_score=score,
+                payload={
+                    "node_id": node.index_id,
+                    "document_version_id": node.document_version_id,
+                    "score": score,
+                },
+                hit_id=f"bm25-{_composite_tree_node_id(node)}-{self._sha256_json(score)[:16]}",
+                filter_identity=filter_identity,
+                policy_identity=policy_identity,
+            )
+            for rank, (node, score) in enumerate(bm25_candidates, start=1)
+        ]
+
+        all_hits = [hit for hits in vector_hits.values() for hit in hits]
+        all_hits.extend(bm25_hits)
+        document_bindings = self._document_bindings_for_hits(all_hits)
+        vector_legs = []
+        for vector_name in sorted(vector_hits):
+            leg_id, leg_kind, backend_id = self._leg_identity(vector_name)
+            vector_legs.append(
+                (
+                    vector_name,
+                    leg_id,
+                    leg_kind,
+                    backend_id,
+                    self._sha256_json(
+                        {
+                            "backend": backend_id,
+                            "index": dense_index_revision_id,
+                            "vector": vector_name,
+                        }
+                    ),
+                )
+            )
+        include_bm25 = bool(bm25_candidates) or not vector_legs
+        plans = tuple(
+            PlannedRetrievalLeg(
+                leg_id=leg_id,
+                leg_kind=leg_kind,
+                backend_id=backend_id,
+                index_revision_id=dense_index_revision_id,
+                leg_config_sha256=leg_config,
+                max_hits=self.candidate_pool_size,
+                budget_ms=30_000,
+            )
+            for _name, leg_id, leg_kind, backend_id, leg_config in vector_legs
+        ) + (
+            (
+                PlannedRetrievalLeg(
+                    leg_id="bm25-tree",
+                    leg_kind="bm25",
+                    backend_id=bm25_backend,
+                    index_revision_id=tree_index_revision_id,
+                    leg_config_sha256=bm25_leg_config,
+                    max_hits=self.candidate_pool_size,
+                    budget_ms=30_000,
+                ),
+            )
+            if include_bm25
+            else ()
+        )
+        scope = CandidateQueryScope(
+            tenant_id=tenant_id,
+            corpus_id=corpus_id,
+            filter_identity=filter_identity,
+            policy_identity=policy_identity,
+            query_sha256=query_sha256,
+            retrieval_config_sha256=retrieval_config_sha256,
+            document_bindings=document_bindings,
+            planned_legs=plans,
+            ready_index_revisions={
+                **{
+                    backend_id: dense_index_revision_id
+                    for _n, _i, _k, backend_id, _c in vector_legs
+                },
+                **({bm25_backend: tree_index_revision_id} if include_bm25 else {}),
+            },
+        )
+        legs = tuple(
+            CandidateLeg(
+                leg_id=leg_id,
+                leg_kind=leg_kind,
+                backend_id=backend_id,
+                index_revision_id=dense_index_revision_id,
+                query_sha256=query_sha256,
+                retrieval_config_sha256=retrieval_config_sha256,
+                leg_config_sha256=leg_config,
+                hits=tuple(vector_hits[name]),
+                status=(
+                    "error"
+                    if dense_error
+                    else "success"
+                    if vector_hits[name]
+                    else "empty"
+                ),
+                error_code="backend_error" if dense_error else None,
+            )
+            for name, leg_id, leg_kind, backend_id, leg_config in vector_legs
+        ) + (
+            (
+                CandidateLeg(
+                    leg_id="bm25-tree",
+                    leg_kind="bm25",
+                    backend_id=bm25_backend,
+                    index_revision_id=tree_index_revision_id,
+                    query_sha256=query_sha256,
+                    retrieval_config_sha256=retrieval_config_sha256,
+                    leg_config_sha256=bm25_leg_config,
+                    hits=tuple(bm25_hits),
+                    status="success" if bm25_hits else "empty",
+                ),
+            )
+            if include_bm25
+            else ()
+        )
+        bounds = FusionBounds(
+            max_legs=max(len(legs), 1),
+            max_hits_per_leg=self.candidate_pool_size,
+            max_output=self.candidate_pool_size,
+        )
+        result = fuse_candidates(legs, scope=scope, bounds=bounds, rrf_k=60)
+        self.last_fusion_result = result
+        by_id = {_composite_tree_node_id(node): node for node in subtree_nodes}
+        selected: list[TreeNode] = []
+        seen: set[tuple[str, int]] = set()
+        for candidate in result.candidates:
+            for node_id in candidate.tree_node_ids:
+                node = by_id.get(node_id)
+                if node is None:
+                    continue
+                key = (node.document_version_id, node.index_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected.append(node)
+                if len(selected) == self.candidate_pool_size:
+                    return selected
+        return selected
+
+    def _internal_rrf(
+        self,
+        dense_candidates: List[Tuple[TreeNode, Mapping[str, Any]]],
+        bm25_candidates: List[Tuple[TreeNode, float]],
+    ) -> List[TreeNode]:
+        """RRF for trees without canonical identity.
+
+        The store-backed NodeMeta never carries canonical_block_id/
+        derived_evidence_id, so _candidate_hit always raises and
+        _contract_fusion never succeeds at real query time -- this is the
+        path every live query actually takes today, not a rare fallback.
+        Composite keys here are load-bearing, not defensive.
+        """
+
+        scores: dict[tuple[str, int], float] = {}
+        nodes: dict[tuple[str, int], TreeNode] = {}
+        for candidates in (dense_candidates, bm25_candidates):
+            seen_leg: set[tuple[str, int]] = set()
+            for rank, (node, _raw) in enumerate(candidates, start=1):
+                key = (node.document_version_id, node.index_id)
+                if key in seen_leg:
+                    continue
+                seen_leg.add(key)
+                nodes[key] = node
+                scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
+        ranked_ids = sorted(scores, key=lambda node_id: (-scores[node_id], node_id))
+        return [nodes[node_id] for node_id in ranked_ids[: self.candidate_pool_size]]
+
+    def _hybrid_candidates(
+        self,
+        subtree_nodes: List[TreeNode],
+        query: str,
+        requested_node_types: Sequence[str] = (),
+    ) -> List[TreeNode]:
+        """Fuse dense/visual Qdrant and BM25 before bounded model reranking."""
+
+        dense_error = False
+        try:
+            vector_candidates = self._vector_candidates(
+                subtree_nodes, query, requested_node_types
+            )
+        except Exception:
+            dense_error = True
+            # Empty legs rather than no legs: a failure the trace does not
+            # mention is a failure nobody can see afterwards.
+            vector_candidates = {name: [] for name in self._expected_vector_names()}
+            log.exception("TreeVDB retrieval failed; continuing with in-process BM25")
+
+        # Lexical search is Qdrant's now: server-side, over the whole document
+        # scope, so a keyword can reach a section the selector did not pick --
+        # which the in-process leg could never do, scoring only the subtree it
+        # was handed. It stays for the one case that still needs it: when
+        # Qdrant is unreachable, an outage would otherwise take the dense and
+        # lexical legs together and leave no answer at all.
+        has_lexical = bool(vector_candidates.get(_TREE_SPARSE_VECTOR))
+        bm25_candidates = (
+            self._bm25_candidates(subtree_nodes, query)
+            if dense_error or not has_lexical
+            else []
+        )
+
+        selected: list[TreeNode]
+        try:
+            selected = self._contract_fusion(
+                subtree_nodes=subtree_nodes,
+                query=query,
+                vector_candidates=vector_candidates,
+                bm25_candidates=bm25_candidates,
+                dense_error=dense_error,
+            )
+        except _CandidateContractUnavailable:
+            self.last_fusion_result = None
+            selected = self._internal_rrf(
+                [row for rows in vector_candidates.values() for row in rows],
+                bm25_candidates,
+            )
+
+        # Keep deterministic source coverage when both retrieval legs return a
+        # small set (or a legacy tree cannot participate in contract fusion).
+        seen = {node.index_id for node in selected}
+        for node in self._bounded_text_candidates(subtree_nodes, query):
+            if node.index_id in seen:
+                continue
+            selected.append(node)
+            seen.add(node.index_id)
+            if len(selected) == self.candidate_pool_size:
+                break
+        return selected[: self.candidate_pool_size]
+
+    def _bounded_text_candidates(
+        self, subtree_nodes: List[TreeNode], query: str
+    ) -> List[TreeNode]:
+        """Preselect across the full subtree in bounded memory.
+
+        This compatibility/coverage leg prevents a vector miss from reducing a
+        long selected subtree to its prefix. It retains positive lexical
+        matches and fills the remainder with deterministic positions spanning
+        the selected structure. Runtime is linear in inspected text plus
+        ``O(N log M)`` heap work and memory is ``O(M)``, where ``M`` is
+        ``candidate_pool_size``.
+        """
+
+        limit = self.candidate_pool_size
+        if len(subtree_nodes) <= limit:
+            return list(subtree_nodes)
+
+        query_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for term in re.findall(r"\w+", query.casefold(), flags=re.UNICODE):
+            if term in seen_terms:
+                continue
+            seen_terms.add(term)
+            query_terms.append(term)
+            if len(query_terms) >= 64:
+                break
+
+        # Reserve at least a quarter of the pool for structural coverage. A
+        # semantic vector/BM25 index will eventually replace this compatibility
+        # preselector; the reservation prevents lexical blind spots meanwhile.
+        relevance_limit = max(1, limit - max(1, limit // 4))
+        relevant: list[tuple[int, int]] = []
+        if query_terms:
+            normalized_query = " ".join(query_terms)
+            heap: list[tuple[int, int, int]] = []
+            for position, node in enumerate(subtree_nodes):
+                text = self._node_rerank_text(node).casefold()
+                if not text:
+                    continue
+                text_terms = set(re.findall(r"\w+", text, flags=re.UNICODE))
+                matched = sum(term in text_terms for term in query_terms)
+                if matched == 0:
+                    continue
+                phrase_bonus = int(bool(normalized_query) and normalized_query in text)
+                score = matched * 2 + phrase_bonus
+                item = (score, -position, position)
+                if len(heap) < relevance_limit:
+                    heapq.heappush(heap, item)
+                elif item > heap[0]:
+                    heapq.heapreplace(heap, item)
+            relevant = [(score, position) for score, _negative, position in heap]
+
+        selected_positions = {position for _score, position in relevant}
+        remaining = limit - len(selected_positions)
+        if remaining > 0:
+            node_count = len(subtree_nodes)
+            if remaining == 1:
+                coverage_positions = [node_count // 2]
+            else:
+                coverage_positions = [
+                    round(index * (node_count - 1) / (remaining - 1))
+                    for index in range(remaining)
+                ]
+            selected_positions.update(coverage_positions)
+
+        # Rounding and overlap with lexical matches can leave holes. Fill them
+        # in stable source order without growing beyond the configured bound.
+        if len(selected_positions) < limit:
+            for position in range(len(subtree_nodes)):
+                selected_positions.add(position)
+                if len(selected_positions) >= limit:
+                    break
+
+        return [
+            subtree_nodes[position]
+            for position in sorted(selected_positions)[:limit]
+        ]
+
+    def _confidence_filtered(
+        self,
+        ranked: List[Tuple[Tuple[str, int], float]],
+        *,
+        limit: int | None = None,
+        min_k: int | None = None,
+    ) -> List[Tuple[Tuple[str, int], float]]:
+        """Keep the highest-scoring candidates, but stop at a real drop-off.
+
+        ``limit`` (default ``self.topk``) is an upper bound, not a quota:
+        reranker scores are calibrated relevance probabilities, so padding
+        out to the limit with whatever scored next sends the answer model
+        noise it has to spend tokens (and sometimes trust) discounting.
+        Candidates scoring below ``topk_relative_floor`` of the best match
+        are dropped, down to a floor of ``min_k`` (default ``self.topk_min``)
+        so a query with uniformly modest scores still returns an answer.
+        This only ever shrinks the selection -- it can never add a candidate
+        the limit alone would have excluded.
+        """
+
+        limit = self.topk if limit is None else limit
+        min_k = self.topk_min if min_k is None else min_k
+        bounded = ranked[:limit]
+        if len(bounded) <= min_k:
+            return bounded
+        top_score = bounded[0][1]
+        floor = top_score * self.topk_relative_floor
+        kept = [item for item in bounded if item[1] >= floor]
+        if len(kept) < min_k:
+            kept = bounded[:min_k]
+        return kept
+
+    def text_reranker(
+        self,
+        subtree_nodes: List[TreeNode],
+        query: str,
+        requested_node_types: Sequence[str] = (),
+    ) -> List[Tuple[Tuple[str, int], float]]:
+        """
+        Rerank the original text in the subtree based on their relevance to the query.
+        Use Reranker model
+        """
+        with self.timings.time("candidate_fusion"):
+            candidates = self._hybrid_candidates(
+                subtree_nodes, query, requested_node_types
+            )
+        if not candidates:
+            return []
+
+        max_length = getattr(self.reranker, "max_length", None)
+        if isinstance(max_length, bool) or not isinstance(max_length, int):
+            raise ValueError("reranker.max_length must be an integer")
+        effective_token_length = max_length - 1000
+        if effective_token_length <= 0:
+            raise ValueError(
+                "reranker.max_length must be greater than the 1000-token "
+                "prompt reserve"
+            )
+
+        # One document per reading of a node. Truncation is per document, so a
+        # long pixel description can no longer push the sentence naming the
+        # subject out of the window.
+        doc_text: list[str] = []
+        owners: list[tuple[str, int]] = []
+        for node in candidates:
+            for _kind, text in self._node_rerank_views(node):
+                if not text:
+                    continue
+                if num_tokens(text) > effective_token_length:
+                    text = TextProcessor.split_text_into_chunks(
+                        text=text, max_length=effective_token_length
+                    )
+                    text = text[0]  # use the first chunk
+                doc_text.append(text)
+                owners.append((node.document_version_id, node.index_id))
+        if not doc_text:
+            return []
+
+        try:
+            with self.timings.time("text_rerank"):
+                scores = self.reranker.rerank(
+                    query=query, documents=doc_text, instruction=TEXT_RERANKER_PROMPT
+                )
+            try:
+                score_count = len(scores)
+            except TypeError as exc:
+                raise ValueError(
+                    "reranker must return a sized sequence of scores"
+                ) from exc
+            if score_count != len(doc_text):
+                raise ValueError(
+                    "reranker returned an unexpected number of scores: "
+                    f"expected {len(doc_text)}, got {score_count}"
+                )
+
+            validated_scores = []
+            for position, score in enumerate(scores):
+                if (
+                    isinstance(score, bool)
+                    or not isinstance(score, numbers.Real)
+                    or not math.isfinite(float(score))
+                ):
+                    raise ValueError(
+                        "reranker returned a non-finite numeric score at "
+                        f"position {position}"
+                    )
+                validated_scores.append(float(score))
+        finally:
+            self.reranker.clean_cache()
+
+        # A node scores as well as its best reading: a question resembles one
+        # reading or the other, never their concatenation. Max rather than mean,
+        # because averaging reintroduces exactly the dilution this splits apart.
+        best: dict[tuple[str, int], float] = {}
+        for node_id, score in zip(owners, validated_scores):
+            if score > best.get(node_id, float("-inf")):
+                best[node_id] = score
+
+        ranked_res = sorted(best.items(), key=lambda item: (-item[1], item[0]))
+
+        return ranked_res
+
+    # def multimodal_reranker(
+    #     self, subtree_nodes: List[TreeNode], query: str
+    # ) -> List[Tuple[Tuple[str, int], float]]:
+    #     doc_mm = []
+    #     tree_ids = [node.index_id for node in subtree_nodes]
+    #     for node in subtree_nodes:
+    #         node_type = node.type
+    #         tmp_dict = {}
+    #         if node_type == NodeType.TABLE or node_type == NodeType.IMAGE:
+    #             img_path = node.meta_info.img_path
+    #             tmp_dict["img_path"] = img_path
+    #         text = node.meta_info.content
+    #         tmp_dict["content"] = text
+    #         tmp_dict["node_id"] = node.index_id
+    #         doc_mm.append(tmp_dict)
+
+    #     scores = self.mm_reranker.rerank_documents(
+    #         query=query, doc_list=doc_mm, instruction=MM_RERANKER_INSTRUCTION
+    #     )
+    #     ranked_res = sorted(zip(tree_ids, scores), key=lambda x: x[1], reverse=True)
+    #     # Return the ranked results as a list of tuples (tree_id, score)
+    #     return ranked_res
+
+    def graph_reranker(
+        self,
+        subgraph: nx.Graph,
+        ent_map: Dict[str, List[str]],
+        subtree_nodes: List[TreeNode],
+    ) -> Tuple[List[Tuple[Tuple[str, int], float]], List[str]]:
+        ents_sim = {}
+        with self.timings.time("entity_similarity"):
+            for q_ent_name, gbc_ents in ent_map.items():
+                for node_name in gbc_ents:
+                    if node_name not in subgraph.nodes():
+                        continue
+                    # compute similarity between the query entity and the GBC entity
+                    sim = self.embedder.compute_texts_sim(q_ent_name, node_name)
+                    positive_sim = (sim + 1) / 2
+                    ents_sim[node_name] = ents_sim.get(node_name, 0.0) + positive_sim
+
+        total_sim_sum = sum(ents_sim.values())
+
+        # Normalize the similarity scores
+        personalization_vector = {}
+        if total_sim_sum > 0:
+            for ent, score in ents_sim.items():
+                personalization_vector[ent] = score / total_sim_sum
+        else:
+            return [], []
+
+        pagerank_alpha: float = self.alpha
+        with self.timings.time("semantic_links"):
+            enhanced_graph = enhance_graph_with_semantic_links(
+                graph=subgraph, embedder=self.embedder, x_percentile=self.x_percentile
+            )
+
+        with self.timings.time("pagerank"):
+            pagerank_scores = nx.pagerank(
+                enhanced_graph,
+                alpha=pagerank_alpha,
+                personalization=personalization_vector,
+                weight="weight",
+            )
+
+        res_entities = [(ent, score) for ent, score in pagerank_scores.items()]
+        res_entities = sorted(res_entities, key=lambda item: (-item[1], item[0]))
+        res_entities = res_entities[: self.topk_ent]
+        res_entities = [ent for ent, _ in res_entities]
+        log.info(
+            f"Graph reranker: Retrieved {len(res_entities)} entities with topk={self.topk_ent}."
+        )
+
+        target_tree_ids = {(node.document_version_id, node.index_id) for node in subtree_nodes}
+        # Only create candidates backed by at least one source-linked entity.
+        # Text fusion can still introduce graphless candidates in standard mode;
+        # graph-only mode must not return arbitrary zero-score tree nodes.
+        tree_node_scores = {}
+
+        for entity_name, score in pagerank_scores.items():
+            node_attributes = subgraph.nodes.get(entity_name, {})
+            source_ids = node_attributes.get("source_ids", set())
+            for source_id in source_ids:
+                if source_id in target_tree_ids:
+                    tree_node_scores[source_id] = (
+                        tree_node_scores.get(source_id, 0.0) + score
+                    )
+
+        aggregated_ranked_list = [
+            (tree_id, score)
+            for tree_id, score in tree_node_scores.items()
+            if score > 0
+        ]
+        sorted_ranked_list = sorted(
+            aggregated_ranked_list, key=lambda item: (-item[1], item[0])
+        )
+
+        return sorted_ranked_list, res_entities
+
+    def skyline_filter(
+        self,
+        sub_query: str,
+        subtree_nodes: List[TreeNode],
+        subgraph: nx.Graph,
+        start_ent_map: Dict[str, List[str]],
+        requested_node_types: Sequence[str] = (),
+    ) -> Tuple[List[Tuple[str, int]], List[str]]:
+        if len(subtree_nodes) == 0:
+            log.info("No subtree nodes available for reranking.")
+            return [], []
+
+        if self.variant == "wo_graph":
+            log.info("Variant 'wo_graph' selected: Skipping graph reranker.")
+            # Only use text reranker
+            text_rerank_res = self.text_reranker(subtree_nodes, sub_query, requested_node_types)
+            tree_node_ids = [
+                node_id for node_id, _ in self._confidence_filtered(text_rerank_res)
+            ]
+
+            # use start_ent_map as the returned entities
+            res_entities = []
+            seen_entities = set()
+            for _, gbc_ents in start_ent_map.items():
+                for node_name in gbc_ents:
+                    if node_name not in seen_entities:
+                        seen_entities.add(node_name)
+                        res_entities.append(node_name)
+
+            return tree_node_ids, res_entities
+
+        if self.variant == "wo_text":
+            log.info("Variant 'wo_text' selected: Skipping text reranker.")
+            # Only use graph reranker
+            graph_rerank_res, res_entities = self.graph_reranker(
+                subgraph, start_ent_map, subtree_nodes
+            )
+            tree_node_ids = [node_id for node_id, _ in graph_rerank_res[: self.topk]]
+
+            return tree_node_ids, res_entities
+
+        # 2. Use Three Layer Reranker to select most relevant TreeNodes in the subtree.
+        # 2.1 PPR to rank the most relevant TreeNodes in the subtree.
+        graph_rerank_res, res_entities = self.graph_reranker(
+            subgraph, start_ent_map, subtree_nodes
+        )
+
+        # 2.2 Rerank with text reranker model.
+        text_rerank_res = self.text_reranker(subtree_nodes, sub_query, requested_node_types)
+
+        # 2.3 Rerank with Multimodal method.
+        # mm_rerank_res = self.multimodal_reranker(subtree_nodes, sub_query)
+
+        # Combine the results from three rerankers
+        # merged_scores: Dict[int, List[float]] = merge_ranker_scores(
+        #     graph_rerank_res, text_rerank_res, mm_rerank_res
+        # )
+
+        merged_scores: Dict[int, List[float]] = merge_ranker_scores(
+            graph_rerank_res, text_rerank_res
+        )
+        sel_tree_nodes = calculate_skyline(merged_scores, max_results=self.topk)
+        tree_node_ids = [node["node_id"] for node in sel_tree_nodes]
+
+        if len(tree_node_ids) < self.topk and len(merged_scores) >= self.topk:
+            log.info(
+                f"Skyline returned only {len(tree_node_ids)} nodes. "
+                f"Activating fallback to meet minimum of {self.topk}."
+            )
+
+            filled = self._fill_to_limit(
+                tree_node_ids,
+                graph_rerank_res,
+                text_rerank_res,
+                limit=self.topk,
+            )
+            # Skyline members are the algorithm's actual multi-criteria pick
+            # and are never trimmed; only the padding added purely to reach
+            # the numeric quota is subject to the relevance floor.
+            skyline_ids = set(tree_node_ids)
+            padding_ids = [node_id for node_id in filled if node_id not in skyline_ids]
+            text_score_by_id = dict(text_rerank_res)
+            padding_scored = sorted(
+                ((node_id, text_score_by_id.get(node_id, 0.0)) for node_id in padding_ids),
+                key=lambda item: (-item[1], item[0]),
+            )
+            kept_padding = {
+                node_id
+                for node_id, _ in self._confidence_filtered(
+                    padding_scored,
+                    limit=len(padding_scored),
+                    min_k=max(0, self.topk_min - len(skyline_ids)),
+                )
+            }
+            tree_node_ids = [
+                node_id
+                for node_id in filled
+                if node_id in skyline_ids or node_id in kept_padding
+            ]
+            log.info(
+                "Fallback selected %s unique nodes (%s padding entries dropped "
+                "below the confidence floor).",
+                len(tree_node_ids),
+                len(filled) - len(tree_node_ids),
+            )
+
+        return tree_node_ids[: self.topk], res_entities
+
+    @staticmethod
+    def _fill_to_limit(
+        selected_ids: List[Tuple[str, int]],
+        *ranked_results: Iterable[Tuple[Tuple[str, int], float]],
+        limit: int,
+    ) -> List[Tuple[str, int]]:
+        """Deterministically fill a skyline without ever exceeding ``limit``."""
+
+        result = []
+        seen = set()
+
+        def add(node_id: Tuple[str, int]) -> bool:
+            if node_id in seen:
+                return False
+            seen.add(node_id)
+            result.append(node_id)
+            return len(result) >= limit
+
+        for node_id in selected_ids:
+            if add(node_id):
+                return result
+
+        iterators = [iter(items) for items in ranked_results]
+        while iterators:
+            active_iterators = []
+            for iterator in iterators:
+                try:
+                    node_id, _ = next(iterator)
+                except StopIteration:
+                    continue
+                active_iterators.append(iterator)
+                if add(node_id):
+                    return result
+            iterators = active_iterators
+
+        return result

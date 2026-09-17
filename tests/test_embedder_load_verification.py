@@ -10,7 +10,7 @@ import unittest
 
 import torch
 
-from Core.provider.embedding import _MIN_SEMANTIC_MARGIN, _MultimodalSharedRuntime
+from retrieval_engine.providers.embeddings import _MIN_SEMANTIC_MARGIN, _MultimodalSharedRuntime
 
 
 class _Randomized:

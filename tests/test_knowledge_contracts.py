@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import unittest
 
-from docarag.domain.base import ContractValidationError
-from docarag.domain.knowledge import (
+from document_services.domain.base import ContractValidationError
+from document_services.domain.knowledge import (
     EntityMention,
     EvidenceAnchor,
     EvidenceGraphRelease,

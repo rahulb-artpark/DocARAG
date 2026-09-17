@@ -10,9 +10,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from docarag import cli
-from docarag.persistence import DocumentScope, SchemaStatus, StageEventStatus
-from docarag.settings import RuntimeSettings
+from document_services import cli
+from document_services.persistence import DocumentScope, SchemaStatus, StageEventStatus
+from document_services.runtime.settings import RuntimeSettings
 
 
 class _Health:
@@ -116,7 +116,7 @@ class StorageCLITests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {}, clear=True),
-                patch("docarag.cli.build_parser") as parser_factory,
+                patch("document_services.cli.build_parser") as parser_factory,
             ):
                 parser_factory.return_value.parse_args.return_value = (
                     argparse.Namespace(settings=str(settings_path), handler=handler)
@@ -144,10 +144,10 @@ class StorageCLITests(unittest.TestCase):
         arguments = argparse.Namespace(settings=None, json=False)
         output = io.StringIO()
         with (
-            patch("docarag.cli._load", return_value=settings),
-            patch("docarag.cli._postgres_ledger", return_value=ledger),
+            patch("document_services.cli._load", return_value=settings),
+            patch("document_services.cli._postgres_ledger", return_value=ledger),
             patch(
-                "docarag.cli._qdrant_health",
+                "document_services.cli._qdrant_health",
                 return_value={
                     "ok": True,
                     "endpoint": "http://127.0.0.1:6333",
@@ -181,9 +181,9 @@ class StorageCLITests(unittest.TestCase):
             ledger = _Ledger()
             arguments = argparse.Namespace(settings=None, document=str(document_path))
             with (
-                patch("docarag.cli._load", return_value=settings),
-                patch("docarag.cli._require_postgres", return_value=ledger),
-                patch("docarag.cli._run", return_value=0) as runner,
+                patch("document_services.cli._load", return_value=settings),
+                patch("document_services.cli._require_postgres", return_value=ledger),
+                patch("document_services.cli._run", return_value=0) as runner,
             ):
                 result = cli.command_index(arguments)
 
@@ -252,10 +252,10 @@ class StorageCLITests(unittest.TestCase):
                 routed_profile=str(profile_path),
             )
             with (
-                patch("docarag.cli._load", return_value=settings),
-                patch("docarag.cli._require_postgres", return_value=ledger),
-                patch("docarag.cli._load_routed_profile", return_value=profile),
-                patch("docarag.cli._run", return_value=0) as runner,
+                patch("document_services.cli._load", return_value=settings),
+                patch("document_services.cli._require_postgres", return_value=ledger),
+                patch("document_services.cli._load_routed_profile", return_value=profile),
+                patch("document_services.cli._run", return_value=0) as runner,
             ):
                 self.assertEqual(0, cli.command_index(arguments))
 

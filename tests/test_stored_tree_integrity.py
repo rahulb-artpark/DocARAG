@@ -20,10 +20,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from docarag import tree_integrity
-from docarag.document_store import DocumentStore, DocumentStoreError
-from docarag.tree_integrity import TreeIntegrityError, verify_stored_tree
-from docarag.tree_store import NodeMeta, TreeNodeView
+from document_services.evidence import tree_integrity
+from document_services.persistence.document_store import DocumentStore, DocumentStoreError
+from document_services.evidence.tree_integrity import TreeIntegrityError, verify_stored_tree
+from document_services.persistence.tree_store import NodeMeta, TreeNodeView
 
 
 def _view(index_id, node_type, parent_id, *, img_path=None, evidence_img=None):

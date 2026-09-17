@@ -9,7 +9,7 @@ import sys
 import unittest
 import uuid
 
-from docarag.domain import (
+from document_services.domain import (
     BlockType,
     DocumentRef,
     ErrorClassification,
@@ -21,8 +21,8 @@ from docarag.domain import (
     ParserArtifactAvailability,
     ParserExecutionError,
 )
-from docarag.ports import ParserRegistry
-from docarag.services.paddleocr_vl import (
+from document_services.ports import ParserRegistry
+from document_services.parser_clients.paddleocr_vl import (
     OFFICIAL_LAYOUT_PARSING_PATH,
     PADDLE_MARKDOWN_IMAGE_ARTIFACT_SCHEMA,
     PADDLE_RAW_PAGE_ARTIFACT_SCHEMA,
@@ -40,7 +40,7 @@ from docarag.services.paddleocr_vl import (
     StoredPaddleOCRVLArtifact,
     build_paddleocr_vl_service_adapter,
 )
-from docarag.source_material import VerifiedSourceMaterial
+from document_services.evidence.sources import VerifiedSourceMaterial
 
 
 PDF_BYTES = b"%PDF-1.7\nverified immutable snapshot\n%%EOF\n"
@@ -820,7 +820,7 @@ def guarded(name, *args, **kwargs):
         raise AssertionError('forbidden import: ' + name)
     return real_import(name, *args, **kwargs)
 builtins.__import__ = guarded
-import docarag.services.paddleocr_vl
+import document_services.parser_clients.paddleocr_vl
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in blocked)))
 """
         completed = subprocess.run(

@@ -6,11 +6,11 @@ from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 
-from Core.Index.Tree import NodeType
-from Core.configs.rag.gbc_config import GBCRAGConfig
-from Core.rag.gbc_plan import Filter, PlanResult
-from Core.rag.gbc_rag import GBCRAG
-from Core.rag.gbc_utils import (
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.configuration.strategies.gbc import GBCRAGConfig
+from retrieval_engine.rag.gbc.planner import Filter, PlanResult
+from retrieval_engine.rag.gbc.agent import GBCRAG
+from retrieval_engine.rag.gbc.context import (
     GBCRAGContext,
     answer_input_char_budget,
     filter_tree_nodes,
@@ -172,7 +172,7 @@ class GlobalQueryBoundTests(unittest.TestCase):
         rag = _rag(limit=2, tree=tree)
         context = GBCRAGContext(query="How many tables?")
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("COUNT"))
 
         self.assertIn("100 items", context.final_answer)
@@ -189,7 +189,7 @@ class GlobalQueryBoundTests(unittest.TestCase):
         rag = _rag(limit=3, tree=tree)
         context = GBCRAGContext(query="Summarize every table")
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("SUMMARIZE"))
 
         step = context.iterations[0]
@@ -223,7 +223,7 @@ class GlobalQueryBoundTests(unittest.TestCase):
         )
         context = GBCRAGContext(query="Summarize every table")
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("SUMMARIZE"))
 
         self.assertEqual("bounded answer", context.final_answer)
@@ -270,7 +270,7 @@ class TheBudgetMeasuresSizeNotPieceCount(unittest.TestCase):
             [],
         )
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("SUMMARIZE"))
 
         self.assertFalse(context.iterations[0].global_budget_exhausted)
@@ -284,7 +284,7 @@ class TheBudgetMeasuresSizeNotPieceCount(unittest.TestCase):
         rag = _rag(limit=512, tree=tree, char_budget=240_000)
         context = GBCRAGContext(query="Summarize everything")
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("SUMMARIZE"))
 
         step = context.iterations[0]
@@ -300,7 +300,7 @@ class TheBudgetMeasuresSizeNotPieceCount(unittest.TestCase):
         rag = _rag(limit=3, tree=tree, char_budget=10_000_000)
         context = GBCRAGContext(query="Summarize everything")
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("SUMMARIZE"))
 
         self.assertIn("9 evidence items", context.final_answer)
@@ -311,7 +311,7 @@ class TheBudgetMeasuresSizeNotPieceCount(unittest.TestCase):
         rag = _rag(limit=512, tree=tree, char_budget=240_000)
         context = GBCRAGContext(query="Summarize everything")
 
-        with patch("Core.rag.gbc_rag.filter_tree_nodes", return_value=nodes):
+        with patch("retrieval_engine.rag.gbc.agent.filter_tree_nodes", return_value=nodes):
             rag.process_analysis(context, _global_plan("SUMMARIZE"))
 
         partial = context.iterations[0].partial_answers[0]

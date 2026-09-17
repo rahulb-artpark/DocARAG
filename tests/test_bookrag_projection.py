@@ -9,9 +9,9 @@ import sys
 import tempfile
 import unittest
 
-from docarag.artifact_store import LocalContentAddressedArtifactStore
-from docarag.asset_material import AssetMaterializationError
-from docarag.bookrag_projection import (
+from document_services.persistence.artifact_store import LocalContentAddressedArtifactStore
+from document_services.evidence.assets import AssetMaterializationError
+from document_services.evidence.projections.bookrag import (
     BOOKRAG_ASSET_LEASE_SCHEMA_VERSION,
     PROJECTION_NAME,
     BookRAGAssetLeaseError,
@@ -25,7 +25,7 @@ from docarag.bookrag_projection import (
     project_canonical_blocks,
     project_to_bookrag_pdf_list,
 )
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -982,10 +982,10 @@ class ProjectionImportBoundaryTests(unittest.TestCase):
         script = r'''
 import json
 import sys
-import docarag.bookrag_projection
+import document_services.evidence.projections.bookrag
 
 forbidden = (
-    "Core", "docling", "mineru", "paddle", "psycopg", "qdrant_client",
+    "retrieval_engine", "docling", "mineru", "paddle", "psycopg", "qdrant_client",
     "torch", "transformers"
 )
 loaded = sorted(

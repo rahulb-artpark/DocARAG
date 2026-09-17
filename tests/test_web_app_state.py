@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from docarag.tree_store import NodeMeta, TreeNodeView
+from document_services.persistence.tree_store import NodeMeta, TreeNodeView
 
 REPO = Path(__file__).resolve().parents[1]
 WEB_PATH = REPO / "Scripts" / "web.py"
@@ -225,7 +225,7 @@ class AnswerTimeBudgetsComeFromTheCurrentConfig(unittest.TestCase):
         # Patch where it is imported from: the helper imports it inside the
         # function, so patching the web module would be a no-op that still
         # passes whenever the real config happens to match.
-        with patch("Core.configs.system_config.load_system_config", return_value=current):
+        with patch("retrieval_engine.configuration.system.load_system_config", return_value=current):
             self.web.refresh_answer_time_budgets(cfg)
         self.assertEqual(cfg.rag.strategy_config.global_evidence_limit, 512)
         self.assertEqual(cfg.rag.strategy_config.global_evidence_char_budget, 48_000)
@@ -239,14 +239,14 @@ class AnswerTimeBudgetsComeFromTheCurrentConfig(unittest.TestCase):
         # Patch where it is imported from: the helper imports it inside the
         # function, so patching the web module would be a no-op that still
         # passes whenever the real config happens to match.
-        with patch("Core.configs.system_config.load_system_config", return_value=current):
+        with patch("retrieval_engine.configuration.system.load_system_config", return_value=current):
             self.web.refresh_answer_time_budgets(cfg)
         self.assertEqual(cfg.rag.strategy_config.topk, 7)
 
     def test_an_unreadable_current_config_leaves_the_run_s_values(self):
         cfg = self._cfg(32, 1000)
         with patch(
-            "Core.configs.system_config.load_system_config", side_effect=OSError("gone")
+            "retrieval_engine.configuration.system.load_system_config", side_effect=OSError("gone")
         ):
             self.web.refresh_answer_time_budgets(cfg)
         self.assertEqual(cfg.rag.strategy_config.global_evidence_limit, 32)

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from Core.Index.Tree import DocumentTree, NodeType
-from Core.pipelines import doc_tree_builder
-from Core.pipelines.doc_tree_builder import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType
+from retrieval_engine.indexing.tree import builder as doc_tree_builder
+from retrieval_engine.indexing.tree.builder import (
     TreeConstructionError,
     construct_tree_index,
 )

@@ -1,0 +1,2641 @@
+from collections import defaultdict
+from bisect import bisect_left
+import heapq
+import itertools
+import re
+from typing import Any, Callable, List, Literal, Mapping, Tuple, Dict, Optional
+
+from pydantic import Field, create_model
+
+from retrieval_engine.indexes.tree import TreeNode, NodeType
+from retrieval_engine.rag.base_strategy import BaseRAG
+from retrieval_engine.providers.language_model import LLM
+from retrieval_engine.providers.vision_model import VLM
+from retrieval_engine.providers.reranking import TextRerankerProvider
+from retrieval_engine.providers.embeddings import MMRerankerProvider
+from retrieval_engine.configuration.strategies.gbc import GBCRAGConfig
+from retrieval_engine.indexes.gbc import GBC
+from retrieval_engine.prompts.gbc import (
+    LLM_EXPANSION_SELECT_PROMPT,
+    QuestionEntity,
+    QuestionEntityExtraction,
+    QUESTION_ENT_PROMPT,
+    QUESTION_ENTITY_TYPES,
+    SecEXPSelection,
+)
+from retrieval_engine.rag.gbc.answer import AnswerAgent
+from retrieval_engine.rag.gbc.planner import (
+    PlanningBudgetExceeded,
+    TaskPlanner,
+    PlanResult,
+    requested_node_type_filter,
+)
+from retrieval_engine.rag.gbc.retrieval import (
+    CorpusRetrievalBinding,
+    HybridRetrievalBinding,
+    Retriever,
+)
+from retrieval_engine.rag.stored_indexes import entity_node_name, split_node_name
+from retrieval_engine.indexing.graph.entity_facets import (
+    CANONICAL_FIELD,
+    collapse_entity_hits,
+    context_text,
+    lexical_terms,
+    lexical_text,
+)
+from document_services.evidence.assets import AssetMaterialResolver
+from document_services.evidence.projections.bookrag import BookRAGAssetMaterializationLease
+from document_services.domain.evidence import AssetKind, AssetRef, DocumentRef
+from document_services.evidence.hydration import CanonicalEvidenceHydrator
+
+from retrieval_engine.rag.gbc.context import (
+    GBCRAGContext,
+    SubStep,
+    answer_input_char_budget,
+    filter_tree_nodes,
+    global_scope_chars,
+)
+
+
+import json
+import networkx as nx
+
+import logging
+
+log = logging.getLogger(__name__)
+
+
+SECTION_SELECTION_POLICY = (
+    "linked-all_then_lexical-path_source-stratified-v2"
+)
+MAX_ANSWER_ASSETS = 64
+MAX_ANSWER_ASSET_BYTES = 32 * 1024 * 1024
+MAX_ANSWER_ASSET_TOTAL_BYTES = 128 * 1024 * 1024
+
+
+class AnswerAssetMaterializationError(RuntimeError):
+    """Canonical visual evidence could not be byte-verified for generation."""
+
+
+class SectionSelectionBudgetExceeded(PlanningBudgetExceeded):
+    """The prompt budget cannot represent all source-linked sections."""
+
+
+# Node types whose own text says what they show but never what they are about.
+# The subject sits in the heading above them, so retrieval carries that heading
+# along; see GBCRAG._with_section_titles.
+_SECTIONED_TYPE_VALUES = frozenset(
+    kind.value
+    for kind in (
+        NodeType.IMAGE,
+        NodeType.CHART,
+        NodeType.DIAGRAM,
+        NodeType.EQUATION,
+        NodeType.CODE,
+        NodeType.ALGORITHM,
+    )
+)
+
+
+def _node_type_value(node: object) -> str:
+    """One node's type as a plain string, however retrieval is holding it."""
+
+    kind = getattr(node, "type", None)
+    return kind.value if isinstance(kind, NodeType) else str(kind or "")
+
+
+def _citation_validation_from_partials(partials: object) -> Dict[str, Any]:
+    if not isinstance(partials, list):
+        return {}
+    for partial in partials:
+        if not isinstance(partial, dict):
+            continue
+        validation = partial.get("answer_citation_validation")
+        if isinstance(validation, dict):
+            return dict(validation)
+    return {}
+
+
+def _citation_bindings_from_validation(
+    validation: object,
+) -> Dict[str, str | None]:
+    """Recover the canonical label map serialized by the answer validator."""
+
+    if not isinstance(validation, dict):
+        return {}
+    allowed = validation.get("allowed_bindings")
+    if not isinstance(allowed, list):
+        return {}
+    bindings: Dict[str, str | None] = {}
+    for item in allowed:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("evidence_label")
+        citation_id = item.get("citation_id")
+        if not isinstance(label, str):
+            continue
+        normalized_id = citation_id if isinstance(citation_id, str) else None
+        if label in bindings and bindings[label] != normalized_id:
+            raise ValueError(
+                f"answer validation contains conflicting binding for {label}"
+            )
+        bindings[label] = normalized_id
+    return bindings
+
+
+class GBCRAG(BaseRAG):
+    """
+    GBC RAG (Graph-Based Contextual Retrieval Augmented Generation) class.
+    This class is designed to handle the retrieval and generation of responses
+    based on a graph-based context.
+    """
+
+    def __init__(
+        self,
+        llm: LLM,
+        vlm: VLM,
+        config: GBCRAGConfig,
+        gbc_index: GBC,
+        tree_vdb: Any,
+        asset_cas_root: str | None = None,
+    ):
+        super().__init__(
+            llm,
+            name="GBC RAG",
+            description="Graph-Based Contextual Retrieval Augmented Generation",
+        )
+        self.vlm = vlm
+        self.cfg = config
+        self.variant = self.cfg.variant
+        if not gbc_index:
+            raise ValueError("GBC index must be provided for GBCRAG.")
+        if tree_vdb is None:
+            raise ValueError("Attested TreeVDB must be provided for GBCRAG.")
+        self.gbc_index = gbc_index
+        self.tree_vdb = tree_vdb
+        self.tree_embedder = getattr(tree_vdb, "embedding_model", None)
+        if asset_cas_root is not None and (
+            not isinstance(asset_cas_root, str) or not asset_cas_root
+        ):
+            raise ValueError("asset_cas_root must be a non-empty path or None")
+        self.asset_cas_root = asset_cas_root
+        self._query_asset_leases: list[BookRAGAssetMaterializationLease] | None = None
+        self._query_asset_attestations: Dict[str, object] = {}
+        self._query_asset_refs: Dict[str, AssetRef] = {}
+        self._query_asset_total_bytes = 0
+        if self.asset_cas_root is not None:
+            # Bind and validate the root before any model generation. No asset
+            # bytes are read until a retrieved evidence item selects them.
+            AssetMaterialResolver(
+                content_addressed_root=self.asset_cas_root,
+                max_assets=MAX_ANSWER_ASSETS,
+                max_asset_bytes=MAX_ANSWER_ASSET_BYTES,
+                max_total_bytes=MAX_ANSWER_ASSET_TOTAL_BYTES,
+            )
+        self.embedder = self.gbc_index.embedder if self.gbc_index else None
+        self.entity_vdb = self.gbc_index.entity_vdb if self.gbc_index else None
+        self.reranker = TextRerankerProvider(
+            model_name=self.cfg.reranker_config.model_name,
+            max_length=self.cfg.reranker_config.max_length,
+            device=self.cfg.reranker_config.device,
+            backend=self.cfg.reranker_config.backend,
+            api_base=self.cfg.reranker_config.api_base,
+            request_timeout_seconds=(
+                self.cfg.reranker_config.request_timeout_seconds
+            ),
+            use_flash_attention=self.cfg.reranker_config.use_flash_attention,
+            flash_attention_fallback=(
+                self.cfg.reranker_config.flash_attention_fallback
+            ),
+        )
+        # GBC RAG config
+        self.threshold_e = self.cfg.sim_threshold_e
+        self.select_depth = self.cfg.select_depth
+        self.max_retry = self.cfg.max_retry
+
+        # Agents
+        self.planner = TaskPlanner(
+            llm=self.llm,
+            enable_global_classification=self.cfg.enable_global_classification,
+            max_query_chars=self.cfg.planner_max_query_chars,
+            max_subquestions=self.cfg.planner_max_subquestions,
+            max_subquestion_chars=self.cfg.planner_max_subquestion_chars,
+            max_filters=self.cfg.planner_max_filters,
+            max_filter_value_chars=self.cfg.planner_max_filter_value_chars,
+        )
+        evidence_hydrator = None
+        tree_index = self.gbc_index.TreeIndex
+        retrieval_binding = self._hybrid_retrieval_binding(tree_index, tree_vdb)
+        if tree_index is not None:
+            tree_meta = tree_index.meta_info
+            for field_name in (
+                "document_version_id",
+                "source_sha256",
+                "source_uri",
+            ):
+                value = getattr(tree_meta, field_name, None)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        "canonical BookRAG tree is missing source identity: "
+                        f"{field_name}"
+                    )
+            evidence_hydrator = CanonicalEvidenceHydrator(
+                self.gbc_index.store.evidence_catalog(),
+                node_resolver=lambda node_ids, tree=tree_index: tree.get_nodes_data(
+                    list(node_ids)
+                ),
+                expected_document_version_id=tree_meta.document_version_id,
+                expected_source_sha256=tree_meta.source_sha256,
+                expected_source_uri=tree_meta.source_uri,
+                max_evidence=64,
+                max_sources_per_evidence=64,
+                max_total_sources=512,
+            )
+        self.evidence_hydrator = evidence_hydrator
+        self.answer = AnswerAgent(
+            complex_synthesis_input_tokens=self.cfg.complex_synthesis_input_tokens,
+            llm=self.llm,
+            vlm=self.vlm,
+            variant=self.variant,
+        )
+        self.retriever = Retriever(
+            variant=self.variant,
+            reranker=self.reranker,
+            # mm_reranker=self.mm_reranker,
+            embedder=self.embedder,
+            alpha=self.cfg.alpha,
+            topk_ent=self.cfg.topk_ent,
+            x_percentile=self.cfg.x_percentile,
+            topk=self.cfg.topk,
+            topk_relative_floor=self.cfg.topk_relative_floor,
+            topk_min=self.cfg.topk_min,
+            candidate_pool_size=self.cfg.candidate_pool_size,
+            tree_vdb=self.tree_vdb,
+            retrieval_binding=retrieval_binding,
+        )
+        self.retrieval_callback: Optional[
+            Callable[[GBCRAGContext, SubStep], None]
+        ] = None
+        # Corpus mode only; always None for a single-document instance.
+        self.evidence_hydrators: Dict[str, CanonicalEvidenceHydrator] | None = None
+        self.corpus_bundle = None
+        self._corpus_store = None
+
+    @classmethod
+    def from_corpus_bundle(
+        cls,
+        llm: LLM,
+        vlm: VLM,
+        config: GBCRAGConfig,
+        corpus_bundle: Any,
+        asset_cas_root: str | None = None,
+    ) -> "GBCRAG":
+        """Alternate constructor: bind to a whole corpus instead of one document.
+
+        Mirrors ``__init__`` but replaces the single-document ``gbc_index``/
+        ``tree_vdb``/``evidence_hydrator`` setup with their corpus-scoped
+        counterparts; the shared agents (planner, reranker, answer, retriever)
+        are built the same way either way.
+        """
+
+        self = cls.__new__(cls)
+        BaseRAG.__init__(
+            self, llm,
+            name="GBC RAG",
+            description="Graph-Based Contextual Retrieval Augmented Generation",
+        )
+        self.vlm = vlm
+        self.cfg = config
+        self.variant = self.cfg.variant
+        if not corpus_bundle or not corpus_bundle.documents:
+            raise ValueError("a non-empty CorpusIndexBundle must be provided for GBCRAG.")
+        self.corpus_bundle = corpus_bundle
+        self.gbc_index = corpus_bundle.documents
+        self.tree_vdb = corpus_bundle.tree_vdb
+        self.tree_embedder = getattr(corpus_bundle.tree_vdb, "embedding_model", None)
+        if asset_cas_root is not None and (
+            not isinstance(asset_cas_root, str) or not asset_cas_root
+        ):
+            raise ValueError("asset_cas_root must be a non-empty path or None")
+        self.asset_cas_root = asset_cas_root
+        self._query_asset_leases: list[BookRAGAssetMaterializationLease] | None = None
+        self._query_asset_attestations: Dict[str, object] = {}
+        self._query_asset_refs: Dict[str, AssetRef] = {}
+        self._query_asset_total_bytes = 0
+        if self.asset_cas_root is not None:
+            AssetMaterialResolver(
+                content_addressed_root=self.asset_cas_root,
+                max_assets=MAX_ANSWER_ASSETS,
+                max_asset_bytes=MAX_ANSWER_ASSET_BYTES,
+                max_total_bytes=MAX_ANSWER_ASSET_TOTAL_BYTES,
+            )
+        self.embedder = corpus_bundle.embedder
+        self.entity_vdb = corpus_bundle.entity_vdb
+        self.reranker = TextRerankerProvider(
+            model_name=self.cfg.reranker_config.model_name,
+            max_length=self.cfg.reranker_config.max_length,
+            device=self.cfg.reranker_config.device,
+            backend=self.cfg.reranker_config.backend,
+            api_base=self.cfg.reranker_config.api_base,
+            request_timeout_seconds=(self.cfg.reranker_config.request_timeout_seconds),
+            use_flash_attention=self.cfg.reranker_config.use_flash_attention,
+            flash_attention_fallback=(self.cfg.reranker_config.flash_attention_fallback),
+        )
+        self.threshold_e = self.cfg.sim_threshold_e
+        self.select_depth = self.cfg.select_depth
+        self.max_retry = self.cfg.max_retry
+
+        self.planner = TaskPlanner(
+            llm=self.llm,
+            enable_global_classification=self.cfg.enable_global_classification,
+            max_query_chars=self.cfg.planner_max_query_chars,
+            max_subquestions=self.cfg.planner_max_subquestions,
+            max_subquestion_chars=self.cfg.planner_max_subquestion_chars,
+            max_filters=self.cfg.planner_max_filters,
+            max_filter_value_chars=self.cfg.planner_max_filter_value_chars,
+        )
+
+        retrieval_binding = self._corpus_retrieval_binding(
+            corpus_bundle.documents, corpus_bundle.tree_vdb
+        )
+        self.evidence_hydrator = None
+        evidence_hydrators: Dict[str, CanonicalEvidenceHydrator] = {}
+        for doc_id, stored_index in corpus_bundle.documents.items():
+            tree_index = stored_index.TreeIndex
+            tree_meta = tree_index.meta_info
+            for field_name in ("document_version_id", "source_sha256", "source_uri"):
+                value = getattr(tree_meta, field_name, None)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"document {doc_id} is missing source identity: {field_name}"
+                    )
+            evidence_hydrators[doc_id] = CanonicalEvidenceHydrator(
+                stored_index.store.evidence_catalog(),
+                node_resolver=lambda node_ids, tree=tree_index: tree.get_nodes_data(
+                    list(node_ids)
+                ),
+                expected_document_version_id=tree_meta.document_version_id,
+                expected_source_sha256=tree_meta.source_sha256,
+                expected_source_uri=tree_meta.source_uri,
+                max_evidence=64,
+                max_sources_per_evidence=64,
+                max_total_sources=512,
+            )
+        self.evidence_hydrators = evidence_hydrators
+
+        from document_services.persistence.corpus_store import CorpusStore
+
+        any_document_store = next(iter(corpus_bundle.documents.values())).store
+        self._corpus_store = CorpusStore(
+            any_document_store.connect, corpus_bundle.tenant_id, corpus_bundle.corpus_id,
+        )
+
+        self.answer = AnswerAgent(
+            llm=self.llm, vlm=self.vlm, variant=self.variant,
+            complex_synthesis_input_tokens=self.cfg.complex_synthesis_input_tokens,
+        )
+        self.retriever = Retriever(
+            variant=self.variant,
+            reranker=self.reranker,
+            embedder=self.embedder,
+            alpha=self.cfg.alpha,
+            topk_ent=self.cfg.topk_ent,
+            x_percentile=self.cfg.x_percentile,
+            topk=self.cfg.topk,
+            topk_relative_floor=self.cfg.topk_relative_floor,
+            topk_min=self.cfg.topk_min,
+            candidate_pool_size=self.cfg.candidate_pool_size,
+            tree_vdb=self.tree_vdb,
+            retrieval_binding=retrieval_binding,
+        )
+        self.retrieval_callback: Optional[Callable[[GBCRAGContext, SubStep], None]] = None
+        return self
+
+    @staticmethod
+    def _binding_from_tree_meta(
+        tree_meta,
+        *,
+        tenant_id: str,
+        corpus_id: str,
+        index_revision_id: str,
+        tree_revision_id: str | None,
+    ) -> HybridRetrievalBinding | None:
+        """Build one document's HybridRetrievalBinding from its own tree metadata."""
+
+        canonical_sha256 = tree_meta.canonical_artifact_sha256
+        source_uri = tree_meta.source_uri
+        if (
+            not isinstance(canonical_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", canonical_sha256) is None
+            or not isinstance(source_uri, str)
+            or not source_uri
+        ):
+            # Historical BookRAG trees remain queryable through deterministic
+            # internal RRF, but cannot claim the canonical candidate contract.
+            log.warning(
+                "BookRAG tree has no canonical artifact identity; hybrid retrieval "
+                "will use compatibility fusion without a CandidateFusionResult"
+            )
+            return None
+        document = DocumentRef.identified(
+            content_sha256=tree_meta.source_sha256,
+            mime_type="application/pdf",
+            source_uri=source_uri,
+            display_name=tree_meta.file_name,
+        )
+        if document.document_version_id != tree_meta.document_version_id:
+            raise ValueError(
+                "BookRAG document identity differs from the TreeVDB document version"
+            )
+        if not isinstance(tree_revision_id, str) or not tree_revision_id:
+            # Compatibility for injected test stores. The production resource
+            # loader always supplies the attested tree semantic digest.
+            tree_revision_id = f"tree-{index_revision_id}"
+        return HybridRetrievalBinding(
+            tenant_id=tenant_id,
+            corpus_id=corpus_id,
+            document_id=document.document_id,
+            document_version_id=document.document_version_id,
+            source_sha256=tree_meta.source_sha256,
+            canonical_artifact_sha256=canonical_sha256,
+            tree_revision_id=tree_revision_id,
+            dense_index_revision_id=index_revision_id,
+        )
+
+    @staticmethod
+    def _hybrid_retrieval_binding(tree_index, tree_vdb) -> HybridRetrievalBinding | None:
+        """Bind candidate fusion to the exact canonical tree/vector revision."""
+
+        if tree_index is None:
+            raise ValueError("GBCRAG requires a loaded BookRAG tree")
+        tree_meta = tree_index.meta_info
+        scope = getattr(tree_vdb, "scope_filter", None)
+        if not isinstance(scope, dict):
+            raise ValueError("TreeVDB is missing its immutable source scope")
+        for field_name in (
+            "tenant_id",
+            "corpus_id",
+            "document_version_id",
+            "index_revision_id",
+            "source_sha256",
+        ):
+            value = scope.get(field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"TreeVDB scope is missing {field_name}")
+        if scope.get("index_kind") != "tree":
+            raise ValueError("GBCRAG requires the attested tree vector scope")
+        if scope["source_sha256"] != tree_meta.source_sha256:
+            raise ValueError("TreeVDB source SHA-256 differs from the BookRAG tree")
+        if scope["document_version_id"] != tree_meta.document_version_id:
+            raise ValueError("TreeVDB document version differs from the BookRAG tree")
+
+        return GBCRAG._binding_from_tree_meta(
+            tree_meta,
+            tenant_id=scope["tenant_id"],
+            corpus_id=scope["corpus_id"],
+            index_revision_id=scope["index_revision_id"],
+            tree_revision_id=getattr(tree_vdb, "tree_revision_id", None),
+        )
+
+    @staticmethod
+    def _corpus_retrieval_binding(
+        documents: Dict[str, Any], tree_vdb: Any,
+    ) -> "CorpusRetrievalBinding | None":
+        """Build one HybridRetrievalBinding per document, all under one corpus scope.
+
+        Unlike ``_hybrid_retrieval_binding``, this trusts each document's own
+        attestation was already verified by the resource loader that opened
+        it -- it validates identity *consistency* (shared tenant/corpus, the
+        bundle's document set matches the shared TreeVDB scope), not
+        attestation readiness again.
+        """
+
+        scope = getattr(tree_vdb, "scope_filter", None)
+        if not isinstance(scope, dict):
+            raise ValueError("TreeVDB is missing its immutable source scope")
+        for field_name in ("tenant_id", "corpus_id", "document_version_id"):
+            if not scope.get(field_name):
+                raise ValueError(f"TreeVDB scope is missing {field_name}")
+        if scope.get("index_kind") != "tree":
+            raise ValueError("GBCRAG requires the attested tree vector scope")
+        scoped_ids = scope["document_version_id"]
+        if not isinstance(scoped_ids, (list, tuple, set)):
+            raise ValueError(
+                "corpus TreeVDB scope must carry a multi-value document_version_id"
+            )
+        if set(documents.keys()) != set(scoped_ids):
+            raise ValueError(
+                "bundle documents do not match the TreeVDB scope's document set"
+            )
+
+        bindings: Dict[str, HybridRetrievalBinding] = {}
+        tenant_ids: set[str] = set()
+        corpus_ids: set[str] = set()
+        for doc_id, stored_index in documents.items():
+            tree_index = stored_index.TreeIndex
+            if tree_index is None:
+                raise ValueError(f"document {doc_id} has no loaded BookRAG tree")
+            tree_meta = tree_index.meta_info
+            for field_name in (
+                "document_version_id", "source_sha256", "source_uri",
+                "tenant_id", "corpus_id", "index_revision_id",
+            ):
+                value = getattr(tree_meta, field_name, None)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"document {doc_id} is missing source identity: {field_name}"
+                    )
+            if tree_meta.document_version_id != doc_id:
+                raise ValueError(
+                    f"document {doc_id} tree metadata disagrees with its own bundle key"
+                )
+            tenant_ids.add(tree_meta.tenant_id)
+            corpus_ids.add(tree_meta.corpus_id)
+            binding = GBCRAG._binding_from_tree_meta(
+                tree_meta,
+                tenant_id=tree_meta.tenant_id,
+                corpus_id=tree_meta.corpus_id,
+                index_revision_id=tree_meta.index_revision_id,
+                tree_revision_id=None,
+            )
+            if binding is None:
+                raise ValueError(
+                    f"document {doc_id} has no canonical artifact identity; "
+                    "corpus-scoped retrieval requires every document to carry one"
+                )
+            bindings[doc_id] = binding
+
+        if len(tenant_ids) != 1 or len(corpus_ids) != 1:
+            raise ValueError("every document in a corpus bundle must share one tenant/corpus")
+        tenant_id, corpus_id = next(iter(tenant_ids)), next(iter(corpus_ids))
+        if tenant_id != scope["tenant_id"] or corpus_id != scope["corpus_id"]:
+            raise ValueError("document identity differs from the TreeVDB scope's tenant/corpus")
+        return CorpusRetrievalBinding(tenant_id=tenant_id, corpus_id=corpus_id, documents=bindings)
+
+    def _notify_retrieval_ready(self, context: GBCRAGContext, step: SubStep) -> None:
+        """Optional UI hook fired after retrieval and before answer generation."""
+        if not self.retrieval_callback:
+            return
+        try:
+            self.retrieval_callback(context, step)
+        except Exception as e:
+            log.warning(f"Retrieval callback failed: {e}")
+
+    def _search_entities(
+        self,
+        text: str,
+        top_k: int,
+        label: str,
+        *,
+        score_floor: float | None = None,
+    ) -> list:
+        """Search the entity index the way the refiner writes it.
+
+        The collection carries named dense vectors plus a sparse one, so an
+        unqualified search cannot read it. Grouping returns one row per entity;
+        the collapse behind it guards a ``canonical_id`` written by a refiner
+        run that this reader did not observe. Duplicates matter more here than
+        during resolution -- ``Graph_Reasoning`` runs PageRank through the
+        GT-Link matrix, so a repeated entity is double-weighted and
+        ``Skyline_Ranker`` sees inflated dimensions.
+
+        ``score_floor`` is the similarity gate, and it has to be applied here
+        rather than to the returned distance: fusion scores come from *ranks*,
+        so the closest candidate scores about the same whether it is the right
+        entity or the least wrong one in a document that does not contain the
+        subject at all. An empty result is the gate firing.
+        """
+
+        hits = self.entity_vdb.search_entities(
+            name_text=text,
+            context_text=context_text(text, ""),
+            lexical_terms=lexical_terms(lexical_text(text, "")),
+            top_k=top_k,
+            group_by=CANONICAL_FIELD,
+            name_score_threshold=score_floor,
+            context_score_threshold=score_floor,
+        )
+        # Bound before collapsing: _bounded_results reads the response lazily
+        # and stops one past the limit, which is what keeps a misbehaving store
+        # from being drained. Collapsing first would materialise it.
+        bounded = self._bounded_results(hits, limit=top_k, label=label)
+        bundle = getattr(self, "corpus_bundle", None)
+        if bundle is not None:
+            for hit in bounded:
+                metadata = hit.get("metadata", {})
+                if not isinstance(metadata, Mapping) or metadata.get("document_version_id") not in bundle.documents:
+                    raise ValueError("entity search returned evidence outside the permitted document scope")
+        return collapse_entity_hits(bounded, limit=top_k)
+
+    def _get_entity_embed_text(self, entity: QuestionEntity) -> str:
+        return f"Name: {entity.entity_name}\nType: {entity.entity_type}"
+
+    def _configured_int(self, name: str, default: int) -> int:
+        value = getattr(getattr(self, "cfg", None), name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    def _query_limits_trace(self) -> Dict[str, int]:
+        trace = self.planner.limits_trace()
+        for field, default in (
+            ("query_entity_limit", 16),
+            ("query_entity_name_chars", 256),
+            ("query_entity_type_chars", 64),
+            ("query_entity_candidate_limit", 5),
+            ("section_selection_candidate_limit", 48),
+            ("section_selection_supplementary_limit", 8),
+            ("section_selection_title_chars", 256),
+            ("section_selection_path_depth", 8),
+            ("section_selection_prompt_chars", 65536),
+        ):
+            trace[field] = self._configured_int(field, default)
+        return trace
+
+    @staticmethod
+    def _bounded_results(items: object, *, limit: int, label: str) -> list:
+        """Materialize at most ``limit + 1`` items and reject contract overflow."""
+
+        if items is None:
+            return []
+        try:
+            bounded = list(itertools.islice(iter(items), limit + 1))
+        except TypeError as exc:
+            raise ValueError(f"{label} must be iterable") from exc
+        if len(bounded) > limit:
+            raise PlanningBudgetExceeded(
+                f"{label} returned more than the configured limit of {limit}"
+            )
+        return bounded
+
+    def _validate_entity(self, entity: object, *, position: int) -> QuestionEntity:
+        name = getattr(entity, "entity_name", None)
+        entity_type = getattr(entity, "entity_type", None)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"query entity {position} has an empty name")
+        if not isinstance(entity_type, str) or not entity_type.strip():
+            raise ValueError(f"query entity {position} has an empty type")
+        name_limit = self._configured_int("query_entity_name_chars", 256)
+        type_limit = self._configured_int("query_entity_type_chars", 64)
+        if len(name) > name_limit:
+            raise PlanningBudgetExceeded(
+                f"query entity {position} name contains {len(name)} characters, "
+                f"exceeding the configured limit of {name_limit}"
+            )
+        if len(entity_type) > type_limit:
+            raise PlanningBudgetExceeded(
+                f"query entity {position} type contains {len(entity_type)} "
+                f"characters, exceeding the configured limit of {type_limit}"
+            )
+        return QuestionEntity(entity_name=name, entity_type=entity_type)
+
+    def _entity_map(
+        self, entities: List[QuestionEntity], force_one: bool = False
+    ) -> Dict[str, List[str]]:
+        """
+        Maps entities to their corresponding IDs in the GBC index.
+        Use vdb to find the entity in GBC index.
+        """
+        entity_limit = self._configured_int("query_entity_limit", 16)
+        bounded_entities = self._bounded_results(
+            entities,
+            limit=entity_limit,
+            label="query entity extraction",
+        )
+        validated_entities = [
+            self._validate_entity(entity, position=index)
+            for index, entity in enumerate(bounded_entities, start=1)
+        ]
+        entities_str = [
+            self._get_entity_embed_text(entity) for entity in validated_entities
+        ]
+        Qent_GBCent_map = defaultdict(list)
+        res_list = []
+        # The gate is a similarity floor inside the search, not a comparison
+        # against what it returns. Fused scores rank candidates against each
+        # other, so the nearest one scores well even when nothing in the
+        # document is related -- read as a distance it accepted everything.
+        similarity_floor = 1.0 - self.threshold_e
+        for ent_str in entities_str:
+            query_res = self._search_entities(
+                ent_str, 2, "entity-vector search", score_floor=similarity_floor
+            )
+            if not query_res:
+                # `force_one` is retained as a compatibility argument, but must
+                # not override the configured quality threshold.  An unrelated
+                # graph seed is worse than an empty entity leg because it can
+                # promote an entire wrong subtree.  Section/text candidates
+                # remain available to the caller when no entity is close.
+                res_list.append(ent_str)
+                log.info(
+                    "No GBC entity candidate for '%s' cleared the similarity "
+                    "floor %.4f.",
+                    ent_str,
+                    similarity_floor,
+                )
+                continue
+            retrieve_name = query_res[0]["metadata"].get("entity_name")
+            retrieve_type = query_res[0]["metadata"].get("entity_type")
+            node_name = entity_node_name(retrieve_name, retrieve_type)
+            Qent_GBCent_map[ent_str].append(node_name)
+            log.info(f"Entity '{ent_str}' mapped to GBC entity: {node_name}")
+
+        if force_one and not Qent_GBCent_map and res_list:
+            log.info(
+                "No entity candidate met the similarity floor %.4f; %d query "
+                "entities were rejected and the entity leg is empty.",
+                similarity_floor,
+                len(res_list),
+            )
+
+        return Qent_GBCent_map
+
+    def _get_query_entity(self, query: str) -> Dict[str, List[str]]:
+        """
+        Get the entity mapping for the query.
+        """
+
+        if not isinstance(query, str) or not query.strip():
+            log.info("Skip entity mapping for an empty query.")
+            return {}
+
+        max_query_chars = self._configured_int("planner_max_query_chars", 4096)
+        if len(query) > max_query_chars:
+            raise PlanningBudgetExceeded(
+                f"query contains {len(query)} characters, exceeding the "
+                f"configured limit of {max_query_chars}"
+            )
+
+        # 1. retrieval relevent entities from the query
+        candidate_limit = self._configured_int("query_entity_candidate_limit", 5)
+        retrieval_ents = self._search_entities(
+            query, candidate_limit, "query entity candidate search"
+        )
+        retrieval_node_names = set()
+        retrieval_nodes = []
+        for ent_info in retrieval_ents:
+            ent_name = ent_info["metadata"].get("entity_name")
+            ent_type = ent_info["metadata"].get("entity_type")
+            node_dict = {
+                "entity_name": ent_name,
+                "entity_type": ent_type,
+            }
+            node_name = entity_node_name(ent_name, ent_type)
+            if node_name not in retrieval_node_names:
+                retrieval_node_names.add(node_name)
+                retrieval_nodes.append(node_dict)
+
+        # 2. llm generate and select entities from the query
+        prompt = QUESTION_ENT_PROMPT.format(
+            input_text=query,
+            entity_types=", ".join(QUESTION_ENTITY_TYPES),
+            retrieved_entities=json.dumps(retrieval_nodes, ensure_ascii=False),
+        )
+        res_entities = []
+        try:
+            res: QuestionEntityExtraction = self.llm.get_json_completion(
+                prompt, QuestionEntityExtraction
+            )
+            if res and res.entities:
+                entity_limit = self._configured_int("query_entity_limit", 16)
+                res_entities = self._bounded_results(
+                    res.entities,
+                    limit=entity_limit,
+                    label="query entity extraction",
+                )
+                res_entities = [
+                    self._validate_entity(entity, position=index)
+                    for index, entity in enumerate(res_entities, start=1)
+                ]
+                entities_name = [entity.entity_name for entity in res_entities]
+                log.info(f"Extracted entities: {entities_name}")
+            else:
+                log.info("No entities extracted from the query.")
+
+        except PlanningBudgetExceeded:
+            raise
+        except Exception as e:
+            log.error(f"Error during entity extraction: {e}")
+
+        if len(res_entities) == 0:
+            # use the retrieval entities if no entity is extracted by llm
+            log.info("Use the question as the entity.")
+            res_entities = [
+                QuestionEntity(entity_name=query, entity_type="TASK_OR_PROBLEM")
+            ]
+
+        Qent_GBCent_map = defaultdict(list)
+        remain_ents = []
+        seen_extracted_entities = set()
+        for res_ent in res_entities:
+            normalized_name = res_ent.entity_name.lower()
+            normalized_type = res_ent.entity_type.upper().replace(" ", "_")
+            normalized_key = (normalized_name, normalized_type)
+            if normalized_key in seen_extracted_entities:
+                continue
+            seen_extracted_entities.add(normalized_key)
+            res_ent = QuestionEntity(
+                entity_name=normalized_name,
+                entity_type=normalized_type,
+            )
+            ent_node_name = entity_node_name(res_ent.entity_name, res_ent.entity_type)
+            if ent_node_name in retrieval_node_names:
+                Qent_GBCent_map[ent_node_name].append(ent_node_name)
+                log.info(
+                    f"Entity '{ent_node_name}' mapped to GBC entity: {ent_node_name}"
+                )
+            else:
+                remain_ents.append(res_ent)
+
+        if remain_ents:
+            remain_map = self._entity_map(remain_ents, force_one=False)
+            for k, v in remain_map.items():
+                Qent_GBCent_map[k].extend(v)
+
+        if self.corpus_bundle is not None:
+            self._augment_with_grouping_candidates(query, Qent_GBCent_map)
+
+        return Qent_GBCent_map
+
+    def _augment_with_grouping_candidates(
+        self, query: str, entity_map: Dict[str, List[str]],
+    ) -> None:
+        """Candidate-proposal steps 2-3: grouping relevance, then member scoring.
+
+        Corpus mode only, mutates ``entity_map`` in place. A grouping's
+        member is added only after scoring against the query directly, on the
+        same axis as a direct match -- never included just because a
+        grouping pointed at it. Capped at one hop: members discovered here
+        are never themselves used to look up further groupings.
+        """
+
+        if self._corpus_store is None:
+            return
+        p1_node_names = {name for names in entity_map.values() for name in names}
+        if not p1_node_names:
+            return
+
+        seen_groupings: set[int] = set()
+        relevant_groupings = []
+        for node_name in p1_node_names:
+            canonical, kind = split_node_name(node_name)
+            if not canonical:
+                continue
+            entity_key = self._corpus_store.entity_key_for_canonical(canonical, kind or "")
+            if entity_key is None:
+                continue
+            for grouping in self._corpus_store.groupings_for_entity(entity_key):
+                if grouping.grouping_key in seen_groupings or not grouping.centroid:
+                    continue
+                seen_groupings.add(grouping.grouping_key)
+                relevant_groupings.append(grouping)
+        if not relevant_groupings:
+            return
+
+        import numpy as np
+
+        query_vec = np.asarray(self.embedder.embed_texts([query])[0], dtype=float)
+        relatedness_floor = 1.0 - self.threshold_e
+        surviving_groupings = []
+        for grouping in relevant_groupings:
+            centroid = np.asarray(grouping.centroid, dtype=float)
+            denom = (np.linalg.norm(query_vec) * np.linalg.norm(centroid)) or 1.0
+            if float((query_vec @ centroid) / denom) >= relatedness_floor:
+                surviving_groupings.append(grouping)
+        if not surviving_groupings:
+            return
+
+        added = 0
+        for grouping in surviving_groupings:
+            for member in self._corpus_store.members_for_grouping(grouping.grouping_key):
+                member_documents = self._corpus_store.document_versions_for_entity(member.entity_key)
+                if not set(member_documents).intersection(self.corpus_bundle.documents):
+                    continue
+                member_node_name = entity_node_name(member.canonical, member.entity_kind)
+                if member_node_name in p1_node_names:
+                    continue
+                sim = self.embedder.compute_texts_sim(query, member_node_name)
+                if (sim + 1) / 2 >= relatedness_floor:
+                    entity_map[query].append(member_node_name)
+                    added += 1
+        if added:
+            log.info(
+                "Grouping relevance added %d candidate entities via %d relevant grouping(s).",
+                added, len(surviving_groupings),
+            )
+
+    def _documents_in_scope(self, entity_map: Dict[str, List[str]]) -> List[str]:
+        """Candidate-proposal step 6: map the final entity set to documents.
+
+        Corpus mode only. Independent safety valve from topk_ent's entity
+        budget -- caps how many documents this query fans out to.
+        """
+
+        if self._corpus_store is None or self.corpus_bundle is None:
+            return list(self.gbc_index.keys()) if isinstance(self.gbc_index, dict) else []
+
+        max_documents = self._configured_int("max_documents_per_query", 4)
+        node_names = {name for names in entity_map.values() for name in names}
+        scored_documents: Dict[str, int] = {}
+        for node_name in node_names:
+            canonical, kind = split_node_name(node_name)
+            if not canonical:
+                continue
+            entity_key = self._corpus_store.entity_key_for_canonical(canonical, kind or "")
+            if entity_key is None:
+                continue
+            for doc_id in self._corpus_store.document_versions_for_entity(entity_key):
+                if doc_id in self.corpus_bundle.documents:
+                    scored_documents[doc_id] = scored_documents.get(doc_id, 0) + 1
+
+        if not scored_documents:
+            # No entity resolved to a document at all -- fail open to the
+            # whole corpus rather than answering from nothing.
+            return list(self.corpus_bundle.documents.keys())[:max_documents]
+
+        ranked = sorted(scored_documents.items(), key=lambda item: (-item[1], item[0]))
+        return [doc_id for doc_id, _count in ranked[:max_documents]]
+
+    def link_tree_node(
+        self, entities_map: Dict[str, List[str]], *, graph_index: Any = None,
+    ) -> List[dict]:
+        """
+        Get the tree nodes for the given entities.
+        """
+        graph_index = graph_index if graph_index is not None else self.gbc_index.GraphIndex
+        tree_node_cnt = defaultdict(list)
+        all_map_nodenames = []
+        seen_node_names = set()
+        for ent_list in entities_map.values():
+            for ent in ent_list:
+                if ent not in seen_node_names:
+                    seen_node_names.add(ent)
+                    all_map_nodenames.append(ent)
+        if not all_map_nodenames:
+            log.warning("No entities found in the mapping.")
+            return []
+
+        for node_name in all_map_nodenames:
+            tree_node_set = graph_index.NodeName2TreeNodes(node_name)
+            for node_id in sorted(tree_node_set):
+                tree_node_cnt[node_id].append(node_name)
+
+        tree_nodes = [
+            {
+                "index_id": node_id,
+                "map_cnt": len(link_ents),
+                "linked_entities": link_ents,
+            }
+            for node_id, link_ents in sorted(
+                tree_node_cnt.items(), key=lambda item: (-len(item[1]), item[0])
+            )
+        ]
+
+        if not tree_nodes:
+            log.warning("No tree nodes found for the given entities.")
+            return []
+
+        log.info(f"Retrieved {len(tree_nodes)} tree nodes based on entity mapping.")
+        return tree_nodes
+
+    def link_section(
+        self, tree_nodes: List[dict], *, tree_index: Any = None,
+    ) -> Dict[int, List[str]]:
+        """
+        Get the linked section TreeNode ids from the tree nodes.
+        given the tree nodes, get the linked section TreeNode ids (specific depth).
+        return the Dict: section_id --> [linked_entity1, linked_entity2, ...]
+        """
+        tree_index = tree_index if tree_index is not None else self.gbc_index.TreeIndex
+        sec_entity_map = defaultdict(list)
+        for node in tree_nodes:
+            node_idx = node["index_id"]
+            ancestor = tree_index.get_ancestor_at_depth(
+                node_idx, self.select_depth
+            )
+            ancestor_idx = ancestor.index_id if ancestor else None
+            node_ents = node["linked_entities"]
+            if ancestor_idx:
+                sec_entity_map[ancestor_idx].extend(node_ents)
+
+        for sec_id, val in sec_entity_map.items():
+            sec_entity_map[sec_id] = list(dict.fromkeys(val))
+
+        log.info(
+            f"Found {len(sec_entity_map)} linked sections at depth {self.select_depth}."
+        )
+        return sec_entity_map
+
+    def prep_SecSel_prompt(
+        self,
+        query: str,
+        link_nodes: List[TreeNode] = None,
+        remain_nodes: List[TreeNode] = None,
+        sec_entity_map: Dict[int, List[str]] = None,
+        iter_context: Optional[SubStep] = None,
+        tree_index: Any = None,
+    ) -> str:
+        """Prepare one bounded, source-ordered section-selection prompt."""
+
+        tree_index = tree_index if tree_index is not None else self.gbc_index.TreeIndex
+        link_nodes = list(link_nodes or [])
+        remain_nodes = list(remain_nodes or [])
+        candidate_limit = self._configured_int(
+            "section_selection_candidate_limit", 48
+        )
+        if len(link_nodes) + len(remain_nodes) > candidate_limit:
+            raise SectionSelectionBudgetExceeded(
+                "section-selection prompt contains "
+                f"{len(link_nodes) + len(remain_nodes)} candidates, exceeding "
+                f"the configured limit of {candidate_limit}"
+            )
+        max_query_chars = self._configured_int("planner_max_query_chars", 4096)
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("section-selection query must be a non-empty string")
+        if len(query) > max_query_chars:
+            raise PlanningBudgetExceeded(
+                f"query contains {len(query)} characters, exceeding the "
+                f"configured limit of {max_query_chars}"
+            )
+
+        title_limit = self._configured_int("section_selection_title_chars", 256)
+        path_depth_limit = self._configured_int(
+            "section_selection_path_depth", 8
+        )
+        truncated_fields = 0
+
+        def bounded_title(value: object) -> str:
+            nonlocal truncated_fields
+            text = value if isinstance(value, str) else ""
+            if len(text) <= title_limit:
+                return text
+            truncated_fields += 1
+            return text[: title_limit - 1] + "…"
+
+        def prep_nodes_json(
+            nodes: List[TreeNode], sec_entity_map: Dict[int, List[str]] = None
+        ) -> str:
+            nonlocal truncated_fields
+            node_infos = []
+            for node in nodes:
+                sec_idx = node.index_id
+                section_title = bounded_title(node.meta_info.content)
+                sec_path = tree_index.get_path_from_root(sec_idx)
+                if len(sec_path) > path_depth_limit:
+                    # Keep the document root context and the most local
+                    # structural ancestors.  The trace records this loss.
+                    truncated_fields += 1
+                    if path_depth_limit == 1:
+                        sec_path = [sec_path[-1]]
+                    else:
+                        sec_path = [
+                            sec_path[0],
+                            *sec_path[-(path_depth_limit - 1) :],
+                        ]
+                title_path_obj = [
+                    bounded_title(path_node.meta_info.content)
+                    for path_node in sec_path
+                ]
+                sec_info = {
+                    "id": sec_idx,
+                    "title": section_title,
+                    "path": title_path_obj,
+                }
+                if sec_entity_map and sec_idx in sec_entity_map:
+                    entities_str = bounded_title(
+                        ", ".join(sec_entity_map[sec_idx])
+                    )
+                    sec_info["contained_entities"] = entities_str
+                node_infos.append(sec_info)
+
+            sec_info_str = json.dumps(
+                node_infos,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return sec_info_str
+
+        link_sec_str = (
+            prep_nodes_json(link_nodes, sec_entity_map=sec_entity_map)
+            if link_nodes
+            else "[]"
+        )
+        remain_sec_str = (
+            prep_nodes_json(remain_nodes, sec_entity_map=None) if remain_nodes else "[]"
+        )
+        query_prompt = LLM_EXPANSION_SELECT_PROMPT.format(
+            user_question=query,
+            primary_candidates_json=link_sec_str,
+            remaining_sections_json=remain_sec_str,
+            max_supplementary_sections=self._configured_int(
+                "section_selection_supplementary_limit", 8
+            ),
+        )
+
+        prompt_limit = self._configured_int(
+            "section_selection_prompt_chars", 65536
+        )
+        if iter_context is not None:
+            iter_context.section_prompt_chars = len(query_prompt)
+            iter_context.section_prompt_truncated_fields = truncated_fields
+        if len(query_prompt) > prompt_limit:
+            if iter_context is not None:
+                iter_context.section_selection_status = "prompt_budget_exceeded"
+                iter_context.section_selection_budget_exhausted = True
+            raise SectionSelectionBudgetExceeded(
+                "rendered section-selection prompt contains "
+                f"{len(query_prompt)} characters, exceeding the configured "
+                f"limit of {prompt_limit}"
+            )
+
+        return query_prompt
+
+    @staticmethod
+    def _query_tokens(text: object) -> set[str]:
+        if not isinstance(text, str):
+            return set()
+        return {
+            token
+            for token in re.findall(r"[^\W_]+", text.casefold())
+            if len(token) > 1
+        }
+
+    def _bounded_section_candidates(
+        self,
+        *,
+        query: str,
+        remain_sections: List[TreeNode],
+        capacity: int,
+        source_positions: Dict[int, int],
+        linked_positions: List[int],
+        tree_index: Any = None,
+    ) -> List[TreeNode]:
+        """Select deterministic top-M structural candidates in bounded memory.
+
+        Three quarters of the budget is assigned to lexical title/path fit and
+        source proximity to linked evidence.  The remainder is filled from
+        source-order strata so a long document is not reduced to its prefix
+        when headings share no query token. Complexity is
+        ``O(S * (D + log M))`` time and ``O(S + M)`` temporary memory for
+        ``S`` sections, bounded path depth ``D`` and configured candidate
+        capacity ``M <= 256``.
+        """
+
+        if capacity <= 0 or not remain_sections:
+            return []
+
+        tree_index = tree_index if tree_index is not None else self.gbc_index.TreeIndex
+        query_tokens = self._query_tokens(query)
+        title_limit = self._configured_int("section_selection_title_chars", 256)
+        path_depth_limit = self._configured_int(
+            "section_selection_path_depth", 8
+        )
+        sorted_linked_positions = sorted(linked_positions)
+
+        def linked_distance(position: int) -> int:
+            if not sorted_linked_positions:
+                return position
+            insertion = bisect_left(sorted_linked_positions, position)
+            distances = []
+            if insertion < len(sorted_linked_positions):
+                distances.append(sorted_linked_positions[insertion] - position)
+            if insertion:
+                distances.append(position - sorted_linked_positions[insertion - 1])
+            return min(distances)
+
+        records: List[Tuple[Tuple[int, ...], TreeNode]] = []
+        for node in remain_sections:
+            title = (node.meta_info.content or "")[:title_limit]
+            path = tree_index.get_path_from_root(node.index_id)
+            path = path[-path_depth_limit:]
+            path_text = " ".join(
+                (path_node.meta_info.content or "")[:title_limit]
+                for path_node in path
+            )
+            title_overlap = len(query_tokens & self._query_tokens(title))
+            path_overlap = len(query_tokens & self._query_tokens(path_text))
+            position = source_positions[node.index_id]
+            proximity = linked_distance(position)
+            # ``heapq.nsmallest`` makes the negated relevance fields highest
+            # priority and keeps every tie stable in source order.
+            rank_key = (
+                -title_overlap,
+                -path_overlap,
+                proximity,
+                position,
+                node.index_id,
+            )
+            records.append((rank_key, node))
+
+        target_count = min(capacity, len(records))
+        relevance_count = max(1, (target_count * 3 + 3) // 4)
+        relevance_top = heapq.nsmallest(
+            relevance_count,
+            records,
+            key=lambda record: record[0],
+        )
+        selected: Dict[int, TreeNode] = {
+            node.index_id: node for _, node in relevance_top
+        }
+
+        # Add deterministic source-stratified coverage. Assign every available
+        # section to its nearest stratum in one O(S log M) pass, retain the best
+        # candidate per stratum, then use one source-order fallback scan if a
+        # stratum happened to contain only relevance-selected sections.
+        coverage_needed = target_count - len(selected)
+        section_count = len(remain_sections)
+        coverage_targets = [
+            min(
+                section_count - 1,
+                ((2 * stratum + 1) * section_count)
+                // (2 * max(1, coverage_needed)),
+            )
+            for stratum in range(coverage_needed)
+        ]
+        best_by_stratum: Dict[int, Tuple[Tuple[int, int, int], TreeNode]] = {}
+        for local_position, node in enumerate(remain_sections):
+            if node.index_id in selected or not coverage_targets:
+                continue
+            insertion = bisect_left(coverage_targets, local_position)
+            stratum_candidates = []
+            if insertion < len(coverage_targets):
+                stratum_candidates.append(insertion)
+            if insertion:
+                stratum_candidates.append(insertion - 1)
+            stratum = min(
+                stratum_candidates,
+                key=lambda index: (
+                    abs(local_position - coverage_targets[index]),
+                    index,
+                ),
+            )
+            candidate_rank = (
+                abs(local_position - coverage_targets[stratum]),
+                source_positions[node.index_id],
+                node.index_id,
+            )
+            current = best_by_stratum.get(stratum)
+            if current is None or candidate_rank < current[0]:
+                best_by_stratum[stratum] = (candidate_rank, node)
+
+        for stratum in sorted(best_by_stratum):
+            node = best_by_stratum[stratum][1]
+            selected[node.index_id] = node
+
+        if len(selected) < target_count:
+            for node in remain_sections:
+                selected.setdefault(node.index_id, node)
+                if len(selected) == target_count:
+                    break
+
+        return sorted(
+            selected.values(),
+            key=lambda node: (source_positions[node.index_id], node.index_id),
+        )
+
+    @staticmethod
+    def _set_retrieval_sec_ids(
+        iter_context: SubStep, ids: List[int], *, document_version_id: str | None,
+    ) -> None:
+        """Write one document's selected sections, single- or multi-document mode."""
+
+        if document_version_id is not None:
+            iter_context.retrieval_sec_ids_by_doc[document_version_id] = ids
+        else:
+            iter_context.retrieval_sec_ids = ids
+
+    def _select_supplementary_sections(self, prompt, primary_ids, remaining_ids):
+        """Constrain IDs to this document's prompt and allow one correction."""
+        allowed = sorted(set(primary_ids) | set(remaining_ids))
+        schema = create_model(
+            "ScopedSectionSelection",
+            __base__=SecEXPSelection,
+            supplementary_ids=(List[Literal[tuple(allowed)]], Field(max_length=32)),
+        )
+        last_error = None
+        for attempt in range(2):
+            correction = (
+                "\nCORRECTION: Return supplementary_ids only from "
+                + json.dumps(sorted(remaining_ids))
+                + ". Copy the actual id values, not list positions. "
+                "Return [] if none apply. Primary sections are already included."
+            ) if attempt else ""
+            if len(prompt + correction) > self._configured_int("section_selection_prompt_chars", 65536):
+                break
+            try:
+                result = self.llm.get_json_completion(prompt + correction, schema)
+                if result is None:
+                    raise ValueError("section selection returned no response")
+                invalid = set(result.supplementary_ids) - set(allowed)
+                if invalid:
+                    raise ValueError(
+                        "section selection returned IDs outside the bounded prompt candidate pool: "
+                        + ", ".join(map(str, sorted(invalid)))
+                    )
+                # Selecting a primary section again adds no new scope.
+                return SecEXPSelection(
+                    supplementary_ids=[value for value in result.supplementary_ids if value not in primary_ids],
+                    explanation=result.explanation,
+                )
+            except (ValueError, RuntimeError) as error:
+                last_error = error
+        raise ValueError(str(last_error or "section selection correction exceeds prompt budget"))
+
+    def llm_section_selection(
+        self,
+        query: str,
+        tree_nodes: List[dict],
+        iter_context: Optional[SubStep] = None,
+        *,
+        tree_index: Any = None,
+        document_version_id: str | None = None,
+    ) -> None:
+        """
+        Use LLM to select the most relevant section based on the query and Section info.
+        """
+        if iter_context is None:
+            raise ValueError("iter_context is required for traced section selection")
+        if getattr(self, "corpus_bundle", None) is not None:
+            if document_version_id not in self.corpus_bundle.documents:
+                raise ValueError("section selection document is outside the permitted document scope")
+            expected_tree = self.gbc_index[document_version_id].TreeIndex
+            if tree_index is not expected_tree:
+                raise ValueError("section selection tree does not belong to its document")
+        tree_index = tree_index if tree_index is not None else self.gbc_index.TreeIndex
+        sec_entity_map = self.link_section(tree_nodes, tree_index=tree_index)
+        requested_link_ids = set(sec_entity_map)
+
+        all_sections = list(
+            tree_index.get_nodes_at_depth(self.select_depth)
+        )
+        source_positions: Dict[int, int] = {}
+        for position, section in enumerate(all_sections):
+            if section.index_id in source_positions:
+                raise ValueError(
+                    f"duplicate section index_id {section.index_id} at selection depth"
+                )
+            source_positions[section.index_id] = position
+        unknown_link_ids = requested_link_ids - source_positions.keys()
+        if unknown_link_ids:
+            raise ValueError(
+                "entity-linked sections are absent from the selected tree depth: "
+                + ", ".join(str(value) for value in sorted(unknown_link_ids))
+            )
+
+        # Set membership makes the partition O(S + L), not O(S * L).
+        link_secs = [
+            section
+            for section in all_sections
+            if section.index_id in requested_link_ids
+        ]
+        remain_secs = [
+            section
+            for section in all_sections
+            if section.index_id not in requested_link_ids
+        ]
+        link_section_ids = [section.index_id for section in link_secs]
+        candidate_limit = self._configured_int(
+            "section_selection_candidate_limit", 48
+        )
+        iter_context.section_selection_policy = SECTION_SELECTION_POLICY
+        iter_context.section_total_count = len(all_sections)
+        iter_context.section_linked_count = len(link_secs)
+        iter_context.section_candidate_limit = candidate_limit
+        iter_context.linked_section_ids = link_section_ids
+
+        if len(link_secs) > candidate_limit:
+            # Linked sections are source-derived evidence, not optional model
+            # suggestions.  Never hide an arbitrary suffix to make the prompt
+            # fit; reject the request before selection or subtree retrieval.
+            iter_context.section_selection_status = "linked_budget_exceeded"
+            iter_context.section_selection_budget_exhausted = True
+            iter_context.section_omitted_count = len(all_sections)
+            raise SectionSelectionBudgetExceeded(
+                f"{len(link_secs)} source-linked sections exceed the configured "
+                f"section candidate limit of {candidate_limit}; no linked "
+                "evidence was silently dropped"
+            )
+
+        remaining_capacity = candidate_limit - len(link_secs)
+        prompt_remain_secs = self._bounded_section_candidates(
+            query=query,
+            remain_sections=remain_secs,
+            capacity=remaining_capacity,
+            source_positions=source_positions,
+            linked_positions=[source_positions[value] for value in link_section_ids],
+            tree_index=tree_index,
+        )
+        iter_context.section_prompt_primary_count = len(link_secs)
+        iter_context.section_prompt_remaining_count = len(prompt_remain_secs)
+        iter_context.section_prompt_candidate_count = (
+            len(link_secs) + len(prompt_remain_secs)
+        )
+        iter_context.section_prompt_candidate_ids = [
+            *link_section_ids,
+            *(section.index_id for section in prompt_remain_secs),
+        ]
+        iter_context.section_omitted_count = len(remain_secs) - len(
+            prompt_remain_secs
+        )
+
+        if len(remain_secs) == 0:
+            log.info("No remaining sections to select from. Skipping LLM expansion.")
+            iter_context.supplementary_ids = []
+            iter_context.selected_explanation = (
+                "No remaining sections for supplementary selection."
+            )
+            self._set_retrieval_sec_ids(
+                iter_context, link_section_ids, document_version_id=document_version_id
+            )
+            iter_context.section_selection_status = "no_remaining_sections"
+            return
+
+        if not prompt_remain_secs:
+            # This occurs when linked evidence consumes the complete prompt
+            # budget.  It is safe to continue because every linked section is
+            # represented and will be retrieved; the omitted supplementary
+            # scope is explicit in the trace.
+            iter_context.supplementary_ids = []
+            iter_context.selected_explanation = (
+                "All section-selection capacity was consumed by source-linked "
+                "sections; supplementary selection was not attempted."
+            )
+            self._set_retrieval_sec_ids(
+                iter_context, link_section_ids, document_version_id=document_version_id
+            )
+            iter_context.section_selection_status = "linked_scope_fills_budget"
+            return
+
+        query_prompt = self.prep_SecSel_prompt(
+            query=query,
+            link_nodes=link_secs,
+            remain_nodes=prompt_remain_secs,
+            sec_entity_map=sec_entity_map,
+            iter_context=iter_context,
+            tree_index=tree_index,
+        )
+        sel_ids = []
+        explanation = "Error or no valid response from LLM during section expansion."
+
+        prompt_remain_ids = {sec.index_id for sec in prompt_remain_secs}
+        try:
+            res = self._select_supplementary_sections(
+                query_prompt, set(link_section_ids), prompt_remain_ids
+            )
+            if res:
+                explanation = res.explanation
+                if res.supplementary_ids:
+                    supplementary_limit = self._configured_int(
+                        "section_selection_supplementary_limit", 8
+                    )
+                    if len(res.supplementary_ids) > supplementary_limit:
+                        iter_context.section_selection_status = (
+                            "model_selection_budget_exceeded"
+                        )
+                        iter_context.section_selection_budget_exhausted = True
+                        raise PlanningBudgetExceeded(
+                            "section selection returned "
+                            f"{len(res.supplementary_ids)} IDs, exceeding the "
+                            f"configured limit of {supplementary_limit}"
+                        )
+                    if len(set(res.supplementary_ids)) != len(
+                        res.supplementary_ids
+                    ):
+                        iter_context.section_selection_status = (
+                            "invalid_duplicate_model_ids"
+                        )
+                        raise ValueError(
+                            "section selection returned duplicate supplementary IDs"
+                        )
+                    invalid_ids = set(res.supplementary_ids) - prompt_remain_ids
+                    if invalid_ids:
+                        iter_context.section_selection_status = (
+                            "invalid_out_of_pool_model_ids"
+                        )
+                        raise ValueError(
+                            "section selection returned IDs outside the bounded "
+                            "prompt candidate pool: "
+                            + ", ".join(
+                                str(value) for value in sorted(invalid_ids)
+                            )
+                        )
+                    sel_ids.extend(res.supplementary_ids)
+
+                    if sel_ids:
+                        log.info(f"LLM selected {len(sel_ids)} supplementary sections.")
+                    else:
+                        log.info("LLM did not select any valid supplementary sections.")
+                else:
+                    log.info("LLM did not select any supplementary sections.")
+
+        except (PlanningBudgetExceeded, ValueError):
+            if iter_context.section_selection_status == "not_started":
+                iter_context.section_selection_status = "invalid_out_of_pool_model_ids"
+            raise
+        except Exception as e:
+            log.error(f"Error occurred during section selection: {e}")
+            iter_context.section_selection_status = "model_error_linked_only"
+            if not link_section_ids:
+                raise RuntimeError(
+                    "section selection failed and no source-linked section is "
+                    "available for fail-closed retrieval"
+                ) from e
+
+        iter_context.supplementary_ids = sel_ids
+        iter_context.selected_explanation = explanation
+
+        if iter_context.section_selection_status == "not_started":
+            iter_context.section_selection_status = (
+                "selected" if sel_ids else "no_supplementary_selected"
+            )
+
+        retrieval_sec_ids = list(dict.fromkeys(link_section_ids + sel_ids))
+        self._set_retrieval_sec_ids(
+            iter_context, retrieval_sec_ids, document_version_id=document_version_id
+        )
+        log.info(
+            f"LLM selected {len(sel_ids)} supplementary sections, total {len(retrieval_sec_ids)} sections for retrieval."
+        )
+
+    @staticmethod
+    def _asset_is_image_compatible(asset: AssetRef) -> bool:
+        media_type = (asset.media_type or "").casefold()
+        return media_type.startswith("image/") or asset.kind in {
+            AssetKind.REGION_CROP,
+            AssetKind.EXTRACTED_IMAGE,
+            AssetKind.PAGE_RENDER,
+        }
+
+    @staticmethod
+    def _visual_evidence_node(node: Mapping[str, Any]) -> bool:
+        node_type = node.get("type")
+        if isinstance(node_type, NodeType):
+            node_type = node_type.value
+        if node_type in {
+            NodeType.IMAGE.value,
+            # A chart and a diagram are pictures the same way an image is. They
+            # were left to the subtype fallback below, which only recognises
+            # the generic words -- so a chart the parser typed by what kind of
+            # chart it is ("bubble", "bar") had no visual evidence at all: no
+            # crop leased, no img_path, and an answer that cited the figure
+            # without ever showing it.
+            NodeType.CHART.value,
+            NodeType.DIAGRAM.value,
+            NodeType.TABLE.value,
+            NodeType.EQUATION.value,
+        }:
+            return True
+        subtype = node.get("semantic_subtype")
+        if not isinstance(subtype, str):
+            return False
+        normalized = re.sub(r"[\s-]+", "_", subtype.strip().casefold())
+        return normalized in {
+            "chart",
+            "diagram",
+            "figure",
+            "flow_chart",
+            "flowchart",
+            "image",
+            "picture",
+            "scan_region",
+            "screenshot",
+            "sketch",
+            "workflow",
+        }
+
+    def _answer_asset_refs(self, node: Mapping[str, Any]) -> tuple[AssetRef, ...]:
+        """Select exact canonical image material for one answer evidence item."""
+
+        if not self._visual_evidence_node(node):
+            return ()
+        raw_sources = node.get("canonical_sources")
+        if not isinstance(raw_sources, list):
+            raise AnswerAssetMaterializationError(
+                "visual evidence is missing hydrated canonical_sources"
+            )
+        declared_ids = node.get("canonical_asset_ids") or []
+        if not isinstance(declared_ids, list) or any(
+            not isinstance(value, str) or not value for value in declared_ids
+        ):
+            raise AnswerAssetMaterializationError(
+                "visual evidence has invalid canonical_asset_ids"
+            )
+        selected_ids = node.get("selected_asset_ids") or []
+        if not isinstance(selected_ids, list) or any(
+            not isinstance(value, str) or not value for value in selected_ids
+        ):
+            raise AnswerAssetMaterializationError(
+                "visual evidence has invalid selected_asset_ids"
+            )
+        declared = set(declared_ids)
+        selected = set(selected_ids)
+        if not selected.issubset(declared):
+            raise AnswerAssetMaterializationError(
+                "selected answer assets are outside canonical_asset_ids"
+            )
+
+        by_id: Dict[str, AssetRef] = {}
+        for source_position, source in enumerate(raw_sources):
+            if not isinstance(source, Mapping):
+                raise AnswerAssetMaterializationError(
+                    f"canonical_sources[{source_position}] must be an object"
+                )
+            raw_assets = source.get("assets", [])
+            if not isinstance(raw_assets, list):
+                raise AnswerAssetMaterializationError(
+                    f"canonical_sources[{source_position}].assets must be an array"
+                )
+            for asset_position, raw_asset in enumerate(raw_assets):
+                if not isinstance(raw_asset, Mapping):
+                    raise AnswerAssetMaterializationError(
+                        "canonical asset entry must be an object"
+                    )
+                try:
+                    asset = AssetRef.from_dict(raw_asset)
+                except Exception as exc:
+                    raise AnswerAssetMaterializationError(
+                        "hydrated canonical asset is invalid"
+                    ) from exc
+                if asset.asset_id not in declared:
+                    raise AnswerAssetMaterializationError(
+                        "hydrated asset is outside canonical_asset_ids"
+                    )
+                previous = by_id.get(asset.asset_id)
+                if previous is not None and previous != asset:
+                    raise AnswerAssetMaterializationError(
+                        "one canonical asset ID resolves to conflicting references"
+                    )
+                by_id[asset.asset_id] = asset
+
+        if set(by_id) != declared:
+            raise AnswerAssetMaterializationError(
+                "canonical_asset_ids do not resolve exactly through canonical_sources"
+            )
+        if selected:
+            assets = [by_id[asset_id] for asset_id in selected_ids]
+            if any(not self._asset_is_image_compatible(asset) for asset in assets):
+                raise AnswerAssetMaterializationError(
+                    "selected canonical answer asset is not image-compatible"
+                )
+            return tuple(assets)
+
+        # Older canonical tree projections may have withheld img_path because
+        # no indexing-time lease was supplied. Select one stable canonical crop
+        # now so tables, equations, diagrams, and images can still reach VLM.
+        compatible = sorted(
+            (asset for asset in by_id.values() if self._asset_is_image_compatible(asset)),
+            key=lambda asset: (
+                {
+                    AssetKind.REGION_CROP: 0,
+                    AssetKind.EXTRACTED_IMAGE: 1,
+                    AssetKind.PAGE_RENDER: 2,
+                    AssetKind.SOURCE: 3,
+                }[asset.kind],
+                asset.asset_id,
+            ),
+        )
+        return tuple(compatible[:1])
+
+    def _begin_query_asset_materialization(self) -> None:
+        if self._query_asset_leases is not None:
+            raise RuntimeError("GBCRAG query asset lease is already active")
+        self._query_asset_leases = []
+        self._query_asset_attestations = {}
+        self._query_asset_refs = {}
+        self._query_asset_total_bytes = 0
+
+    def _finish_query_asset_materialization(self) -> None:
+        leases = getattr(self, "_query_asset_leases", None)
+        self._query_asset_leases = None
+        self._query_asset_attestations = {}
+        self._query_asset_refs = {}
+        self._query_asset_total_bytes = 0
+        if leases is None:
+            return
+        first_error: BaseException | None = None
+        for lease in reversed(leases):
+            try:
+                lease.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    log.exception("Additional answer asset lease close failed")
+        if first_error is not None:
+            raise AnswerAssetMaterializationError(
+                "canonical answer asset changed before generation completed"
+            ) from first_error
+
+    def _materialize_answer_assets(
+        self, tree_data: List[Dict[str, Any]]
+    ) -> None:
+        """Lease bounded canonical CAS paths and attach verified prompt material."""
+
+        assets_by_node: Dict[int, tuple[AssetRef, ...]] = {}
+        new_assets: Dict[str, AssetRef] = {}
+        for node in tree_data:
+            refs = self._answer_asset_refs(node)
+            if not refs:
+                continue
+            node_id = node.get("index_id")
+            if isinstance(node_id, bool) or not isinstance(node_id, int):
+                raise AnswerAssetMaterializationError(
+                    "retrieved visual evidence has an invalid tree node ID"
+                )
+            assets_by_node[node_id] = refs
+            for asset in refs:
+                bound = self._query_asset_refs.get(asset.asset_id)
+                if bound is not None and bound != asset:
+                    raise AnswerAssetMaterializationError(
+                        "one answer asset ID resolves to conflicting references"
+                    )
+                pending = new_assets.get(asset.asset_id)
+                if pending is not None and pending != asset:
+                    raise AnswerAssetMaterializationError(
+                        "one pending answer asset ID resolves to conflicting references"
+                    )
+                if bound is None:
+                    new_assets.setdefault(asset.asset_id, asset)
+
+        if not assets_by_node:
+            return
+        if self._query_asset_leases is None:
+            raise AnswerAssetMaterializationError(
+                "answer asset materialization requires an active GBCRAG query"
+            )
+        if self.asset_cas_root is None:
+            log.warning(
+                "Skipping verified visual material for %d node(s); "
+                "DOCARAG_ASSET_CAS_ROOT is not set. Text evidence (table cells, "
+                "OCR, captions) still grounds the answer.",
+                len(assets_by_node),
+            )
+            return
+
+        if new_assets:
+            remaining_assets = MAX_ANSWER_ASSETS - len(self._query_asset_refs)
+            remaining_bytes = (
+                MAX_ANSWER_ASSET_TOTAL_BYTES - self._query_asset_total_bytes
+            )
+            if len(new_assets) > remaining_assets or remaining_bytes < 1:
+                raise AnswerAssetMaterializationError(
+                    "answer asset selection exceeds the per-query asset limits"
+                )
+            resolver = AssetMaterialResolver(
+                content_addressed_root=self.asset_cas_root,
+                max_assets=remaining_assets,
+                max_asset_bytes=MAX_ANSWER_ASSET_BYTES,
+                max_total_bytes=remaining_bytes,
+            )
+            ordered = tuple(new_assets[key] for key in sorted(new_assets))
+            try:
+                lease = BookRAGAssetMaterializationLease(resolver, ordered)
+            except Exception as exc:
+                raise AnswerAssetMaterializationError(
+                    "canonical answer asset materialization failed"
+                ) from exc
+            attestations = {
+                asset.asset_id: lease.attestation_for(asset) for asset in ordered
+            }
+            self._query_asset_leases.append(lease)
+            self._query_asset_refs.update(new_assets)
+            self._query_asset_attestations.update(attestations)
+            self._query_asset_total_bytes += sum(
+                attestation.size_bytes for attestation in attestations.values()
+            )
+
+        for node in tree_data:
+            node_id = node.get("index_id")
+            refs = assets_by_node.get(node_id)
+            if not refs:
+                continue
+            attestations = [
+                self._query_asset_attestations[asset.asset_id] for asset in refs
+            ]
+            material_payloads = [attestation.to_dict() for attestation in attestations]
+            verified_ids = [attestation.asset_id for attestation in attestations]
+            node["img_path"] = attestations[0].materialized_path
+            node["answer_selected_asset_ids"] = verified_ids
+            node["asset_material_status"] = "verified"
+            node["asset_materialization_attestations"] = material_payloads
+            citation = node.get("citation")
+            if not isinstance(citation, dict):
+                raise AnswerAssetMaterializationError(
+                    "verified answer asset requires a canonical citation"
+                )
+            citation["asset_material_status"] = "verified"
+            citation["asset_material_scope"] = "answer_selected_assets"
+            citation["verified_asset_ids"] = verified_ids
+            citation["asset_materialization_attestations"] = material_payloads
+            locations = citation.get("locations")
+            if isinstance(locations, list):
+                verified_set = set(verified_ids)
+                for location in locations:
+                    if not isinstance(location, dict):
+                        continue
+                    location_assets = location.get("assets")
+                    if not isinstance(location_assets, list):
+                        continue
+                    location_ids = {
+                        asset.get("asset_id")
+                        for asset in location_assets
+                        if isinstance(asset, Mapping)
+                    }
+                    matched = [
+                        payload
+                        for payload in material_payloads
+                        if payload["asset_id"] in location_ids & verified_set
+                    ]
+                    if matched:
+                        location["asset_material_status"] = "verified"
+                        location["asset_material_scope"] = "answer_selected_assets"
+                        location["verified_asset_ids"] = [
+                            payload["asset_id"] for payload in matched
+                        ]
+                        location["asset_materialization_attestations"] = matched
+
+    def _section_titles(self) -> List[str]:
+        """Return the heading titles the planner is allowed to filter on.
+
+        Corpus mode has no single ``.TreeIndex`` -- ``self.gbc_index`` is a
+        dict of per-document StoredIndex objects there (see
+        ``from_corpus_bundle``) -- so the planner's filter vocabulary is the
+        union of every document's titles instead of one document's own.
+        """
+
+        tree_indexes = (
+            [stored_index.TreeIndex for stored_index in self.gbc_index.values()]
+            if self.corpus_bundle is not None
+            else [self.gbc_index.TreeIndex]
+        )
+        seen: Dict[str, None] = {}
+        for tree_index in tree_indexes:
+            for node in tree_index.get_nodes(hasRoot=False):
+                if (
+                    node.type == NodeType.TITLE
+                    and isinstance(node.meta_info.content, str)
+                    and node.meta_info.content.strip()
+                ):
+                    seen[node.meta_info.content] = None
+        return list(seen)
+
+    def _validate_evidence_document_scope(self, rows, step):
+        bundle = getattr(self, "corpus_bundle", None)
+        if bundle is None:
+            return
+        allowed = set(bundle.documents).intersection(step.documents_in_scope)
+        for row in rows:
+            if row.get("document_version_id") not in allowed:
+                raise ValueError("answer evidence is outside the permitted document scope")
+
+    def _process_retrieved_nodes(
+        self, tree_data: List[Dict[str, Any]], iter_context: SubStep
+    ) -> None:
+        """Processes and categorizes retrieved nodes into the iteration context."""
+        self._validate_evidence_document_scope(tree_data, iter_context)
+        if self.evidence_hydrator is not None:
+            tree_data = self.evidence_hydrator.hydrate(tree_data)
+        elif self.evidence_hydrators:
+            # Corpus mode: each node hydrates against its own document's
+            # hydrator -- a citation resolved against the wrong document's
+            # evidence catalog would validate against the wrong source.
+            by_doc: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            unhydrated: List[Dict[str, Any]] = []
+            for node in tree_data:
+                doc_id = node.get("document_version_id")
+                if doc_id in self.evidence_hydrators:
+                    by_doc[doc_id].append(node)
+                else:
+                    unhydrated.append(node)
+            hydrated: List[Dict[str, Any]] = list(unhydrated)
+            for doc_id, nodes in by_doc.items():
+                document_rows = self.evidence_hydrators[doc_id].hydrate(nodes)
+                if any(row.get("document_version_id") != doc_id for row in document_rows):
+                    raise ValueError("hydrated answer evidence belongs to a different document")
+                hydrated.extend(document_rows)
+            tree_data = hydrated
+        self._validate_evidence_document_scope(tree_data, iter_context)
+        if self.evidence_hydrator is not None or self.evidence_hydrators:
+            self._materialize_answer_assets(tree_data)
+        iter_context.retrieval_nodes = tree_data
+
+        image_nodes = [node for node in tree_data if node["type"] == NodeType.IMAGE]
+        text_nodes = [node for node in tree_data if node["type"] != NodeType.IMAGE]
+
+        iter_context.iteration_image_nodes = image_nodes
+        iter_context.iteration_text_nodes = text_nodes
+
+    def _with_section_titles(self, node_ids: List[int], *, tree_index: Any = None) -> List[int]:
+        """Bring each retrieved figure, equation or listing's heading with it.
+
+        A figure, an equation and a code listing all state what they show
+        without stating what they are about: the subject is in the heading
+        above them. Retrieval scores each node on its own text, so the heading
+        is never the reason one of these is found and never arrives beside it.
+
+        An answer then gets a sag equation with no way to know which surface it
+        defines, or a rendered surface described as "an abstract teardrop form"
+        with nothing tying it to the section it illustrates. The heading is one
+        short node away and is the whole context, so it is brought along rather
+        than left to be inferred.
+
+        Measured on a 1871-page optics manual: 2956 of the 2957 figure,
+        equation and listing nodes sit directly under their section title, so
+        the direct parent is the heading in every case that matters. Titles
+        already retrieved on their own merit are not added twice, and a node
+        parented straight to the root simply has no heading to add.
+        """
+
+        tree = tree_index if tree_index is not None else self.gbc_index.TreeIndex
+        ordered = list(node_ids)
+        seen = set(ordered)
+        titles: List[int] = []
+        for node_id in ordered:
+            node = tree.get_node_by_index_id(node_id)
+            if node is None or _node_type_value(node) not in _SECTIONED_TYPE_VALUES:
+                continue
+            # A store-backed view names its parent by id; an in-memory tree
+            # holds the node itself. Both shapes reach retrieval.
+            parent = getattr(node, "parent", None)
+            if parent is None:
+                parent_id = getattr(node, "parent_id", None)
+                parent = (
+                    tree.get_node_by_index_id(parent_id)
+                    if parent_id is not None
+                    else None
+                )
+            if parent is None or _node_type_value(parent) != NodeType.TITLE.value:
+                continue
+            if parent.index_id in seen:
+                continue
+            seen.add(parent.index_id)
+            titles.append(parent.index_id)
+        if titles:
+            log.info(
+                "Retrieval brought %d section heading(s) along with the "
+                "figures, equations and listings that sit under them",
+                len(titles),
+            )
+        return ordered + titles
+
+    def _attach_candidate_fusion_trace(
+        self, tree_data: List[Dict[str, Any]]
+    ) -> None:
+        """Persist the validated dense/BM25 rank trace with retrieved evidence."""
+
+        fusion = getattr(self.retriever, "last_fusion_result", None)
+        if fusion is None:
+            return
+        legs = {trace.leg_id: trace for trace in fusion.leg_traces}
+        by_node_id: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for candidate in fusion.candidates:
+            trace = {
+                "fusion_id": fusion.fusion_id,
+                "fused_candidate_id": candidate.fused_candidate_id,
+                "fused_rank": candidate.fused_rank,
+                "fused_score": candidate.fused_score,
+                "modalities": list(candidate.modalities),
+                "selected_representation_ids": list(
+                    candidate.selected_representation_ids
+                ),
+                "selected_asset_ids": list(candidate.selected_asset_ids),
+                "contributions": [
+                    {
+                        "leg_id": contribution.leg_id,
+                        "leg_kind": legs[contribution.leg_id].leg_kind,
+                        "backend_id": legs[contribution.leg_id].backend_id,
+                        "selected_rank": contribution.selected_rank,
+                        "selected_raw_score": contribution.selected_raw_score,
+                        "rrf_contribution": contribution.rrf_contribution,
+                    }
+                    for contribution in candidate.contributions
+                ],
+            }
+            for node_id in candidate.tree_node_ids:
+                if not isinstance(node_id, str):
+                    continue
+                doc_id, sep, index_id_str = node_id.partition(":")
+                if not sep or not re.fullmatch(r"-?\d+", index_id_str):
+                    continue
+                by_node_id[(doc_id, int(index_id_str))] = trace
+        for node in tree_data:
+            key = (node.get("document_version_id") or "", node.get("index_id"))
+            trace = by_node_id.get(key)
+            if trace is not None:
+                node["candidate_fusion"] = trace
+
+    def get_GBC_info(self, iter_context: SubStep) -> None:
+        """
+        1. Get subgraph: sel_sec_id --> subtree --> subgraph.
+        2. Use Three Layer Reranker to select most relevant TreeNodes in the subtree.
+            2.1 PPR to rank the most relevant TreeNodes in the subtree.
+            2.2 Rerank with text reranker model.
+            2.3 Rerank with Multimodal method.
+            Then: Skyline algorithm to select the most relevant TreeNodes.
+        3. Combine the connected TreeNodes and Subgraph info to form the final GBC data info.
+        """
+
+        if self.corpus_bundle is not None:
+            self._get_GBC_info_corpus(iter_context)
+            return
+
+        # 1. Get subgraph: sel_sec_id --> subtree --> subgraph.
+        # Get the subtree rooted at the selected section ID
+        if self.variant == "wo_selector":
+            log.info("Variant 'wo_selector' selected")
+            subtree_nodes = self.gbc_index.TreeIndex.get_nodes(hasRoot=False)
+        else:
+            log.info(f"Using {self.variant} variant for retrieval.")
+            retrieval_sec_ids = iter_context.retrieval_sec_ids
+            subtree_nodes = self.gbc_index.TreeIndex.get_subtree_nodes(
+                retrieval_sec_ids
+            )
+
+        subtree_ids = [node.index_id for node in subtree_nodes]
+
+        timings = self.retriever.timings
+        with timings.time("subgraph"):
+            subgraph: nx.Graph = self.gbc_index.GraphIndex.get_kg_subgraph(
+                subtree_ids, document_version_id=self.gbc_index.TreeIndex.meta_info.document_version_id,
+            )
+
+        start_ent_map = iter_context.gbc_entity_map
+
+        tree_node_ids, res_entities = self.retriever.skyline_filter(
+            iter_context.sub_query,
+            subtree_nodes,
+            subgraph,
+            start_ent_map,
+            iter_context.requested_node_types,
+        )
+
+        log.info(f"After skyline filtering, select {len(tree_node_ids)} TreeNodes")
+
+        Graph_data = self.gbc_index.GraphIndex.get_subgraph_data(res_entities)
+        iter_context.iteration_graph_nodes = Graph_data.get("nodes", [])
+        iter_context.iteration_graph_edges = Graph_data.get("edges", [])
+
+        # skyline_filter returns (document_version_id, index_id) pairs; only one document here.
+        tree_node_index_ids = [index_id for _doc_id, index_id in tree_node_ids]
+        tree_node_index_ids = self._with_section_titles(tree_node_index_ids)
+        tree_data = self.gbc_index.TreeIndex.get_nodes_data(tree_node_index_ids)
+        self._attach_candidate_fusion_trace(tree_data)
+        self._process_retrieved_nodes(tree_data, iter_context)
+
+    @staticmethod
+    def _merge_document_graph(combined_graph, doc_subgraph):
+        sources = {
+            name: set(combined_graph.nodes[name].get("source_ids", ()))
+            | set(data.get("source_ids", ()))
+            for name, data in doc_subgraph.nodes(data=True)
+            if name in combined_graph
+        }
+        merged = nx.compose(combined_graph, doc_subgraph)
+        for name, source_ids in sources.items():
+            merged.nodes[name]["source_ids"] = source_ids
+        return merged
+
+    def _get_GBC_info_corpus(self, iter_context: SubStep) -> None:
+        """Corpus-mode counterpart to ``get_GBC_info``: one real ranking pass
+        across every document in scope, not one per document merged after."""
+
+        documents = iter_context.documents_in_scope
+        if not set(documents).issubset(self.corpus_bundle.documents):
+            raise ValueError("retrieval document is outside the permitted document scope")
+        if not documents:
+            iter_context.iteration_graph_nodes = []
+            iter_context.iteration_graph_edges = []
+            self._process_retrieved_nodes([], iter_context)
+            return
+
+        timings = self.retriever.timings
+        combined_graph = nx.Graph()
+        all_subtree_nodes: List[Any] = []
+        entities_by_doc: Dict[str, set] = {}
+
+        with timings.time("subgraph"):
+            for doc_id in documents:
+                stored_index = self.gbc_index[doc_id]
+                if self.variant == "wo_selector":
+                    subtree_nodes = stored_index.TreeIndex.get_nodes(hasRoot=False)
+                else:
+                    sec_ids = iter_context.retrieval_sec_ids_by_doc.get(doc_id, [])
+                    subtree_nodes = stored_index.TreeIndex.get_subtree_nodes(sec_ids)
+                if any(node.document_version_id != doc_id for node in subtree_nodes):
+                    raise ValueError("subtree node belongs to a different document")
+                all_subtree_nodes.extend(subtree_nodes)
+                subtree_ids = [node.index_id for node in subtree_nodes]
+                doc_subgraph = stored_index.GraphIndex.get_kg_subgraph(
+                    subtree_ids, document_version_id=doc_id,
+                )
+                allowed_sources = {(doc_id, index_id) for index_id in subtree_ids}
+                if any(
+                    not set(data.get("source_ids", ())).issubset(allowed_sources)
+                    for _, data in doc_subgraph.nodes(data=True)
+                ):
+                    raise ValueError("graph source node is outside its document subtree")
+                combined_graph = self._merge_document_graph(combined_graph, doc_subgraph)
+                entities_by_doc[doc_id] = set(doc_subgraph.nodes)
+
+            entity_keys: set[int] = set()
+            if self._corpus_store is not None:
+                for node_names in entities_by_doc.values():
+                    for node_name in node_names:
+                        canonical, kind = split_node_name(node_name)
+                        if not canonical:
+                            continue
+                        entity_key = self._corpus_store.entity_key_for_canonical(
+                            canonical, kind or ""
+                        )
+                        if entity_key is not None:
+                            entity_keys.add(entity_key)
+                if entity_keys:
+                    cross_edges = self._corpus_store.inferred_relations_for_entities(
+                        entity_keys, document_version_ids=documents
+                    )
+                    any_graph_index = next(iter(self.gbc_index.values())).GraphIndex
+                    any_graph_index.add_cross_document_edges(
+                        combined_graph, cross_edges,
+                        discount_factor=self.cfg.cross_doc_edge_discount_factor,
+                    )
+
+        start_ent_map = iter_context.gbc_entity_map
+        tree_node_keys, res_entities = self.retriever.skyline_filter(
+            iter_context.sub_query, all_subtree_nodes, combined_graph,
+            start_ent_map, iter_context.requested_node_types,
+        )
+        log.info(
+            "Corpus retrieval: selected %d TreeNode(s) across %d document(s) in one ranked pass",
+            len(tree_node_keys), len({doc_id for doc_id, _ in tree_node_keys}),
+        )
+
+        iter_context.iteration_graph_nodes = [
+            {"id": name, "entity_name": name}
+            for name in sorted(combined_graph.nodes)
+            if name in res_entities
+        ]
+        iter_context.iteration_graph_edges = [
+            {
+                "source": source, "target": target,
+                "relation_name": data.get("relation_name"),
+                "weight": data.get("weight"),
+                "description": data.get("description"),
+            }
+            for source, target, data in combined_graph.edges(data=True)
+            if source in res_entities or target in res_entities
+        ][:64]
+
+        by_doc_ids: Dict[str, List[int]] = defaultdict(list)
+        allowed_node_keys = {(node.document_version_id, node.index_id) for node in all_subtree_nodes}
+        for doc_id, index_id in tree_node_keys:
+            if (doc_id, index_id) not in allowed_node_keys:
+                raise ValueError("ranked tree node is outside the permitted document subtrees")
+            by_doc_ids[doc_id].append(index_id)
+        tree_data: List[Dict[str, Any]] = []
+        for doc_id, ids in by_doc_ids.items():
+            stored_index = self.gbc_index[doc_id]
+            ids = self._with_section_titles(ids, tree_index=stored_index.TreeIndex)
+            rows = stored_index.TreeIndex.get_nodes_data(ids)
+            title = self.corpus_bundle.document_titles.get(doc_id, "") if self.corpus_bundle else ""
+            for row in rows:
+                if row.get("document_version_id") != doc_id:
+                    raise ValueError("retrieved tree row belongs to a different document")
+                row["document_title"] = title
+            tree_data.extend(rows)
+
+        self._attach_candidate_fusion_trace(tree_data)
+        self._process_retrieved_nodes(tree_data, iter_context)
+
+    def _retrieve(
+        self,
+        query: str,
+        iter_context: SubStep = None,
+    ) -> None:
+        """
+        GBC retrieval following the steps:
+        1. Extract entities from the query.
+        2. Get the section nodes based on the entities.
+        3. Use LLM to select the most relevant section based on the query and Section info.
+        4. Use graph-based retrieval on the subgraph projected by the subtree (Select Section).
+
+        iter_context: IterationStep, Iteration context for the current step.
+        """
+
+        timings = self.retriever.timings
+        with timings.time("query_entities"):
+            Qent_GBCent_map = self._get_query_entity(query)
+        iter_context.gbc_entity_map = Qent_GBCent_map
+
+        if self.corpus_bundle is not None:
+            documents = self._documents_in_scope(Qent_GBCent_map)
+            iter_context.documents_in_scope = documents
+            all_tree_nodes: List[dict] = []
+            with timings.time("link_tree_nodes"):
+                for doc_id in documents:
+                    graph_index = self.gbc_index[doc_id].GraphIndex
+                    doc_tree_nodes = self.link_tree_node(
+                        Qent_GBCent_map, graph_index=graph_index
+                    )
+                    for row in doc_tree_nodes:
+                        row["document_version_id"] = doc_id
+                    all_tree_nodes.extend(doc_tree_nodes)
+            iter_context.linked_tree_nodes = all_tree_nodes
+
+            if self.variant == "wo_selector":
+                log.info("Variant 'wo_selector' selected: Skipping LLM section selection.")
+                for doc_id in documents:
+                    root = self.gbc_index[doc_id].TreeIndex.root_node
+                    iter_context.retrieval_sec_ids_by_doc[doc_id] = (
+                        [root.index_id] if root else []
+                    )
+            else:
+                with timings.time("section_selection"):
+                    for doc_id in documents:
+                        doc_tree_nodes = [
+                            row for row in all_tree_nodes
+                            if row.get("document_version_id") == doc_id
+                        ]
+                        selection_step = SubStep(
+                            sub_query=query, sub_number=iter_context.sub_number
+                        )
+                        try:
+                            self.llm_section_selection(
+                                query, doc_tree_nodes, selection_step,
+                                tree_index=self.gbc_index[doc_id].TreeIndex,
+                                document_version_id=doc_id,
+                            )
+                        finally:
+                            iter_context.section_selection_by_doc[doc_id] = {
+                                key: value for key, value in selection_step.model_dump().items()
+                                if (key.startswith("section_") and key != "section_selection_by_doc")
+                                or key in {"linked_section_ids", "supplementary_ids", "selected_explanation"}
+                            }
+                        iter_context.retrieval_sec_ids_by_doc.update(
+                            selection_step.retrieval_sec_ids_by_doc
+                        )
+        else:
+            with timings.time("link_tree_nodes"):
+                tree_nodes = self.link_tree_node(Qent_GBCent_map)
+            iter_context.linked_tree_nodes = tree_nodes
+
+            # 3. Use LLM to select the most relevant section or supplementary sections
+            if self.variant == "wo_selector":
+                log.info("Variant 'wo_selector' selected: Skipping LLM section selection.")
+                iter_context.retrieval_sec_ids = [
+                    self.gbc_index.TreeIndex.root_node.index_id
+                ]
+            else:
+                with timings.time("section_selection"):
+                    self.llm_section_selection(query, tree_nodes, iter_context)
+
+        # 4. Graph-based retrieval on subgraph projected by the subtree (Select Section)
+        self.get_GBC_info(iter_context)
+        timings.log_summary()
+
+    @property
+    def _citations_enabled(self) -> bool:
+        return self.evidence_hydrator is not None or bool(self.evidence_hydrators)
+
+    def process_analysis(self, context: GBCRAGContext, query_analysis: PlanResult):
+        log.info(f"Query analysis type: {query_analysis.query_type}")
+        planner = getattr(self, "planner", None)
+        if planner is not None:
+            # Revalidate at the execution boundary.  This also protects
+            # callers that deserialize a cached/model-produced PlanResult and
+            # invoke ``process_analysis`` directly.
+            query_analysis = planner.validate_plan(query_analysis)
+
+        if query_analysis.query_type == "simple":
+            query = query_analysis.original_query
+            current_step = SubStep(
+                sub_query=query,
+                sub_number=1,
+                requested_node_types=list(
+                    requested_node_type_filter(query_analysis.requested_node_types)
+                ),
+            )
+            self._retrieve(query, current_step)
+            self._notify_retrieval_ready(context, current_step)
+
+            final_answer, partial_answers, citations = self.answer.answer_simple_question(
+                query=query,
+                retrieved_nodes=current_step.retrieval_nodes,
+                entities=current_step.iteration_graph_nodes,
+                relations=current_step.iteration_graph_edges,
+                require_citations=self._citations_enabled,
+            )
+            current_step.partial_answers = partial_answers
+            current_step.generated_answer = final_answer
+            current_step.citations = citations
+            current_step.answer_validation = _citation_validation_from_partials(
+                partial_answers
+            )
+
+            context.iterations.append(current_step)
+            context.final_answer = final_answer
+            context.answer_validation = current_step.answer_validation
+        elif query_analysis.query_type == "complex":
+            # 1. Separate retrieval tasks from the full plan
+            retrieval_tasks = [
+                sub_q
+                for sub_q in query_analysis.sub_questions
+                if sub_q.type == "retrieval"
+            ]
+
+            # 2. Execute each retrieval task and collect the results
+            sub_question_results = []
+            for i, task in enumerate(retrieval_tasks):
+                sub_question = task.question
+                current_step = SubStep(
+                    sub_query=sub_question,
+                    sub_number=i + 1,
+                    requested_node_types=list(
+                        requested_node_type_filter(task.requested_node_types)
+                    ),
+                )
+                self._retrieve(sub_question, current_step)
+                self._notify_retrieval_ready(context, current_step)
+
+                sub_answer, partial_answers, citations = self.answer.answer_simple_question(
+                    query=sub_question,
+                    retrieved_nodes=current_step.retrieval_nodes,
+                    entities=current_step.iteration_graph_nodes,
+                    relations=current_step.iteration_graph_edges,
+                    require_citations=self._citations_enabled,
+                    evidence_scope=f"Q{i + 1}",
+                )
+                current_step.partial_answers = partial_answers
+                current_step.generated_answer = sub_answer
+                current_step.citations = citations
+                current_step.answer_validation = _citation_validation_from_partials(
+                    partial_answers
+                )
+                context.iterations.append(current_step)
+
+                sub_question_results.append(
+                    {
+                        "question": sub_question,
+                        "answer": sub_answer,
+                        "answer_validation": current_step.answer_validation,
+                        "evidence_bindings": _citation_bindings_from_validation(
+                            current_step.answer_validation
+                        ),
+                    }
+                )
+            final_answer, final_validation = (
+                self.answer.answer_complex_question_with_validation(
+                    original_query=query_analysis.original_query,
+                    sub_question_plan=query_analysis.sub_questions,
+                    sub_question_results=sub_question_results,
+                    require_citations=self._citations_enabled,
+                )
+            )
+            context.final_answer = final_answer
+            context.answer_validation = final_validation
+
+        elif query_analysis.query_type == "global":
+            if self.corpus_bundle is not None:
+                raise NotImplementedError(
+                    "global queries (COUNT/LIST/SUMMARIZE/ANALYZE over a whole "
+                    "document) are not supported in corpus-scoped retrieval yet"
+                )
+            # Create a step for the global operation
+            current_step = SubStep(
+                sub_query=query_analysis.original_query, sub_number=1
+            )
+
+            # 1. Filter the tree nodes based on the plan's filters
+            filtered_nodes: List[TreeNode] = filter_tree_nodes(
+                self.gbc_index.TreeIndex, query_analysis.filters
+            )
+            operation = query_analysis.operation.upper()
+            filtered_count = len(filtered_nodes)
+            current_step.global_filtered_count = filtered_count
+            current_step.global_evidence_limit = self.cfg.global_evidence_limit
+            # Read from the answer model, so the scope can never be larger than
+            # the window that has to hold it plus the answer.
+            char_budget = answer_input_char_budget(
+                self.llm, self.cfg.global_evidence_char_budget
+            )
+            log.info(
+                "Global filter resulted in %d nodes; evidence budget %d chars.",
+                filtered_count,
+                char_budget,
+            )
+
+            # 2. Perform the specified operation
+            if operation == "COUNT":
+                # COUNT is exact and needs neither hydration nor a model call.
+                # Avoid loading every canonical record merely to count an
+                # already materialized filtered tree scope.
+                count_result = filtered_count
+                # You can format this into a more natural sentence if desired
+                final_answer = (
+                    f"Based on my analysis of the document, I found {count_result} items"
+                    f" that answer the question: '{query_analysis.original_query}'"
+                )
+
+                current_step.partial_answers = [
+                    {"source": "Direct Count", "content": final_answer}
+                ]
+                current_step.answer_validation = {
+                    "status": "deterministic_count",
+                    "valid": True,
+                    "citations_required": False,
+                }
+                current_step.retrieval_nodes = []
+                self._notify_retrieval_ready(context, current_step)
+            elif (
+                filtered_count > self.cfg.global_evidence_limit
+                or global_scope_chars(filtered_nodes) > char_budget
+            ):
+                # A silent prefix/sample is inaccurate, while one model call
+                # per item is an unbounded latency and cost failure. Until the
+                # durable asynchronous hierarchical Map/Reduce worker lands,
+                # fail explicitly and preserve the full scope in the trace.
+                #
+                # What is measured here is the scope's size, not how many pieces
+                # it was cut into. Counting items alone refused "what are all the
+                # defects in vision and causes" on a 44-node chapter whose entire
+                # text is about 5,200 tokens -- a scope any answer model reads
+                # without effort -- while letting through a scope of half as many
+                # but far larger nodes. A question about a whole short document is
+                # a reasonable question and now gets an answer.
+                scope_chars = global_scope_chars(filtered_nodes)
+                current_step.global_budget_exhausted = True
+                current_step.retrieval_nodes = []
+                exceeded = (
+                    f"{filtered_count} evidence items, exceeding the limit of "
+                    f"{self.cfg.global_evidence_limit}"
+                    if filtered_count > self.cfg.global_evidence_limit
+                    else (
+                        f"{scope_chars:,} characters of evidence, exceeding the "
+                        f"budget of {char_budget:,}"
+                    )
+                )
+                final_answer = (
+                    f"This global query matched {exceeded}. Narrow the page, "
+                    "section, or modality filter; no partial answer was generated."
+                )
+                current_step.partial_answers = [
+                    {
+                        "source": "Global evidence budget",
+                        "content": final_answer,
+                        "matched_count": filtered_count,
+                        "evidence_limit": self.cfg.global_evidence_limit,
+                        "matched_chars": scope_chars,
+                        "char_budget": char_budget,
+                        "budget_exhausted": True,
+                    }
+                ]
+                current_step.answer_validation = {
+                    "status": "not_generated_budget_exhausted",
+                    "valid": False,
+                    "citations_required": False,
+                }
+                self._notify_retrieval_ready(context, current_step)
+            else:  # For LIST, SUMMARIZE, ANALYZE
+                filter_nodes_ids = [node.index_id for node in filtered_nodes]
+                tree_data = self.gbc_index.TreeIndex.get_nodes_data(filter_nodes_ids)
+                self._process_retrieved_nodes(tree_data, current_step)
+                self._notify_retrieval_ready(context, current_step)
+                # Call the dedicated global answer agent method
+                final_answer, partials, citations = self.answer.answer_global_question(
+                    original_query=query_analysis.original_query,
+                    operation=operation,
+                    filtered_nodes=current_step.retrieval_nodes,
+                    require_citations=self._citations_enabled,
+                )
+                current_step.partial_answers = partials
+                current_step.citations = citations
+                current_step.answer_validation = _citation_validation_from_partials(
+                    partials
+                )
+
+            current_step.generated_answer = final_answer
+            context.iterations.append(current_step)
+            context.final_answer = final_answer
+            context.answer_validation = current_step.answer_validation
+        else:
+            log.warning(f"Unknown query type: {query_analysis.query_type}")
+            context.final_answer = "I'm sorry, I cannot process this query."
+
+    def _create_augmented_prompt(self, query: str) -> str:
+        pass
+
+    def generation(self, query: str, query_output_dir: str):
+        self._begin_query_asset_materialization()
+        query_failed = False
+        try:
+            self.planner.validate_query(query)
+            context = GBCRAGContext(query=query)
+            context.planning_limits = self._query_limits_trace()
+
+            if self.variant == "wo_plan":
+                log.info("Variant 'wo_plan' selected: Skipping LLM planning.")
+                query_analysis = PlanResult(
+                    query_type="simple",
+                    original_query=query,
+                )
+            else:
+                query_analysis: PlanResult = self.planner.analyze(
+                    query, section_titles=self._section_titles()
+                )
+
+            context.plan = query_analysis
+            self.process_analysis(context, query_analysis)
+
+            log.info(f"Final answer for query '{query}': {context.final_answer}")
+            retrieval_ids = self._save_retrieval_res(context, query_output_dir)
+
+            return context.final_answer, retrieval_ids
+        except BaseException:
+            query_failed = True
+            raise
+        finally:
+            try:
+                # Re-hash every handed-out CAS path after the answer model has
+                # consumed it. A mismatch prevents a successful answer return.
+                self._finish_query_asset_materialization()
+            except BaseException:
+                if query_failed:
+                    log.exception(
+                        "Answer asset lease verification also failed while the "
+                        "query was already failing"
+                    )
+                else:
+                    raise
+
+    def _save_retrieval_res(self, context: GBCRAGContext, query_output_dir: str):
+        retrieval_ids = []
+
+        # direct save the context to a json file
+        retrieval_save_res = query_output_dir / "retrieval_res.json"
+        context_dict = context.model_dump()
+        with open(retrieval_save_res, "w", encoding="utf-8") as f:
+            json.dump(context_dict, f, indent=2, ensure_ascii=False)
+        log.info(f"Retrieval results saved to {retrieval_save_res}")
+
+        # Bare tree numbers are local to a document. Preserve both identities
+        # in group/all chat results, including equal node numbers in two books.
+        if getattr(self, "corpus_bundle", None) is not None:
+            keys = {
+                (node["document_version_id"], node["index_id"])
+                for step in context.iterations
+                for node in step.retrieval_nodes
+            }
+            return [
+                {"document_version_id": doc_id, "index_id": index_id}
+                for doc_id, index_id in sorted(keys)
+            ]
+
+        # use the tree nodes as retrieval ids
+        retrieval_ids = []
+        for iter_step in context.iterations:
+            text_nodes = iter_step.iteration_text_nodes
+            if text_nodes:
+                for node in text_nodes:
+                    node_id = node.get("index_id")
+                    if node_id is not None and node_id not in retrieval_ids:
+                        retrieval_ids.append(node_id)
+            image_nodes = iter_step.iteration_image_nodes
+            if image_nodes:
+                for node in image_nodes:
+                    node_id = node.get("index_id")
+                    if node_id is not None and node_id not in retrieval_ids:
+                        retrieval_ids.append(node_id)
+
+        retrieval_ids = sorted(retrieval_ids)
+
+        return retrieval_ids
+
+    def close(self):
+        """Release rerank, attested tree, entity/graph, and model resources."""
+
+        try:
+            self._finish_query_asset_materialization()
+        except Exception:
+            log.exception("Failed to re-verify active answer asset leases on close")
+        self.asset_cas_root = None
+        reranker = getattr(self, "reranker", None)
+        self.reranker = None
+        tree_embedder = getattr(self, "tree_embedder", None)
+        self.tree_embedder = None
+        tree_vdb = getattr(self, "tree_vdb", None)
+        self.tree_vdb = None
+        retriever = getattr(self, "retriever", None)
+        if retriever is not None:
+            retriever.tree_vdb = None
+            retriever.retrieval_binding = None
+        gbc_index = getattr(self, "gbc_index", None)
+        self.gbc_index = None
+        self.embedder = None
+        try:
+            self._close_owned_resources(
+                ("GBC reranker", reranker),
+                ("TreeVDB embedder", tree_embedder),
+                ("TreeVDB", tree_vdb),
+                ("GBC index", gbc_index),
+            )
+        finally:
+            super().close()

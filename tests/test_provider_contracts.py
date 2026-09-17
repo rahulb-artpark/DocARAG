@@ -10,15 +10,15 @@ from unittest.mock import Mock, call, patch
 import numpy as np
 from pydantic import BaseModel
 
-from Core.configs.embedding_config import EmbeddingConfig
-from Core.configs.graph_config import GraphConfig
-from Core.configs.llm_config import LLMConfig
-from Core.configs.rerank_config import RerankerConfig
-from Core.configs.vlm_config import VLMConfig
-from Core.provider.embedding import TextEmbeddingProvider
-from Core.provider.llm import OllamaController, OpenAIController
-from Core.provider.rerank import TextRerankerProvider
-from Core.provider.vlm import (
+from retrieval_engine.configuration.embeddings import EmbeddingConfig
+from retrieval_engine.configuration.knowledge_graph import GraphConfig
+from retrieval_engine.configuration.language_model import LLMConfig
+from retrieval_engine.configuration.reranking import RerankerConfig
+from retrieval_engine.configuration.vision_model import VLMConfig
+from retrieval_engine.providers.embeddings import TextEmbeddingProvider
+from retrieval_engine.providers.language_model import OllamaController, OpenAIController
+from retrieval_engine.providers.reranking import TextRerankerProvider
+from retrieval_engine.providers.vision_model import (
     GPTVLMController,
     OllamaVLMController,
     QwenVLController,
@@ -460,7 +460,7 @@ class RerankerProviderContractTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"modelscope": modelscope}),
             patch(
-                "Core.provider.rerank.importlib.import_module",
+                "retrieval_engine.providers.reranking.importlib.import_module",
                 side_effect=ImportError("not installed"),
             ),
         ):
@@ -480,7 +480,7 @@ class RerankerProviderContractTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {"modelscope": modelscope}),
             patch(
-                "Core.provider.rerank.importlib.import_module",
+                "retrieval_engine.providers.reranking.importlib.import_module",
                 side_effect=ImportError("not installed"),
             ),
             self.assertRaisesRegex(RuntimeError, "requested but is unavailable"),
@@ -495,7 +495,7 @@ class RerankerProviderContractTests(unittest.TestCase):
         model_factory.from_pretrained.assert_not_called()
 
     def test_graph_config_settings_reach_embedding_and_reranker_providers(self):
-        from Core.pipelines.kg_refiner import KGRefiner
+        from retrieval_engine.indexing.graph.refiner import KGRefiner
 
         graph_config = GraphConfig(
             embedding_config=EmbeddingConfig(
@@ -513,9 +513,9 @@ class RerankerProviderContractTests(unittest.TestCase):
         )
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch("Core.pipelines.kg_refiner.TextEmbeddingProvider") as embedding,
-            patch("Core.pipelines.kg_refiner.TextRerankerProvider") as reranker,
-            patch("Core.pipelines.kg_refiner.VectorStore"),
+            patch("retrieval_engine.indexing.graph.refiner.TextEmbeddingProvider") as embedding,
+            patch("retrieval_engine.indexing.graph.refiner.TextRerankerProvider") as reranker,
+            patch("retrieval_engine.indexing.graph.refiner.VectorStore"),
         ):
             refiner = KGRefiner(
                 llm=object(),

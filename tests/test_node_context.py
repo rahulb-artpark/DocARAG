@@ -11,7 +11,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from Core.pipelines.node_context import (
+from retrieval_engine.indexing.tree.context import (
     MAX_STEPS,
     PROSE_WORDS,
     adjacent_context,

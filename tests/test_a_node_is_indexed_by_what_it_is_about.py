@@ -33,8 +33,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.pipelines import vdb_index
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.indexing.vector import builder as vdb_index
 
 
 def _tree(directory, **figure_meta):

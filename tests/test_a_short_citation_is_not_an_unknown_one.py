@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import unittest
 
-from Core.rag.gbc_answer import _evidence_scope_of, _scope_answer_markers
+from retrieval_engine.rag.gbc.answer import _evidence_scope_of, _scope_answer_markers
 
 
 def _nodes(*labels):
@@ -83,7 +83,7 @@ class TheGateStillRejectsWhatItShould(unittest.TestCase):
     """Namespacing must not turn a genuinely unknown citation into a valid one."""
 
     def test_a_label_beyond_the_evidence_is_still_unknown(self):
-        from docarag.answer_validation import validate_answer_citations
+        from document_services.retrieval.answer_validation import validate_answer_citations
 
         scope = _evidence_scope_of(_nodes("Q1-E1", "Q1-E2"))
         answer = _scope_answer_markers("cites [E9]", scope)
@@ -96,7 +96,7 @@ class TheGateStillRejectsWhatItShould(unittest.TestCase):
         self.assertIn("Q1-E9", result.unknown_labels)
 
     def test_the_short_form_now_resolves_to_its_evidence(self):
-        from docarag.answer_validation import validate_answer_citations
+        from document_services.retrieval.answer_validation import validate_answer_citations
 
         scope = _evidence_scope_of(_nodes("Q1-E1", "Q1-E2"))
         answer = _scope_answer_markers("the sag equation [E1]", scope)

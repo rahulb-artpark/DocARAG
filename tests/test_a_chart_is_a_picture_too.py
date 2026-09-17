@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import unittest
 
-from Core.Index.Tree import NodeType
-from Core.rag.gbc_rag import GBCRAG
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.rag.gbc.agent import GBCRAG
 
 visual = GBCRAG._visual_evidence_node
 

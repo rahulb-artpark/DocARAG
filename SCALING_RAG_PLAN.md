@@ -71,7 +71,7 @@ canonical, scalable design is complete.
 
 | Area | Implemented now | Still required before the target claim is true |
 |---|---|---|
-| Supported entry point | Repository/editable-install `docarag` CLI with `init`, `settings`, read-only `setup-plan`, `doctor`, implemented `storage up/down/migrate/status`, routed-profile `validate/show`, parser-worker `validate/serve`, `index`, `status`, `verify`, `ask`, and loopback `web`; the installed entry point plus help, settings, and storage command parsing pass a clean-wheel boundary test without checkout-owned `Core`, PyYAML, or model-framework imports | Standalone complete `lite` application services and packaged compatibility-run resources: `status` execution, named-run verification, `index`, `ask`, and `web` still use a configured checkout. Also required: model management, curated deployment profiles, stable `/v1` API and SDK |
+| Supported entry point | Repository/editable-install `docarag` CLI with `init`, `settings`, read-only `setup-plan`, `doctor`, implemented `storage up/down/migrate/status`, routed-profile `validate/show`, parser-worker `validate/serve`, `index`, `status`, `verify`, `ask`, and loopback `web`; the installed entry point plus help, settings, and storage command parsing pass a clean-wheel boundary test without checkout-owned `retrieval_engine`, PyYAML, or model-framework imports | Standalone complete `lite` application services and packaged compatibility-run resources: `status` execution, named-run verification, `index`, `ask`, and `web` still use a configured checkout. Also required: model management, curated deployment profiles, stable `/v1` API and SDK |
 | Reproducible indexing | PDF/config/code-derived revision ID, content-addressed source snapshot, attempt-local state/logs, runtime fingerprint, checksummed artifact manifest, deterministic MinerU observation/canonical artifacts, derived-block lineage, quick/deep verification of run-local artifacts, a fixture-only runtime compatibility manifest inspected by `doctor`, an atomic source/tree/config/embedding-bound Qdrant readiness attestation plus scoped live count, and PostgreSQL document/dispatch trace adoption | Certified package/model/container pins and served-weight digests in revision identity; remote Qdrant content-digest/outbox reconciliation able to detect same-count mutations; adoption of PostgreSQL work leases, artifact receipts, index revisions, and dead-letter recovery by every legacy stage; distributed coordination and full durable `T/G/M` publication |
 | Default storage | Loopback-only Compose starts PostgreSQL 18 and Qdrant with durable named volumes. PostgreSQL has explicit checksummed migrations and APIs for immutable document versions/artifact receipts, guarded index revisions, append-only events, idempotent work, `FOR UPDATE SKIP LOCKED` leases, attempts and fencing; the compatibility CLI now records document admission and dispatch plus append-only `parse`/`tree`/`summary`/`graph`/`entity`/`vector` stage events with per-stage artifact receipts and index-revision publication, but does not yet drive stages as item-level leased/resumable work. Qdrant is the only vector provider and uses deterministic IDs, scoped payload filters, idempotent upserts/deletes, and readiness attestations checked against exact scoped counts. | Backup/restore drills, outbox integration, access-policy enforcement, item-level resumable leased-work adoption by every stage, remote Qdrant content reconciliation, Qdrant sparse/visual/multivector qualification, and clustered production operation |
 | Routed parsing contract | Dependency-light Docling, MinerU-normalized, and PaddleOCR-VL translators; source-bound lazy PyMuPDF page probe; explicit capability registry; deterministic router; bounded fallback/adjudication; versioned generic parser-worker HTTP client/server; strict clients for Docling Serve async export, MinerU 3.x task results, and PaddleOCR-VL's complete `/layout-parsing` pipeline; one-vendor foreground worker composition with strict secret-safe TOML profiles; fail-closed fusion and canonical provider; typed MinerU effort; contiguous sparse-page batching; verified source-byte handoff; immutable local-CAS publication for raw exports and parser assets; exact Paddle response retention with request-wide artifact bounds; result-scoped MinerU middle-artifact receipts; explicit bounded parent/caption/footnote/reference/reading-order/table-continuation assertions; and typed table-cell, bounded MathML-symbol, explicit diagram/flow subgraphs preserved through reconciliation and BookRAG tree metadata | Pinned worker/service images and owned supervision; supported routed `docarag index` composition through the application service; shared/object artifact transport for multi-host workers; CAS quota/garbage collection; curated deployment profiles; measured routing thresholds; live qualification of MinerU/Paddle extension fields; real-model qualification/version pins; and the clean-host deployment gate |
@@ -258,7 +258,7 @@ recoverability and evaluation truth before adding more infrastructure.
 
 ### 2.1 Confirmed remaining scale and reliability defects
 
-- Tree summaries and KG extraction now commit source/model/prompt-bound checkpoints, but `Core/Index/Tree.py` still publishes the complete mutable object graph only at the end. A crash can therefore repeat non-checkpointed tree/refinement work even though completed model calls are reusable.
+- Tree summaries and KG extraction now commit source/model/prompt-bound checkpoints, but `retrieval_engine/indexes/tree.py` still publishes the complete mutable object graph only at the end. A crash can therefore repeat non-checkpointed tree/refinement work even though completed model calls are reusable.
 - The MinerU positional merge has been replaced by source-bound, page-local reconciliation with bounded candidate/probe work, explicit disagreement status, stable prior-revision identity, and cross-parser lineage. The generic routed orchestration path can fuse all three adapter results, the lazy page probe can supply source-bound routing features, and the provider can persist/reuse a staged, rollback-protected ready pair. Strict service clients now cover all three documented vendor surfaces and publish verified local artifacts, but the supported compatibility index command still uses the legacy MinerU runtime because routed settings/index composition, service supervision, and live qualification are not shipped.
 - MinerU now retains each task's validated `middle.json` as one result-scoped,
   digest-bound receipt (including an explicit `not_emitted` outcome), so an
@@ -283,10 +283,10 @@ recoverability and evaluation truth before adding more infrastructure.
 - All three adapters now emit only explicit, bounded structural relations and semantic subgraphs, and `CanonicalBlock` preserves them through reconciliation and the BookRAG tree handoff. MinerU/Paddle unresolved, ambiguous, invalid, self, container-only and disallowed-cross-page refs remain audited instead of guessed; reading order is adjacent and costs `O(B log B + R)`, never all-pairs. Exact assertion digests remain distinct from conservative source-neutral comparison digests; equivalent vendor tables can share one representative without laundering the other parser's selectors, while changed content/topology remains review-gated. Full graphs are stored once in the tree; vector metadata contains bounded ID/digest receipts. Live MinerU/Paddle rich-field qualification and live evidence-sidecar construction/invocation remain open; immutable checkpoint publication itself is implemented. Do not compensate by asking the knowledge-graph LLM to reconstruct lost layout from flattened text.
 - `pdf_refiner.py` still treats some text/table judgment failures as a logged fallback. These quality degradations need typed stage issues and policy-controlled retry/review rather than an implicit best-effort result.
 - The BookRAG tree vector path is now microbatched, but some baseline/RAPTOR and offline multimodal-evaluation paths still materialize whole chunk/embedding collections.
-- `Core/rag/gbc_utils.py::enhance_graph_with_semantic_links` still constructs a dense pairwise cosine-similarity matrix below its new 512-node guard. The guard prevents runaway scopes, but the allowed path remains quadratic and should move to offline ANN links.
-- `Core/rag/gbc_retrieval.py` now scans the chosen subtree once, combines positive lexical matches with deterministic structural coverage, and caps **that leg's retained reranker input** in `O(text bytes + N_S log M)` time and `O(M)` retained-candidate memory. This does not make the complete query `O(M)`: `gbc_rag.py` first materializes the selected subtree, `gbc_utils.py` copies the induced graph, PageRank visits that selected graph, and graph candidates are sorted before fusion. The current overall bound is therefore approximately `O(N_S + L_S + I_S(V_S+E_S) + N_G log N_G + text bytes + N_S log M)` time and `O(N_S+V_S+E_S)` memory, with a guarded optional `O(V_S^2)` semantic-link matrix. The two-score graph/text Skyline itself is deterministic, hard-capped, and `O(M log M)`; candidate generation is still tree/graph scoped rather than hybrid retrieval.
+- `retrieval_engine/rag/gbc/context.py::enhance_graph_with_semantic_links` still constructs a dense pairwise cosine-similarity matrix below its new 512-node guard. The guard prevents runaway scopes, but the allowed path remains quadratic and should move to offline ANN links.
+- `retrieval_engine/rag/gbc/retrieval.py` now scans the chosen subtree once, combines positive lexical matches with deterministic structural coverage, and caps **that leg's retained reranker input** in `O(text bytes + N_S log M)` time and `O(M)` retained-candidate memory. This does not make the complete query `O(M)`: `gbc_rag.py` first materializes the selected subtree, `gbc_utils.py` copies the induced graph, PageRank visits that selected graph, and graph candidates are sorted before fusion. The current overall bound is therefore approximately `O(N_S + L_S + I_S(V_S+E_S) + N_G log N_G + text bytes + N_S log M)` time and `O(N_S+V_S+E_S)` memory, with a guarded optional `O(V_S^2)` semantic-link matrix. The two-score graph/text Skyline itself is deterministic, hard-capped, and `O(M log M)`; candidate generation is still tree/graph scoped rather than hybrid retrieval.
 - With `candidate_pool_size=512` and remote rerank batches of four, the current sequential path can issue 128 rerank calls for one sub-query. At the configured 30-second per-attempt timeout that is a theoretical 64-minute timeout envelope before any outer decomposition, not an acceptable request deadline. Item caps must be supplemented by a single propagated request deadline, call budget and token/pixel budget.
-- `Core/provider/vdb.py` now uses deterministic representation IDs,
+- `retrieval_engine/indexes/vector_store.py` now uses deterministic representation IDs,
   source-bound strict IDs for tree indexing, `upsert`, exact
   payload-scope-filtered deletion, and mandatory tenant/corpus/document/source/
   index filters. The tree-vector builder reconciles stale rows only inside that
@@ -297,7 +297,7 @@ recoverability and evaluation truth before adding more infrastructure.
   transactional outbox/diffing, remote content reconciliation, immutable visual
   byte handoff, served-weight attestation, and multi-node scale remain open.
 - Provider calls now have process-wide admission and lifecycle cleanup. Compatible GME handles share a model/device-keyed, reference-counted runtime, and one forward pass is admitted at a time so concurrent requests cannot multiply its transient GPU memory. The active configuration can still place MinerU, Ollama LLM/VLM, a local reranker, and GME on one GPU without a capacity-aware cross-process lease. The observed process mix reached roughly 43.3 GiB of a 48.9 GiB GPU while idle.
-- `Core/Index/Graph.py` uses `networkx.Graph`, so relation direction and multiple distinct relations between the same entity pair cannot be represented robustly.
+- `retrieval_engine/indexes/graph.py` uses `networkx.Graph`, so relation direction and multiple distinct relations between the same entity pair cannot be represented robustly.
 - The new evidence-release builder preserves every row and ordinal it receives,
   but `KGExtractor.res_repair` currently aggregates same-name/type entities and
   collapses relations on `(source, target, relation_name)` before the checkpoint
@@ -307,7 +307,7 @@ recoverability and evaluation truth before adding more infrastructure.
   raw assertion fidelity.
 - Graph `source_ids` still contain document-local integer tree IDs. The referenced tree nodes now carry canonical/derived source lineage, but integer IDs still collide across documents and are not sufficient as the durable corpus-level GT-Link authority.
 - Relation edges are now serialized into a bounded answer-facing graph context, but the underlying undirected single-edge graph still collapses direction and multiple relation assertions.
-- The multimodal reranker in `Core/rag/gbc_retrieval.py` is commented out. Images must first survive entity/section selection and text reranking based mostly on captions.
+- The multimodal reranker in `retrieval_engine/rag/gbc/retrieval.py` is commented out. Images must first survive entity/section selection and text reranking based mostly on captions.
 - Long evidence is split for reranking and only the first chunk is scored. This
   creates a systematic tail blind spot for long sections/tables. Replace it
   with query-aware bounded chunk candidates (plus heading/path context), retain
@@ -352,8 +352,8 @@ The current repository is a research implementation, not yet an easy-to-operate 
 - A dependency-light `pyproject.toml`, checksummed PostgreSQL migration policy, parser contract suites for all three adapters, deterministic router/orchestrator/reconciliation/projector fixtures, strict configuration round trips, and architecture-boundary tests now exist. There is still no complete package lock, clean-host real-worker suite, database backup/restore gate, or supported model/parser compatibility matrix.
 - The wheel includes `docarag*`, and its entry point plus help, settings, and
   storage command parsing pass a clean-wheel test with all checkout-owned
-  `Core` and PyYAML imports blocked. Compatibility `status` execution,
-  named-run verification, `index`, `ask`, and `web` still discover `Core`,
+  `retrieval_engine` and PyYAML imports blocked. Compatibility `status` execution,
+  named-run verification, `index`, `ask`, and `web` still discover `retrieval_engine`,
   `Scripts/index_pdf.sh`, `Scripts/web.py`, or other checkout resources at
   runtime. The release must either package those application services and
   resources cleanly or make a separately versioned BookRAG compatibility
@@ -759,7 +759,7 @@ The Web UI should show a document/page/stage timeline, live completed/pending/re
 Organize DocARAG as a modular monolith using dependency inversion. The domain layer must run its unit tests without importing Torch, Paddle, Transformers, Qdrant, FastAPI, or a parser package.
 
 ```text
-src/docarag/
+src/document_services/
   domain/          canonical evidence, BookIndex T/G/M, policies, errors
   application/     ingest/index/query use cases and stage orchestration
   ports/           parser, model, store, vector, artifact, event protocols
@@ -773,8 +773,8 @@ tests/
 
 Dependency direction is one-way: `api/cli/adapters -> application -> domain/ports`. Domain and application code never imports an adapter. Enforce this in CI with an import-boundary test.
 
-The first vertical seam is implemented under `docarag/domain`, `docarag/ports`,
-`docarag/adapters`, and the dependency-light routing/reconciliation/orchestration
+The first vertical seam is implemented under `document_services/domain`, `document_services/ports`,
+`document_services/parser_adapters`, and the dependency-light routing/reconciliation/orchestration
 modules. Its DTOs validate source hashes, page identity, coordinate spaces,
 parser/model/config provenance, representations, assets, capabilities, typed
 issues, and deterministic IDs without importing an ML or storage runtime. The
@@ -2175,7 +2175,7 @@ lite.
 Status: **dependency-light probe, transport, provider, and composition seam
 implemented; vendor execution and evaluation open**.
 
-Implemented under `docarag`:
+Implemented under `document_services`:
 
 - source-bound parser DTOs, capability registry, and fake adapter contract;
 - Docling export, MinerU-normalized, and PaddleOCR-VL page translators;

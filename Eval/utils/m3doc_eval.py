@@ -10,7 +10,7 @@ from scipy.optimize import linear_sum_assignment
 from word2number.w2n import word_to_num
 
 from Eval.utils.extract_answer import AnswerExtractor, load_prompt
-from Core.configs.dataset_config import DatasetConfig
+from retrieval_engine.configuration.dataset import DatasetConfig
 from Eval.utils.utils import get_all_cost
 
 from concurrent.futures import ThreadPoolExecutor

@@ -11,10 +11,10 @@ import unittest
 import urllib.request
 from unittest.mock import patch
 
-from docarag import cli
-from docarag.routed_profile import load_routed_runtime_profile
-from docarag.settings import RuntimeSettings
-from docarag.setup_plan import (
+from document_services import cli
+from document_services.runtime.routing_profile import load_routed_runtime_profile
+from document_services.runtime.settings import RuntimeSettings
+from document_services.operations.setup_planner import (
     SETUP_PLAN_SCHEMA_VERSION,
     build_setup_plan,
     render_setup_plan,
@@ -61,9 +61,9 @@ class SetupPlanTests(unittest.TestCase):
     def test_controller_supports_vendor_worker_python_313_but_not_314(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = make_checkout(Path(directory))
-            with patch("docarag.setup_plan.sys.version_info", (3, 13, 7)):
+            with patch("document_services.operations.setup_planner.sys.version_info", (3, 13, 7)):
                 supported = build_setup_plan(settings, environment={})
-            with patch("docarag.setup_plan.sys.version_info", (3, 14, 0)):
+            with patch("document_services.operations.setup_planner.sys.version_info", (3, 14, 0)):
                 unsupported = build_setup_plan(settings, environment={})
 
         def controller(plan):
@@ -226,7 +226,7 @@ class SetupPlanTests(unittest.TestCase):
             settings = make_checkout(Path(directory))
             output = io.StringIO()
             with (
-                patch("docarag.cli._load", return_value=settings),
+                patch("document_services.cli._load", return_value=settings),
                 contextlib.redirect_stdout(output),
             ):
                 code = cli.main(["setup-plan", "--json"])
@@ -234,7 +234,7 @@ class SetupPlanTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             settings.system_config.unlink()
             with (
-                patch("docarag.cli._load", return_value=settings),
+                patch("document_services.cli._load", return_value=settings),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 blocked_code = cli.main(["setup-plan", "--json"])
@@ -264,7 +264,7 @@ class SetupPlanTests(unittest.TestCase):
 
     def test_import_does_not_load_model_frameworks(self):
         code = (
-            "import json,sys; import docarag.setup_plan; "
+            "import json,sys; import document_services.operations.setup_planner; "
             "roots=('torch','paddle','paddleocr','docling','mineru','transformers','vllm'); "
             "print(json.dumps(sorted(n for n in sys.modules if n.split('.')[0] in roots)))"
         )

@@ -6,13 +6,13 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from Core.Index.Tree import NodeType
-from Core.rag.gbc_vanilla_rag import GBCVanillaRAG
-from Core.rag.graph_rag import GraphRAG
-from Core.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
-from Core.rag.mm_rag import MMRAG
-from Core.rag.traverse_agent import TraverseAgent
-from Core.rag.vanilla_rag import VanillaRAG
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.rag.strategies.gbc_vanilla import GBCVanillaRAG
+from retrieval_engine.rag.strategies.graph import GraphRAG
+from retrieval_engine.rag.grounding import NO_RETRIEVED_EVIDENCE_ANSWER
+from retrieval_engine.rag.strategies.multimodal import MMRAG
+from retrieval_engine.rag.strategies.traverse import TraverseAgent
+from retrieval_engine.rag.strategies.vanilla import VanillaRAG
 
 
 class EmptyRetrievalGroundingTests(unittest.TestCase):

@@ -14,8 +14,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from docarag.compat import inspect_run_readiness
-from docarag.provenance import verify_artifact_manifest
+from document_services.runtime.bookrag_bridge import inspect_run_readiness
+from document_services.evidence.provenance import verify_artifact_manifest
 from tests.test_cli_settings import qualified_routed_profile_text
 
 
@@ -37,12 +37,12 @@ import pickle
 from types import SimpleNamespace
 
 args = sys.argv[1:]
-if args[:2] == ["-m", "docarag.evidence_persist"]:
+if args[:2] == ["-m", "document_services.persistence.evidence_writer"]:
     # The driver requires evidence to be persisted before a run counts as
     # usable; these tests exercise stage orchestration, not the store.
     print("stub: evidence persisted")
     raise SystemExit(0)
-if args and args[0].endswith("docarag/runtime_probe.py"):
+if args and args[0].endswith("document_services/operations/environment_probe.py"):
     output = Path(args[args.index("--output") + 1])
     revision_id = args[args.index("--revision-id") + 1]
     attempt_id = args[args.index("--attempt-id") + 1]
@@ -75,8 +75,8 @@ if args and args[0].endswith("docarag/runtime_probe.py"):
     )
     output.chmod(0o400)
     raise SystemExit(0)
-if args[:2] == ["-m", "docarag.tree_integrity"]:
-    from docarag.tree_integrity import _main
+if args[:2] == ["-m", "document_services.evidence.tree_integrity"]:
+    from document_services.evidence.tree_integrity import _main
 
     # Evidence persistence is stubbed above, so there is no store for the
     # driver's store check to read. These tests exercise stage orchestration;
@@ -88,8 +88,8 @@ if args[:2] == ["-m", "docarag.tree_integrity"]:
             raise SystemExit(0)
         del integrity_args[index : index + 2]
     raise SystemExit(_main(integrity_args))
-if args[:2] == ["-m", "docarag.provenance"]:
-    from docarag.provenance import _main
+if args[:2] == ["-m", "document_services.evidence.provenance"]:
+    from document_services.evidence.provenance import _main
 
     publish_run = Path(args[args.index("--run") + 1])
     (publish_run / ".fake-publish-started").touch()
@@ -97,7 +97,7 @@ if args[:2] == ["-m", "docarag.provenance"]:
     if publish_sleep:
         time.sleep(publish_sleep)
     raise SystemExit(_main(args[2:]))
-if args[:2] == ["-m", "docarag.qdrant_readiness"]:
+if args[:2] == ["-m", "document_services.persistence.qdrant_readiness"]:
     attestation = Path(args[args.index("--attestation") + 1])
     revision_id = args[args.index("--revision-id") + 1]
     expected_kind = (
@@ -113,7 +113,7 @@ if args[:2] == ["-m", "docarag.qdrant_readiness"]:
         raise SystemExit("attestation index-kind mismatch")
     print(payload["point_count"])
     raise SystemExit(0)
-if args[:2] == ["-m", "docarag.artifact_roles"]:
+if args[:2] == ["-m", "document_services.evidence.artifact_roles"]:
     run_dir = Path(args[args.index("--run") + 1])
     output = Path(args[args.index("--output") + 1])
     is_bm25 = (
@@ -307,7 +307,7 @@ elif stage == "vdb":
 class IndexDriverIntegrationTests(unittest.TestCase):
     def setUp(self):
         qdrant = patch(
-            "Core.utils.artifact_paths.qdrant_collection_state",
+            "retrieval_engine.utils.artifact_paths.qdrant_collection_state",
             return_value=SimpleNamespace(exists=True, point_count=1),
         )
         qdrant.start()
@@ -316,12 +316,12 @@ class IndexDriverIntegrationTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.repo = self.base / "repo with 'quotes'"
         (self.repo / "Scripts").mkdir(parents=True)
-        (self.repo / "Core" / "utils").mkdir(parents=True)
-        (self.repo / "Core" / "__init__.py").write_text("", encoding="utf-8")
-        (self.repo / "Core" / "utils" / "__init__.py").write_text(
+        (self.repo / "retrieval_engine" / "utils").mkdir(parents=True)
+        (self.repo / "retrieval_engine" / "__init__.py").write_text("", encoding="utf-8")
+        (self.repo / "retrieval_engine" / "utils" / "__init__.py").write_text(
             "", encoding="utf-8"
         )
-        (self.repo / "Core" / "utils" / "artifact_paths.py").write_text(
+        (self.repo / "retrieval_engine" / "utils" / "artifact_paths.py").write_text(
             "from dataclasses import dataclass\n"
             "import hashlib\n"
             "class QdrantProtocolError(RuntimeError): pass\n"
@@ -337,7 +337,7 @@ class IndexDriverIntegrationTests(unittest.TestCase):
             encoding="utf-8",
         )
         shutil.copy2(INDEX_DRIVER, self.repo / "Scripts/index_pdf.sh")
-        shutil.copytree(REPO / "docarag", self.repo / "docarag")
+        shutil.copytree(REPO / "document_services", self.repo / "document_services")
         (self.repo / "main.py").write_text("", encoding="utf-8")
         self.fake_runtime = self.repo / "fake-runtime"
         self.fake_runtime.write_text(FAKE_RUNTIME, encoding="utf-8")

@@ -9,21 +9,21 @@ import tempfile
 import unittest
 from unittest import mock
 
-from docarag.application import (
+from document_services.application import (
     DocumentExtractionRequest,
     ExtractDocumentUseCase,
     RoutedDocumentExtractionBackend,
 )
-from docarag.canonical_artifacts import (
+from document_services.evidence.artifacts import (
     CANONICAL_CONTRACT_SCHEMA_VERSION,
     CANONICAL_EVIDENCE_SCHEMA_VERSION,
 )
-from docarag.composition import (
+from document_services.parsing.bookrag_handoff import (
     BookRAGHandoffNotReadyError,
     RoutedBookRAGFacade,
     RoutedBookRAGResult,
 )
-from docarag.domain import (
+from document_services.domain import (
     AcceleratorKind,
     BlockType,
     BoundingBox,
@@ -45,13 +45,13 @@ from docarag.domain import (
     RepresentationKind,
     SourceGeometry,
 )
-from docarag.domain.base import content_sha256
-from docarag.presets import (
+from document_services.domain.base import content_sha256
+from document_services.parsing.routing_presets import (
     DOCLING_ADAPTER,
     MINERU_ADAPTER,
     PADDLEOCR_VL_ADAPTER,
 )
-from docarag.routed_ingestion import (
+from document_services.parsing.routed_ingestion import (
     CANONICAL_ARTIFACT_FILE,
     LAST_ATTEMPT_AUDIT_FILE,
     ROUTED_AUDIT_FILE,
@@ -64,8 +64,8 @@ from docarag.routed_ingestion import (
     RoutedIngestionPolicy,
     RoutedIngestionSourceBindingError,
 )
-from docarag.routing import PageFeatures
-from docarag.source_material import SOURCE_MATERIAL_BINDING_KEY
+from document_services.parsing.routing import PageFeatures
+from document_services.evidence.sources import SOURCE_MATERIAL_BINDING_KEY
 
 
 class _FakeProbe:
@@ -392,7 +392,7 @@ class RoutedCanonicalIngestionProviderTests(unittest.TestCase):
             return real_replace(source, destination)
 
         with mock.patch(
-            "docarag.routed_ingestion.os.replace",
+            "document_services.parsing.routed_ingestion.os.replace",
             side_effect=replace_with_failure,
         ):
             with self.assertRaisesRegex(

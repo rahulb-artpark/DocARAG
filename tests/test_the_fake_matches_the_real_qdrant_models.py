@@ -124,7 +124,7 @@ class OurOwnCallsAreValid(unittest.TestCase):
 
         from qdrant_client import models
 
-        from Core.provider.vdb import VectorSchema, VectorStore
+        from retrieval_engine.indexes.vector_store import VectorSchema, VectorStore
         from tests.qdrant_fakes import FakeQdrantClient
 
         class _Embedder:
@@ -169,7 +169,7 @@ class OurOwnCallsAreValid(unittest.TestCase):
 
     def test_the_tree_collection_config_validates(self):
         models = _real_models()
-        from Core.provider.vdb import _TREE_DENSE_VECTORS, _TREE_SPARSE_VECTOR
+        from retrieval_engine.indexes.vector_store import _TREE_DENSE_VECTORS, _TREE_SPARSE_VECTOR
 
         vectors = {
             name: models.VectorParams(size=2048, distance=models.Distance.COSINE)

@@ -11,7 +11,7 @@ if [[ -z "$QUESTION" ]]; then
   exit 1
 fi
 
-COMMAND=(python -m docarag ask)
+COMMAND=(python -m document_services ask)
 if [[ -n "$RUN" ]]; then
   COMMAND+=(--run "$RUN")
 fi

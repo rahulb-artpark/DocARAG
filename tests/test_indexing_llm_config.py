@@ -5,8 +5,8 @@ from unittest.mock import Mock
 
 from pydantic import BaseModel
 
-from Core.configs.llm_config import LLMConfig, indexing_llm_config
-from Core.provider.llm import OllamaController
+from retrieval_engine.configuration.language_model import LLMConfig, indexing_llm_config
+from retrieval_engine.providers.language_model import OllamaController
 
 
 class Payload(BaseModel):

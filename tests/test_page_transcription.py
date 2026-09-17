@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from docarag.page_transcription import (
+from document_services.enrichment.page_transcription import (
     align_transcription,
     lexicon_validity,
     merge_band_lines,

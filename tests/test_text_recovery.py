@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from docarag.text_recovery import (
+from document_services.enrichment.text_recovery import (
     _covered_fraction,
     _is_empty_text_block,
     _normalize,
@@ -55,7 +55,7 @@ class CoordinateSpaceTests(unittest.TestCase):
         # A scale factor here silently reads the wrong part of the page and
         # grafts one region's words onto another block.
         recorder: list[tuple[float, float, float, float]] = []
-        module = importlib.import_module("docarag.text_recovery")
+        module = importlib.import_module("document_services.enrichment.text_recovery")
         fake = types.SimpleNamespace(PdfDocument=lambda _path: _FakeDocument(recorder))
         blocks = [{"type": "text", "text": "", "page_idx": 0, "bbox": [128, 272, 493, 492]}]
 

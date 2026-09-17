@@ -5,7 +5,7 @@ import unittest
 
 from pydantic import BaseModel, ValidationError
 
-from Core.provider.structured_output import parse_structured, strip_code_fence
+from retrieval_engine.providers.structured_output import parse_structured, strip_code_fence
 
 
 class Entity(BaseModel):

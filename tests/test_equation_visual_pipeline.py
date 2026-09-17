@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from Core.Index.Tree import DocumentTree, NodeType
-from Core.pipelines.tree_node_builder import create_node_by_type
-from Core.pipelines import vdb_index
-from Core.rag.gbc_answer import AnswerAgent
+from retrieval_engine.indexes.tree import DocumentTree, NodeType
+from retrieval_engine.indexing.tree.nodes import create_node_by_type
+from retrieval_engine.indexing.vector import builder as vdb_index
+from retrieval_engine.rag.gbc.answer import AnswerAgent
 
 
 class EquationVisualPipelineTests(unittest.TestCase):

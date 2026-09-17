@@ -5,7 +5,7 @@ import subprocess
 import sys
 import unittest
 
-from docarag.domain import (
+from document_services.domain import (
     AssetKind,
     AssetRef,
     BlockType,
@@ -21,7 +21,7 @@ from docarag.domain import (
     SourceGeometry,
     content_sha256,
 )
-from docarag.reconciliation import (
+from document_services.parsing.reconciliation import (
     ReconciliationError,
     ReconciliationIssueCode,
     ReconciliationPolicy,
@@ -320,8 +320,8 @@ class ParserReconciliationTests(unittest.TestCase):
     def test_import_does_not_load_parser_or_model_runtimes(self):
         script = """
 import json, sys
-import docarag.reconciliation
-forbidden = ('Core', 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
+import document_services.parsing.reconciliation
+forbidden = ("retrieval_engine", 'torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """
         completed = subprocess.run(

@@ -6,8 +6,8 @@ import subprocess
 import sys
 import unittest
 
-from docarag.adapters.mineru_compat import MinerUNormalizedAdapter
-from docarag.domain import (
+from document_services.parser_adapters.mineru_compat import MinerUNormalizedAdapter
+from document_services.domain import (
     AcceleratorKind,
     AssetKind,
     AssetRef,
@@ -41,7 +41,7 @@ from docarag.domain import (
     UnsupportedSchemaVersionError,
     stable_id,
 )
-from docarag.ports import ParserRegistry
+from document_services.ports import ParserRegistry
 
 
 def request_fixture() -> ParseRequest:
@@ -810,7 +810,7 @@ class MinerUNormalizedAdapterTests(unittest.TestCase):
     def test_contract_imports_do_not_load_ml_or_vendor_packages(self):
         script = """
 import json, sys
-import docarag.domain, docarag.ports, docarag.adapters.mineru_compat
+import document_services.domain, document_services.ports, document_services.parser_adapters.mineru_compat
 forbidden = ('torch', 'mineru', 'paddle', 'paddleocr', 'docling', 'transformers', 'vllm')
 print(json.dumps(sorted(name for name in sys.modules if name.split('.')[0] in forbidden)))
 """

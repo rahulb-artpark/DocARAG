@@ -9,18 +9,18 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from docarag.presets import (
+from document_services.parsing.routing_presets import (
     DOCLING_ADAPTER,
     MINERU_ADAPTER,
     PADDLEOCR_VL_ADAPTER,
 )
-from docarag.routed_profile import (
+from document_services.runtime.routing_profile import (
     ROUTED_PROFILE_SCHEMA_VERSION,
     RoutedProfileReadError,
     RoutedProfileValidationError,
     load_routed_runtime_profile,
 )
-from docarag.domain import MinerUEffort
+from document_services.domain import MinerUEffort
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent

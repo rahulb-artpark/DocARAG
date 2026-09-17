@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from unittest.mock import ANY, Mock, patch
 
-from Core import construct_index
-from Core.provider.TokenTracker import TokenTracker
-from Core.configs.graph_config import (
+from retrieval_engine.indexing import pipeline as construct_index
+from retrieval_engine.providers.token_tracker import TokenTracker
+from retrieval_engine.configuration.knowledge_graph import (
     GraphConfig,
     entity_attestation_directory,
     graph_artifact_variant,
@@ -160,7 +160,7 @@ class ConstructIndexStageTests(unittest.TestCase):
 
         with (
             patch(
-                "docarag.vdb_tree_source.StoreTreeSource.open", return_value=tree
+                "document_services.persistence.vector_tree_source.StoreTreeSource.open", return_value=tree
             ),
             patch.object(
                 construct_index, "build_knowledge_graph", return_value=graph
@@ -258,7 +258,7 @@ class ConstructIndexStageTests(unittest.TestCase):
             with (
                 patch.object(construct_index.TokenTracker, "get_instance", return_value=tracker),
                 patch(
-                    "docarag.vdb_tree_source.StoreTreeSource.open",
+                    "document_services.persistence.vector_tree_source.StoreTreeSource.open",
                     return_value=SimpleNamespace(nodes=[], store_seal=None, meta_info=None),
                 ),
                 patch.object(construct_index, "build_vdb_index") as build_vdb,

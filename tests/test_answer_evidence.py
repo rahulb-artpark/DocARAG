@@ -4,8 +4,8 @@ from copy import deepcopy
 from types import SimpleNamespace
 import unittest
 
-from Core.Index.Tree import NodeType
-from Core.rag.gbc_answer import AnswerAgent
+from retrieval_engine.indexes.tree import NodeType
+from retrieval_engine.rag.gbc.answer import AnswerAgent
 
 
 class AnswerEvidenceTests(unittest.TestCase):

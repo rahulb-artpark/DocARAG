@@ -6,10 +6,10 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.configs.vdb_config import VDBConfig
-from Core.pipelines import vdb_index
-from Core.provider.vdb import VectorStore
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.configuration.vector_store import VDBConfig
+from retrieval_engine.indexing.vector import builder as vdb_index
+from retrieval_engine.indexes.vector_store import VectorStore
 from tests.qdrant_fakes import qdrant_store
 
 

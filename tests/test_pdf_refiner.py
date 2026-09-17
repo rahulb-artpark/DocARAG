@@ -13,13 +13,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from Core.pipelines.pdf_refiner import (
+from retrieval_engine.parsing.pdf_refinement import (
     StitchingJudgmentsResponse,
     is_likely_content_label,
     label_merger,
     search_label_content_candidate,
 )
-from Core.prompts.refiner_prompt import StitchingJudgment
+from retrieval_engine.prompts.refinement import StitchingJudgment
 
 
 class IsLikelyContentLabelTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class IsLikelyContentLabelTests(unittest.TestCase):
     def test_never_overlaps_with_is_likely_incomplete_paragraphs_own_population(self):
         # The two passes must never both claim the same block: label_merger
         # targets exactly what Rule 1 excludes from continuation-merging.
-        from Core.pipelines.pdf_refiner import is_likely_incomplete_paragraph
+        from retrieval_engine.parsing.pdf_refinement import is_likely_incomplete_paragraph
 
         cases = [
             "Answer to Check Yourself",

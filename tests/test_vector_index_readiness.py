@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from Core.Index.Tree import DocumentTree, NodeType, TreeNode
-from Core.pipelines import vdb_index
-from Core.utils.artifact_paths import QdrantCollectionState, QdrantUnavailableError
-from Core.utils.vector_index_manifest import (
+from retrieval_engine.indexes.tree import DocumentTree, NodeType, TreeNode
+from retrieval_engine.indexing.vector import builder as vdb_index
+from retrieval_engine.utils.artifact_paths import QdrantCollectionState, QdrantUnavailableError
+from retrieval_engine.indexes.vector_manifest import (
     VECTOR_INDEX_ATTESTATION_NAME,
     read_vector_index_attestation,
 )

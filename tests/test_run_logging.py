@@ -8,7 +8,7 @@ import tempfile
 import threading
 import unittest
 
-from docarag.run_logging import RunLogScope, current_logging_run_id
+from document_services.operations.run_logging import RunLogScope, current_logging_run_id
 
 
 class RunLogScopeTests(unittest.TestCase):

@@ -11,8 +11,8 @@ from __future__ import annotations
 import unittest
 from collections import defaultdict
 
-from Core.Index.Graph import Entity, Graph
-from Core.pipelines.kg_refiner import EntityResolutionStats, KGRefiner
+from retrieval_engine.indexes.graph import Entity, Graph
+from retrieval_engine.indexing.graph.refiner import EntityResolutionStats, KGRefiner
 
 
 class _VDB:

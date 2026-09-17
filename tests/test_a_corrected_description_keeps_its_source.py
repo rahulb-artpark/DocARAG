@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import unittest
 
-from docarag.derived_identity import (
+from document_services.evidence.identity import (
     derived_evidence_id,
     derived_identity_payload,
     derived_output_identity,
 )
-from docarag.edit import (
+from document_services.indexing.editing import (
     HUMAN_EDIT_TRANSFORMATION,
     _DIRECT_EVIDENCE_FIELDS,
     _derived_evidence_for_edit,
@@ -75,14 +75,14 @@ class _StubType:
         self.value = value
 
     def __enter__(self):
-        import docarag.edit as edit
+        import document_services.indexing.editing as edit
 
         self.original = edit._primary_block_type
         edit._primary_block_type = lambda _run, _evidence: self.value
         return self
 
     def __exit__(self, *_exc):
-        import docarag.edit as edit
+        import document_services.indexing.editing as edit
 
         edit._primary_block_type = self.original
         return False
