@@ -25,6 +25,7 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from document_services import __version__
+from document_services.indexing.office_convert import OFFICE_SUFFIXES
 from document_services.runtime.settings import (
     DEFAULT_FILENAME,
     RuntimeSettings,
@@ -558,9 +559,24 @@ def command_index(args: argparse.Namespace) -> int:
     pdf = Path(args.document).expanduser().resolve()
     if not pdf.is_file():
         raise CLIError(f"Document not found: {pdf}")
-    if pdf.suffix.lower() != ".pdf":
+    suffix = pdf.suffix.lower()
+    if suffix in OFFICE_SUFFIXES:
+        from document_services.indexing.office_convert import (
+            OfficeConversionError,
+            convert_office_to_pdf,
+        )
+
+        try:
+            pdf = convert_office_to_pdf(
+                pdf,
+                cache_dir=settings.runs_dir / "_uploads" / "_converted",
+                sha256=_stable_file_sha256(pdf),
+            )
+        except OfficeConversionError as exc:
+            raise CLIError(str(exc)) from exc
+    elif suffix != ".pdf":
         raise CLIError(
-            "The current compatibility indexer accepts PDF files only. "
+            "The current compatibility indexer accepts PDF, DOCX, or PPTX files. "
             "Additional ingestors are part of the canonical-ingestion phase."
         )
     if not settings.system_config.is_file():

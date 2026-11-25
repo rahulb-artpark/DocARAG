@@ -803,6 +803,14 @@ pip install -r requirements.txt
 
 BookRAG uses [MinerU](https://github.com/opendatalab/MinerU) for PDF parsing and document information extraction. The compatibility preset selected by a new `docarag.toml`, [`config/ollama-gbc.yaml`](./config/ollama-gbc.yaml), currently uses the local `vlm-transformers` MinerU backend; its `server_url` is therefore unused and the parser consumes local RAM/VRAM. Other checked-in configurations may use `vlm-sglang-client` and require the corresponding service. For graph extraction, the default local NLP model is `en_core_web_sm`, which is included in [`requirements.txt`](./requirements.txt).
 
+`docarag index` also accepts `.docx` and `.pptx` documents: [`document_services/indexing/office_convert.py`](./document_services/indexing/office_convert.py) renders them to PDF first (neither format has PDF's fixed page geometry, which the indexer's evidence and citations are built on) and indexes the result exactly like a native PDF upload. This needs a system-wide [LibreOffice](https://www.libreoffice.org/) install — not a pip/conda package, so it is not in `requirements.txt` or `environment.yml`:
+
+```bash
+sudo apt install libreoffice   # or your distribution's equivalent
+```
+
+PDF-only indexing works without it; `docarag doctor` reports it as an optional `command.libreoffice` check.
+
 The Ollama names in that preset (`gpt-oss-bookrag`, `qwen3-vl-bookrag`, and
 `qwen3-embedding:0.6b`) are workstation model tags, not models provisioned by
 this repository. Confirm them with `ollama list`, replace the `model_name`

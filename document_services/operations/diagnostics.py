@@ -563,6 +563,13 @@ def doctor_for_settings(
         CommandSpec("flock", "flock", args=("--version",)),
         CommandSpec("setsid", "setsid", args=("--version",)),
         CommandSpec("nohup", "nohup", args=("--version",)),
+        # Not a pip/conda package: LibreOffice converts .docx/.pptx uploads to
+        # PDF before indexing (see document_services/indexing/office_convert.py).
+        # Optional -- PDF-only indexing works without it.
+        CommandSpec(
+            "libreoffice", "soffice", args=("--version",),
+            required=False, timeout_seconds=15.0,
+        ),
     ]
     if python_executable:
         runtime_python = (str(python_executable),)

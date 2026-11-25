@@ -26,14 +26,13 @@ const state = {
   documentRuns: [],
   groups: [],
   libraryRuns: [],
-  // Drive-style library: folder being browsed ("" = My Library root), selection, layout.
+  // Drive-style library: folder being browsed ("" = My Library root), selection.
   library: {
     folder: "",
     selected: null,
     search: "",
     status: "",
     sort: { key: "name", dir: "asc" },
-    layout: "list",
     detailOpen: true,
     expanded: new Set([""]),
     menuItems: [],
@@ -427,7 +426,6 @@ async function api(path, opts) {
 document.addEventListener("DOMContentLoaded", boot);
 
 async function boot() {
-  state.library.layout = readPref("noetics.libraryLayout", "list") === "grid" ? "grid" : "list";
   state.library.detailOpen = readPref("noetics.libraryDetail", "open") !== "closed";
   wireTabs();
   wireGraphControls();
@@ -643,6 +641,14 @@ const fmtDuration = (sec) => {
   if (sec < 60) return `${sec.toFixed(0)}s`;
   const m = Math.floor(sec / 60);
   return m < 60 ? `${m}m ${Math.round(sec % 60)}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+};
+
+const fmtBytes = (n) => {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} KB`;
+  return `${n} B`;
 };
 
 const fmtTokens = (n) => {
@@ -1020,13 +1026,8 @@ function renderLibrary() {
 
   const where = lib.folder === LIBRARY_ROOT || lib.folder === LIBRARY_ALL ? null : folderById(lib.folder);
   $("dropBarText").innerHTML = where
-    ? `Drop a PDF here or click to upload into <b>${escapeHtml(where.name)}</b>`
-    : "Drop a PDF here or click to upload";
-  document.querySelectorAll(".viewToggle [data-layout]").forEach((b) => {
-    const on = b.dataset.layout === lib.layout;
-    b.classList.toggle("active", on);
-    b.setAttribute("aria-pressed", String(on));
-  });
+    ? `Drop a document here or click to upload into <b>${escapeHtml(where.name)}</b>`
+    : "Drop a document here or click to upload";
   $("libraryView").classList.toggle("detailOpen", lib.detailOpen);
   $("driveInfoBtn").setAttribute("aria-pressed", String(lib.detailOpen));
   $("driveInfoBtn").classList.toggle("active", lib.detailOpen);
@@ -1145,7 +1146,7 @@ function visibleRuns({ ignoreStatus = false } = {}) {
   const key = lib.sort.key;
   return runs.sort((a, b) => {
     if (key === "created") return dir * (new Date(runAddedAt(a) || 0) - new Date(runAddedAt(b) || 0));
-    if (key === "tokens") return dir * (((a.metrics || {}).totalTokens || 0) - ((b.metrics || {}).totalTokens || 0));
+    if (key === "size") return dir * ((a.sizeBytes || 0) - (b.sizeBytes || 0));
     return dir * byName(a, b);
   });
 }
@@ -1189,8 +1190,7 @@ function folderRowHtml(folder) {
     <div class="dCell dStatus muted">${items} item${items === 1 ? "" : "s"}</div>
     ${showLocation() ? `<div class="dCell dLoc">${folder.parentId ? `<button type="button" class="locChip" data-nav="${escapeHtml(folder.parentId)}">${ICONS.folder}${escapeHtml(folderById(folder.parentId).name)}</button>` : '<span class="locChip root">My Library</span>'}</div>` : ""}
     <div class="dCell dWhen">${escapeHtml(fmtDay(folder.createdAt))}</div>
-    <div class="dCell dTokens muted">—</div>
-    <div class="dCell dTime muted">—</div>
+    <div class="dCell dSize muted">—</div>
     <div class="dCell dMore"><button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(folder.name)}">⋮</button></div>
   </div>`;
 }
@@ -1207,33 +1207,8 @@ function runRowHtml(run) {
     <div class="dCell dStatus">${runStatusHtml(run)}</div>
     ${showLocation() ? `<div class="dCell dLoc">${locationHtml(run)}</div>` : ""}
     <div class="dCell dWhen">${escapeHtml(fmtDay(runAddedAt(run)))}</div>
-    <div class="dCell dTokens">${escapeHtml(fmtTokens(run.metrics && run.metrics.totalTokens))}</div>
-    <div class="dCell dTime">${escapeHtml(fmtDuration(runIndexSeconds(run)))}</div>
+    <div class="dCell dSize">${escapeHtml(fmtBytes(run.sizeBytes))}</div>
     <div class="dCell dMore"><button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(run.name)}">⋮</button></div>
-  </div>`;
-}
-
-function folderCardHtml(folder) {
-  const lib = state.library;
-  const selected = lib.selected && lib.selected.kind === "folder" && lib.selected.id === folder.id;
-  return `<div class="dCard folder${selected ? " selected" : ""}" tabindex="0" draggable="true"
-      data-kind="folder" data-id="${escapeHtml(folder.id)}" data-drop-folder="${escapeHtml(folder.id)}">
-    ${ICONS.folder}<span class="dLabel" title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</span>
-    <button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(folder.name)}">⋮</button>
-  </div>`;
-}
-
-function runCardHtml(run) {
-  const lib = state.library;
-  const selected = lib.selected && lib.selected.kind === "run" && lib.selected.id === run.runDir;
-  return `<div class="dCard file${selected ? " selected" : ""}" tabindex="0" draggable="true"
-      data-kind="run" data-id="${escapeHtml(run.runDir)}">
-    <div class="dCardTitle">${ICONS.pdf}<span class="dLabel" title="${escapeHtml(run.name)}">${escapeHtml(run.name)}</span>
-      <button type="button" class="moreBtn" data-more aria-label="More actions for ${escapeHtml(run.name)}">⋮</button></div>
-    <div class="dThumb">
-      <div class="dThumbStages">${run.stages.map((s) => `<span class="thumbStage ${escapeHtml(s.status)}" title="${escapeHtml(s.name)}: ${escapeHtml(s.status)}">${escapeHtml(s.name)}</span>`).join("")}</div>
-      <div class="dThumbFoot">${runStatusHtml(run)}<span class="muted">${escapeHtml(fmtDay(runAddedAt(run)))}</span></div>
-    </div>
   </div>`;
 }
 
@@ -1262,16 +1237,10 @@ function driveBodyHtml() {
     return `<div class="driveEmpty">
       ${ICONS.folder}
       <h3>${q ? "No matches" : lib.status ? "Nothing with this status here" : lib.folder === LIBRARY_ROOT || lib.folder === LIBRARY_ALL ? "Your library is empty" : "This folder is empty"}</h3>
-      <p>${q ? "Try a different name or tag." : lib.status ? "Clear the filter to see everything." : "Drop a PDF here, or move documents in from another folder."}</p>
+      <p>${q ? "Try a different name or tag." : lib.status ? "Clear the filter to see everything." : "Drop a document here, or move documents in from another folder."}</p>
       ${!q && !lib.status && folderById(lib.folder) && state.libraryRuns.length
         ? '<button type="button" class="btn" data-act="add-existing">Add existing documents…</button>' : ""}
     </div>`;
-  }
-
-  if (lib.layout === "grid") {
-    return `
-      ${folders.length ? `<h4 class="gridHead">Folders</h4><div class="dGrid folders">${folders.map(folderCardHtml).join("")}</div>` : ""}
-      ${runs.length ? `<h4 class="gridHead">Files</h4><div class="dGrid files">${runs.map(runCardHtml).join("")}</div>` : ""}`;
   }
 
   return `<div class="dTable" role="table" aria-label="Library contents">
@@ -1280,8 +1249,7 @@ function driveBodyHtml() {
       <div class="dCell dStatus">Status</div>
       ${showLocation() ? '<div class="dCell dLoc">Location</div>' : ""}
       <div class="dCell dWhen">${sortHeadHtml("created", "Added")}</div>
-      <div class="dCell dTokens">${sortHeadHtml("tokens", "Tokens")}</div>
-      <div class="dCell dTime">Index time</div>
+      <div class="dCell dSize">${sortHeadHtml("size", "Size")}</div>
       <div class="dCell dMore"></div>
     </div>
     ${folders.map(folderRowHtml).join("")}
@@ -1683,7 +1651,7 @@ function placeMenuItems() {
   const here = folderById(state.library.folder) ? state.library.folder : LIBRARY_ROOT;
   return [
     { label: "New folder", act: () => createFolder(here) },
-    { label: "Upload PDF", act: () => $("fileInput").click() },
+    { label: "Upload document", act: () => $("fileInput").click() },
     here && { sep: true },
     here && { label: "Add existing documents…", act: () => openAddDocsModal(here) },
   ];
@@ -1852,10 +1820,17 @@ function setUploadStatus(message, isError) {
   box.innerHTML = message;
 }
 
+const UPLOAD_CONTENT_TYPES = {
+  ".pdf": "application/pdf",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+
 async function uploadPdf(file, plan, folderId) {
   if (!file) return;
-  if (!/\.pdf$/i.test(file.name)) {
-    setUploadStatus("Only PDF files can be indexed.", true);
+  const ext = (/\.[^.]+$/.exec(file.name) || [""])[0].toLowerCase();
+  if (!UPLOAD_CONTENT_TYPES[ext]) {
+    setUploadStatus("Only PDF, Word (.docx), or PowerPoint (.pptx) files can be indexed.", true);
     return;
   }
   const zone = $("dropZone");
@@ -1863,7 +1838,7 @@ async function uploadPdf(file, plan, folderId) {
   setUploadStatus(`<span class="spinner"></span>Uploading and starting <b>${escapeHtml(file.name)}</b>…`);
   try {
     const headers = {
-      "Content-Type": "application/pdf",
+      "Content-Type": UPLOAD_CONTENT_TYPES[ext],
       "X-Filename": encodeURIComponent(file.name),
     };
     if (plan) headers["X-Cross-Link-Plan"] = encodeURIComponent(JSON.stringify(plan));
@@ -1917,12 +1892,6 @@ function wireLibrary() {
     lib.status = lib.status === chip.dataset.status ? "" : chip.dataset.status;
     renderLibrary();
   });
-  document.querySelectorAll(".viewToggle [data-layout]").forEach((btn) =>
-    btn.addEventListener("click", () => {
-      lib.layout = btn.dataset.layout;
-      writePref("noetics.libraryLayout", lib.layout);
-      renderLibrary();
-    }));
   $("driveInfoBtn").addEventListener("click", () => {
     lib.detailOpen = !lib.detailOpen;
     writePref("noetics.libraryDetail", lib.detailOpen ? "open" : "closed");
@@ -1955,7 +1924,7 @@ function wireLibrary() {
       return;
     }
     const nav = e.target.closest("[data-nav]");
-    if (nav && !e.target.closest(".dRow, .dCard, #driveDetail")) {
+    if (nav && !e.target.closest(".dRow, #driveDetail")) {
       navigateFolder(nav.dataset.nav);
     }
   });
@@ -1990,17 +1959,17 @@ function wireLibrary() {
     selectItem(item.dataset.kind, item.dataset.id);
   });
   body.addEventListener("dblclick", (e) => {
-    const item = e.target.closest(".dRow[data-kind], .dCard[data-kind]");
+    const item = e.target.closest(".dRow[data-kind]");
     if (item && !e.target.closest("[data-more], .locChip[data-nav]")) openItem(item.dataset.kind, item.dataset.id);
   });
   body.addEventListener("keydown", (e) => {
-    const item = e.target.closest(".dRow[data-kind], .dCard[data-kind]");
+    const item = e.target.closest(".dRow[data-kind]");
     if (!item) return;
     if (e.key === "Enter") { e.preventDefault(); openItem(item.dataset.kind, item.dataset.id); }
     if (e.key === " ") { e.preventDefault(); selectItem(item.dataset.kind, item.dataset.id); }
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
-      const all = Array.from(body.querySelectorAll(".dRow[data-kind], .dCard[data-kind]"));
+      const all = Array.from(body.querySelectorAll(".dRow[data-kind]"));
       const next = all[all.indexOf(item) + (e.key === "ArrowDown" ? 1 : -1)];
       if (next) next.focus();
     }
@@ -2008,7 +1977,7 @@ function wireLibrary() {
   $("driveMain").addEventListener("contextmenu", (e) => {
     if (e.target.closest("input, #driveFilters")) return;
     e.preventDefault();
-    const item = e.target.closest(".dRow[data-kind], .dCard[data-kind]");
+    const item = e.target.closest(".dRow[data-kind]");
     if (item) {
       selectItem(item.dataset.kind, item.dataset.id);
       openDriveMenu(itemMenu(item.dataset.kind, item.dataset.id), { x: e.clientX, y: e.clientY });

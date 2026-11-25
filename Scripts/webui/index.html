@@ -55,7 +55,9 @@
               <span class="driveNewPlus" aria-hidden="true">+</span> New
             </button>
           </div>
-          <input id="fileInput" type="file" accept="application/pdf,.pdf" hidden />
+          <input id="fileInput" type="file"
+                 accept=".pdf,.docx,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                 hidden />
           <nav class="driveTree" id="driveTree"></nav>
           <div class="driveNavFoot" id="driveNavFoot"></div>
         </aside>
@@ -70,14 +72,6 @@
           <div class="driveHead">
             <nav class="driveCrumbs" id="driveCrumbs" aria-label="Location"></nav>
             <div class="driveTools">
-              <div class="viewToggle" role="group" aria-label="Layout">
-                <button type="button" data-layout="list" title="List layout" aria-label="List layout">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v2H3zm0 6h18v2H3zm0 6h18v2H3z"/></svg>
-                </button>
-                <button type="button" data-layout="grid" title="Grid layout" aria-label="Grid layout">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zm10 0h8v8h-8zM3 13h8v8H3zm10 0h8v8h-8z"/></svg>
-                </button>
-              </div>
               <button type="button" class="driveIconBtn" id="driveInfoBtn" title="Details" aria-label="Toggle details" aria-pressed="true">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16z"/></svg>
               </button>
@@ -86,9 +80,9 @@
           <div class="driveFilters" id="driveFilters" role="group" aria-label="Filter by status"></div>
           <div class="uploadStatus" id="uploadStatus" hidden></div>
           <div class="driveBody" id="driveBody"></div>
-          <div class="dropBar" id="dropZone" tabindex="0" role="button" aria-label="Choose a PDF or drop one here">
+          <div class="dropBar" id="dropZone" tabindex="0" role="button" aria-label="Choose a PDF, Word, or PowerPoint file, or drop one here">
             <span class="dropBarPlus" aria-hidden="true">+</span>
-            <span id="dropBarText">Drop a PDF here or click to upload</span>
+            <span id="dropBarText">Drop a PDF, Word, or PowerPoint file here or click to upload</span>
           </div>
           <div class="dropOverlay" id="dropOverlay" hidden><span id="dropOverlayText">Drop to upload</span></div>
         </section>

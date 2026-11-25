@@ -12,6 +12,7 @@ import errno
 import hashlib
 import ipaddress
 import copy
+import io
 import json
 import logging
 import mimetypes
@@ -25,6 +26,7 @@ import threading
 import time
 import traceback
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -55,6 +57,8 @@ from retrieval_engine.providers.token_tracker import TokenTracker
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
+OOXML_MAGIC = b"PK\x03\x04"
+KNOWN_UPLOAD_SUFFIXES = (".pdf", ".docx", ".pptx")
 STAGE_ORDER = ("tree", "graph", "vdb")
 _STAGE_TOKEN_KEYS = {
     "tree": ("tree_index_construction", "tree_node_summary"),
@@ -69,14 +73,41 @@ def uploads_dir():
     return runs_root() / "_uploads"
 
 
-def safe_pdf_name(raw):
-    """Return a bounded ``.pdf`` filename that cannot escape the upload dir."""
+def safe_document_name(raw, suffix):
+    """Return a bounded filename with ``suffix`` that cannot escape the upload dir."""
 
     stem = Path(unquote(str(raw or ""))).name
     cleaned = re.sub(r"[^\w.\- ]+", "_", stem).strip(" .") or "document"
-    if cleaned.lower().endswith(".pdf"):
-        cleaned = cleaned[:-4].strip(" .") or "document"
-    return f"{cleaned[:80]}.pdf"
+    lowered = cleaned.lower()
+    for known in KNOWN_UPLOAD_SUFFIXES:
+        if lowered.endswith(known):
+            cleaned = cleaned[: -len(known)].strip(" .") or "document"
+            break
+    return f"{cleaned[:80]}{suffix}"
+
+
+def sniff_upload_kind(body):
+    """('pdf'|'docx'|'pptx', None) from real bytes, or (None, error message).
+
+    The filename a client sends is cosmetic; only the bytes decide what gets
+    indexed. docx and pptx are both zip containers, so telling them apart (and
+    rejecting an arbitrary zip) means checking which office part is inside.
+    """
+
+    if body[: len(PDF_MAGIC)] == PDF_MAGIC:
+        return "pdf", None
+    if body[: len(OOXML_MAGIC)] == OOXML_MAGIC:
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                names = set(archive.namelist())
+        except zipfile.BadZipFile:
+            return None, "Not a valid PDF, DOCX, or PPTX file"
+        if "word/document.xml" in names:
+            return "docx", None
+        if "ppt/presentation.xml" in names:
+            return "pptx", None
+        return None, "Not a valid PDF, DOCX, or PPTX file"
+    return None, "Not a valid PDF, DOCX, or PPTX file"
 
 
 def find_run_dirs():
@@ -590,6 +621,7 @@ def run_summary(run_dir, history=None):
     resumable = run_code_fingerprint_matches(run_dir)
     progress["codeChanged"] = resumable is False
     progress["hasPdf"] = run_indexed_pdf(run_dir) is not None
+    progress["sizeBytes"] = run_source_size_bytes(run_dir)
     progress["canResume"] = bool(
         not progress["isIndexing"]
         and resumable is not False
@@ -901,7 +933,9 @@ def start_index(pdf_path):
         cwd=str(REPO),
         capture_output=True,
         text=True,
-        timeout=600,
+        # 600s of headroom beyond the office_convert.py conversion's own
+        # 300s cap, for a .docx/.pptx upload that needs LibreOffice first.
+        timeout=900,
     )
     output = f"{completed.stdout}\n{completed.stderr}"
     if completed.returncode != 0:
@@ -1121,6 +1155,23 @@ def run_indexed_pdf(run_dir):
         candidate = source.get(key)
         if isinstance(candidate, str) and Path(candidate).is_file():
             return Path(candidate)
+    return None
+
+
+def run_source_size_bytes(run_dir):
+    """Size of the indexed PDF, in bytes -- the manifest's own record if present,
+    else measured from disk so an older run without that field still reports one."""
+
+    source = _read_json_if_present(Path(run_dir) / "run-manifest.json").get("source") or {}
+    size = source.get("size_bytes")
+    if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+        return size
+    pdf = run_indexed_pdf(run_dir)
+    if pdf is not None:
+        try:
+            return pdf.stat().st_size
+        except OSError:
+            return None
     return None
 
 
@@ -3062,7 +3113,6 @@ class Handler(SimpleHTTPRequestHandler):
         if folder_id and folder_id not in {g.get("id") for g in list_groups()}:
             self.send_error_json(HTTPStatus.NOT_FOUND, f"Unknown folder: {folder_id}")
             return
-        name = safe_pdf_name(self.headers.get("X-Filename"))
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -3074,16 +3124,18 @@ class Handler(SimpleHTTPRequestHandler):
         if length > MAX_UPLOAD_BYTES:
             self.send_error_json(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                f"PDF exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit",
+                f"Document exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit",
             )
             return
         body = self.rfile.read(length)
         if len(body) != length:
             self.send_error_json(HTTPStatus.BAD_REQUEST, "Upload was truncated")
             return
-        if not body.startswith(PDF_MAGIC):
-            self.send_error_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Not a PDF file")
+        kind, sniff_error = sniff_upload_kind(body)
+        if kind is None:
+            self.send_error_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, sniff_error)
             return
+        name = safe_document_name(self.headers.get("X-Filename"), f".{kind}")
 
         target = uploads_dir() / name
         try:
